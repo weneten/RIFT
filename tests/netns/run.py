@@ -655,9 +655,17 @@ def main():
     WORK = pathlib.Path(tempfile.mkdtemp(prefix="rift-netns-"))
     try:
         create_topology()
+        # Newly assigned IPv6 addresses remain tentative during DAD. Do not bind
+        # probe sockets until the real kernel has completed address activation.
+        wait_until(lambda: all(not ns(name, "ip", "-6", "address", "show", "tentative").stdout.strip()
+                               for name in NETNS),
+                   "IPv6 addresses to finish duplicate address detection", timeout=20)
         prior = install_foreign_state()
         start_underlay_echo()
-        check_normal_traffic()
+        def underlay_ready():
+            check_normal_traffic()
+            return True
+        wait_until(underlay_ready, "underlay echo listeners to become ready", timeout=20)
         # Normal underlay path must be selected before RIFT owns anything.
         baselines = {name: (ns(name, "ip", "route", "get", PUBLIC_V4,
                                "from", f"172.31.0.{idx}").stdout.strip(),
@@ -715,6 +723,12 @@ def main():
         assert FOREIGN_RULE in ns(VPS, "ip", "rule", "show").stdout
         print("PASS crash/restart preserves existing firewall objects and policy rules")
         print("PASS namespace integration suite completed; no performance numbers were collected")
+    except Exception:
+        # Preserve diagnostics in the job log before cleanup removes the scratch directory.
+        for logfile in WORK.glob("*.log"):
+            print(f"--- {logfile.name} ---", file=sys.stderr)
+            print(logfile.read_text(encoding="utf-8", errors="replace")[-5000:], file=sys.stderr)
+        raise
     finally:
         cleanup()
 
