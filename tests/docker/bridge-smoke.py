@@ -129,9 +129,9 @@ def main():
         vps_cfg.write_text(cfg, encoding="utf-8")
         agent_cfg.write_text(cfg, encoding="utf-8")
         try:
-            docker("build", "--tag", TAG, "--file", ROOT / "Dockerfile", ROOT, timeout=900)
+            docker("build", "--tag", TAG, "--file", ROOT / "Dockerfile", ROOT, timeout=900, capture=False)
             docker("build", "--tag", f"{TAG}-agent", "--file", ROOT / "tests/docker/Agent.Dockerfile",
-                   "--build-arg", f"RIFT_IMAGE={TAG}", ROOT / "tests/docker", timeout=900)
+                   "--build-arg", f"RIFT_IMAGE={TAG}", ROOT / "tests/docker", timeout=900, capture=False)
             # Network namespace is explicit and isolated. No host networking or published ports.
             docker("network", "create", "--ipv6", "--subnet", "198.18.90.0/24",
                    "--gateway", "198.18.90.1", "--subnet", "2001:db8:90::/64",
@@ -148,7 +148,8 @@ def main():
                    "--mount", f"type=volume,src={TAG}-vps-state,dst=/var/lib/rift",
                    "--env", "RIFT_PUBLIC_ENDPOINT=rift-vps", "--env", f"RIFT_PUBLIC_IPS={IPS}",
                    "--env", "RIFT_ENROLLMENT_BIND=0.0.0.0:8443", "--env", "RIFT_ENROLLMENT_ENABLED=true",
-                   "--network-alias", "rift-vps", TAG)
+                   "--network-alias", "rift-vps", TAG,
+                   "--config", "/etc/rift/config.toml", "server")
             docker("run", "-d", "--name", CLIENT, "--network", NET, "--ip", CLIENT4,
                    "--ip6", CLIENT6, "python:3.13-slim", "sleep", "infinity", timeout=180)
 
