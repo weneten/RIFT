@@ -29,7 +29,6 @@ BR_BACKEND = f"rbb{PID}"
 WORK = None
 PROCS = []
 NETNS = [VPS, ROUTER, CLIENT, CLIENT_ALT, BACKEND, *AGENTS]
-FOREIGN_RULE = "18000: from 198.18.0.77 lookup 200"
 PUBLIC_V4 = "198.18.0.1"
 PUBLIC_V4_NEW = "198.18.0.2"
 PUBLIC_V6 = "2001:db8:42:5249::1"
@@ -564,7 +563,8 @@ def check_routes_and_foreign(prior, baselines):
     nft_after = ns(VPS, "nft", "list", "table", "inet", "rift_preserve").stdout
     rules_after = ns(VPS, "ip", "rule", "show").stdout
     assert nft_after == foreign_nft_before, "foreign nftables table changed"
-    assert FOREIGN_RULE in rules_after, "foreign IP policy rule was lost"
+    assert rules_after == foreign_rules_before, (
+        f"foreign IP policy rules changed: before={foreign_rules_before!r}, after={rules_after!r}")
     for name in AGENTS:
         # Untagged underlay traffic keeps the ordinary default route.
         idx = AGENTS.index(name) + 2
@@ -766,7 +766,7 @@ def main():
         wait_until(lambda: cli(VPS, server_cfg, "status", env=server_env).returncode == 0,
                    "RIFT server to restart from saved state", timeout=35)
         assert ns(VPS, "nft", "list", "table", "inet", "rift_preserve").stdout == prior[0]
-        assert FOREIGN_RULE in ns(VPS, "ip", "rule", "show").stdout
+        assert ns(VPS, "ip", "rule", "show").stdout == prior[1], "foreign policy rules changed after restart"
         print("PASS crash/restart preserves existing firewall objects and policy rules")
         print("PASS namespace integration suite completed; no performance numbers were collected")
     except Exception:
