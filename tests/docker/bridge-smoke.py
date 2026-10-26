@@ -92,7 +92,7 @@ def main():
                       "--sysctl", "net.ipv4.conf.default.rp_filter=2",
                       "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m",
                       "--tmpfs", "/run:rw,noexec,nosuid,size=4m"]
-            docker("run", "-d", "--name", VPS, *common, "--network", NET,
+            docker("run", "-d", "--name", VPS, *common,
                    "--ip", VPS4, "--ip6", VPS6,
                    "--mount", f"type=bind,src={vps_cfg},dst=/etc/rift/config.toml,readonly",
                    "--mount", f"type=volume,src={TAG}-vps-state,dst=/var/lib/rift",
@@ -105,7 +105,7 @@ def main():
             vps_command = ["rift", "--config", "/etc/rift/config.toml", "--json", "status"]
             wait_for("server admin socket", lambda: docker("exec", VPS, *vps_command, check=False).returncode == 0)
             invite = json.loads(exec_cli("agents", "add", "core", "--ttl", "15m").stdout)
-            docker("run", "-d", "--name", AGENT, *common, "--network", NET,
+            docker("run", "-d", "--name", AGENT, *common,
                    "--ip", AGENT4, "--ip6", AGENT6,
                    "--mount", f"type=bind,src={agent_cfg},dst=/etc/rift/config.toml,readonly",
                    "--mount", f"type=volume,src={TAG}-agent-state,dst=/var/lib/rift",
