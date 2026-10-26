@@ -441,7 +441,8 @@ def sftp_test(server_cfg):
             local_size = payload.stat().st_size if payload.exists() else "missing"
             downloaded_size = downloaded.stat().st_size if downloaded.exists() else "missing"
             try:
-                remote_size = docker("exec", SFTP_NAME, "stat", "-c", "%s", "--", remote,
+                remote_size = docker("exec", "--user", "rift-sftp", SFTP_NAME, "stat",
+                                     "-c", "%s", "--", remote,
                                      check=False).stdout.strip() or "missing/unavailable"
             except Exception:
                 remote_size = "unavailable"
@@ -451,7 +452,8 @@ def sftp_test(server_cfg):
             raise
         expected = hashlib.sha256(payload.read_bytes()).hexdigest()
         actual = hashlib.sha256(downloaded.read_bytes()).hexdigest()
-        remote_hash = docker("exec", SFTP_NAME, "sha256sum", remote).stdout.split()[0]
+        # The fixture drops DAC_OVERRIDE and owns this tree mode 0750, so root cannot read it.
+        remote_hash = docker("exec", "--user", "rift-sftp", SFTP_NAME, "sha256sum", remote).stdout.split()[0]
         if expected != actual or expected != remote_hash:
             raise RuntimeError(f"SFTP {family} upload/download hash mismatch: local={expected}, downloaded={actual}, server={remote_hash}")
         logs = docker_logs(SFTP_NAME)
