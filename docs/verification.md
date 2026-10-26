@@ -7,11 +7,12 @@ Recorded on 2026-10-26. Prepared test coverage is separate from executed evidenc
 - Rust stable 1.99.1, native Windows MSVC build.
 - `cargo fmt --all -- --check`.
 - `cargo clippy --all-targets -- -D warnings`.
-- `cargo test --all-targets`: 32 tests, no failures or ignored tests (27 library, 3 CLI, 2 TLS integration tests).
+- `cargo test --all-targets`: 34 tests, no failures or ignored tests (29 library, 3 CLI, 2 TLS integration tests).
 - Real IPv4-to-IPv6 TCP and IPv6-to-IPv4 UDP loopback translation, including translated-forward ban checks.
 - Real TLS loopback transport: valid DNS/IP SANs accepted; wrong CA, wrong hostname and expired certificate rejected before enrollment data is decoded.
 - Enrollment-state reservation, replay, expiry, cancellation, key rotation, duplicate/overlapping grants, generation acknowledgments and persisted apply-failure tests.
 - Recovery of automatic TLS material from the committed bundle after missing derived files; conflicting files preserved.
+- Missing IPv4/IPv6 FIB tables are treated as empty during initial routing ownership checks and agent route installation; other command failures and partial dumps remain errors.
 - Linux x86_64 source/type checking and strict Clippy through the Zig cross toolchain, including Linux-only Unix-socket code. This is not a Linux runtime test or a linked Linux release artifact.
 - Both supplied Compose files pass `docker compose config --quiet`; an already-enrolled agent can omit its token.
 - All Python integration harnesses pass syntax compilation. Code/comments/commands/documentation were checked for unintended German text.
@@ -27,7 +28,7 @@ The local test process needed permission to use loopback sockets outside the Win
 - HTTPS through Traefik v3 with a trusted test certificate and original-address JSON access logs.
 - Multiarchitecture amd64/arm64 OCI image build workflow.
 
-These require disposable Linux runners with the documented kernel features. Docker Desktop's engine was not available on this workstation. No CI workflow was pushed or executed from this session, and no service was deployed to a VPS.
+These require disposable Linux runners with the documented kernel features. Docker Desktop's engine was not available on this workstation. GitHub Actions has executed the Rust checks and Linux release builds successfully. The integration jobs have exposed startup and harness failures; full Linux/Docker runtime acceptance remains pending. No service was deployed to a VPS from this session.
 
 ## Release gates
 

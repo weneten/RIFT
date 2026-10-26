@@ -660,30 +660,8 @@ impl Kernel {
             ensure!(saved == expected, "RIFT routing settings differ from existing ownership marker; refusing to reuse the table");
             return Ok(());
         }
-        let v4 = run_output(
-            "ip",
-            [
-                "-N",
-                "-4",
-                "route",
-                "show",
-                "table",
-                &self.config.route_table.to_string(),
-            ],
-        )
-        .await?;
-        let v6 = run_output(
-            "ip",
-            [
-                "-N",
-                "-6",
-                "route",
-                "show",
-                "table",
-                &self.config.route_table.to_string(),
-            ],
-        )
-        .await?;
+        let v4 = read_route_table("-4", self.config.route_table).await?;
+        let v6 = read_route_table("-6", self.config.route_table).await?;
         ensure!(
             v4.trim().is_empty() && v6.trim().is_empty(),
             "routing table {} is already populated; refusing to claim it",
@@ -724,7 +702,7 @@ impl Kernel {
         let table = self.config.route_table.to_string();
         let iface = self.interface();
         for fam in ["-4", "-6"] {
-            let current = run_output("ip", ["-N", fam, "route", "show", "table", &table]).await?;
+            let current = read_route_table(fam, self.config.route_table).await?;
             for line in current.lines() {
                 let owned_default = (line.starts_with("default dev ")
                     && line.contains(iface)
@@ -1523,6 +1501,49 @@ async fn run_output<const N: usize>(program: &str, args: [&str; N]) -> Result<St
     );
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
+async fn read_route_table(family: &str, table: u32) -> Result<String> {
+    let out = Command::new("ip")
+        .kill_on_drop(true)
+        .env("LC_ALL", "C")
+        .args(["-N", family, "route", "show", "table", &table.to_string()])
+        .output()
+        .await
+        .context("read routing table")?;
+    route_table_output(
+        family,
+        table,
+        out.status.code(),
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+    )
+}
+fn route_table_output(
+    family: &str,
+    table: u32,
+    code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<String> {
+    if code == Some(0) {
+        return Ok(stdout.trim().to_string());
+    }
+    // The kernel creates each family's FIB table lazily, on its first route.
+    let missing = match family {
+        "-4" => "Error: ipv4: FIB table does not exist.",
+        "-6" => "Error: ipv6: FIB table does not exist.",
+        _ => bail!("unsupported routing address family {family}"),
+    };
+    if code == Some(2)
+        && stdout.trim().is_empty()
+        && stderr.trim() == format!("{missing}\nDump terminated")
+    {
+        return Ok(String::new());
+    }
+    bail!(
+        "ip {family} route show table {table} failed (exit {code:?}): {}",
+        stderr.trim()
+    )
+}
 async fn run_stdin<const N: usize>(program: &str, args: [&str; N], input: &[u8]) -> Result<String> {
     let mut child = Command::new(program)
         .kill_on_drop(true)
@@ -1879,6 +1900,52 @@ mod tests {
     use super::*;
     use crate::model::{AgentRecord, AgentStatus};
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn absent_fib_tables_are_empty_for_each_address_family() {
+        for (family, name) in [("-4", "ipv4"), ("-6", "ipv6")] {
+            let stderr = format!("Error: {name}: FIB table does not exist.\nDump terminated\n");
+            assert_eq!(
+                route_table_output(family, 51888, Some(2), "", &stderr).unwrap(),
+                ""
+            );
+        }
+    }
+
+    #[test]
+    fn route_table_reads_preserve_existing_routes_and_fail_on_other_errors() {
+        let route = "default dev foreign0 metric 10\n";
+        assert_eq!(
+            route_table_output("-4", 51888, Some(0), route, "").unwrap(),
+            route.trim()
+        );
+        assert_eq!(
+            route_table_output("-6", 51888, Some(0), "", "").unwrap(),
+            ""
+        );
+        let missing = "Error: ipv4: FIB table does not exist.\nDump terminated\n";
+        for (family, code, stdout, stderr) in [
+            (
+                "-4",
+                Some(2),
+                "",
+                "RTNETLINK answers: Operation not permitted\nDump terminated\n",
+            ),
+            ("-4", Some(2), "", "Dump terminated\n"),
+            ("-4", Some(1), "", missing),
+            ("-4", None, "", missing),
+            ("-4", Some(2), route, missing),
+            ("-6", Some(2), "", missing),
+            (
+                "-4",
+                Some(2),
+                "",
+                "Error: ipv4: FIB table does not exist.\nDump terminated\nUnexpected error\n",
+            ),
+        ] {
+            assert!(route_table_output(family, 51888, code, stdout, stderr).is_err());
+        }
+    }
 
     fn agent() -> AgentRecord {
         AgentRecord {
