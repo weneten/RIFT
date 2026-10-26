@@ -503,6 +503,8 @@ accessLog:
   format: json
 ''')
     static_config.chmod(0o644)
+    # Clients connect by IP and send no hostname SNI. Traefik selects
+    # tls.certificates by DNS name, so the IP-SAN certificate is the default.
     dynamic_config = write(config_dir / "dynamic.yml", '''
 http:
   routers:
@@ -520,6 +522,11 @@ tls:
   certificates:
     - certFile: /etc/traefik/server.crt
       keyFile: /etc/traefik/server.key
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /etc/traefik/server.crt
+        keyFile: /etc/traefik/server.key
 ''')
     dynamic_config.chmod(0o644)
     backend_code = '''from http.server import BaseHTTPRequestHandler,HTTPServer
