@@ -10,9 +10,9 @@ permissions:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -22,19 +22,19 @@ jobs:
       - run: cargo test --all-targets
 
   linux-netns:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y iproute2 wireguard-tools nftables iptables iperf3 curl conntrack openssl
       - run: cargo build --release
       - run: sudo env RIFT_NETNS_DISPOSABLE_VM=1 bash tests/netns/run.sh
 
   docker-bridge:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
       - run: sudo env RIFT_DOCKER_BRIDGE_VM=1 bash tests/docker/bridge-smoke.sh
