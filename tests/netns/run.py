@@ -616,8 +616,8 @@ def migrate_nat_port(server_cfg):
     sh_ns(ROUTER, "nft flush chain ip rift_test_nat postrouting; "
           "nft add rule ip rift_test_nat postrouting ip saddr 172.31.0.0/24 udp dport 51820 snat to 198.18.0.254:42000-42999 random; "
           "nft add rule ip rift_test_nat postrouting ip saddr 172.31.0.0/24 masquerade")
-    run(["conntrack", "-D", "--orig-src", "172.31.0.2", "--orig-dst", PUBLIC_V4_NEW,
-         "--proto", "udp", "--dport", "51820"], check=False)
+    ns(ROUTER, "conntrack", "-D", "--orig-src", "172.31.0.2", "--orig-dst", PUBLIC_V4_NEW,
+       "--proto", "udp", "--dport", "51820", check=False)
     def port_moved():
         endpoints = [p.get("endpoint", "") for p in status(server_cfg)["peers"]]
         return any(endpoint.startswith("198.18.0.254:") and
@@ -643,10 +643,9 @@ def replay_and_wrong_ca(server_cfg, replay_token):
     wrong = WORK / "wrong-ca.crt"
     run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
          "-keyout", WORK / "wrong-ca.key", "-out", wrong, "-subj", "/CN=wrong-ca"])
-    from urllib.parse import urlsafe_b64decode, urlsafe_b64encode
-    bundle = json.loads(urlsafe_b64decode(token[3:] + "=="))
+    bundle = json.loads(base64.urlsafe_b64decode(token[3:] + "=="))
     bundle["ca_pem"] = wrong.read_text(encoding="utf-8")
-    bad_token = "v1." + urlsafe_b64encode(json.dumps(bundle, separators=(",", ":")).encode()).decode().rstrip("=")
+    bad_token = "v1." + base64.urlsafe_b64encode(json.dumps(bundle, separators=(",", ":")).encode()).decode().rstrip("=")
     badca_cfg = config(WORK / "state-badca", server=False)
     proc = daemon(AGENTS[2], badca_cfg, ["agent"],
                   {"RIFT_SERVER": f"{SERVER_HOST}:8443", "RIFT_AGENT_NAME": "badca",
