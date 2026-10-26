@@ -80,6 +80,36 @@ def docker_logs(name):
     return result.stdout + result.stderr
 
 
+def run_sftp(args, *, timeout=90):
+    """Run one SFTP case, retaining bounded diagnostics and reaping its process group."""
+    proc = subprocess.Popen([str(a) for a in args], text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr = proc.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = proc.communicate()
+        raise RuntimeError(
+            f"SFTP command timed out after {timeout}s; stdout tail:\n{stdout[-6000:]}"
+            f"\nstderr tail:\n{stderr[-6000:]}")
+    if proc.returncode:
+        raise RuntimeError(
+            f"SFTP command failed ({proc.returncode}); stdout tail:\n{stdout[-6000:]}"
+            f"\nstderr tail:\n{stderr[-6000:]}")
+    return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
+
+
 def report_failure_diagnostics():
     """Print service logs while containers and daemon log files still exist."""
     for container in TEST_CONTAINERS:
@@ -398,13 +428,27 @@ def sftp_test(server_cfg):
         batch = write(WORK / f"sftp-{family}.batch",
                       f"put {payload} {remote}\nget {remote} {downloaded}\n")
         url = f"rift-sftp@[{address}]" if family == "v6" else f"rift-sftp@{address}"
-        run(["ip", "netns", "exec", CLIENT_NS, "sftp", "-b", batch,
-             "-F", "/dev/null", "-P", str(SFTP_PORTS[family]),
-             "-oBatchMode=yes", "-oIdentitiesOnly=yes",
-             "-oPreferredAuthentications=publickey", "-oPasswordAuthentication=no",
-             "-oIdentityFile=" + str(key_path), "-oUserKnownHostsFile=" + str(known_hosts),
-             "-oGlobalKnownHostsFile=/dev/null", "-oStrictHostKeyChecking=yes",
-             "-oConnectTimeout=10", url], timeout=90)
+        sftp_command = ["ip", "netns", "exec", CLIENT_NS, "sftp", "-v", "-b", batch,
+                        "-F", "/dev/null", "-P", str(SFTP_PORTS[family]),
+                        "-oBatchMode=yes", "-oIdentitiesOnly=yes",
+                        "-oPreferredAuthentications=publickey", "-oPasswordAuthentication=no",
+                        "-oIdentityFile=" + str(key_path), "-oUserKnownHostsFile=" + str(known_hosts),
+                        "-oGlobalKnownHostsFile=/dev/null", "-oStrictHostKeyChecking=yes",
+                        "-oConnectTimeout=10", url]
+        try:
+            run_sftp(sftp_command)
+        except Exception:
+            local_size = payload.stat().st_size if payload.exists() else "missing"
+            downloaded_size = downloaded.stat().st_size if downloaded.exists() else "missing"
+            try:
+                remote_size = docker("exec", SFTP_NAME, "stat", "-c", "%s", "--", remote,
+                                     check=False).stdout.strip() or "missing/unavailable"
+            except Exception:
+                remote_size = "unavailable"
+            print(f"SFTP {family} transfer diagnostics: local upload={local_size} bytes, "
+                  f"local download={downloaded_size} bytes, remote file={remote_size} bytes",
+                  file=sys.stderr)
+            raise
         expected = hashlib.sha256(payload.read_bytes()).hexdigest()
         actual = hashlib.sha256(downloaded.read_bytes()).hexdigest()
         remote_hash = docker("exec", SFTP_NAME, "sha256sum", remote).stdout.split()[0]
