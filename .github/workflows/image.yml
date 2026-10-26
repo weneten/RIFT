@@ -1,0 +1,27 @@
+name: Multi-architecture image build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          outputs: type=oci,dest=/tmp/rift-image.tar
+          tags: rift:${{ github.ref_name }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rift-multiarch-oci
+          path: /tmp/rift-image.tar

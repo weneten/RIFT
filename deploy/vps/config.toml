@@ -1,0 +1,11 @@
+state_dir = "/var/lib/rift"
+interface = "rift0"
+wg_port = 51820
+enrollment_bind = "0.0.0.0:8443"
+enrollment_enabled = true
+control_port = 8444
+route_table = 51888
+rule_priority = 11000
+mark = 1380515840
+mark_mask = 4294901760
+mtu = 1380

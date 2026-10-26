@@ -1,0 +1,16 @@
+.git
+.github
+.env
+.env.*
+target
+.tools
+.test-results
+**/.env
+**/*.key
+**/*.pem
+**/*.db
+**/*.db-shm
+**/*.db-wal
+tests
+docs
+deploy/**/config.toml

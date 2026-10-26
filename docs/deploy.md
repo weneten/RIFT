@@ -1,0 +1,65 @@
+# Linux deployment and verification
+
+## Preflight before changing host networking
+
+Run these checks from a disposable Linux VM first. Do not run the destructive parts of the integration harness on a production VPS.
+
+1. Record `uname -a`, `uname -m`, `docker version`, `docker compose version`, `ip -V`, `wg --version`, `nft --version`, and `iptables --version`. Confirm the container target is supported (`linux/amd64` or `linux/arm64`).
+2. Inspect current `ip -4 rule`, `ip -6 rule`, `ip -4 route show table all`, `ip -6 route show table all`, `nft list ruleset`, and (when installed) `iptables-save`/`ip6tables-save`. Save these outputs outside the production deployment state for comparison.
+3. Check WireGuard on the actual host kernel in a temporary network namespace: `ip netns add rift-preflight`; `ip -n rift-preflight link add rift-probe type wireguard`; delete the namespace. A successful probe establishes that the kernel supports the interface in that namespace. A version string alone does not prove kernel configuration or module availability. If the distro ships WireGuard as a module, the host administrator may need to load/install it before the container starts; the image does not load kernel modules.
+4. Inspect `net.ipv4.ip_forward`, `net.ipv6.conf.all.forwarding`, `net.ipv4.conf.default.rp_filter`, `net.ipv4.conf.all.rp_filter`, and relevant per-interface `rp_filter` and `src_valid_mark` values. The current kernel adapter requires IPv4 and IPv6 forwarding to already be enabled and never changes those global settings. Configure only the families the host must route, for example with an administrator-managed sysctl file:
+
+   ```ini
+   net.ipv4.ip_forward = 1
+   net.ipv6.conf.all.forwarding = 1
+   net.ipv4.conf.default.rp_filter = 2
+   ```
+
+   `rp_filter=2` on `default` makes new interfaces, including `rift0`, inherit loose source validation. This setting affects interfaces created later, so review it with the VPS administrator. RIFT also attempts to set only its own `rift0` interface to loose mode; with Docker host networking, `/proc/sys` may be read-only, so preconfigure the default before creating the tunnel. Do not set `net.ipv4.conf.all.rp_filter=0` as a workaround. If fwmark-based routing is used in both directions and reverse-path validation rejects valid return traffic, evaluate `src_valid_mark=1` on exact interfaces in staging. Enabling IPv6 forwarding can change router-advertisement behavior; if the public NIC relies on RA, check its `accept_ra` setting and configure it deliberately.
+5. Confirm the host SSH route and session remain stable, and confirm free UDP port 51820 and TCP port 8443. Open only the ports required by the deployment in both cloud security groups and host firewall. TCP 8444 is the control listener for WireGuard peers; do not expose it to the public interface.
+6. Render the VPS Compose config with `docker compose --env-file .env -f deploy/vps/compose.yml config`. On the agent, use `docker compose --env-file .env -f deploy/agent/compose.yml config --quiet`: full Compose config output contains the expanded enrollment token. Verify there is no `privileged`, no added `SYS_ADMIN`/`NET_RAW`, no Docker port publish in host mode, and no unexpected host path mount. `RIFT_PUBLIC_IPS` must list the actual public address(es), not documentation examples.
+7. By default the server creates and persists its own CA, TLS certificate, and private keys in the RIFT state volume. The certificate SAN uses `RIFT_PUBLIC_ENDPOINT`; keep the state volume private and persistent. If using external TLS material, set all of `tls_cert`, `tls_key`, and `tls_ca` together, mount the files read-only, and verify the trust anchor matches the certificate chain.
+
+The Compose files use `network_mode: host`; the container shares the Linux host's network namespace. `CAP_NET_ADMIN` is therefore host-impacting. Docker may change forwarding sysctls and forwarding firewall policy when its bridge networking starts. Keep Docker's firewall integration enabled and do not edit or flush Docker-created rules. RIFT should add/delete only its exact routes, policy rules, links, and nftables objects. Reserve distinct route table IDs, rule priorities, and packet marks for RIFT; do not take over the main/default tables or remove unrelated rules.
+
+## Rollout and rollback
+
+1. Deploy the exact image and config to a disposable Linux VM with the same kernel family, Docker backend, and firewall manager as production.
+2. Keep a separate working SSH session and a timed out-of-band recovery path. Capture the host's routes, policy rules, firewall rules, sysctls, and Docker network state before startup.
+3. Start the server and one agent, then verify `rift status`, handshake state, and a test forward. Add more agents only after the first has survived restart.
+4. For rollback, stop only the RIFT Compose project and use the RIFT-owned cleanup/reconciliation path. Compare the host state against the saved baseline. Never use `nft flush ruleset`, `ip rule flush`, `iptables -F`, or a blanket route-table flush on a shared host.
+5. Simulate termination during startup and after configuration has applied. After restart, verify the service reconciles only its owned objects and does not change the normal main-table route or SSH path. A network namespace teardown removes objects inside that namespace, but host-side veths/routes/rules require explicit ownership-aware cleanup.
+
+Do not declare the host-network deployment safe from container-level tests alone. Host networking intentionally removes network-namespace isolation; a separate bridge/network-namespace design is preferable when the service can forward traffic without directly owning the host stack.
+
+## Functional test matrix
+
+Run `sudo env RIFT_NETNS_DISPOSABLE_VM=1 bash tests/netns/run.sh` on a disposable Ubuntu or Debian Linux host with root privileges, `iproute2`, `wireguard-tools`, `nftables`, `conntrack`, `openssl`, and the built RIFT server/agent binaries. It creates isolated namespaces and real WireGuard interfaces, a temporary bridge and NAT router, and removes them on exit. It must not run on a production host. The harness is expected to fail if a prerequisite or behavior is missing; it does not silently skip checks.
+
+For the container runtime in bridge mode, run `sudo env RIFT_DOCKER_BRIDGE_VM=1 bash tests/docker/bridge-smoke.sh` on a disposable Linux VM with Docker Engine. This test builds the image, starts a server, one agent, and a separate client on an isolated dual-stack Docker bridge, then checks source-preserving IPv4/IPv6 TCP/UDP forwarding through a real WireGuard tunnel and the reply route back to the client. It uses only `CAP_NET_ADMIN`; it never enables host networking or publishes ports. It is not a substitute for host-network VPS testing.
+
+The Docker publishing integration test runs in a disposable Linux VM only: `sudo env RIFT_DOCKER_PUBLISHED_VM=1 bash tests/docker/published-port-e2e.sh`. It runs the agent in the host network namespace (matching the Compose host-network agent), while the VPS and client use isolated network namespaces and the destination is a real Docker bridge container reached through four Docker `-p` mappings. It verifies the original IPv4/IPv6 client address on TCP and UDP replies. The test temporarily enables host forwarding and loose default reverse-path filtering, records and restores those three sysctls on exit, refuses an existing `rift0`, `inet rift` table, rule priority 11000, or nonempty route table 51888, and cleans only its test objects. Run it only on a disposable runner; it exercises Docker's host firewall integration.
+
+That same published-port test includes two application checks. Its SFTP image is built only for testing and creates ephemeral SSH host keys; the client obtains the server public key from the container, pins it in `known_hosts`, requires strict host-key verification, uploads/downloads a file over IPv4 and IPv6, compares SHA-256 hashes, and checks `sshd` logs for the original client address. Its official `traefik:v3` test container serves HTTPS on the forwarded port, routes through the file provider to a small HTTP backend, and writes JSON access logs. A short-lived test CA signs a certificate with the VPS test VIPs as IP SANs; the client verifies it with `curl --cacert`, and the test checks each log's `ClientHost` against the original IPv4/IPv6 client address. The test does not configure PROXY protocol. These application checks are implemented in CI but have not yet been run on this Windows host.
+
+The release gate should include:
+
+| Area | Evidence |
+|---|---|
+| IPv4 and IPv6 | Separate client source addresses reach the test destination through the assigned agent; destination observes the expected client/tunnel source according to the configured forwarding mode. |
+| TCP and UDP | Echo service succeeds for each family/protocol and returns the observed source address; the harness does not capture packets or independently verify server-side peer logs. |
+| Docker published backend | Disposable-host test sends distinct client IPv4/IPv6 TCP/UDP flows through a host-network agent to a Docker `-p` bridge backend and checks the echo source and return path. |
+| SFTP | The same disposable-host test requires strict pinned SSH host keys, tests upload and download hashes for IPv4 and IPv6 clients, and checks original client addresses in `sshd` logs. |
+| HTTPS / Traefik | The test verifies an IP-SAN certificate against its temporary CA using `curl --cacert`, forwards requests through Traefik v3's file provider to an HTTP backend, and checks JSON `ClientHost` values for both client families. PROXY protocol is not enabled. |
+| Policy routing | Marked client traffic selects the RIFT table and WireGuard; unmarked traffic uses the same baseline route and public egress before/after. The WireGuard UDP endpoint remains on the underlay. |
+| Endpoint/NAT change | Change the remote endpoint IPv4 and the translated UDP source port in a NAT namespace; prove handshake and bidirectional traffic recover without changing the VPS default route. |
+| Three agents | Enroll three agents and exercise each agent's independent public TCP/UDP forwards. The current echo response verifies client source preservation, not the selected agent identity, so a dedicated cross-agent isolation assertion remains outstanding. |
+| Coexistence | The namespace harness installs a separate Fail2ban-style nftables table on an agent with exact-client INPUT and FORWARD drops. It checks that the banned client's services fail, the other client and RIFT control state remain available, RIFT policy re-apply leaves the foreign table intact, and deleting the foreign table restores access. Separately, `rift bans add --agent NAME --forward-id ID --ip ADDRESS --ttl DURATION` sends a restricted ban request to the selected agent for an active translated forward; the namespace test checks source isolation and automatic TTL expiry. There is no explicit remove subcommand; expiry is time-based. |
+| Crash/restart | Kill/restart an agent after apply and verify it restores saved forwarding policy; restart the server and verify its admin socket returns while unrelated nftables/IP rule state survives. Forwarding after server restart and startup-interruption rollback remain staging checks. |
+| Enrollment and TLS | The harness rejects wrong-CA TLS and replay of a consumed invitation, and checks generated server private-key file permissions. Expired-token rejection and a plaintext-secret scan are not currently asserted. |
+
+The bridge and published-port tests validate real client datapaths; neither proves production host-network safety or SSH continuity. The SFTP test validates a small file transfer and source logging, not large-transfer behavior or production key lifecycle. The Traefik test validates TLS termination, file-provider routing, and source logging, not reverse-proxy headers or production health checks. Also run staging tests for firewall backend compatibility, systemd/host reboot behavior, cloud security groups, and SSH continuity.
+
+## Reproducible performance procedure
+
+Do not publish benchmark numbers without collecting them. On the same Linux host pair and with the same CPU allocation, run `iperf3` directly over the underlay and then over the WireGuard path for IPv4 and IPv6, TCP and UDP. Record the kernel, CPU, image digest, MTU, test duration, number of parallel streams, and tunnel state. Use a warm-up, then at least three measured runs for each case; repeat with three agents active. Report throughput, RTT/jitter/loss (UDP), CPU utilization, and any handshakes/retransmits. Verify the normal unmarked baseline separately so throughput changes are not mistaken for routing correctness.

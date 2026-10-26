@@ -1,0 +1,37 @@
+# RIFT architecture and security boundaries
+
+RIFT uses one Rust binary, an agent-initiated WireGuard tunnel and a separate enrollment transport. Normal same-family application packets remain in Linux WireGuard, routing, conntrack and nftables. `ip` and `wg` are executed directly as maintained Netlink clients; no shell interprets configuration values. `nft` receives a generated atomic batch on standard input.
+
+## Trust and exposure
+
+The VPS operator controls all publications. Only the local Unix socket permits administration; socket permissions and Linux peer credentials restrict callers to root or the daemon UID. TCP 8443 speaks the bounded RIFT TLS enrollment protocol, not HTTP, and accepts no admin operations. TCP 8444 binds the VPS tunnel addresses and carries narrow agent requests inside WireGuard. Agents cannot request arbitrary routes, commands, firewall programs or publications.
+
+An invitation contains a random one-time bearer credential and a public CA certificate. The latter enters the ordinary rustls root store; chain, hostname/IP SAN and time checks stay enabled. The server stores only the credential hash. Tokens are name-bound, expiring and reserved atomically to a durable agent identity, public key and attempt ID. Pending peers receive only access to activation/control, with no publication rights. Activation over WireGuard proves possession of the private key before consuming the token. Identical pending retries are idempotent; used tokens cannot enroll another installation.
+
+The VPS is trusted by agents to deliver published traffic with external source addresses. An agent accepts those sources from its single VPS peer, but its firewall limits delivery to the granted service tuples. VPS peers accept only their individually assigned `/32` and `/128` sources, which prevents one agent from impersonating another agent's tunnel address. All peers, including staged peers, are denied general forwarding and access to other agents. Agent-originated bans are limited to that agent's active translated forward and a bounded TTL.
+
+Private WireGuard keys stay in separate mode-0600 files. The server's private CA material stays on the VPS. Automatic TLS generation commits one mode-0600 bundle before materializing PEM files, allowing restart after partial writes. Keep volume backups private. The automatic server certificate is valid for one year; certificate maintenance is necessary before future enrollments after expiry. Existing WireGuard credentials do not depend on TLS certificate expiry when enrollment is disabled.
+
+## Transparent packet path
+
+The VPS DNATs an explicitly assigned public IP/protocol/port tuple to the selected agent's tunnel address and target port, without SNAT. The agent records a reserved connection-mark bit range for granted ingress. Locally generated replies restore that mark in a route-type OUTPUT chain; Docker replies restore it in PREROUTING before host routing. A dedicated routing table sends the reply back through WireGuard. Conntrack reverses Docker publication NAT and then the VPS DNAT.
+
+The agent uses broad WireGuard AllowedIPs to accept external source addresses, but installs no general default route in its main table. Source rules for its own tunnel addresses also permit the first IPv6 reply lookup when no native IPv6 default exists. Unreachable fallback routes and egress guards stop marked replies from falling back to the home WAN. Generic wildcard IPv6 UDP applications must bind their tunnel IP or select the received destination as their reply source.
+
+Explicit public listeners must be public unicast addresses listed in the VPS configuration. Backend addresses are always the selected agent's own assigned tunnel addresses, never arbitrary LAN prefixes. Existing interface-address and route overlaps are rejected. Port checks inspect local sockets and foreign NAT rules. Existing Docker/host firewall drops remain authoritative: an ACCEPT in RIFT cannot override a later DROP in another table. Fail2ban should restrict service bans to the inner service path; broad bans on the WireGuard UDP underlay can still interrupt the tunnel.
+
+## Configuration and recovery
+
+TOML and documented environment overrides own static deployment settings. SQLite owns agents, invitations, bans and dynamic forward grants; TOML reload never replaces those rows. CLI changes commit desired state transactionally. The operation journal and separately confirmed snapshot distinguish requested configuration from successfully reconciled kernel configuration. New publications wait for the agent's generation ACK. `status` reports pending forwards and apply failures.
+
+Configuration cannot commit atomically across SQLite, routes, WireGuard and nftables. The reconciler serializes kernel changes, retries desired state after failures and attempts to restore confirmed grants. Rollback never restores a removed/disabled peer, a revoked forward or a superseded key. If an underlying kernel operation also prevents rollback, the failure remains visible; this is not an unconditional cross-system transaction guarantee. A process restart reconstructs desired state and the agent restores its cached policy before opening control.
+
+Live reload permits validated mutable parameters; interfaces, address pools, routing reservations, listener ports and TLS identity require a service restart. Stopping the daemon intentionally leaves its owned kernel configuration for restart. Full removal needs ownership-aware cleanup; deleting a state volume first destroys the ownership evidence and is not an uninstall procedure.
+
+## Explicit translation
+
+Cross-family translation is an opt-in TCP/UDP forwarder in the same binary. Its application packets traverse userspace and the target sees the VPS tunnel address. Original remote addresses are recorded in structured VPS logs and can be blocked per forward through the VPS or agent's local CLI. Connection/session counts and UDP queue sizes are bounded. Transparent same-family forwards do not enter this code path.
+
+## Evidence boundary
+
+Unit tests, real loopback TLS tests, and IPv4/IPv6 translation tests can run on a developer machine. They do not prove transparent kernel forwarding, Fail2ban, Docker publication or production SSH continuity. The Linux namespace and Docker integration suites exercise those paths on disposable privileged runners. SFTP, Traefik, full host reboots, staging firewall combinations and iperf3 measurements remain explicit release gates until their real results are recorded.

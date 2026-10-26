@@ -1,0 +1,31 @@
+name: rift-vps
+
+services:
+  rift-server:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: rift:local
+    container_name: rift-server
+    network_mode: host
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+      - /run:rw,noexec,nosuid,size=4m
+    volumes:
+      - rift-state:/var/lib/rift
+      - ./config.toml:/etc/rift/config.toml:ro
+    environment:
+      RIFT_PUBLIC_ENDPOINT: ${RIFT_PUBLIC_ENDPOINT:?Set RIFT_PUBLIC_ENDPOINT in the root .env}
+      RIFT_PUBLIC_IPS: ${RIFT_PUBLIC_IPS:?Set RIFT_PUBLIC_IPS in the root .env}
+      RIFT_ENROLLMENT_BIND: ${RIFT_ENROLLMENT_BIND:-0.0.0.0:8443}
+      RIFT_ENROLLMENT_ENABLED: ${RIFT_ENROLLMENT_ENABLED:-true}
+    command: ["--config", "/etc/rift/config.toml", "server"]
+
+volumes:
+  rift-state:

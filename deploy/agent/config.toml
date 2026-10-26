@@ -1,0 +1,7 @@
+state_dir = "/var/lib/rift"
+interface = "rift0"
+route_table = 51888
+rule_priority = 11000
+mark = 1380515840
+mark_mask = 4294901760
+mtu = 1380
