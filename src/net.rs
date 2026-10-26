@@ -1170,6 +1170,8 @@ fn parse_wg_dump(output: &str) -> Result<Vec<WgPeer>> {
     Ok(peers)
 }
 
+// Keep meta l4proto before conntrack port comparisons in both renderers.
+// nftables 1.0.6 needs this context to infer the transport-port datatype.
 #[allow(clippy::too_many_arguments)] // Explicit kernel renderer inputs, shared by server and renderer tests.
 fn render_server_rules(
     interface: &str,
@@ -1211,8 +1213,8 @@ fn render_server_rules(
                 "add rule inet rift prerouting_nat iifname != \"{interface}\" {addr_family} daddr {addr} {proto} dport {listen_port} dnat {target_family} to {target}\n"
             ));
             out.push_str(&format!(
-                "add rule inet rift forward iifname != \"{interface}\" oifname \"{interface}\" ct direction original ct status dnat ct mark & {mask:#x} == {mark:#x} ct original {addr_family} daddr {addr} ct original protocol {proto} ct original proto-dst {listen_port} {target_family} daddr {target_ip} {proto} dport {target_port} accept\n\
-                 add rule inet rift forward iifname \"{interface}\" oifname != \"{interface}\" ct direction reply ct status dnat ct mark & {mask:#x} == {mark:#x} ct original {addr_family} daddr {addr} ct original protocol {proto} ct original proto-dst {listen_port} ct reply {target_family} saddr {target_ip} ct reply proto-src {target_port} accept\n"
+                "add rule inet rift forward iifname != \"{interface}\" oifname \"{interface}\" ct direction original ct status dnat ct mark & {mask:#x} == {mark:#x} ct original {addr_family} daddr {addr} ct original protocol {proto} meta l4proto {proto} ct original proto-dst {listen_port} {target_family} daddr {target_ip} {proto} dport {target_port} accept\n\
+                 add rule inet rift forward iifname \"{interface}\" oifname != \"{interface}\" ct direction reply ct status dnat ct mark & {mask:#x} == {mark:#x} ct original {addr_family} daddr {addr} ct original protocol {proto} meta l4proto {proto} ct original proto-dst {listen_port} ct reply {target_family} saddr {target_ip} meta l4proto {proto} ct reply proto-src {target_port} accept\n"
             ));
         }
     }
@@ -1253,19 +1255,28 @@ fn render_agent_rules(
                 String::new()
             };
             out.push_str(&format!(
-                "add rule inet rift prerouting_mark iifname \"{interface}\" ct direction original {src_clause}ct original {dest_family} daddr {dest_ip} ct original protocol {} ct original proto-dst {port} ct mark set (ct mark & {:#x}) | {:#x}\n\
-                 add rule inet rift input iifname \"{interface}\" ct direction original ct mark & {mask:#x} == {mark:#x} {src_clause}ct original {dest_family} daddr {dest_ip} ct original protocol {} ct original proto-dst {port} accept\n\
-                 add rule inet rift forward iifname \"{interface}\" oifname != \"{interface}\" ct direction original ct mark & {mask:#x} == {mark:#x} {src_clause}ct original {dest_family} daddr {dest_ip} ct original protocol {} ct original proto-dst {port} accept\n\
-                 add rule inet rift forward iifname != \"{interface}\" oifname \"{interface}\" ct direction reply ct mark & {mask:#x} == {mark:#x} {src_clause}ct original {dest_family} daddr {dest_ip} ct original protocol {} ct original proto-dst {port} accept\n",
-                f.protocol, !mask, mark, f.protocol, f.protocol, f.protocol
+                "add rule inet rift prerouting_mark iifname \"{interface}\" ct direction original {src_clause}ct original {dest_family} daddr {dest_ip} ct original protocol {} meta l4proto {} ct original proto-dst {port} ct mark set (ct mark & {:#x}) | {:#x}\n\
+                 add rule inet rift input iifname \"{interface}\" ct direction original ct mark & {mask:#x} == {mark:#x} {src_clause}ct original {dest_family} daddr {dest_ip} ct original protocol {} meta l4proto {} ct original proto-dst {port} accept\n\
+                 add rule inet rift forward iifname \"{interface}\" oifname != \"{interface}\" ct direction original ct mark & {mask:#x} == {mark:#x} {src_clause}ct original {dest_family} daddr {dest_ip} ct original protocol {} meta l4proto {} ct original proto-dst {port} accept\n\
+                 add rule inet rift forward iifname != \"{interface}\" oifname \"{interface}\" ct direction reply ct mark & {mask:#x} == {mark:#x} {src_clause}ct original {dest_family} daddr {dest_ip} ct original protocol {} meta l4proto {} ct original proto-dst {port} accept\n",
+                f.protocol,
+                f.protocol,
+                !mask,
+                mark,
+                f.protocol,
+                f.protocol,
+                f.protocol,
+                f.protocol,
+                f.protocol,
+                f.protocol
             ));
         }
     }
     out.push_str(&format!(
         "add rule inet rift prerouting_mark ct direction reply ct mark & {mask:#x} == {mark:#x} meta mark set (meta mark & {:#x}) | {mark:#x}\n\
          add rule inet rift output_route ct direction reply ct mark & {mask:#x} == {mark:#x} meta mark set (meta mark & {:#x}) | {mark:#x}\n\
-         add rule inet rift input iifname \"{interface}\" ct direction reply ct state established ct original ip saddr {agent_v4} ct original ip daddr {server_v4} ct original protocol tcp ct original proto-dst {control_port} accept\n\
-         add rule inet rift input iifname \"{interface}\" ct direction reply ct state established ct original ip6 saddr {agent_v6} ct original ip6 daddr {server_v6} ct original protocol tcp ct original proto-dst {control_port} accept\n\
+         add rule inet rift input iifname \"{interface}\" ct direction reply ct state established ct original ip saddr {agent_v4} ct original ip daddr {server_v4} ct original protocol tcp meta l4proto tcp ct original proto-dst {control_port} accept\n\
+         add rule inet rift input iifname \"{interface}\" ct direction reply ct state established ct original ip6 saddr {agent_v6} ct original ip6 daddr {server_v6} ct original protocol tcp meta l4proto tcp ct original proto-dst {control_port} accept\n\
          add rule inet rift input iifname \"{interface}\" drop\n\
          add rule inet rift forward oifname \"{interface}\" drop\n\
          add rule inet rift forward iifname \"{interface}\" drop\n\
@@ -2019,6 +2030,8 @@ mod tests {
         let a = agent();
         let agents = BTreeMap::from([(a.id.clone(), &a)]);
         let f = forward(ForwardMode::Transparent);
+        let mut udp = f.clone();
+        udp.protocol = Protocol::Udp;
         let rendered = render_server_rules(
             "rift0",
             0x52490000,
@@ -2026,14 +2039,15 @@ mod tests {
             8444,
             Ipv4Addr::new(10, 88, 0, 1),
             "fd88:5249:4654::1".parse().unwrap(),
-            &[&f],
+            &[&f, &udp],
             &agents,
         )
         .unwrap();
         assert!(rendered.contains("tcp dport 80 dnat ip to 10.88.0.2:8080"));
         assert!(rendered.contains("tcp dport 81 dnat ip to 10.88.0.2:8081"));
-        assert!(rendered.contains("ct original ip daddr 203.0.113.1 ct original protocol tcp ct original proto-dst 80 ip daddr 10.88.0.2 tcp dport 8080 accept"));
-        assert!(rendered.contains("ct direction reply ct status dnat ct mark & 0xffff0000 == 0x52490000 ct original ip daddr 203.0.113.1"));
+        assert!(rendered.contains("ct original ip daddr 203.0.113.1 ct original protocol tcp meta l4proto tcp ct original proto-dst 80 ip daddr 10.88.0.2 tcp dport 8080 accept"));
+        assert!(rendered.contains("ct direction reply ct status dnat ct mark & 0xffff0000 == 0x52490000 ct original ip daddr 203.0.113.1 ct original protocol tcp meta l4proto tcp ct original proto-dst 80 ct reply ip saddr 10.88.0.2 meta l4proto tcp ct reply proto-src 8080 accept"));
+        assert!(rendered.contains("ct original ip daddr 203.0.113.1 ct original protocol udp meta l4proto udp ct original proto-dst 80 ip daddr 10.88.0.2 udp dport 8080 accept"));
         assert!(!rendered.contains("forward iifname \"rift0\" oifname != \"rift0\" ct mark & 0xffff0000 == 0x52490000 accept"));
         assert!(!rendered.contains("snat"));
         assert!(!rendered.contains("masquerade"));
@@ -2055,11 +2069,16 @@ mod tests {
             mtu: 1380,
         };
         let f = forward(ForwardMode::Translate);
-        let rendered = render_agent_rules("rift0", 0x52490000, 0xffff0000, &w, &[&f]).unwrap();
+        let mut udp = f.clone();
+        udp.protocol = Protocol::Udp;
+        let rendered =
+            render_agent_rules("rift0", 0x52490000, 0xffff0000, &w, &[&f, &udp]).unwrap();
         assert!(rendered.contains("ip saddr 10.88.0.1"));
         assert!(rendered.contains("ct direction original"));
         assert!(rendered.contains("ct mark & 0xffff0000 == 0x52490000"));
-        assert!(rendered.contains("ct original ip daddr 10.88.0.2 ct original protocol tcp ct original proto-dst 8080 accept"));
+        assert!(rendered.contains("ct original ip daddr 10.88.0.2 ct original protocol tcp meta l4proto tcp ct original proto-dst 8080 accept"));
+        assert!(rendered.contains("ct original ip daddr 10.88.0.2 ct original protocol udp meta l4proto udp ct original proto-dst 8080 accept"));
+        assert!(rendered.contains("ct original ip saddr 10.88.0.2 ct original ip daddr 10.88.0.1 ct original protocol tcp meta l4proto tcp ct original proto-dst 8444 accept"));
         assert!(rendered.contains("iifname != \"rift0\" oifname \"rift0\" ct direction reply ct mark & 0xffff0000 == 0x52490000 ct original ip saddr 10.88.0.1 ct original ip daddr 10.88.0.2"));
         assert!(
             !rendered.contains("input iifname \"rift0\" ct mark & 0xffff0000 == 0x52490000 accept")
