@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real single-agent WireGuard datapath check on an isolated Docker bridge."""
 import json
+import ipaddress
 import os
 import pathlib
 import subprocess
@@ -67,6 +68,55 @@ assert got==src,(got,src)
                   family, proto, source, destination, str(port)).stdout.strip()
 
 
+def listener_matches(endpoint, expected_ip, expected_port, family):
+    if endpoint.startswith("["):
+        close = endpoint.rfind("]")
+        if close < 0 or endpoint[close + 1:close + 2] != ":":
+            return False
+        host, port_text = endpoint[1:close], endpoint[close + 2:]
+    else:
+        host, separator, port_text = endpoint.rpartition(":")
+        if not separator:
+            return False
+    try:
+        actual_ip = ipaddress.ip_address(host)
+        actual_port = int(port_text)
+    except ValueError:
+        return False
+    return actual_ip.version == family and actual_ip == expected_ip and actual_port == expected_port
+
+
+def agent_echo_sockets_ready(tunnel4, tunnel6):
+    for family, address in ((4, tunnel4), (6, tunnel6)):
+        for proto, option, port in (("tcp", "-t", 19080), ("udp", "-u", 19081)):
+            result = docker("exec", AGENT, "ss", "-H", "-l", "-n",
+                            f"-{family}", option, check=False)
+            if result.returncode != 0 or not any(
+                    len(fields := line.split()) >= 4
+                    and listener_matches(fields[-2], ipaddress.ip_address(address), port, family)
+                    for line in result.stdout.splitlines()):
+                return False
+    return True
+
+
+def print_container_diagnostics():
+    present = set(docker("ps", "-a", "--format", "{{.Names}}", check=False).stdout.splitlines())
+    for name in (AGENT, VPS):
+        if name not in present:
+            continue
+        logs = docker("logs", name, check=False)
+        output = logs.stdout + logs.stderr
+        if output.strip():
+            print(f"--- {name} logs ---", file=sys.stderr)
+            print(output[-5000:], file=sys.stderr)
+        if name == AGENT:
+            echo_log = docker("exec", name, "cat", "/tmp/rift-echo.log", check=False)
+            echo_output = echo_log.stdout + echo_log.stderr
+            if echo_output.strip():
+                print("--- agent echo listener log ---", file=sys.stderr)
+                print(echo_output[-3000:], file=sys.stderr)
+
+
 def main():
     if sys.platform != "linux" or os.environ.get("RIFT_DOCKER_BRIDGE_VM") != "1":
         raise SystemExit("run only on a disposable Linux Docker VM with RIFT_DOCKER_BRIDGE_VM=1")
@@ -116,7 +166,12 @@ def main():
             ready = wait_for("agent to be active", lambda: next((a for a in
                 json.loads(exec_cli("status").stdout)["snapshot"]["agents"]
                 if a["name"] == "core" and a["status"] == "active"), None))
-            del ready
+            tunnel4, tunnel6 = ready["tunnel_ipv4"], ready["tunnel_ipv6"]
+            docker("exec", "-d", AGENT, "sh", "-c",
+                   'exec python3 /usr/local/libexec/rift-echo.py "$1" "$2" >> /tmp/rift-echo.log 2>&1',
+                   "rift-echo", tunnel4, tunnel6)
+            wait_for("agent v4/v6 TCP/UDP echo listeners",
+                     lambda: agent_echo_sockets_ready(tunnel4, tunnel6))
             forwards = [(VPS4, 18080, "tcp"), (VPS4, 18081, "udp"),
                         (VPS6, 18082, "tcp"), (VPS6, 18083, "udp")]
             for ip, port, proto in forwards:
@@ -127,7 +182,10 @@ def main():
                 state = json.loads(exec_cli("status").stdout)
                 snap = state["snapshot"]
                 active = next((a for a in snap["agents"] if a["name"] == "core"), None)
-                return active if active and active["applied_generation"] >= snap["generation"] else None
+                fully_applied = (state.get("fully_applied") is True
+                                 and not state.get("pending_forwards")
+                                 and state.get("apply_error") is None)
+                return active if fully_applied and active and active["applied_generation"] >= snap["generation"] else None
             wait_for("agent forwarding policy", applied)
 
             cases = [("4", "tcp", CLIENT4, VPS4, 18080),
@@ -140,6 +198,9 @@ def main():
                     raise RuntimeError(f"{family}/{proto}: agent observed {got}, expected client source {source}")
                 print(f"PASS Docker bridge {family}/{proto}: WireGuard reply reached original client source {got}")
             print("PASS bridge datapath over real WireGuard; no host networking or published ports")
+        except Exception:
+            print_container_diagnostics()
+            raise
         finally:
             for name in (AGENT, VPS, CLIENT):
                 docker("rm", "--force", name, check=False)
