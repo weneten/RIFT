@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Root-only Linux integration test: real RIFT processes and WireGuard in netns."""
 import base64
+import ipaddress
 import json
 import os
 import pathlib
@@ -252,38 +253,76 @@ else:
 '''
 
 
-def start_echoes():
+def start_echo_process(namespace, script, args, label):
+    log = (WORK / f"{label}.log").open("w", encoding="utf-8")
+    process = subprocess.Popen(["ip", "netns", "exec", namespace, "python3", str(script), *args],
+                               stdout=subprocess.DEVNULL, stderr=log,
+                               start_new_session=True, text=True)
+    PROCS.append((process, log, namespace))
+    return process
+
+
+def wait_echo_ready(namespace, family, proto, address, port):
+    expected_ip = ipaddress.ip_address(address)
+    ss_proto = "-t" if proto == "tcp" else "-u"
+
+    def ready():
+        result = ns(namespace, "ss", "-H", "-l", "-n", f"-{family}", ss_proto, timeout=5)
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) >= 4 and ss_local_endpoint_matches(
+                    fields[-2], expected_ip, port, int(family)):
+                return True
+        return None
+
+    wait_until(ready, f"{namespace} {family}/{proto} echo socket at {address}:{port}", timeout=25)
+
+
+def ss_local_endpoint_matches(endpoint, expected_ip, expected_port, family):
+    if endpoint.startswith("["):
+        close = endpoint.rfind("]")
+        if close < 0 or endpoint[close + 1:close + 2] != ":":
+            return False
+        host, local_port = endpoint[1:close], endpoint[close + 2:]
+    else:
+        host, separator, local_port = endpoint.rpartition(":")
+        if not separator:
+            return False
+    try:
+        local_ip = ipaddress.ip_address(host)
+        parsed_port = int(local_port)
+    except ValueError:
+        return False
+    return local_ip.version == family and local_ip == expected_ip and parsed_port == expected_port
+
+
+def start_echoes(server_cfg):
     echo_file = write(WORK / "echo.py", ECHO, 0o755)
-    for i, name in enumerate(AGENTS, start=2):
-        v4, v6 = f"10.88.0.{i}", f"fd88:5249:4654::{i}"
+    records = status(server_cfg)["snapshot"]["agents"]
+    agents_by_name = {record["name"]: record for record in records}
+    for namespace, logical_name in zip(AGENTS, ("agent1", "agent2", "agent3")):
+        record = agents_by_name.get(logical_name)
+        if not record or record["status"] != "active":
+            raise RuntimeError(f"cannot start echo listeners: {logical_name} is not active in the server snapshot")
+        v4, v6 = record["tunnel_ipv4"], record["tunnel_ipv6"]
         for fam, address in (("4", v4), ("6", v6)):
             for proto, port in (("tcp", 19080), ("udp", 19081)):
-                p = subprocess.Popen(["ip", "netns", "exec", name, "python3", str(echo_file),
-                                      fam, proto, address, str(port)],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                     start_new_session=True)
-                PROCS.append((p, open(os.devnull, "w"), name))
-                time.sleep(.15)
+                start_echo_process(namespace, echo_file, [fam, proto, address, str(port)],
+                                   f"echo-{logical_name}-{fam}-{proto}")
+                wait_echo_ready(namespace, fam, proto, address, port)
     backend_echo = WORK / "backend-echo.py"
     write(backend_echo, ECHO, 0o755)
-    p = subprocess.Popen(["ip", "netns", "exec", BACKEND, "python3", str(backend_echo),
-                          "4", "tcp", "10.77.0.2", "19082"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
-    PROCS.append((p, open(os.devnull, "w"), BACKEND))
-    time.sleep(.2)
+    start_echo_process(BACKEND, backend_echo, ["4", "tcp", "10.77.0.2", "19082"],
+                       "echo-backend-v4-tcp")
+    wait_echo_ready(BACKEND, "4", "tcp", "10.77.0.2", 19082)
 
 
 def start_underlay_echo():
     echo_file = write(WORK / "underlay-echo.py", ECHO, 0o755)
     for fam, address, port in (("4", PUBLIC_V4, "19443"),
                                ("6", PUBLIC_V6, "19444")):
-        p = subprocess.Popen(["ip", "netns", "exec", VPS, "python3", str(echo_file),
-                              fam, "tcp", address, port],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             start_new_session=True)
-        PROCS.append((p, open(os.devnull, "w"), VPS))
-    time.sleep(.2)
+        start_echo_process(VPS, echo_file, [fam, "tcp", address, port],
+                           f"echo-underlay-{fam}-tcp")
 
 
 def check_normal_traffic():
@@ -328,9 +367,13 @@ def add_forwards(server_cfg, agent_names):
 
 def wait_policy(server_cfg, count):
     def synced():
-        snap = status(server_cfg)["snapshot"]
+        current = status(server_cfg)
+        snap = current["snapshot"]
         agents = snap["agents"]
-        return agents if len(agents) == count and all(
+        fully_applied = (current.get("fully_applied") is True
+                         and not current.get("pending_forwards")
+                         and current.get("apply_error") is None)
+        return agents if fully_applied and len(agents) == count and all(
             a["status"] == "active" and a["applied_generation"] >= snap["generation"]
             for a in agents) else None
     return wait_until(synced, "all agents to apply the current forwarding generation")
@@ -433,9 +476,12 @@ def fail2ban_coexistence_test(server_cfg, ports):
              "RIFT_PUBLIC_IPS": f"{PUBLIC_V4},{PUBLIC_V4_NEW},{PUBLIC_V6}"}).stdout)
     forward_id = forward["id"]
     wait_policy(server_cfg, 3)
+    agent3 = next(record for record in status(server_cfg)["snapshot"]["agents"]
+                  if record["name"] == "agent3")
+    agent3_ipv4 = agent3["tunnel_ipv4"]
     sh_ns(AGENTS[2], "nft add table ip rift_it_nat; "
           "nft 'add chain ip rift_it_nat prerouting { type nat hook prerouting priority dstnat; policy accept; }'; "
-          "nft add rule ip rift_it_nat prerouting iifname rift0 ip daddr 10.88.0.4 tcp dport 19082 dnat to 10.77.0.2:19082")
+          f"nft add rule ip rift_it_nat prerouting iifname rift0 ip daddr {agent3_ipv4} tcp dport 19082 dnat to 10.77.0.2:19082")
     sh_ns(AGENTS[2], "nft add table inet f2b_test; "
           "nft 'add chain inet f2b_test input { type filter hook input priority 10; policy accept; }'; "
           "nft 'add chain inet f2b_test forward { type filter hook forward priority 10; policy accept; }'; "
@@ -649,7 +695,7 @@ def main():
         raise SystemExit("set RIFT_NETNS_DISPOSABLE_VM=1 only after confirming this is a disposable Linux VM")
     if not BIN.is_file():
         raise SystemExit(f"RIFT binary not found: {BIN} (build with cargo build --release first)")
-    for command in ("ip", "wg", "nft", "conntrack", "openssl", "python3"):
+    for command in ("ip", "ss", "wg", "nft", "conntrack", "openssl", "python3"):
         if shutil.which(command) is None:
             raise SystemExit(f"missing required command: {command}")
     WORK = pathlib.Path(tempfile.mkdtemp(prefix="rift-netns-"))
@@ -697,7 +743,7 @@ def main():
                                                 "RIFT_ENROLLMENT_TOKEN": token})
         wait_agents(server_cfg, 3)
         wait_initial_nat_port(server_cfg)
-        start_echoes()
+        start_echoes(server_cfg)
         ports = add_forwards(server_cfg, ["agent1", "agent2", "agent3"])
         wait_policy(server_cfg, 3)
         traffic_test(["agent1", "agent2", "agent3"], ports)
