@@ -704,12 +704,8 @@ impl Kernel {
         for fam in ["-4", "-6"] {
             let current = read_route_table(fam, self.config.route_table).await?;
             for line in current.lines() {
-                let owned_default = (line.starts_with("default dev ")
-                    && line.contains(iface)
-                    && line.contains("metric 10"))
-                    || (line.starts_with("unreachable default") && line.contains("metric 42760"));
                 ensure!(
-                    owned_default,
+                    is_agent_default_route(line, iface),
                     "RIFT routing table {} contains an unexpected route: {line}",
                     self.config.route_table
                 );
@@ -1501,6 +1497,19 @@ async fn run_output<const N: usize>(program: &str, args: [&str; N]) -> Result<St
     );
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
+fn is_agent_default_route(line: &str, interface: &str) -> bool {
+    let fields: Vec<_> = line.split_whitespace().collect();
+    let metric = fields
+        .windows(2)
+        .find(|pair| pair[0] == "metric")
+        .map(|pair| pair[1]);
+    // ip -N renders RTN_UNREACHABLE as 7 instead of its symbolic name.
+    if matches!(fields.as_slice(), ["7" | "unreachable", "default", ..]) {
+        return metric == Some("42760");
+    }
+    matches!(fields.as_slice(), ["default", "dev", device, ..] if *device == interface)
+        && metric == Some("10")
+}
 async fn read_route_table(family: &str, table: u32) -> Result<String> {
     let out = Command::new("ip")
         .kill_on_drop(true)
@@ -1900,6 +1909,31 @@ mod tests {
     use super::*;
     use crate::model::{AgentRecord, AgentStatus};
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn agent_route_validation_accepts_numeric_and_symbolic_unreachable_defaults() {
+        for route in [
+            "7 default metric 42760",
+            "unreachable default metric 42760",
+            "7 default dev lo metric 42760 pref medium",
+            "default dev rift0 scope 253 metric 10",
+            "default dev rift0 metric 10 pref medium",
+        ] {
+            assert!(is_agent_default_route(route, "rift0"), "{route}");
+        }
+        for route in [
+            "7 default metric 427600",
+            "7 192.0.2.0/24 metric 42760",
+            "8 default metric 42760",
+            "default dev rift01 metric 10",
+            "default dev rift0 metric 100",
+            "192.0.2.0/24 dev rift0 metric 10",
+            "default via 192.0.2.1 dev eth0 metric 10",
+            "",
+        ] {
+            assert!(!is_agent_default_route(route, "rift0"), "{route}");
+        }
+    }
 
     #[test]
     fn absent_fib_tables_are_empty_for_each_address_family() {
