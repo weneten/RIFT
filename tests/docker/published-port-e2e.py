@@ -80,6 +80,23 @@ def docker_logs(name):
     return result.stdout + result.stderr
 
 
+def report_failure_diagnostics():
+    """Print service logs while containers and daemon log files still exist."""
+    for container in TEST_CONTAINERS:
+        try:
+            logs = docker_logs(container)
+        except Exception as exc:
+            print(f"--- container {container}: unable to read logs: {exc} ---", file=sys.stderr)
+            continue
+        if logs.strip():
+            print(f"--- container {container} (last 4000 characters) ---", file=sys.stderr)
+            print(logs[-4000:], file=sys.stderr)
+    if WORK and WORK.is_dir():
+        for log in sorted(WORK.glob("*.log")):
+            print(f"--- daemon {log.name} (last 4000 characters) ---", file=sys.stderr)
+            print(log.read_text(encoding="utf-8", errors="replace")[-4000:], file=sys.stderr)
+
+
 def daemon(name, cfg, command, env, host=False):
     args = [str(BIN), "--config", str(cfg), *command]
     if not host:
@@ -299,7 +316,10 @@ def run_datapath(server_cfg, agent_cfg):
         state = json.loads(admin(NS, server_cfg, "status").stdout)
         snap = state["snapshot"]
         peer = next((a for a in snap["agents"] if a["name"] == "host-agent"), None)
-        return peer if peer and peer["applied_generation"] >= snap["generation"] else None
+        fully_applied = (state.get("fully_applied") is True
+                         and not state.get("pending_forwards")
+                         and state.get("apply_error") is None)
+        return peer if fully_applied and peer and peer["applied_generation"] >= snap["generation"] else None
     wait_for("host agent policy to apply", applied)
 
     code = r'''import socket,sys
@@ -328,7 +348,10 @@ def wait_policy(server_cfg):
         state = json.loads(admin(NS, server_cfg, "status").stdout)
         snap = state["snapshot"]
         peer = next((a for a in snap["agents"] if a["name"] == "host-agent"), None)
-        return peer if peer and peer["applied_generation"] >= snap["generation"] else None
+        fully_applied = (state.get("fully_applied") is True
+                         and not state.get("pending_forwards")
+                         and state.get("apply_error") is None)
+        return peer if fully_applied and peer and peer["applied_generation"] >= snap["generation"] else None
     wait_for("host agent to apply the new application forward", applied)
 
 
@@ -544,6 +567,9 @@ def main():
         server_cfg, agent_cfg = create_network()
         run_datapath(server_cfg, agent_cfg)
         print("PASS host-network agent reached a real Docker -p service; published ports and client return routes work")
+    except Exception:
+        report_failure_diagnostics()
+        raise
     finally:
         cleanup()
 
@@ -553,8 +579,4 @@ if __name__ == "__main__":
         main()
     except Exception as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
-        if WORK:
-            for log in WORK.glob("*.log"):
-                print(f"--- {log.name} ---", file=sys.stderr)
-                print(log.read_text(encoding="utf-8", errors="replace")[-4000:], file=sys.stderr)
         raise

@@ -1,8 +1,12 @@
 #!/bin/sh
 set -eu
-install -d -o rift-sftp -g rift-sftp -m 0750 /home/rift-sftp
-install -d -o rift-sftp -g rift-sftp -m 0700 /home/rift-sftp/.ssh
-install -o rift-sftp -g rift-sftp -m 0600 /run/test_authorized_keys /home/rift-sftp/.ssh/authorized_keys
+# Keep directories root-owned until setup finishes; DAC_OVERRIDE is disabled.
+install -d -m 0750 /home/rift-sftp
+install -d -m 0700 /home/rift-sftp/.ssh
+install -m 0600 /run/test_authorized_keys /home/rift-sftp/.ssh/authorized_keys
+chown rift-sftp:rift-sftp /home/rift-sftp/.ssh/authorized_keys
+chown rift-sftp:rift-sftp /home/rift-sftp/.ssh
+chown rift-sftp:rift-sftp /home/rift-sftp
 install -d -m 0755 /run/sshd
 ssh-keygen -q -t ed25519 -N '' -f /run/sshd/ssh_host_ed25519_key
 exec /usr/sbin/sshd -D -e \
