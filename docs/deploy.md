@@ -25,7 +25,7 @@ deploy/vps/rift-site add core app.example 8081 --proxy nginx
 deploy/vps/rift-site rm app.example
 ```
 
-Without `--proxy`, the command uses the saved default (`traefik` until `rift-site proxy caddy` or `rift-site proxy nginx`). The chosen proxy must be the process listening on TCP 443. Otherwise the command exits before it creates a forward and names the proxy that does hold 443. It does not start a second proxy.
+Without `--proxy`, the command uses the saved default (`traefik` until `deploy/vps/rift-site proxy caddy` or `deploy/vps/rift-site proxy nginx`). The chosen proxy must be the process listening on TCP 443. Otherwise the command exits before it creates a forward and names the proxy that does hold 443. It does not start a second proxy.
 
 The home service must listen on the target port for the agent tunnel address, for example `0.0.0.0`. The proxy reaches the service through the VPS public address so prerouting DNAT still applies. Packets from the internet to the allocated high port are not forwarded. Traefik uses the existing certificate resolver. Caddy obtains the certificate itself. Nginx runs `certbot --nginx` when `certbot` is on the host; if it is missing, the site file is still written and the command says that TLS was not requested.
 

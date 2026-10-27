@@ -1,3 +1,4 @@
+# Copy this file as-is. The public address is RIFT_PUBLIC_IPS in .env, not a line in this file.
 state_dir = "/var/lib/rift"
 interface = "rift0"
 wg_port = 51820

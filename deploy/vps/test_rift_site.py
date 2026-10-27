@@ -30,6 +30,18 @@ class RenderTests(unittest.TestCase):
         self.assertIn("server_name app.makl.xyz;", nginx)
         self.assertIn("proxy_pass http://181.214.231.165:20000;", nginx)
 
+    def test_public_ip_comes_from_env_before_toml(self):
+        toml = 'public_ips = ["203.0.113.10"]\n'
+        self.assertEqual(rift_site.resolve_public_ip(toml, "198.51.100.10"), "198.51.100.10")
+        self.assertEqual(rift_site.resolve_public_ip(toml, ""), "203.0.113.10")
+        self.assertEqual(rift_site.resolve_public_ip("", " 198.51.100.10 "), "198.51.100.10")
+        with self.assertRaises(rift_site.SiteError):
+            rift_site.resolve_public_ip("", "")
+        with self.assertRaises(rift_site.SiteError):
+            rift_site.resolve_public_ip("", "rift.example.net")
+        with self.assertRaises(rift_site.SiteError):
+            rift_site.resolve_public_ip("", "198.51.100.10,203.0.113.10")
+
     def test_allocate_reuses_the_first_free_port(self):
         self.assertEqual(rift_site.allocate_port({20000, 20001}, 20000, 20999), 20002)
         with self.assertRaises(rift_site.SiteError):

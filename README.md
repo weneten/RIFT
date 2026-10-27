@@ -19,7 +19,7 @@ sudo sh deploy/prepare-host
 
 `prepare-host` writes `/etc/sysctl.d/99-rift.conf` and checks that the kernel can create a WireGuard interface. Run it once per machine. RIFT does not change those sysctls itself.
 
-On the VPS, copy the server config and the env file:
+On the VPS, copy the server config and the env file. The copied `config.toml` is complete. The address, the DNS name, and the role are only in `.env`.
 
 ```sh
 cp deploy/vps/config.toml config.toml
@@ -43,7 +43,7 @@ docker exec rift-server rift --config /etc/rift/config.toml agents add core --tt
 
 Copy the printed `RIFT_SERVER`, `RIFT_AGENT_NAME`, and `RIFT_ENROLLMENT_TOKEN` lines into the home server's `.env`. The token is a one-time secret. Remove it from `.env` after the agent is active.
 
-On the home server, copy the agent config and the env file:
+On the home server, copy the agent config and the env file. That config is complete too. The invitation values go only in `.env`.
 
 ```sh
 cp deploy/agent/config.toml config.toml
@@ -63,12 +63,11 @@ Check the tunnel from the VPS. The agent is ready when its status is `active`.
 docker exec rift-server rift --config /etc/rift/config.toml status
 ```
 
-The home service must listen on `0.0.0.0` or the agent tunnel address. To publish it as HTTPS, the VPS proxy that already owns port 443 must be Traefik, Caddy, or Nginx. DNS for the new name points at the same VPS address.
+The home service must listen on `0.0.0.0` or the agent tunnel address. To publish it as HTTPS, run this from the repository on the VPS. The proxy that already owns port 443 must be Traefik, Caddy, or Nginx. DNS for the new name points at the same VPS address.
 
 ```sh
-ln -sf "$(pwd)/deploy/vps/rift-site" /usr/local/bin/rift-site
-rift-site add core app.example.net 8081 --proxy traefik
-rift-site rm app.example.net
+deploy/vps/rift-site add core app.example.net 8081 --proxy traefik
+deploy/vps/rift-site rm app.example.net
 ```
 
 The first Traefik add switches Traefik's file provider to a watched directory and recreates that container. Existing Docker-label routes stay in place.
