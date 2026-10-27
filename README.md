@@ -19,25 +19,42 @@ sudo sh deploy/prepare-host
 
 `prepare-host` writes `/etc/sysctl.d/99-rift.conf` and checks that the kernel can create a WireGuard interface. Run it once per machine. RIFT does not change those sysctls itself.
 
-On the VPS, copy the server config and edit `.env`. Set `RIFT_ROLE=server`. `RIFT_PUBLIC_ENDPOINT` is the DNS name agents and the certificate use, without a port. `RIFT_PUBLIC_IPS` is the address configured on the VPS network interface. Packets arrive on that address, so a DNS name is not valid there.
+On the VPS, copy the server config and the env file:
 
 ```sh
 cp deploy/vps/config.toml config.toml
 cp .env.example .env
-docker compose --env-file .env pull
-docker compose --env-file .env up -d
+```
+
+Edit `.env` before starting. Set `RIFT_ROLE=server`. `RIFT_PUBLIC_ENDPOINT` is the DNS name agents and the certificate use, without a port. `RIFT_PUBLIC_IPS` is the address configured on the VPS network interface. Packets arrive on that address, so a DNS name is not valid there. Compose reads `.env` in the project directory by itself, so the start commands do not pass `--env-file`.
+
+Start the server only after that edit:
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+Wait until `docker logs rift-server` prints `RIFT server ready`. The admin socket is not listening before that line. Then create the invitation:
+
+```sh
 docker exec rift-server rift --config /etc/rift/config.toml agents add core --ttl 15m
 ```
 
 Copy the printed `RIFT_SERVER`, `RIFT_AGENT_NAME`, and `RIFT_ENROLLMENT_TOKEN` lines into the home server's `.env`. The token is a one-time secret. Remove it from `.env` after the agent is active.
 
-On the home server, copy the agent config. Set `RIFT_ROLE=agent`.
+On the home server, copy the agent config and the env file:
 
 ```sh
 cp deploy/agent/config.toml config.toml
 cp .env.example .env
-docker compose --env-file .env pull
-docker compose --env-file .env up -d
+```
+
+Edit `.env` and set `RIFT_ROLE=agent`, plus the three lines from the invitation. Start the agent only after that edit:
+
+```sh
+docker compose pull
+docker compose up -d
 ```
 
 Check the tunnel from the VPS. The agent is ready when its status is `active`.
