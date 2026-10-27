@@ -573,7 +573,7 @@ impl Kernel {
                 .with_context(|| format!("read required forwarding sysctl {path}"))?;
             ensure!(
                 value.trim() == "1",
-                "{path} must already be 1; RIFT does not change global forwarding sysctls"
+                "{path} must be 1. On the host run `sudo sh deploy/prepare-host`; RIFT does not change global forwarding sysctls"
             );
         }
         Ok(())
@@ -633,13 +633,13 @@ impl Kernel {
             .context("parse interface rp_filter")?;
         if all.max(current) == 1 {
             tokio::fs::write(&path, b"2\n").await.with_context(|| format!(
-                "strict rp_filter is active and per-interface setting {path} is not writable; set net.ipv4.conf.default.rp_filter=2 before creating rift0, or set this interface to 2 on the host"
+                "strict rp_filter is active and per-interface setting {path} is not writable; on the host run `sudo sh deploy/prepare-host`"
             ))?;
             let actual: u8 = read_sysctl(&path)
                 .await?
                 .parse()
                 .context("parse updated interface rp_filter")?;
-            ensure!(all.max(actual) == 2, "strict rp_filter remains effective on {}; set net.ipv4.conf.default.rp_filter=2 or this interface to 2 on the host", self.interface());
+            ensure!(all.max(actual) == 2, "strict rp_filter remains effective on {}; on the host run `sudo sh deploy/prepare-host`", self.interface());
         }
         Ok(())
     }

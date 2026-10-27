@@ -4,55 +4,61 @@ RIFT is a Rust WireGuard forwarding service with a VPS server and enrolled agent
 
 Read [the architecture and security boundaries](docs/architecture.md) and [the recorded verification status](docs/verification.md) before deployment. Source code, comments, CLI commands, diagnostics and documentation use English.
 
-## Linux host requirements
+## Start
 
-- A 64-bit Linux VPS and Docker Engine with Compose v2.
-- A Linux kernel with WireGuard support and `iproute2`; verify the actual kernel with `ip link add ... type wireguard` in a disposable network namespace. The WireGuard module is a host-kernel feature; it is not installed by the container image.
-- Inspect the current forwarding sysctls, routes, policy rules, and firewall before deployment.
-- The current RIFT dataplane requires both `net.ipv4.ip_forward=1` and `net.ipv6.conf.all.forwarding=1`; RIFT reads but does not change these host-wide sysctls. New `rift0` interfaces need loose IPv4 reverse-path filtering (`net.ipv4.conf.default.rp_filter=2`) when the kernel/container cannot set the interface value itself. Avoid disabling reverse-path filtering globally. If the IPv6 uplink uses router advertisements, review its `accept_ra` behavior after enabling forwarding.
-- Cloud firewall/security-group and host firewall rules that permit inbound TCP 8443 for enrollment and UDP 51820 for WireGuard. TCP 8444 is the control service and should remain reachable only through the WireGuard interface; do not expose it publicly.
-- A public DNS name or IP address for the VPS. `RIFT_PUBLIC_ENDPOINT` excludes the WireGuard port; the server configuration's `wg_port` defaults to 51820.
+Use a 64-bit Linux host with Docker Engine and Compose v2. Open UDP `51820` and TCP `8443` in the VPS cloud firewall. Leave TCP `8444` closed on the public interface. Point a DNS name at the VPS address.
 
-RIFT requires `CAP_NET_ADMIN` to configure interfaces and routes. The supplied Compose files use host networking, so this capability affects the VPS network namespace. Run the first deployment in a disposable Linux VM, review `docker compose config`, and keep an independent SSH session available. The service does not need `--privileged`, `SYS_ADMIN`, or `NET_RAW` in the supplied configuration. Do not use a global firewall flush or edit Docker-managed chains as part of setup or cleanup.
-
-## Configure and start the VPS server
-
-From the repository root, copy `.env.example` to `.env`, then set `RIFT_PUBLIC_ENDPOINT` to the VPS DNS name or address (without a port) and `RIFT_PUBLIC_IPS` to the comma-separated public addresses the server should use. Keep `.env` private; it contains enrollment material after an agent invitation is created.
-
-Review the mounted settings in `deploy/vps/config.toml`, then validate and start:
+On the VPS and on the home server:
 
 ```sh
-docker compose --env-file .env -f deploy/vps/compose.yml config
-docker compose --env-file .env -f deploy/vps/compose.yml up -d --build
-docker compose --env-file .env -f deploy/vps/compose.yml logs -f
+git clone https://github.com/weneten/RIFT.git
+cd RIFT
+git pull
+sudo sh deploy/prepare-host
 ```
 
-If all TLS paths are omitted, the server generates a local CA and a server certificate using the hostname or IP in `RIFT_PUBLIC_ENDPOINT`, and stores the private material in the persistent `/var/lib/rift` volume. The invitation bundles the CA trust anchor and one-time secret for agent enrollment. A deployment with externally managed certificates can set all three `tls_cert`, `tls_key`, and `tls_ca` paths in the VPS TOML config; mount those files read-only and keep the CA file matched to the server certificate.
+`prepare-host` writes `/etc/sysctl.d/99-rift.conf` and checks that the kernel can create a WireGuard interface. Run it once per machine. RIFT does not change those sysctls itself.
 
-`host_firewall` defaults to `auto`. On a UFW host, the server opens its own control, enrollment, WireGuard and `rift0` forward path in the UFW user chains, and the agent opens granted tunnel ports the same way. Published ports do not each need a UFW rule. Cloud security groups still need UDP 51820, TCP 8443 and the public listen port. Set `host_firewall = "off"` or `RIFT_HOST_FIREWALL=off` to leave UFW unchanged. `rift doctor` reports when a host filter would still drop the path.
-
-In production, a deployment copy may live elsewhere if the same relative layout is preserved: `.env` at the project root and the Compose file at `deploy/vps/compose.yml`. The config file is mounted read-only at `/etc/rift/config.toml`; persistent identity and state live in the named `rift-state` volume mounted at `/var/lib/rift`.
-
-## Enroll an agent
-
-On the VPS, create a short-lived invitation. Copy the printed invitation value directly into the agent's private `.env` file:
+On the VPS, copy the server config and edit `.env`. Set `RIFT_ROLE=server`, `RIFT_PUBLIC_ENDPOINT` to the DNS name without a port, and `RIFT_PUBLIC_IPS` to the public address. Set `RIFT_PROJECT=rift-vps` only when an older Compose project already owns that state volume.
 
 ```sh
-docker compose --env-file .env -f deploy/vps/compose.yml exec rift-server \
-  rift --config /etc/rift/config.toml agents add core --ttl 15m
+cp deploy/vps/config.toml config.toml
+cp .env.example .env
+docker compose --env-file .env pull
+docker compose --env-file .env up -d
+docker exec rift-server rift --config /etc/rift/config.toml agents add core --ttl 15m
 ```
 
-Set `RIFT_SERVER` to `hostname:8443`, `RIFT_AGENT_NAME` to the chosen agent name, and `RIFT_ENROLLMENT_TOKEN` to the invitation value in the agent host's `.env`. The invitation bundles a one-time secret and the server TLS trust anchor. `RIFT_SERVER` includes the enrollment port; `RIFT_PUBLIC_ENDPOINT` does not. Keep the token secret and remove it from `.env` after successful enrollment. The agent connects over TLS, then establishes the WireGuard tunnel.
+Copy the printed `RIFT_SERVER`, `RIFT_AGENT_NAME`, and `RIFT_ENROLLMENT_TOKEN` lines into the home server's `.env`. The token is a one-time secret. Remove it from `.env` after the agent is active.
 
-Start the agent from the repository root on its Linux host:
+On the home server, copy the agent config. Set `RIFT_ROLE=agent`. Set `RIFT_PROJECT=rift-agent` only to keep an older state volume.
 
 ```sh
-docker compose --env-file .env -f deploy/agent/compose.yml config --quiet
-docker compose --env-file .env -f deploy/agent/compose.yml up -d --build
-docker compose --env-file .env -f deploy/agent/compose.yml logs -f
+cp deploy/agent/config.toml config.toml
+cp .env.example .env
+docker compose --env-file .env pull
+docker compose --env-file .env up -d
 ```
 
-Each VPS/agent host should have its own deployment `.env`, Compose project, and persistent state volume. For a third-party agent, use the documented enrollment flow and least privilege; do not share the VPS state volume.
+Check the tunnel from the VPS. The agent is ready when its status is `active`.
+
+```sh
+docker exec rift-server rift --config /etc/rift/config.toml status
+```
+
+The home service must listen on `0.0.0.0` or the agent tunnel address. To publish it as HTTPS, the VPS proxy that already owns port 443 must be Traefik, Caddy, or Nginx. DNS for the new name points at the same VPS address.
+
+```sh
+ln -sf "$(pwd)/deploy/vps/rift-site" /usr/local/bin/rift-site
+rift-site add core app.example.net 8081 --proxy traefik
+rift-site rm app.example.net
+```
+
+The first Traefik add switches Traefik's file provider to a watched directory and recreates that container. Existing Docker-label routes stay in place.
+
+With TLS paths omitted, the server generates a local CA and certificate for `RIFT_PUBLIC_ENDPOINT` and stores them in the `rift-state` volume. `host_firewall` defaults to `auto`, so a UFW host opens enrollment, WireGuard, and the `rift0` forward path without a rule per published port. The cloud firewall still needs UDP `51820`, TCP `8443`, and any public listen port. The Compose service uses host networking and `CAP_NET_ADMIN`. It does not need `--privileged`. Keep `.env` private.
+
+`deploy/vps/compose.yml` and `deploy/agent/compose.yml` build `rift:local` from this repository instead of pulling `weneten/rift:latest`. Use those files when the published image is not the one you want to run.
 
 ## CLI
 
@@ -75,14 +81,7 @@ Build a local image for the current platform:
 docker build -t rift:local .
 ```
 
-Pushes to `main` publish `weneten/rift:latest` for `linux/amd64` and `linux/arm64`. From a checkout with `config.toml` and `.env`:
-
-```sh
-docker compose --env-file .env pull
-docker compose --env-file .env up -d
-```
-
-`RIFT_ROLE` is `server` or `agent`. The root `docker-compose.yml` is that published image. `deploy/vps/compose.yml` and `deploy/agent/compose.yml` still build `rift:local` from this repository.
+Pushes to `main` publish `weneten/rift:latest` for `linux/amd64` and `linux/arm64`. The root `docker-compose.yml` runs that image. The steps are in [Start](#start).
 
 ## Development and integration checks
 

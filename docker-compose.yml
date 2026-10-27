@@ -1,3 +1,4 @@
+# Once per host, before the first start: sudo sh deploy/prepare-host
 # Published image for both roles. The same file runs on the VPS and the home server.
 # Copy deploy/vps/config.toml or deploy/agent/config.toml to ./config.toml.
 # .env on the VPS: RIFT_ROLE=server, RIFT_PUBLIC_ENDPOINT, RIFT_PUBLIC_IPS.
