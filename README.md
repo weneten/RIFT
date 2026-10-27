@@ -75,13 +75,14 @@ Build a local image for the current platform:
 docker build -t rift:local .
 ```
 
-Build amd64 and arm64 images with Buildx:
+Pushes to `main` publish `weneten/rift:latest` for `linux/amd64` and `linux/arm64`. From a checkout with `config.toml` and `.env`:
 
 ```sh
-docker buildx build --platform linux/amd64,linux/arm64 --output type=oci,dest=rift-images.tar .
+docker compose --env-file .env pull
+docker compose --env-file .env up -d
 ```
 
-The OCI archive contains both target architectures. To publish a multi-platform manifest, use a configured registry and an explicit registry tag with `--push`.
+`RIFT_ROLE` is `server` or `agent`. The root `docker-compose.yml` is that published image. `deploy/vps/compose.yml` and `deploy/agent/compose.yml` still build `rift:local` from this repository.
 
 ## Development and integration checks
 

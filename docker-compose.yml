@@ -1,0 +1,37 @@
+# Published image for both roles. The same file runs on the VPS and the home server.
+# Copy deploy/vps/config.toml or deploy/agent/config.toml to ./config.toml.
+# .env on the VPS: RIFT_ROLE=server, RIFT_PUBLIC_ENDPOINT, RIFT_PUBLIC_IPS.
+# .env on the agent: RIFT_ROLE=agent, RIFT_SERVER, RIFT_AGENT_NAME, RIFT_ENROLLMENT_TOKEN.
+# Set RIFT_PROJECT=rift-vps or RIFT_PROJECT=rift-agent to keep an existing state volume.
+
+name: ${RIFT_PROJECT:-rift}
+
+services:
+  rift:
+    image: weneten/rift:latest
+    container_name: rift-${RIFT_ROLE:?Set RIFT_ROLE to server or agent}
+    network_mode: host
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+      - /run:rw,noexec,nosuid,size=4m
+    volumes:
+      - rift-state:/var/lib/rift
+      - ${RIFT_CONFIG:-./config.toml}:/etc/rift/config.toml:ro
+    environment:
+      RIFT_PUBLIC_ENDPOINT: ${RIFT_PUBLIC_ENDPOINT:-}
+      RIFT_PUBLIC_IPS: ${RIFT_PUBLIC_IPS:-}
+      RIFT_ENROLLMENT_BIND: ${RIFT_ENROLLMENT_BIND:-0.0.0.0:8443}
+      RIFT_ENROLLMENT_ENABLED: ${RIFT_ENROLLMENT_ENABLED:-true}
+      RIFT_SERVER: ${RIFT_SERVER:-}
+      RIFT_AGENT_NAME: ${RIFT_AGENT_NAME:-}
+      RIFT_ENROLLMENT_TOKEN: ${RIFT_ENROLLMENT_TOKEN:-}
+    command: ["--config", "/etc/rift/config.toml", "${RIFT_ROLE}"]
+
+volumes:
+  rift-state:

@@ -1,27 +1,95 @@
-name: Multi-architecture image build
+name: Build and Push to Docker Hub
 
 on:
-  workflow_dispatch:
   push:
-    tags: ["v*"]
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: docker-hub-publish
+  cancel-in-progress: true
+
 jobs:
-  build:
+  build-amd64:
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Build and push amd64
+        run: |
+          set -eu
+          attempt=1
+          while [ "$attempt" -le 3 ]; do
+            if docker buildx build \
+              --push \
+              --platform linux/amd64 \
+              --tag ${{ secrets.DOCKER_USERNAME }}/rift:amd64 \
+              --cache-from type=gha,scope=rift-amd64 \
+              --cache-to type=gha,scope=rift-amd64,mode=max \
+              --provenance=true \
+              --sbom=true \
+              .; then
+              exit 0
+            fi
+            echo "amd64 build attempt ${attempt} failed" >&2
+            attempt=$((attempt + 1))
+            sleep 20
+          done
+          exit 1
+
+  build-arm64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
-      - uses: docker/build-push-action@v7
+      - uses: docker/login-action@v3
         with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          outputs: type=oci,dest=/tmp/rift-image.tar
-          tags: rift:${{ github.ref_name }}
-      - uses: actions/upload-artifact@v7
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Build and push arm64
+        run: |
+          set -eu
+          attempt=1
+          while [ "$attempt" -le 3 ]; do
+            if docker buildx build \
+              --push \
+              --platform linux/arm64 \
+              --tag ${{ secrets.DOCKER_USERNAME }}/rift:arm64 \
+              --cache-from type=gha,scope=rift-arm64 \
+              --cache-to type=gha,scope=rift-arm64,mode=max \
+              --provenance=true \
+              --sbom=true \
+              .; then
+              exit 0
+            fi
+            echo "arm64 build attempt ${attempt} failed" >&2
+            attempt=$((attempt + 1))
+            sleep 20
+          done
+          exit 1
+
+  merge:
+    runs-on: ubuntu-24.04
+    needs: [build-amd64, build-arm64]
+    steps:
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v3
         with:
-          name: rift-multiarch-oci
-          path: /tmp/rift-image.tar
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Publish latest
+        run: |
+          docker buildx imagetools create \
+            -t ${{ secrets.DOCKER_USERNAME }}/rift:latest \
+            ${{ secrets.DOCKER_USERNAME }}/rift:amd64 \
+            ${{ secrets.DOCKER_USERNAME }}/rift:arm64
