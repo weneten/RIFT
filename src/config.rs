@@ -1,10 +1,18 @@
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use ipnet::{Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
 };
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HostFirewall {
+    #[default]
+    Auto,
+    Off,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -29,6 +37,8 @@ pub struct Config {
     pub mtu: u16,
     pub handshake_timeout: u64,
     pub poll_seconds: u64,
+    /// `auto` extends UFW user chains when they exist. `off` leaves the host firewall untouched.
+    pub host_firewall: HostFirewall,
     pub agent_name: Option<String>,
     pub server_address: Option<String>,
     #[serde(skip)]
@@ -60,6 +70,7 @@ impl Default for Config {
             mtu: 1380,
             handshake_timeout: 180,
             poll_seconds: 10,
+            host_firewall: HostFirewall::Auto,
             agent_name: None,
             server_address: None,
             enrollment_token: None,
@@ -103,6 +114,15 @@ impl Config {
         if let Ok(v) = std::env::var("RIFT_ENROLLMENT_ENABLED") {
             if !v.is_empty() {
                 config.enrollment_enabled = v.parse()?;
+            }
+        }
+        if let Ok(v) = std::env::var("RIFT_HOST_FIREWALL") {
+            if !v.is_empty() {
+                config.host_firewall = match v.to_ascii_lowercase().as_str() {
+                    "auto" => HostFirewall::Auto,
+                    "off" => HostFirewall::Off,
+                    _ => bail!("RIFT_HOST_FIREWALL must be auto or off"),
+                };
             }
         }
         for (key, slot) in [
@@ -230,6 +250,13 @@ mod tests {
             ..Default::default()
         };
         assert!(c.validate().is_err());
+    }
+    #[test]
+    fn host_firewall_defaults_to_auto_and_parses_off() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.host_firewall, HostFirewall::Auto);
+        let config: Config = toml::from_str("host_firewall = \"off\"\n").unwrap();
+        assert_eq!(config.host_firewall, HostFirewall::Off);
     }
     #[test]
     fn rejects_non_ula() {

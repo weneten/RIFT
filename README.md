@@ -29,6 +29,8 @@ docker compose --env-file .env -f deploy/vps/compose.yml logs -f
 
 If all TLS paths are omitted, the server generates a local CA and a server certificate using the hostname or IP in `RIFT_PUBLIC_ENDPOINT`, and stores the private material in the persistent `/var/lib/rift` volume. The invitation bundles the CA trust anchor and one-time secret for agent enrollment. A deployment with externally managed certificates can set all three `tls_cert`, `tls_key`, and `tls_ca` paths in the VPS TOML config; mount those files read-only and keep the CA file matched to the server certificate.
 
+`host_firewall` defaults to `auto`. On a UFW host, the server opens its own control, enrollment, WireGuard and `rift0` forward path in the UFW user chains, and the agent opens granted tunnel ports the same way. Published ports do not each need a UFW rule. Cloud security groups still need UDP 51820, TCP 8443 and the public listen port. Set `host_firewall = "off"` or `RIFT_HOST_FIREWALL=off` to leave UFW unchanged. `rift doctor` reports when a host filter would still drop the path.
+
 In production, a deployment copy may live elsewhere if the same relative layout is preserved: `.env` at the project root and the Compose file at `deploy/vps/compose.yml`. The config file is mounted read-only at `/etc/rift/config.toml`; persistent identity and state live in the named `rift-state` volume mounted at `/var/lib/rift`.
 
 ## Enroll an agent

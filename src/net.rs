@@ -168,6 +168,7 @@ impl Kernel {
             &peers,
         )?;
         self.replace_nft_table(&rules).await?;
+        self.sync_server_host_firewall().await?;
         Ok(())
     }
 
@@ -258,6 +259,7 @@ impl Kernel {
             &forwards,
         )?;
         self.replace_nft_table(&rules).await?;
+        self.sync_agent_host_firewall(welcome, &forwards).await?;
         Ok(())
     }
 
@@ -302,6 +304,13 @@ impl Kernel {
         let link = run_output("ip", ["link", "show", "dev", self.interface()]).await;
         let nft_owned = self.is_nft_owned().await;
         let interface_owned = self.is_interface_owned().await;
+        let host = self.host_firewall_doctor().await;
+        let mut warnings = vec![
+            "Global forwarding sysctls are inspected but never changed by RIFT.".to_string(),
+            "IPv6 wildcard UDP services should bind the WireGuard address or use IPV6_PKTINFO for replies."
+                .to_string(),
+        ];
+        warnings.extend(host.warnings);
         Ok(json!({
             "interface": self.interface(),
             "interface_present": link.as_ref().is_ok_and(|s| !s.is_empty()),
@@ -313,10 +322,8 @@ impl Kernel {
             "rule_priority": self.config.rule_priority,
             "mark": format!("{:#x}/{:#x}", self.config.mark, self.config.mark_mask),
             "public_ips": self.config.public_ips,
-            "warnings": [
-                "Global forwarding sysctls are inspected but never changed by RIFT.",
-                "IPv6 wildcard UDP services should bind the WireGuard address or use IPV6_PKTINFO for replies."
-            ]
+            "host_firewall": host.status,
+            "warnings": warnings
         }))
     }
 
@@ -357,6 +364,7 @@ impl Kernel {
 
     pub async fn cleanup(&self) -> Result<()> {
         let _apply = APPLY_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+        self.remove_host_firewall().await?;
         if self.is_nft_owned().await {
             if nft_table_exists().await? {
                 run_ok("nft", ["delete", "table", "inet", "rift"])
@@ -412,6 +420,129 @@ impl Kernel {
             *self.endpoint_refresh.lock().await = Some((Instant::now(), desired));
         }
         Ok(())
+    }
+
+    async fn sync_server_host_firewall(&self) -> Result<()> {
+        if self.config.host_firewall == crate::config::HostFirewall::Off {
+            return self.remove_host_firewall().await;
+        }
+        let obs = crate::host_firewall::observe(&self.nft_ruleset().await?)?;
+        if obs.input.is_empty() && obs.forward.is_empty() {
+            return Ok(());
+        }
+        let uplinks =
+            crate::host_firewall::uplinks(&self.address_json().await?, &self.config.public_ips)?;
+        if !self.config.public_ips.is_empty() && uplinks.is_empty() && !obs.forward.is_empty() {
+            bail!(
+                "configured public IPs are not assigned on this host; not opening UFW forwarding"
+            );
+        }
+        let plan = crate::host_firewall::plan_server(
+            &obs,
+            &crate::host_firewall::ServerSpec {
+                interface: self.interface(),
+                server_v4: self.config.server_ipv4,
+                server_v6: self.config.server_ipv6,
+                control_port: self.config.control_port,
+                wg_port: self.config.wg_port,
+                enrollment: self
+                    .config
+                    .enrollment_enabled
+                    .then_some(self.config.enrollment_bind),
+                uplinks: &uplinks,
+            },
+        )?;
+        self.apply_host_plan(&plan).await
+    }
+
+    async fn sync_agent_host_firewall(
+        &self,
+        welcome: &Welcome,
+        forwards: &[&Forward],
+    ) -> Result<()> {
+        if self.config.host_firewall == crate::config::HostFirewall::Off {
+            return self.remove_host_firewall().await;
+        }
+        let obs = crate::host_firewall::observe(&self.nft_ruleset().await?)?;
+        if obs.input.is_empty() && obs.forward.is_empty() {
+            return Ok(());
+        }
+        let plan = crate::host_firewall::plan_agent(
+            &obs,
+            &crate::host_firewall::AgentSpec {
+                interface: self.interface(),
+                tunnel_v4: welcome.tunnel_ipv4,
+                tunnel_v6: welcome.tunnel_ipv6,
+                forwards,
+            },
+        )?;
+        self.apply_host_plan(&plan).await
+    }
+
+    async fn apply_host_plan(&self, plan: &crate::host_firewall::Plan) -> Result<()> {
+        for script in [&plan.create, &plan.fill, &plan.jumps] {
+            if !script.trim().is_empty() {
+                nft_batch(script).await?;
+            }
+        }
+        if !plan.summary.is_empty()
+            && (!plan.fill.trim().is_empty() || !plan.jumps.trim().is_empty())
+        {
+            tracing::info!("{}", plan.summary);
+        }
+        Ok(())
+    }
+
+    async fn remove_host_firewall(&self) -> Result<()> {
+        let obs = crate::host_firewall::observe(&self.nft_ruleset().await?)?;
+        let script = crate::host_firewall::plan_remove(&obs);
+        if script.trim().is_empty() {
+            return Ok(());
+        }
+        nft_batch(&script)
+            .await
+            .context("remove RIFT host-firewall jumps")
+    }
+
+    async fn host_firewall_doctor(&self) -> crate::host_firewall::DoctorReport {
+        let mode = match self.config.host_firewall {
+            crate::config::HostFirewall::Auto => "auto",
+            crate::config::HostFirewall::Off => "off",
+        };
+        let ruleset = match self.nft_ruleset().await {
+            Ok(ruleset) => ruleset,
+            Err(error) => {
+                return crate::host_firewall::DoctorReport {
+                    status: json!({ "mode": mode, "error": error.to_string() }),
+                    warnings: vec![format!("host firewall inspection failed: {error}")],
+                };
+            }
+        };
+        let obs = match crate::host_firewall::observe(&ruleset) {
+            Ok(obs) => obs,
+            Err(error) => {
+                return crate::host_firewall::DoctorReport {
+                    status: json!({ "mode": mode, "error": error.to_string() }),
+                    warnings: vec![format!("host firewall inspection failed: {error}")],
+                };
+            }
+        };
+        let uplinks = match self.address_json().await {
+            Ok(addresses) => crate::host_firewall::uplinks(&addresses, &self.config.public_ips)
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        crate::host_firewall::report(mode, &obs, &uplinks, !self.config.public_ips.is_empty())
+    }
+
+    async fn nft_ruleset(&self) -> Result<Value> {
+        let text = run_output("nft", ["-j", "list", "ruleset"]).await?;
+        serde_json::from_str(&text).context("parse nftables JSON ruleset")
+    }
+
+    async fn address_json(&self) -> Result<Value> {
+        let text = run_output("ip", ["-j", "address", "show"]).await?;
+        serde_json::from_str(&text).context("parse ip address JSON")
     }
 
     async fn preflight_forwarding(&self) -> Result<()> {

@@ -2,6 +2,7 @@ pub mod audit;
 pub mod config;
 pub mod daemon;
 pub mod enrollment;
+pub(crate) mod host_firewall;
 pub mod model;
 pub mod net;
 pub mod protocol;
