@@ -3,9 +3,8 @@
 # Copy deploy/vps/config.toml or deploy/agent/config.toml to ./config.toml.
 # .env on the VPS: RIFT_ROLE=server, RIFT_PUBLIC_ENDPOINT, RIFT_PUBLIC_IPS.
 # .env on the agent: RIFT_ROLE=agent, RIFT_SERVER, RIFT_AGENT_NAME, RIFT_ENROLLMENT_TOKEN.
-# Set RIFT_PROJECT=rift-vps or RIFT_PROJECT=rift-agent to keep an existing state volume.
 
-name: ${RIFT_PROJECT:-rift}
+name: rift
 
 services:
   rift:

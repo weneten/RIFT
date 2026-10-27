@@ -19,7 +19,7 @@ sudo sh deploy/prepare-host
 
 `prepare-host` writes `/etc/sysctl.d/99-rift.conf` and checks that the kernel can create a WireGuard interface. Run it once per machine. RIFT does not change those sysctls itself.
 
-On the VPS, copy the server config and edit `.env`. Set `RIFT_ROLE=server`, `RIFT_PUBLIC_ENDPOINT` to the DNS name without a port, and `RIFT_PUBLIC_IPS` to the public address. Set `RIFT_PROJECT=rift-vps` only when an older Compose project already owns that state volume.
+On the VPS, copy the server config and edit `.env`. Set `RIFT_ROLE=server`. `RIFT_PUBLIC_ENDPOINT` is the DNS name agents and the certificate use, without a port. `RIFT_PUBLIC_IPS` is the address configured on the VPS network interface. Packets arrive on that address, so a DNS name is not valid there.
 
 ```sh
 cp deploy/vps/config.toml config.toml
@@ -31,7 +31,7 @@ docker exec rift-server rift --config /etc/rift/config.toml agents add core --tt
 
 Copy the printed `RIFT_SERVER`, `RIFT_AGENT_NAME`, and `RIFT_ENROLLMENT_TOKEN` lines into the home server's `.env`. The token is a one-time secret. Remove it from `.env` after the agent is active.
 
-On the home server, copy the agent config. Set `RIFT_ROLE=agent`. Set `RIFT_PROJECT=rift-agent` only to keep an older state volume.
+On the home server, copy the agent config. Set `RIFT_ROLE=agent`.
 
 ```sh
 cp deploy/agent/config.toml config.toml
