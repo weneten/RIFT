@@ -1,8 +1,8 @@
 use crate::{
     config::Config,
     model::{
-        AgentPolicy, AgentStatus, Family, Forward, ForwardMode, PeerStats, PortRange, Protocol,
-        StateSnapshot, Welcome,
+        AgentPolicy, AgentStatus, Family, Forward, ForwardMode, Ingress, PeerStats, PortRange,
+        Protocol, StateSnapshot, Welcome,
     },
 };
 use anyhow::{bail, ensure, Context, Result};
@@ -157,6 +157,22 @@ impl Kernel {
         }
 
         self.ensure_nft_ownership().await?;
+        let local_ingress = forwards
+            .iter()
+            .any(|forward| forward.ingress == Ingress::Local);
+        let uplinks = if local_ingress {
+            let found = crate::host_firewall::uplinks(
+                &self.address_json().await?,
+                &self.config.public_ips,
+            )?;
+            ensure!(
+                !found.is_empty(),
+                "local ingress needs a NIC that owns a configured public IP"
+            );
+            found
+        } else {
+            Vec::new()
+        };
         let rules = render_server_rules(
             self.interface(),
             self.config.mark,
@@ -166,9 +182,10 @@ impl Kernel {
             self.config.server_ipv6,
             &forwards,
             &peers,
+            &uplinks,
         )?;
         self.replace_nft_table(&rules).await?;
-        self.sync_server_host_firewall().await?;
+        self.sync_server_host_firewall(local_ingress).await?;
         Ok(())
     }
 
@@ -422,7 +439,7 @@ impl Kernel {
         Ok(())
     }
 
-    async fn sync_server_host_firewall(&self) -> Result<()> {
+    async fn sync_server_host_firewall(&self, local_ingress: bool) -> Result<()> {
         if self.config.host_firewall == crate::config::HostFirewall::Off {
             return self.remove_host_firewall().await;
         }
@@ -450,6 +467,7 @@ impl Kernel {
                     .enrollment_enabled
                     .then_some(self.config.enrollment_bind),
                 uplinks: &uplinks,
+                local_ingress,
             },
         )?;
         self.apply_host_plan(&plan).await
@@ -1301,6 +1319,26 @@ fn parse_wg_dump(output: &str) -> Result<Vec<WgPeer>> {
     Ok(peers)
 }
 
+fn ingress_clause(tunnel: &str, forward: &Forward, uplinks: &[String]) -> Result<String> {
+    let mut clause = format!("iifname != \"{tunnel}\"");
+    if forward.ingress != Ingress::Local {
+        return Ok(clause);
+    }
+    ensure!(
+        !uplinks.is_empty(),
+        "local ingress forward {} has no public uplink to exclude",
+        forward.id
+    );
+    for name in uplinks {
+        ensure!(
+            crate::host_firewall::valid_ifname(name),
+            "invalid uplink interface {name}"
+        );
+        clause.push_str(&format!(" iifname != \"{name}\""));
+    }
+    Ok(clause)
+}
+
 // Keep meta l4proto before conntrack port comparisons in both renderers.
 // nftables 1.0.6 needs this context to infer the transport-port datatype.
 #[allow(clippy::too_many_arguments)] // Explicit kernel renderer inputs, shared by server and renderer tests.
@@ -1313,6 +1351,7 @@ fn render_server_rules(
     server_v6: std::net::Ipv6Addr,
     forwards: &[&Forward],
     agents: &BTreeMap<String, &crate::model::AgentRecord>,
+    uplinks: &[String],
 ) -> Result<String> {
     let mut out = "add chain inet rift prerouting_mark { type filter hook prerouting priority mangle; policy accept; }\n\
          add chain inet rift prerouting_nat { type nat hook prerouting priority dstnat; policy accept; }\n\
@@ -1336,22 +1375,23 @@ fn render_server_rules(
             let (target_family, target_ip) = nft_addr(agent_ip);
             let proto = f.protocol.to_string();
             let target = nft_nat_target(f.target_ip(agent), target_port);
+            let iif = ingress_clause(interface, f, uplinks)?;
             out.push_str(&format!(
-                "add rule inet rift prerouting_mark iifname != \"{interface}\" {addr_family} daddr {addr} {proto} dport {listen_port} ct direction original ct mark set (ct mark & {:#x}) | {:#x}\n",
+                "add rule inet rift prerouting_mark {iif} {addr_family} daddr {addr} {proto} dport {listen_port} ct direction original ct mark set (ct mark & {:#x}) | {:#x}\n",
                 !mask, mark
             ));
             out.push_str(&format!(
-                "add rule inet rift prerouting_nat iifname != \"{interface}\" {addr_family} daddr {addr} {proto} dport {listen_port} dnat {target_family} to {target}\n"
+                "add rule inet rift prerouting_nat {iif} {addr_family} daddr {addr} {proto} dport {listen_port} dnat {target_family} to {target}\n"
             ));
             // A missing MSS option must not skip the separate grant accept.
             if f.protocol == Protocol::Tcp {
                 out.push_str(&format!(
-                    "add rule inet rift forward iifname != \"{interface}\" oifname \"{interface}\" ct direction original ct status dnat ct mark & {mask:#x} == {mark:#x} ct original {addr_family} daddr {addr} ct original protocol tcp meta l4proto tcp ct original proto-dst {listen_port} {target_family} daddr {target_ip} tcp dport {target_port} meta l4proto tcp tcp flags & syn == syn tcp option maxseg size set rt mtu\n\
+                    "add rule inet rift forward {iif} oifname \"{interface}\" ct direction original ct status dnat ct mark & {mask:#x} == {mark:#x} ct original {addr_family} daddr {addr} ct original protocol tcp meta l4proto tcp ct original proto-dst {listen_port} {target_family} daddr {target_ip} tcp dport {target_port} meta l4proto tcp tcp flags & syn == syn tcp option maxseg size set rt mtu\n\
                      add rule inet rift forward iifname \"{interface}\" oifname != \"{interface}\" ct direction reply ct status dnat ct mark & {mask:#x} == {mark:#x} ct original {addr_family} daddr {addr} ct original protocol tcp meta l4proto tcp ct original proto-dst {listen_port} ct reply {target_family} saddr {target_ip} meta l4proto tcp ct reply proto-src {target_port} meta l4proto tcp tcp flags & syn == syn tcp option maxseg size set rt mtu\n"
                 ));
             }
             out.push_str(&format!(
-                "add rule inet rift forward iifname != \"{interface}\" oifname \"{interface}\" ct direction original ct status dnat ct mark & {mask:#x} == {mark:#x} ct original {addr_family} daddr {addr} ct original protocol {proto} meta l4proto {proto} ct original proto-dst {listen_port} {target_family} daddr {target_ip} {proto} dport {target_port} accept\n\
+                "add rule inet rift forward {iif} oifname \"{interface}\" ct direction original ct status dnat ct mark & {mask:#x} == {mark:#x} ct original {addr_family} daddr {addr} ct original protocol {proto} meta l4proto {proto} ct original proto-dst {listen_port} {target_family} daddr {target_ip} {proto} dport {target_port} accept\n\
                  add rule inet rift forward iifname \"{interface}\" oifname != \"{interface}\" ct direction reply ct status dnat ct mark & {mask:#x} == {mark:#x} ct original {addr_family} daddr {addr} ct original protocol {proto} meta l4proto {proto} ct original proto-dst {listen_port} ct reply {target_family} saddr {target_ip} meta l4proto {proto} ct reply proto-src {target_port} accept\n"
             ));
         }
@@ -2164,6 +2204,7 @@ mod tests {
             },
             protocol: Protocol::Tcp,
             mode,
+            ingress: crate::model::Ingress::Public,
             target_family: Family::V4,
             enabled: true,
             generation: 1,
@@ -2185,6 +2226,7 @@ mod tests {
             "fd88:5249:4654::1".parse().unwrap(),
             &[&f, &udp],
             &agents,
+            &[],
         )
         .unwrap();
         assert!(rendered.contains("tcp dport 80 dnat ip to 10.88.0.2:8080"));
@@ -2201,6 +2243,61 @@ mod tests {
         assert!(!rendered.contains("forward iifname \"rift0\" oifname != \"rift0\" ct mark & 0xffff0000 == 0x52490000 accept"));
         assert!(!rendered.contains("snat"));
         assert!(!rendered.contains("masquerade"));
+        assert!(!rendered.contains("iifname != \"eth0\""));
+    }
+    #[test]
+    fn local_ingress_excludes_the_public_uplink_on_dnat_and_the_original_forward() {
+        let a = agent();
+        let agents = BTreeMap::from([(a.id.clone(), &a)]);
+        let mut f = forward(ForwardMode::Transparent);
+        f.ingress = Ingress::Local;
+        f.listen_ports = PortRange { start: 80, end: 80 };
+        f.target_ports = PortRange {
+            start: 8080,
+            end: 8080,
+        };
+        let uplinks = vec!["eth0".to_string()];
+        let rendered = render_server_rules(
+            "rift0",
+            0x52490000,
+            0xffff0000,
+            8444,
+            Ipv4Addr::new(10, 88, 0, 1),
+            "fd88:5249:4654::1".parse().unwrap(),
+            &[&f],
+            &agents,
+            &uplinks,
+        )
+        .unwrap();
+        let excluded = "iifname != \"rift0\" iifname != \"eth0\"";
+        assert!(rendered.contains(&format!(
+            "prerouting_nat {excluded} ip daddr 203.0.113.1 tcp dport 80 dnat ip to 10.88.0.2:8080"
+        )));
+        assert!(rendered.contains(&format!(
+            "forward {excluded} oifname \"rift0\" ct direction original"
+        )));
+        assert!(
+            rendered.contains("forward iifname \"rift0\" oifname != \"rift0\" ct direction reply")
+        );
+        assert!(render_server_rules(
+            "rift0",
+            0x52490000,
+            0xffff0000,
+            8444,
+            Ipv4Addr::new(10, 88, 0, 1),
+            "fd88:5249:4654::1".parse().unwrap(),
+            &[&f],
+            &agents,
+            &[],
+        )
+        .is_err());
+    }
+    #[test]
+    fn forward_without_ingress_stays_public() {
+        let raw = r#"{"id":1,"agent_id":"a","listen_ip":"203.0.113.1","listen_ports":{"start":80,"end":80},"target_ports":{"start":80,"end":80},"protocol":"tcp","mode":"transparent","target_family":"v4","enabled":true,"generation":1}"#;
+        let parsed: Forward = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.ingress, Ingress::Public);
+        parsed.validate().unwrap();
     }
     #[test]
     fn agent_renderer_classifies_translate_only_from_vps_tunnel_source() {

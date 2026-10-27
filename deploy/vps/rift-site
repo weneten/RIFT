@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+"""Publish one home-agent port as an HTTPS name on the VPS proxy that owns port 443."""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+PROXIES = ("traefik", "caddy", "nginx")
+HOST_RE = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$",
+    re.IGNORECASE,
+)
+AGENT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+SS_PROCESS = re.compile(r'\(\("([^"]+)"')
+STATE_PATH = Path(os.environ.get("RIFT_SITE_STATE", "/var/lib/rift-site/sites.json"))
+
+
+class SiteError(Exception):
+    pass
+
+
+def valid_host(host):
+    return bool(HOST_RE.match(host))
+
+
+def valid_agent(agent):
+    return bool(AGENT_RE.match(agent))
+
+
+def router_name(host):
+    cleaned = re.sub(r"[^a-z0-9]+", "-", host.lower()).strip("-")
+    return f"rift-{cleaned}"[:60]
+
+
+def allocate_port(used, low, high):
+    for port in range(low, high + 1):
+        if port not in used:
+            return port
+    raise SiteError(f"no free listen port in {low}-{high}")
+
+
+def render_traefik(host, url, resolver, http_entry, https_entry):
+    name = router_name(host)
+    return (
+        "http:\n"
+        "  routers:\n"
+        f"    {name}-web:\n"
+        f"      rule: Host(`{host}`)\n"
+        "      entryPoints:\n"
+        f"        - {http_entry}\n"
+        f"      service: {name}\n"
+        f"    {name}-websecure:\n"
+        f"      rule: Host(`{host}`)\n"
+        "      entryPoints:\n"
+        f"        - {https_entry}\n"
+        "      tls:\n"
+        f"        certResolver: {resolver}\n"
+        f"      service: {name}\n"
+        "  services:\n"
+        f"    {name}:\n"
+        "      loadBalancer:\n"
+        "        servers:\n"
+        f"          - url: {url}\n"
+    )
+
+
+def render_caddy(host, url):
+    backend = url[7:] if url.startswith("http://") else url
+    return f"{host} {{\n    reverse_proxy {backend}\n}}\n"
+
+
+def render_nginx(host, url):
+    return (
+        "server {\n"
+        "    listen 80;\n"
+        f"    server_name {host};\n"
+        "    location / {\n"
+        f"        proxy_pass {url};\n"
+        "        proxy_set_header Host $host;\n"
+        "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
+        "        proxy_set_header X-Forwarded-Proto $scheme;\n"
+        "    }\n"
+        "}\n"
+    )
+
+
+def publishes_443(ports):
+    return bool(re.search(r"(?:0\.0\.0\.0|\[::\]|:::):443->", ports or ""))
+
+
+def proxy_kind(name, image):
+    blob = f"{name} {image}".lower()
+    hits = [kind for kind in PROXIES if kind in blob]
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
+def listeners_from_ss(text):
+    found = []
+    for line in text.splitlines():
+        if not re.search(r"(?:^|\s)\[?(?:::|[0-9.]+|::)\]?:443(?:\s|$)", line):
+            continue
+        match = SS_PROCESS.search(line)
+        if match:
+            found.append(match.group(1))
+    return found
+
+
+def containers_from_ps(text):
+    rows = []
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            rows.append({"name": parts[0], "image": parts[1], "ports": parts[2]})
+    return rows
+
+
+def edge_holders(containers, host_processes):
+    host_kinds = []
+    for process in host_processes:
+        kind = proxy_kind(process, "")
+        if kind and kind not in host_kinds and process != "docker-proxy":
+            host_kinds.append(kind)
+    if host_kinds:
+        return host_kinds
+    found = []
+    for container in containers:
+        if not publishes_443(container.get("ports", "")):
+            continue
+        kind = proxy_kind(container.get("name", ""), container.get("image", ""))
+        if kind and kind not in found:
+            found.append(kind)
+    return found
+
+
+def require_edge(wanted, containers, host_processes):
+    holders = edge_holders(containers, host_processes)
+    if holders == [wanted]:
+        return
+    if not holders:
+        raise SiteError(f"{wanted} is not listening on port 443")
+    if len(holders) == 1:
+        raise SiteError(f"{holders[0]} holds port 443, not {wanted}")
+    raise SiteError(f"{' and '.join(holders)} hold port 443, not only {wanted}")
+
+
+def public_ip_from_toml(text):
+    match = re.search(r'public_ips\s*=\s*\[\s*"([^"]+)"', text)
+    if not match:
+        raise SiteError("public_ips is missing from the RIFT config")
+    return match.group(1)
+
+
+def listen_ports_of(forward):
+    ports = forward.get("listen_ports") or {}
+    start = int(ports.get("start", 0))
+    end = int(ports.get("end", start))
+    if start <= 0 or end < start:
+        return set()
+    return set(range(start, end + 1))
+
+
+def traefik_layout(doc):
+    obj = doc[0] if isinstance(doc, list) else doc
+    args = obj.get("Args") or (obj.get("Config") or {}).get("Cmd") or []
+    if isinstance(args, str):
+        args = args.split()
+    labels = (obj.get("Config") or {}).get("Labels") or {}
+    source = None
+    for mount in obj.get("Mounts") or []:
+        dest = mount.get("Destination") or ""
+        src = mount.get("Source") or ""
+        if dest.endswith("dynamic_conf.yml") or src.endswith("dynamic_conf.yml"):
+            source = src
+    joined = " ".join(args)
+    ready = "providers.file.directory=" in joined and "providers.file.filename=" not in joined
+    return {
+        "ready": ready,
+        "args": list(args),
+        "file_source": source,
+        "working_dir": labels.get("com.docker.compose.project.working_dir"),
+        "config_files": labels.get("com.docker.compose.project.config_files"),
+        "service": labels.get("com.docker.compose.service") or "traefik",
+    }
+
+
+def migrate_compose(text):
+    """Return (text, changed). changed is true only when the single-file provider was rewritten."""
+    if "--providers.file.filename=/dynamic_conf.yml" not in text:
+        return text, False
+    output = []
+    changed = False
+    for line in text.splitlines(keepends=True):
+        newline = "\n" if line.endswith("\n") else ""
+        body = line[:-1] if newline else line
+        if "--providers.file.filename=/dynamic_conf.yml" in body and body.lstrip().startswith("-"):
+            indent = body[: len(body) - len(body.lstrip())]
+            output.append(f'{indent}- "--providers.file.directory=/dynamic"{newline}')
+            output.append(f'{indent}- "--providers.file.watch=true"{newline}')
+            changed = True
+            continue
+        if "--providers.file.filename=/dynamic_conf.yml" in body:
+            body = body.replace(
+                "--providers.file.filename=/dynamic_conf.yml",
+                "--providers.file.directory=/dynamic --providers.file.watch=true",
+            )
+            changed = True
+        rewritten, did = _rewrite_volume(body)
+        changed = changed or did
+        output.append(rewritten + newline)
+    return "".join(output), changed
+
+
+def _rewrite_volume(body):
+    match = re.search(r'([\'"]?)(?P<src>\S*dynamic_conf\.yml):/dynamic_conf\.yml(?P<mode>:[a-z]+)?\1', body)
+    if not match:
+        return body, False
+    source = match.group("src")
+    mode = match.group("mode") or ":ro"
+    parent = str(Path(source).parent).replace("\\", "/")
+    replacement = f"{parent}/dynamic:/dynamic{mode}"
+    return body[: match.start()] + replacement + body[match.end() :], True
+
+
+def default_state(public_ip):
+    return {
+        "proxy": "traefik",
+        "public_ip": public_ip,
+        "listen_min": 20000,
+        "listen_max": 20999,
+        "container": "rift-server",
+        "rift_config": "/etc/rift/config.toml",
+        "traefik": {
+            "dynamic_dir": "/root/traefik/dynamic",
+            "cert_resolver": "myresolver",
+            "http_entrypoint": "web",
+            "https_entrypoint": "websecure",
+        },
+        "caddy": {
+            "sites_dir": "/etc/caddy/rift-sites",
+            "reload": ["caddy", "reload", "--config", "/etc/caddy/Caddyfile"],
+        },
+        "nginx": {
+            "sites_dir": "/etc/nginx/rift-sites",
+            "test": ["nginx", "-t"],
+            "reload": ["nginx", "-s", "reload"],
+        },
+        "sites": {},
+    }
+
+
+def load_state():
+    if not STATE_PATH.exists():
+        return None
+    return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+
+
+def save_state(state):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = STATE_PATH.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(STATE_PATH)
+
+
+def run(cmd, cwd=None):
+    completed = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, check=False)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "command failed").strip()
+        raise SiteError(detail)
+    return completed.stdout
+
+
+def rift(state, *args):
+    raw = run(
+        [
+            "docker",
+            "exec",
+            state["container"],
+            "rift",
+            "--config",
+            state["rift_config"],
+            "--json",
+            *args,
+        ]
+    )
+    return json.loads(raw) if raw.strip() else None
+
+
+def capture_edge():
+    ps = run(["docker", "ps", "--format", "{{.Names}}\t{{.Image}}\t{{.Ports}}"])
+    ss = subprocess.run(
+        ["ss", "-H", "-ltnp", "( sport = :443 )"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    processes = listeners_from_ss(ss.stdout) if ss.returncode == 0 else []
+    return containers_from_ps(ps), processes
+
+
+def used_ports(state):
+    used = set()
+    for site in state["sites"].values():
+        used.add(int(site["listen"]))
+    listed = rift(state, "forwards", "list") or []
+    for forward in listed:
+        used.update(listen_ports_of(forward))
+    return used
+
+
+def service_url(state, listen):
+    return f"http://{state['public_ip']}:{listen}"
+
+
+def site_path(state, proxy, host):
+    if proxy == "traefik":
+        directory = Path(state["traefik"]["dynamic_dir"])
+        suffix = ".yml"
+    elif proxy == "caddy":
+        directory = Path(state["caddy"]["sites_dir"])
+        suffix = ".caddy"
+    else:
+        directory = Path(state["nginx"]["sites_dir"])
+        suffix = ".conf"
+    return directory / f"{host}{suffix}"
+
+
+def render_site(state, proxy, host, listen):
+    url = service_url(state, listen)
+    if proxy == "traefik":
+        cfg = state["traefik"]
+        return render_traefik(
+            host,
+            url,
+            cfg["cert_resolver"],
+            cfg["http_entrypoint"],
+            cfg["https_entrypoint"],
+        )
+    if proxy == "caddy":
+        return render_caddy(host, url)
+    return render_nginx(host, url)
+
+
+def reload_proxy(state, proxy, host):
+    if proxy == "traefik":
+        return None
+    if proxy == "caddy":
+        run(state["caddy"]["reload"])
+        return None
+    run(state["nginx"]["test"])
+    run(state["nginx"]["reload"])
+    if shutil.which("certbot"):
+        run(["certbot", "--nginx", "--non-interactive", "--agree-tos", "-d", host])
+        return None
+    return "certbot is not installed; TLS was not requested"
+
+
+def ensure_traefik_provider(state):
+    raw = run(["docker", "inspect", "traefik"])
+    layout = traefik_layout(json.loads(raw))
+    if layout["ready"]:
+        return
+    if not layout["file_source"] or not layout["config_files"] or not layout["working_dir"]:
+        raise SiteError(
+            "Traefik file provider is still a single file. "
+            "Point it at a watched /dynamic directory before rift-site can add a name."
+        )
+    source = Path(layout["file_source"])
+    dynamic = Path(state["traefik"]["dynamic_dir"])
+    dynamic.mkdir(parents=True, exist_ok=True)
+    destination = dynamic / "ssh.yml"
+    if source.exists() and not destination.exists():
+        destination.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    compose_path = Path(layout["config_files"])
+    original = compose_path.read_text(encoding="utf-8")
+    migrated, changed = migrate_compose(original)
+    if not changed:
+        raise SiteError(f"could not rewrite the Traefik file provider in {compose_path}")
+    compose_path.write_text(migrated, encoding="utf-8")
+    run(
+        ["docker", "compose", "-f", str(compose_path), "up", "-d", "--no-deps", layout["service"]],
+        cwd=layout["working_dir"],
+    )
+
+
+def remove_forward(state, forward_id):
+    if not forward_id:
+        return
+    try:
+        rift(state, "forwards", "remove", "--id", str(forward_id))
+    except SiteError as error:
+        if "not found" not in str(error):
+            raise
+
+
+def command_add(agent, host, port, proxy):
+    if not valid_agent(agent) or not valid_host(host):
+        raise SiteError("agent or host is not a usable name")
+    target = int(port)
+    if not 1 <= target <= 65535:
+        raise SiteError("port must be in 1..65535")
+    state = load_state()
+    if state is None:
+        config = run(["docker", "exec", "rift-server", "cat", "/etc/rift/config.toml"])
+        state = default_state(public_ip_from_toml(config))
+    chosen = proxy or state.get("proxy") or "traefik"
+    if chosen not in PROXIES:
+        raise SiteError("proxy must be traefik, caddy, or nginx")
+    require_edge(chosen, *capture_edge())
+    if chosen == "traefik":
+        ensure_traefik_provider(state)
+    existing = state["sites"].get(host)
+    if existing and int(existing["target"]) == target and existing.get("agent") == agent and existing.get("proxy") == chosen:
+        listen = int(existing["listen"])
+        forward_id = existing.get("forward_id")
+    else:
+        if existing:
+            remove_forward(state, existing.get("forward_id"))
+        listen = int(existing["listen"]) if existing else allocate_port(
+            used_ports(state), int(state["listen_min"]), int(state["listen_max"])
+        )
+        created = rift(
+            state,
+            "forwards",
+            "add",
+            "--agent",
+            agent,
+            "--listen",
+            str(listen),
+            "--target",
+            str(target),
+            "--ingress",
+            "local",
+        )
+        forward_id = created["id"]
+    created_forward = not existing or existing.get("forward_id") != forward_id
+    if existing and existing.get("proxy") != chosen:
+        site_path(state, existing["proxy"], host).unlink(missing_ok=True)
+    path = site_path(state, chosen, host)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(render_site(state, chosen, host, listen), encoding="utf-8")
+        state["sites"][host] = {
+            "agent": agent,
+            "target": target,
+            "listen": listen,
+            "proxy": chosen,
+            "forward_id": forward_id,
+        }
+        save_state(state)
+    except Exception:
+        if created_forward:
+            remove_forward(state, forward_id)
+        raise
+    note = reload_proxy(state, chosen, host)
+    print(f"https://{host}")
+    print(f"DNS: {host} -> {state['public_ip']}")
+    if note:
+        print(note)
+
+
+def command_rm(host):
+    state = load_state()
+    if state is None or host not in state["sites"]:
+        raise SiteError(f"{host} is not a rift-site")
+    site = state["sites"][host]
+    path = site_path(state, site["proxy"], host)
+    path.unlink(missing_ok=True)
+    remove_forward(state, site.get("forward_id"))
+    del state["sites"][host]
+    save_state(state)
+    try:
+        reload_proxy(state, site["proxy"], host)
+    except SiteError as error:
+        print(f"proxy reload: {error}", file=sys.stderr)
+
+
+def command_proxy(name):
+    state = load_state() or default_state("")
+    if not name:
+        print(state.get("proxy") or "traefik")
+        return
+    if name not in PROXIES:
+        raise SiteError("proxy must be traefik, caddy, or nginx")
+    state["proxy"] = name
+    if not state.get("public_ip"):
+        config = run(["docker", "exec", "rift-server", "cat", "/etc/rift/config.toml"])
+        state["public_ip"] = public_ip_from_toml(config)
+    save_state(state)
+    print(name)
+
+
+def usage():
+    return (
+        "usage: rift-site add AGENT HOST PORT [--proxy traefik|caddy|nginx]\n"
+        "       rift-site rm HOST\n"
+        "       rift-site proxy [traefik|caddy|nginx]"
+    )
+
+
+def main(argv):
+    if len(argv) < 2:
+        raise SiteError(usage())
+    command = argv[1]
+    if command == "add":
+        proxy = None
+        args = argv[2:]
+        if "--proxy" in args:
+            index = args.index("--proxy")
+            proxy = args[index + 1]
+            args = args[:index] + args[index + 2 :]
+        if len(args) != 3:
+            raise SiteError(usage())
+        command_add(args[0], args[1], args[2], proxy)
+        return
+    if command == "rm" and len(argv) == 3:
+        command_rm(argv[2])
+        return
+    if command == "proxy" and len(argv) in (2, 3):
+        command_proxy(argv[2] if len(argv) == 3 else None)
+        return
+    raise SiteError(usage())
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv)
+    except (SiteError, json.JSONDecodeError, KeyError, ValueError) as error:
+        print(f"rift-site: {error}", file=sys.stderr)
+        sys.exit(1)

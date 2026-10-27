@@ -65,6 +65,8 @@ rift --config /etc/rift/config.toml agent
 
 Administrative commands such as `rift status` and `rift agents add NAME --ttl 15m` connect to the local state/admin socket. Run them in the server container or on the host with the same config path and access to its state volume. Use `rift --help` for the command list supported by the built version.
 
+`rift forwards add` accepts `--ingress public` (the default) or `--ingress local`. Local ingress publishes the port to interfaces other than the public NIC, which is the path used by a reverse proxy on the same VPS. `deploy/vps/rift-site` turns one home port into an HTTPS name on the proxy that already listens on port 443. See [deploy.md](docs/deploy.md).
+
 ## Build
 
 Build a local image for the current platform:

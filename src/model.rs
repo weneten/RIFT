@@ -31,6 +31,13 @@ pub enum ForwardMode {
     Transparent,
     Translate,
 }
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Ingress {
+    #[default]
+    Public,
+    Local,
+}
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Family {
@@ -126,6 +133,10 @@ pub struct Forward {
     pub target_ports: PortRange,
     pub protocol: Protocol,
     pub mode: ForwardMode,
+    /// `local` DNATs only packets that did not arrive on a public-address NIC.
+    /// Missing on older state means `public`.
+    #[serde(default)]
+    pub ingress: Ingress,
     pub target_family: Family,
     pub enabled: bool,
     pub generation: u64,
@@ -160,6 +171,10 @@ impl Forward {
         anyhow::ensure!(
             self.mode != ForwardMode::Translate || Family::of(self.listen_ip) != self.target_family,
             "translation requires different address families"
+        );
+        anyhow::ensure!(
+            self.ingress != Ingress::Local || self.mode == ForwardMode::Transparent,
+            "local ingress applies only to transparent forwards"
         );
         Ok(())
     }

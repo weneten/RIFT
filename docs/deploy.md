@@ -22,6 +22,23 @@ Run these checks from a disposable Linux VM first. Do not run the destructive pa
 
 The Compose files use `network_mode: host`; the container shares the Linux host's network namespace. `CAP_NET_ADMIN` is therefore host-impacting. Docker may change forwarding sysctls and forwarding firewall policy when its bridge networking starts. Keep Docker's firewall integration enabled and do not edit or flush Docker-created rules. RIFT adds and deletes its own routes, policy rules, links, and nftables objects. With `host_firewall = "auto"` it also owns the `rift-host-in` and `rift-host-fwd` chains and their single jump from a UFW user chain. Reserve distinct route table IDs, rule priorities, and packet marks for RIFT; do not take over the main/default tables or remove unrelated rules.
 
+## Publish a home service with a name
+
+`deploy/vps/rift-site` runs on the VPS host, outside the read-only RIFT container. It stores its state in `/var/lib/rift-site/sites.json`. One command allocates a listen port in `20000-20999`, adds a transparent `--ingress local` forward, and writes a site file for Traefik, Caddy, or Nginx.
+
+```sh
+deploy/vps/rift-site add core app.example 8081 --proxy traefik
+deploy/vps/rift-site add core app.example 8081 --proxy caddy
+deploy/vps/rift-site add core app.example 8081 --proxy nginx
+deploy/vps/rift-site rm app.example
+```
+
+Without `--proxy`, the command uses the saved default (`traefik` until `rift-site proxy caddy` or `rift-site proxy nginx`). The chosen proxy must be the process listening on TCP 443. Otherwise the command exits before it creates a forward and names the proxy that does hold 443. It does not start a second proxy.
+
+The home service must listen on the target port for the agent tunnel address, for example `0.0.0.0`. The proxy reaches the service through the VPS public address so prerouting DNAT still applies. Packets from the internet to the allocated high port are not forwarded. Traefik uses the existing certificate resolver. Caddy obtains the certificate itself. Nginx runs `certbot --nginx` when `certbot` is on the host; if it is missing, the site file is still written and the command says that TLS was not requested.
+
+The first Traefik add, when Traefik's file provider is still a single file, copies that file to `/root/traefik/dynamic/ssh.yml`, switches the Compose service to `--providers.file.directory=/dynamic` with `--providers.file.watch=true`, and recreates that service. Docker-label routes are left as they are. Point DNS for the new name at the VPS public address.
+
 ## Rollout and rollback
 
 1. Deploy the exact image and config to a disposable Linux VM with the same kernel family, Docker backend, and firewall manager as production.

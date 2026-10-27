@@ -104,6 +104,8 @@ enum Forwards {
         target_family: Option<String>,
         #[arg(long,default_value="transparent",value_parser=["transparent","translate"])]
         mode: String,
+        #[arg(long, default_value = "public", value_parser = ["public", "local"])]
+        ingress: String,
     },
     Remove {
         #[arg(long)]
@@ -203,6 +205,7 @@ async fn run() -> Result<()> {
                     listen_ip,
                     target_family,
                     mode,
+                    ingress,
                 } => {
                     let ip = listen_ip.or_else(|| if config.public_ips.len() == 1 { config.public_ips.first().copied() } else { None }).context("use --listen-ip when the VPS has zero or multiple configured public IPs")?;
                     let family = match target_family.as_deref() {
@@ -221,6 +224,11 @@ async fn run() -> Result<()> {
                             ForwardMode::Translate
                         } else {
                             ForwardMode::Transparent
+                        },
+                        ingress: if ingress == "local" {
+                            Ingress::Local
+                        } else {
+                            Ingress::Public
                         },
                         target_family: family,
                         enabled: true,
@@ -319,5 +327,29 @@ mod tests {
             "rift", "forwards", "add", "--agent", "core", "--listen", "0", "--target", "22"
         ])
         .is_err());
+    }
+    #[test]
+    fn local_ingress_is_explicit() {
+        let cli = Cli::try_parse_from([
+            "rift",
+            "forwards",
+            "add",
+            "--agent",
+            "core",
+            "--listen",
+            "20000",
+            "--target",
+            "8081",
+            "--ingress",
+            "local",
+        ])
+        .unwrap();
+        let Command::Forwards {
+            command: Forwards::Add { ingress, .. },
+        } = cli.command
+        else {
+            panic!("forwards add");
+        };
+        assert_eq!(ingress, "local");
     }
 }

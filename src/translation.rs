@@ -315,6 +315,7 @@ mod tests {
                 },
                 protocol,
                 mode: ForwardMode::Translate,
+                ingress: crate::model::Ingress::Public,
                 target_family: Family::of(target.ip()),
                 enabled: true,
                 generation: 1,

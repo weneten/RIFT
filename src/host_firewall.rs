@@ -56,6 +56,7 @@ pub struct ServerSpec<'a> {
     pub wg_port: u16,
     pub enrollment: Option<SocketAddr>,
     pub uplinks: &'a [String],
+    pub local_ingress: bool,
 }
 
 pub struct AgentSpec<'a> {
@@ -160,6 +161,23 @@ pub fn plan_server(obs: &Observation, spec: &ServerSpec<'_>) -> Result<Plan> {
             ));
             rules.push(format!(
                 "iifname \"{}\" oifname \"{uplink}\" accept comment \"rift:return\"",
+                spec.interface
+            ));
+        }
+        if spec.local_ingress {
+            ensure!(
+                !spec.uplinks.is_empty(),
+                "local ingress needs a public uplink"
+            );
+            let mut excluded: Vec<String> = spec
+                .uplinks
+                .iter()
+                .map(|name| format!("iifname != \"{name}\""))
+                .collect();
+            excluded.push(format!("iifname != \"{}\"", spec.interface));
+            rules.push(format!(
+                "{} oifname \"{}\" accept comment \"rift:local\"",
+                excluded.join(" "),
                 spec.interface
             ));
         }
@@ -446,7 +464,7 @@ fn require_ifname(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn valid_ifname(name: &str) -> bool {
+pub(crate) fn valid_ifname(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 15
         && name
@@ -497,6 +515,7 @@ mod tests {
             wg_port: 51820,
             enrollment: Some("0.0.0.0:8443".parse().unwrap()),
             uplinks,
+            local_ingress: false,
         }
     }
 
@@ -524,11 +543,30 @@ mod tests {
             .fill
             .contains("iifname \"rift0\" oifname \"eth0\" accept comment \"rift:return\""));
         assert!(!plan.fill.contains("iifname \"eth0\" tcp dport 8444"));
+        assert!(!plan.fill.contains("rift:local"));
         assert!(!plan.jumps.contains("ufw-user-input"));
         assert!(plan.jumps.contains("ufw-user-forward"));
         assert!(plan.jumps.contains("ufw6-user-input"));
         assert!(plan.create.contains("add chain ip6 filter rift-host-in"));
         assert!(!plan.create.contains("add chain ip filter rift-host-in"));
+    }
+
+    #[test]
+    fn local_ingress_accepts_forwarding_that_did_not_arrive_on_the_uplink() {
+        let obs = observe(&ruleset()).unwrap();
+        let uplinks = vec!["eth0".to_string()];
+        let mut spec = server_spec(&uplinks);
+        spec.local_ingress = true;
+        let plan = plan_server(&obs, &spec).unwrap();
+        assert!(plan.fill.contains(
+            "iifname != \"eth0\" iifname != \"rift0\" oifname \"rift0\" accept comment \"rift:local\""
+        ));
+        assert!(plan
+            .fill
+            .contains("iifname \"eth0\" oifname \"rift0\" accept comment \"rift:forward\""));
+        spec.uplinks = &[];
+        spec.local_ingress = true;
+        assert!(plan_server(&obs, &spec).is_err());
     }
 
     #[test]
@@ -542,6 +580,7 @@ mod tests {
             target_ports: "8000".parse().unwrap(),
             protocol: Protocol::Tcp,
             mode: ForwardMode::Transparent,
+            ingress: crate::model::Ingress::Public,
             target_family: Family::V4,
             enabled: true,
             generation: 1,

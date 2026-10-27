@@ -871,6 +871,7 @@ mod tests {
             target_ports: PortRange { start: 80, end: 81 },
             protocol: Protocol::Tcp,
             mode: ForwardMode::Transparent,
+            ingress: crate::model::Ingress::Public,
             target_family: Family::V4,
             enabled: true,
             generation: 1,
