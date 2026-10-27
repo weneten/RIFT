@@ -19,14 +19,14 @@ sudo sh deploy/prepare-host
 
 `prepare-host` writes `/etc/sysctl.d/99-rift.conf` and checks that the kernel can create a WireGuard interface. Run it once per machine. RIFT does not change those sysctls itself.
 
-On the VPS, copy the server config and the env file. The copied `config.toml` is complete. The address, the DNS name, and the role are only in `.env`.
+On the VPS, copy the server config and the server env file. The copied `config.toml` is complete. The DNS name and the NIC address are only in `.env`.
 
 ```sh
 cp deploy/vps/config.toml config.toml
-cp .env.example .env
+cp .env.server.example .env
 ```
 
-Edit `.env` before starting. Set `RIFT_ROLE=server`. `RIFT_PUBLIC_ENDPOINT` is the DNS name agents and the certificate use, without a port. `RIFT_PUBLIC_IPS` is the address configured on the VPS network interface. Packets arrive on that address, so a DNS name is not valid there. Compose reads `.env` in the project directory by itself, so the start commands do not pass `--env-file`.
+Edit `.env` before starting. `RIFT_PUBLIC_ENDPOINT` is the DNS name agents and the certificate use, without a port. `RIFT_PUBLIC_IPS` is the address configured on the VPS network interface. Packets arrive on that address, so a DNS name is not valid there. Leave `COMPOSE_PROFILES=server`. That value starts the server service, whose command is `server`. Compose reads `.env` in the project directory by itself, so the start commands do not pass `--env-file`.
 
 Start the server only after that edit:
 
@@ -43,14 +43,14 @@ docker exec rift-server rift --config /etc/rift/config.toml agents add core --tt
 
 Copy the printed `RIFT_SERVER`, `RIFT_AGENT_NAME`, and `RIFT_ENROLLMENT_TOKEN` lines into the home server's `.env`. The token is a one-time secret. Remove it from `.env` after the agent is active.
 
-On the home server, copy the agent config and the env file. That config is complete too. The invitation values go only in `.env`.
+On the home server, copy the agent config and the agent env file. That config is complete too. The invitation values go only in `.env`.
 
 ```sh
 cp deploy/agent/config.toml config.toml
-cp .env.example .env
+cp .env.agent.example .env
 ```
 
-Edit `.env` and set `RIFT_ROLE=agent`, plus the three lines from the invitation. Start the agent only after that edit:
+Edit `.env` and replace the three invitation lines. Leave `COMPOSE_PROFILES=agent`. That value starts the agent service, whose command is `agent`. Start the agent only after that edit:
 
 ```sh
 docker compose pull
@@ -63,11 +63,16 @@ Check the tunnel from the VPS. The agent is ready when its status is `active`.
 docker exec rift-server rift --config /etc/rift/config.toml status
 ```
 
+The state volume `rift_rift-state` holds the WireGuard keys, the certificate, and the agents. On the next start, RIFT rebuilds its interface, firewall table, and routing rules when that volume is gone and the kernel still has RIFT's own entries. Agents and invitations live only in the volume. `docker system prune --volumes` and `docker compose down -v` delete them, and the next start does not bring them back. Create the invitation again.
+
 The home service must listen on `0.0.0.0` or the agent tunnel address. To publish it as HTTPS, run this from the repository on the VPS. The proxy that already owns port 443 must be Traefik, Caddy, or Nginx. DNS for the new name points at the same VPS address.
 
 ```sh
 deploy/vps/rift-site add core app.example.net 8081 --proxy traefik
-deploy/vps/rift-site rm app.example.net
+```
+
+```sh
+deploy/vps/rift-site remove app.example.net
 ```
 
 The first Traefik add switches Traefik's file provider to a watched directory and recreates that container. Existing Docker-label routes stay in place.

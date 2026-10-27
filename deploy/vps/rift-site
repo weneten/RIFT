@@ -362,6 +362,15 @@ def service_url(state, listen):
     return f"http://{state['public_ip']}:{listen}"
 
 
+def missing_agent_message(agent, detail):
+    if "agent not found" in detail:
+        return (
+            f"agent {agent} has not finished enrollment. "
+            "Wait until its status is active"
+        )
+    return detail
+
+
 def site_path(state, proxy, host):
     if proxy == "traefik":
         directory = Path(state["traefik"]["dynamic_dir"])
@@ -468,19 +477,22 @@ def command_add(agent, host, port, proxy):
         listen = int(existing["listen"]) if existing else allocate_port(
             used_ports(state), int(state["listen_min"]), int(state["listen_max"])
         )
-        created = rift(
-            state,
-            "forwards",
-            "add",
-            "--agent",
-            agent,
-            "--listen",
-            str(listen),
-            "--target",
-            str(target),
-            "--ingress",
-            "local",
-        )
+        try:
+            created = rift(
+                state,
+                "forwards",
+                "add",
+                "--agent",
+                agent,
+                "--listen",
+                str(listen),
+                "--target",
+                str(target),
+                "--ingress",
+                "local",
+            )
+        except SiteError as error:
+            raise SiteError(missing_agent_message(agent, str(error))) from None
         forward_id = created["id"]
     created_forward = not existing or existing.get("forward_id") != forward_id
     if existing and existing.get("proxy") != chosen:
@@ -541,7 +553,7 @@ def command_proxy(name):
 def usage():
     return (
         "usage: rift-site add AGENT HOST PORT [--proxy traefik|caddy|nginx]\n"
-        "       rift-site rm HOST\n"
+        "       rift-site remove HOST\n"
         "       rift-site proxy [traefik|caddy|nginx]"
     )
 
@@ -561,7 +573,7 @@ def main(argv):
             raise SiteError(usage())
         command_add(args[0], args[1], args[2], proxy)
         return
-    if command == "rm" and len(argv) == 3:
+    if command in ("remove", "rm") and len(argv) == 3:
         command_rm(argv[2])
         return
     if command == "proxy" and len(argv) in (2, 3):

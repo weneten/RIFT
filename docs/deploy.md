@@ -22,7 +22,7 @@ The Compose files use `network_mode: host`; the container shares the Linux host'
 deploy/vps/rift-site add core app.example 8081 --proxy traefik
 deploy/vps/rift-site add core app.example 8081 --proxy caddy
 deploy/vps/rift-site add core app.example 8081 --proxy nginx
-deploy/vps/rift-site rm app.example
+deploy/vps/rift-site remove app.example
 ```
 
 Without `--proxy`, the command uses the saved default (`traefik` until `deploy/vps/rift-site proxy caddy` or `deploy/vps/rift-site proxy nginx`). The chosen proxy must be the process listening on TCP 443. Otherwise the command exits before it creates a forward and names the proxy that does hold 443. It does not start a second proxy.

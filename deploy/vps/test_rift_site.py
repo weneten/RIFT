@@ -42,6 +42,16 @@ class RenderTests(unittest.TestCase):
         with self.assertRaises(rift_site.SiteError):
             rift_site.resolve_public_ip("", "198.51.100.10,203.0.113.10")
 
+    def test_missing_agent_says_enrollment_is_unfinished(self):
+        self.assertIn(
+            "has not finished enrollment",
+            rift_site.missing_agent_message("core", "rift: agent not found"),
+        )
+        self.assertEqual(
+            rift_site.missing_agent_message("core", "connection refused"),
+            "connection refused",
+        )
+
     def test_allocate_reuses_the_first_free_port(self):
         self.assertEqual(rift_site.allocate_port({20000, 20001}, 20000, 20999), 20002)
         with self.assertRaises(rift_site.SiteError):
