@@ -1750,7 +1750,11 @@ struct RoutingReservation<'a> {
     v6_pool: ipnet::Ipv6Net,
 }
 
-fn routing_claim(routes: &[&str], rules: &[&str], reserved: &RoutingReservation<'_>) -> RoutingClaim {
+fn routing_claim(
+    routes: &[&str],
+    rules: &[&str],
+    reserved: &RoutingReservation<'_>,
+) -> RoutingClaim {
     let mut owned = false;
     for text in routes {
         for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
@@ -1811,18 +1815,21 @@ fn lookup_is(line: &str, table: u32) -> bool {
         .is_some_and(|value| value == table.to_string())
 }
 
-fn selector_is_managed_tunnel(from: &str, v4_pool: ipnet::Ipv4Net, v6_pool: ipnet::Ipv6Net) -> bool {
+fn selector_is_managed_tunnel(
+    from: &str,
+    v4_pool: ipnet::Ipv4Net,
+    v6_pool: ipnet::Ipv6Net,
+) -> bool {
     if let Ok(net) = from.parse::<IpNet>() {
         return match net.addr() {
             IpAddr::V4(ip) => net.prefix_len() == 32 && v4_pool.contains(&ip),
             IpAddr::V6(ip) => net.prefix_len() == 128 && v6_pool.contains(&ip),
         };
     }
-    from.parse::<IpAddr>()
-        .is_ok_and(|ip| match ip {
-            IpAddr::V4(ip) => v4_pool.contains(&ip),
-            IpAddr::V6(ip) => v6_pool.contains(&ip),
-        })
+    from.parse::<IpAddr>().is_ok_and(|ip| match ip {
+        IpAddr::V4(ip) => v4_pool.contains(&ip),
+        IpAddr::V6(ip) => v6_pool.contains(&ip),
+    })
 }
 
 fn is_agent_default_route(line: &str, interface: &str) -> bool {
@@ -2468,7 +2475,11 @@ mod tests {
             RoutingClaim::Foreign
         ));
         assert!(matches!(
-            routing_claim(&routes, &["11000:\tfrom 192.0.2.10 lookup 51888"], &reserved),
+            routing_claim(
+                &routes,
+                &["11000:\tfrom 192.0.2.10 lookup 51888"],
+                &reserved
+            ),
             RoutingClaim::Foreign
         ));
         assert!(matches!(
