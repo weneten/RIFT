@@ -835,11 +835,35 @@ impl Kernel {
         }
         let v4 = read_route_table("-4", self.config.route_table).await?;
         let v6 = read_route_table("-6", self.config.route_table).await?;
-        ensure!(
-            v4.trim().is_empty() && v6.trim().is_empty(),
-            "routing table {} is already populated; refusing to claim it",
-            self.config.route_table
-        );
+        let rules_v4 = run_output("ip", ["-4", "rule", "show"]).await?;
+        let rules_v6 = run_output("ip", ["-6", "rule", "show"]).await?;
+        match routing_claim(
+            &[&v4, &v6],
+            &[&rules_v4, &rules_v6],
+            &RoutingReservation {
+                interface: self.interface(),
+                table: self.config.route_table,
+                priority: self.config.rule_priority,
+                mark: self.config.mark,
+                mask: self.config.mark_mask,
+                v4_pool: self.config.ipv4_pool,
+                v6_pool: self.config.ipv6_pool,
+            },
+        ) {
+            RoutingClaim::Foreign => bail!(
+                "routing table {} is already populated; refusing to claim it",
+                self.config.route_table
+            ),
+            RoutingClaim::Orphan => {
+                tracing::warn!(
+                    table = self.config.route_table,
+                    "replacing orphaned RIFT routes and policy rules; their ownership marker is gone"
+                );
+                self.delete_all_agent_rules().await?;
+                self.delete_agent_routes().await?;
+            }
+            RoutingClaim::Empty => {}
+        }
         self.ensure_rule_slots_available().await?;
         write_owner_new(&path, &expected).await?;
         Ok(())
@@ -1117,21 +1141,11 @@ impl Kernel {
                         .nth(1)
                         .and_then(|s| s.split_whitespace().next())
                     {
-                        let managed = from
-                            .parse::<IpNet>()
-                            .map(|net| match net.addr() {
-                                IpAddr::V4(ip) => {
-                                    net.prefix_len() == 32 && self.config.ipv4_pool.contains(&ip)
-                                }
-                                IpAddr::V6(ip) => {
-                                    net.prefix_len() == 128 && self.config.ipv6_pool.contains(&ip)
-                                }
-                            })
-                            .unwrap_or_else(|_| {
-                                from.parse::<IpAddr>()
-                                    .map(|ip| self.is_managed_agent_ip(ip))
-                                    .unwrap_or(false)
-                            });
+                        let managed = selector_is_managed_tunnel(
+                            from,
+                            self.config.ipv4_pool,
+                            self.config.ipv6_pool,
+                        );
                         if managed {
                             run_ok_allow_missing(
                                 "ip",
@@ -1720,6 +1734,97 @@ async fn run_output<const N: usize>(program: &str, args: [&str; N]) -> Result<St
     );
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
+enum RoutingClaim {
+    Empty,
+    Orphan,
+    Foreign,
+}
+
+struct RoutingReservation<'a> {
+    interface: &'a str,
+    table: u32,
+    priority: u32,
+    mark: u32,
+    mask: u32,
+    v4_pool: ipnet::Ipv4Net,
+    v6_pool: ipnet::Ipv6Net,
+}
+
+fn routing_claim(routes: &[&str], rules: &[&str], reserved: &RoutingReservation<'_>) -> RoutingClaim {
+    let mut owned = false;
+    for text in routes {
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            if is_agent_default_route(line, reserved.interface) {
+                owned = true;
+            } else {
+                return RoutingClaim::Foreign;
+            }
+        }
+    }
+    for text in rules {
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let Some(existing) = line.split(':').next().and_then(|v| v.trim().parse().ok()) else {
+                continue;
+            };
+            let mentions_table = lookup_is(line, reserved.table);
+            let mentions_priority =
+                existing == reserved.priority || existing == reserved.priority.saturating_add(1);
+            if !mentions_table && !mentions_priority {
+                continue;
+            }
+            if rule_is_rift(line, existing, reserved) {
+                owned = true;
+            } else {
+                return RoutingClaim::Foreign;
+            }
+        }
+    }
+    if owned {
+        RoutingClaim::Orphan
+    } else {
+        RoutingClaim::Empty
+    }
+}
+
+fn rule_is_rift(line: &str, existing: u32, reserved: &RoutingReservation<'_>) -> bool {
+    if !lookup_is(line, reserved.table) {
+        return false;
+    }
+    if existing == reserved.priority {
+        return line
+            .split("from ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .is_some_and(|from| {
+                from != "all"
+                    && selector_is_managed_tunnel(from, reserved.v4_pool, reserved.v6_pool)
+            });
+    }
+    existing == reserved.priority.saturating_add(1)
+        && parse_rule_fwmark(line) == Some((reserved.mark, reserved.mask))
+}
+
+fn lookup_is(line: &str, table: u32) -> bool {
+    line.split_whitespace()
+        .skip_while(|token| *token != "lookup")
+        .nth(1)
+        .is_some_and(|value| value == table.to_string())
+}
+
+fn selector_is_managed_tunnel(from: &str, v4_pool: ipnet::Ipv4Net, v6_pool: ipnet::Ipv6Net) -> bool {
+    if let Ok(net) = from.parse::<IpNet>() {
+        return match net.addr() {
+            IpAddr::V4(ip) => net.prefix_len() == 32 && v4_pool.contains(&ip),
+            IpAddr::V6(ip) => net.prefix_len() == 128 && v6_pool.contains(&ip),
+        };
+    }
+    from.parse::<IpAddr>()
+        .is_ok_and(|ip| match ip {
+            IpAddr::V4(ip) => v4_pool.contains(&ip),
+            IpAddr::V6(ip) => v6_pool.contains(&ip),
+        })
+}
+
 fn is_agent_default_route(line: &str, interface: &str) -> bool {
     let fields: Vec<_> = line.split_whitespace().collect();
     let metric = fields
@@ -2329,6 +2434,47 @@ mod tests {
             &[],
         )
         .is_err());
+    }
+    #[test]
+    fn orphan_rift_routes_are_reclaimed_and_foreign_routes_are_refused() {
+        let reserved = RoutingReservation {
+            interface: "rift0",
+            table: 51888,
+            priority: 11000,
+            mark: 0x52490000,
+            mask: 0xffff0000,
+            v4_pool: "10.88.0.0/24".parse().unwrap(),
+            v6_pool: "fd88:5249:4654::/64".parse().unwrap(),
+        };
+        let routes = [
+            "unreachable default metric 42760",
+            "7 default dev lo metric 42760 pref medium",
+        ];
+        let rules = [
+            "11000:\tfrom 10.88.0.2 lookup 51888",
+            "11001:\tfrom all fwmark 0x52490000/0xffff0000 lookup 51888",
+            "11000:\tfrom fd88:5249:4654::2 lookup 51888",
+        ];
+        assert!(matches!(
+            routing_claim(&routes, &rules, &reserved),
+            RoutingClaim::Orphan
+        ));
+        assert!(matches!(
+            routing_claim(&[""], &[""], &reserved),
+            RoutingClaim::Empty
+        ));
+        assert!(matches!(
+            routing_claim(&["192.0.2.0/24 dev eth0 metric 10"], &rules, &reserved),
+            RoutingClaim::Foreign
+        ));
+        assert!(matches!(
+            routing_claim(&routes, &["11000:\tfrom 192.0.2.10 lookup 51888"], &reserved),
+            RoutingClaim::Foreign
+        ));
+        assert!(matches!(
+            routing_claim(&routes, &["11002:\tfrom 10.88.0.2 lookup 51888"], &reserved),
+            RoutingClaim::Foreign
+        ));
     }
     #[test]
     fn rift_alias_identifies_an_orphaned_interface() {
