@@ -646,9 +646,33 @@ impl Kernel {
 
     async fn ensure_interface(&self, expected_public: &str, private_key_path: &Path) -> Result<()> {
         let marker_path = self.owner_path("interface");
-        let exists = interface_exists(self.interface()).await?;
+        let mut exists = interface_exists(self.interface()).await?;
         let mut owner = read_owner_file(&marker_path).await?;
         let mut live_public = None;
+        if exists && owner.is_none() {
+            let alias = match interface_alias(self.interface()).await {
+                Ok(alias) => alias,
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("did not return the interface alias") =>
+                {
+                    String::new()
+                }
+                Err(error) => return Err(error),
+            };
+            if rift_interface_alias(&alias) {
+                tracing::warn!(
+                    interface = self.interface(),
+                    alias,
+                    "replacing orphaned RIFT WireGuard interface; its ownership marker is gone"
+                );
+                run_ok("ip", ["link", "delete", "dev", self.interface()])
+                    .await
+                    .context("delete orphaned RIFT WireGuard interface")?;
+                exists = false;
+            }
+        }
         if exists {
             let saved = owner.as_deref().context("WireGuard interface already exists but has no persistent RIFT ownership marker; refusing to take it over")?;
             ensure!(
@@ -1017,7 +1041,11 @@ impl Kernel {
         match read_owner_file(&path).await? {
             Some(saved) => ensure!(saved == expected, "nft ownership marker is invalid"),
             None => {
-                ensure!(!table_exists, "nft table inet rift exists without a RIFT ownership marker; refusing to replace it");
+                if table_exists {
+                    tracing::warn!(
+                        "replacing orphaned nft table inet rift; its ownership marker is gone"
+                    );
+                }
                 write_owner_new(&path, &expected).await?;
             }
         }
@@ -2012,6 +2040,16 @@ async fn interface_exists(interface: &str) -> Result<bool> {
     }
     bail!("ip link preflight failed: {}", err.trim())
 }
+fn rift_interface_alias(alias: &str) -> bool {
+    let Some(token) = alias.strip_prefix("rift:") else {
+        return false;
+    };
+    !token.is_empty()
+        && token.len() <= 64
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+}
 async fn interface_alias(interface: &str) -> Result<String> {
     let output = run_output("ip", ["-j", "link", "show", "dev", interface]).await?;
     let value: Value = serde_json::from_str(&output).context("parse ip link JSON")?;
@@ -2291,6 +2329,16 @@ mod tests {
             &[],
         )
         .is_err());
+    }
+    #[test]
+    fn rift_alias_identifies_an_orphaned_interface() {
+        assert!(rift_interface_alias(
+            "rift:dfc1f76d-be1c-4475-96d9-75036e592ed7"
+        ));
+        assert!(!rift_interface_alias(""));
+        assert!(!rift_interface_alias("rift:"));
+        assert!(!rift_interface_alias("wg0"));
+        assert!(!rift_interface_alias("rift:not a token"));
     }
     #[test]
     fn forward_without_ingress_stays_public() {
