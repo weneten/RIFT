@@ -133,7 +133,9 @@ pub async fn serve(
     let acceptor = TlsAcceptor::from(server_tls(&config)?);
     let permits = Arc::new(Semaphore::new(64));
     let limits = Arc::new(StdMutex::new(HashMap::<IpAddr, (Instant, u8)>::new()));
+    let mut requests = tokio::task::JoinSet::new();
     loop {
+        while requests.try_join_next().is_some() {}
         let (tcp, peer) = listener.accept().await?;
         if !allow_ip(&limits, peer.ip()) {
             tracing::warn!("enrollment rate limit from {peer}");
@@ -151,7 +153,7 @@ pub async fn serve(
         let config = config.clone();
         let public = server_public_key.clone();
         let kernel = kernel.clone();
-        tokio::spawn(async move {
+        requests.spawn(async move {
             let _permit = permit;
             if let Err(e) = timeout(
                 ENROLL_TIMEOUT,

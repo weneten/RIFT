@@ -109,6 +109,9 @@ pub async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
         tokio::select! {_ = tokio::signal::ctrl_c()=>break,_=&mut terminate_future=>break,
         _=tokio::time::sleep(poll)=>{if let Err(e)=expire_and_reconcile(&server).await{tracing::error!("reconcile failed: {e:#}");}}}
     }
+    // Wait for an in-flight reconciliation before stopping request handlers.
+    // Keep this lock until cleanup finishes so no handler can apply new state.
+    let kernel = server.kernel.lock().await;
     for task in &tasks {
         task.abort();
     }
@@ -118,7 +121,7 @@ pub async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
         }
     })
     .await;
-    Ok(())
+    kernel.cleanup().await.context("clean up server networking")
 }
 
 async fn ensure_server_keypair(config: &Config) -> Result<(String, PathBuf)> {
@@ -245,7 +248,9 @@ async fn reload_config(s: &Server) -> Result<u64> {
 
 async fn accept_control(listener: TcpListener, s: Arc<Server>) {
     let permits = Arc::new(Semaphore::new(128));
+    let mut requests = tokio::task::JoinSet::new();
     loop {
+        while requests.try_join_next().is_some() {}
         let accepted = listener.accept().await;
         let (stream, remote) = match accepted {
             Ok(v) => v,
@@ -259,7 +264,7 @@ async fn accept_control(listener: TcpListener, s: Arc<Server>) {
             Err(_) => continue,
         };
         let s = s.clone();
-        tokio::spawn(async move {
+        requests.spawn(async move {
             let _permit = permit;
             if let Err(e) = timeout(
                 Duration::from_secs(12),
@@ -454,7 +459,9 @@ async fn bind_admin(_path: PathBuf) -> Result<()> {
 #[cfg(unix)]
 async fn serve_admin(listener: tokio::net::UnixListener, s: Arc<Server>) -> Result<()> {
     let permits = Arc::new(Semaphore::new(32));
+    let mut requests = tokio::task::JoinSet::new();
     loop {
+        while requests.try_join_next().is_some() {}
         let (mut stream, _) = listener.accept().await?;
         if !admin_peer_allowed(&stream) {
             continue;
@@ -464,7 +471,7 @@ async fn serve_admin(listener: tokio::net::UnixListener, s: Arc<Server>) -> Resu
             Err(_) => continue,
         };
         let s = s.clone();
-        tokio::spawn(async move {
+        requests.spawn(async move {
             let _p = permit;
             let result = timeout(Duration::from_secs(15), async {
                 let req: AdminRequest = protocol::receive(&mut stream).await?;
@@ -779,7 +786,10 @@ fn host_port(host: &str, port: u16) -> String {
     }
 }
 
-async fn run_agent_inner(config: Config) -> Result<()> {
+async fn run_agent_inner(
+    config: Config,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     config.validate()?;
     secure_dir(&config.state_dir)?;
     let id_path = config.identity_path();
@@ -857,6 +867,9 @@ async fn run_agent_inner(config: Config) -> Result<()> {
     let poll = Duration::from_secs(config.poll_seconds);
     let mut failures = 0u32;
     loop {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
         let welcome = identity
             .welcome
             .clone()
@@ -889,7 +902,10 @@ async fn run_agent_inner(config: Config) -> Result<()> {
             let base = (2_u64.saturating_pow(failures.min(5))).min(30);
             Duration::from_secs(base + rand::random::<u64>() % (base / 2 + 1))
         };
-        tokio::time::sleep(retry).await;
+        tokio::select! {
+            _ = tokio::time::sleep(retry) => {},
+            _ = shutdown.changed() => return Ok(()),
+        }
     }
 }
 pub async fn run_agent(config: Config) -> Result<()> {
@@ -905,10 +921,14 @@ pub async fn run_agent(config: Config) -> Result<()> {
             }
         })
     };
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let work = async {
         let mut attempt = 0u32;
         loop {
-            match run_agent_inner(config.clone()).await {
+            if *shutdown_rx.borrow() {
+                return Ok(());
+            }
+            match run_agent_inner(config.clone(), &mut shutdown_rx).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     attempt = attempt.saturating_add(1);
@@ -918,15 +938,29 @@ pub async fn run_agent(config: Config) -> Result<()> {
                         attempt,
                         "agent startup/control failed; retrying with backoff: {e:#}"
                     );
-                    tokio::time::sleep(Duration::from_secs(base + jitter)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(base + jitter)) => {},
+                        _ = shutdown_rx.changed() => return Ok(()),
+                    }
                 }
             }
         }
     };
-    let result = tokio::select! { result=work=>result, _=shutdown_signal()=>Ok(()) };
+    tokio::pin!(work);
+    let result: Result<()> = tokio::select! {
+        result = &mut work => result,
+        _ = shutdown_signal() => {
+            let _ = shutdown_tx.send(true);
+            work.await
+        }
+    };
     #[cfg(unix)]
     admin_task.abort();
-    result
+    result?;
+    Kernel::new(config.clone())
+        .cleanup()
+        .await
+        .context("clean up agent networking")
 }
 
 #[cfg(unix)]

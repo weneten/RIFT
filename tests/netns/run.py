@@ -767,6 +767,34 @@ def main():
         assert ns(VPS, "nft", "list", "table", "inet", "rift_preserve").stdout == prior[0]
         assert ns(VPS, "ip", "rule", "show").stdout == prior[1], "foreign policy rules changed after restart"
         print("PASS crash/restart preserves existing firewall objects and policy rules")
+
+        # Orderly shutdown removes RIFT state without touching unrelated rules;
+        # persistent identities and grants restore service after both restart.
+        agent_proc = next(proc for proc, _, name in reversed(PROCS)
+                          if name == AGENTS[0] and proc.poll() is None)
+        for proc in (agent_proc, server_proc):
+            proc.send_signal(signal.SIGTERM)
+            assert proc.wait(timeout=60) == 0, "RIFT orderly shutdown failed"
+        for name in (VPS, AGENTS[0]):
+            assert ns(name, "ip", "link", "show", "rift0", check=False).returncode != 0
+            assert ns(name, "nft", "list", "table", "inet", "rift", check=False).returncode != 0
+            for family in ("-4", "-6"):
+                assert not ns(name, "ip", family, "route", "show", "table", "51888", check=False).stdout.strip()
+                rules = ns(name, "ip", family, "rule", "show").stdout
+                assert not any(line.startswith(("11000:", "11001:")) for line in rules.splitlines())
+        assert ns(VPS, "nft", "list", "table", "inet", "rift_preserve").stdout == prior[0]
+        assert ns(VPS, "ip", "rule", "show").stdout == prior[1]
+        expect_tcp_unreachable(ports[("agent1", PUBLIC_V4, "tcp")], PUBLIC_V4)
+        check_normal_traffic()
+        server_proc = daemon(VPS, server_cfg, ["server"], server_env)
+        wait_until(lambda: cli(VPS, server_cfg, "status", env=server_env).returncode == 0,
+                   "server after orderly restart", timeout=35)
+        daemon(AGENTS[0], agent_cfgs[0], ["agent"], {"RIFT_SERVER": f"{SERVER_HOST}:8443",
+               "RIFT_AGENT_NAME": "agent1"})
+        wait_agents(server_cfg, 2)
+        wait_policy(server_cfg, 2)
+        traffic_test(["agent1"], ports)
+        print("PASS orderly stop cleans networking and restart restores forwarding")
         print("PASS namespace integration suite completed; no performance numbers were collected")
     except Exception:
         # Preserve diagnostics in the job log before cleanup removes the scratch directory.

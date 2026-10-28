@@ -397,7 +397,7 @@ docker compose ps
 
 On the server, run `sudo sh deploy/vps/install-cli` again after `git pull` to update the installed CLI and site helper. Check logs, agent status and representative services after the update. Review configuration changes before replacing your local `config.toml` or `.env`.
 
-The `rift-state` volume contains identities, keys, certificates and dynamic configuration. Protect and back up the state on **both** server and agent, and test restoration. `docker compose down -v` and volume pruning can delete this state; agents and invitations cannot be recovered merely by restarting. Stopping the daemon intentionally leaves RIFT-owned kernel configuration for restart, so deleting a volume is not a complete uninstall. Use the ownership-aware rollout and rollback procedure in [docs/deploy.md](docs/deploy.md#rollout-and-rollback).
+The `rift-state` volume contains identities, keys, certificates and dynamic configuration. Protect and back up the state on **both** server and agent, and test restoration. A normal `docker compose down` asks RIFT to remove its owned networking configuration; a subsequent `docker compose up -d` recreates it from the retained volume. A crash, forced kill or cleanup error can leave network state behind; inspect the logs and use the ownership-aware recovery procedure in [docs/deploy.md](docs/deploy.md#rollout-and-rollback). `docker compose down -v` and volume pruning can delete the state; agents and invitations cannot be recovered merely by restarting. Host-wide sysctl settings installed by `deploy/prepare-host` remain in place.
 
 ## Build and development
 
