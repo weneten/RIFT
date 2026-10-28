@@ -792,7 +792,16 @@ def main():
                "RIFT_AGENT_NAME": "agent1"})
         wait_agents(server_cfg, 2)
         wait_policy(server_cfg, 2)
-        traffic_test(["agent1"], ports)
+        # Agent records and applied generations persist across the restart;
+        # they do not prove that the new WireGuard interface has handshakes.
+        def restarted_agents_online():
+            health = {agent["name"]: agent for agent in status(server_cfg)["agent_health"]}
+            return all(health.get(name, {}).get("online") for name in ("agent1", "agent2"))
+        wait_until(restarted_agents_online, "both agents to handshake after server restart", timeout=75)
+        def restored_traffic():
+            traffic_test(["agent1", "agent2"], ports)
+            return True
+        wait_until(restored_traffic, "forwarded traffic to recover after restart", timeout=75)
         print("PASS orderly stop cleans networking and restart restores forwarding")
         print("PASS namespace integration suite completed; no performance numbers were collected")
     except Exception:
