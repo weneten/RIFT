@@ -16,4 +16,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=build /src/target/release/rift /usr/local/bin/rift
 USER 0:0
 WORKDIR /
+HEALTHCHECK --interval=30s --timeout=20s --start-period=90s --retries=3 \
+  CMD /usr/local/bin/rift --config /etc/rift/config.toml status >/dev/null 2>&1 || exit 1
 ENTRYPOINT ["/usr/local/bin/rift"]
