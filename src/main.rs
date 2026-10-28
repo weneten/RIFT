@@ -3,6 +3,8 @@ use clap::{Parser, Subcommand};
 use rift::{config::Config, model::*, protocol::AdminRequest};
 use std::{net::IpAddr, path::PathBuf};
 
+mod output;
+
 #[derive(Parser)]
 #[command(name = "rift", version, about = "Rust Internet Forwarding Tunnel")]
 struct Cli {
@@ -163,13 +165,24 @@ async fn run() -> Result<()> {
         Command::Agent => return rift::daemon::run_agent(config).await,
         Command::Doctor => {
             let result = rift::net::Kernel::new(config).doctor().await?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            if cli.json {
+                println!("{}", serde_json::to_string(&result)?);
+            } else {
+                println!("{}", output::doctor(&result));
+            }
             return Ok(());
         }
         Command::Config {
             command: ConfigCommand::Validate,
         } => {
-            println!("Configuration valid: {}", cli.config.display());
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"valid": true, "config": cli.config})
+                );
+            } else {
+                println!("Configuration valid: {}", cli.config.display());
+            }
             return Ok(());
         }
         Command::Status => AdminRequest::Status,
@@ -254,7 +267,7 @@ async fn run() -> Result<()> {
             },
         },
     };
-    let response = rift::daemon::admin_call(&config, request).await?;
+    let response = rift::daemon::admin_call(&config, request.clone()).await?;
     if !response.ok {
         bail!(
             "{}",
@@ -272,7 +285,22 @@ async fn run() -> Result<()> {
         );
         eprintln!("Copy these values into the agent's private .env file. This invitation is single-use and expires.");
     } else {
-        println!("{}", serde_json::to_string_pretty(&response.data)?);
+        let agents = if matches!(
+            request,
+            AdminRequest::ForwardsList | AdminRequest::ForwardAdd(_)
+        ) {
+            rift::daemon::admin_call(&config, AdminRequest::AgentsList)
+                .await
+                .ok()
+                .filter(|response| response.ok)
+                .map(|response| response.data)
+        } else {
+            None
+        };
+        println!(
+            "{}",
+            output::render(&request, &response.data, agents.as_ref())
+        );
     }
     Ok(())
 }

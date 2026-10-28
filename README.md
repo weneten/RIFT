@@ -336,6 +336,15 @@ rift forwards remove --id 1
 
 `agents rename` and `agents rotate` are also available; inspect `rift agents --help` and the relevant subcommand's help before using them. For translated forwards, `bans add --agent NAME --forward-id ID --ip ADDRESS --ttl 1h` blocks an original client address temporarily; `bans list` shows bans. Bans expire by TTL; there is no explicit remove command. Use `--json` for machine-readable administrative output and `rift --help` for the full CLI.
 
+Forwards are shown as a compact table, including the ID used for removal, agent, listener, target port, ingress and state. Agent names are resolved when available; an ID is shown if they cannot be retrieved. For example:
+
+```text
+ID  AGENT  PROTO  LISTEN                  TARGET  FAMILY  INGRESS  MODE         STATE
+5   core   TCP    203.0.113.10:25001     5201    v4      local    transparent  enabled
+```
+
+Normal commands print concise status and confirmations. Use `rift --json status`, `rift --json forwards list`, or `rift --json doctor` for complete machine-readable data. The `--json` format is also used by the site helper and integration tools.
+
 ## Configuration
 
 `config.toml` contains static settings; `.env` supplies the Compose profile and the documented environment overrides. Compose reads the project `.env` automatically. Agents, invitations and forwards are stored in the persistent state volume rather than in TOML.
