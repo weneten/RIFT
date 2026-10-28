@@ -2234,19 +2234,21 @@ async fn remove_owner_file(path: &Path) -> Result<()> {
 async fn run_ok_allow_missing<const N: usize>(program: &str, args: [&str; N]) -> Result<()> {
     match run_ok(program, args).await {
         Ok(()) => Ok(()),
-        Err(error)
-            if {
-                let message = error.to_string().to_ascii_lowercase();
-                message.contains("no such process")
-                    || message.contains("not found")
-                    || message.contains("cannot find")
-                    || message.contains("no such file")
-            } =>
-        {
-            Ok(())
-        }
+        Err(error) if missing_cleanup_object(program, &args, &error.to_string()) => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn missing_cleanup_object(program: &str, args: &[&str], error: &str) -> bool {
+    let message = error.to_ascii_lowercase();
+    message.contains("no such process")
+        || message.contains("not found")
+        || message.contains("cannot find")
+        || message.contains("no such file")
+        // `ip route del` reports this when the FIB table was never created.
+        || (program == "ip"
+            && matches!(args, ["-4" | "-6", "route", "del", ..])
+            && message.trim() == "ip failed: error: fib table does not exist.")
 }
 
 #[cfg(test)]
@@ -2254,6 +2256,36 @@ mod tests {
     use super::*;
     use crate::model::{AgentRecord, AgentStatus};
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn cleanup_accepts_missing_fib_only_for_route_deletion() {
+        let missing = "ip failed: Error: FIB table does not exist.";
+        assert!(missing_cleanup_object(
+            "ip",
+            &["-4", "route", "del", "default"],
+            missing
+        ));
+        assert!(missing_cleanup_object(
+            "ip",
+            &["-6", "route", "del", "default"],
+            missing
+        ));
+        assert!(!missing_cleanup_object(
+            "ip",
+            &["-4", "rule", "del"],
+            missing
+        ));
+        assert!(!missing_cleanup_object(
+            "ip",
+            &["-4", "route", "del"],
+            "ip failed: Operation not permitted"
+        ));
+        assert!(!missing_cleanup_object(
+            "ip",
+            &["-4", "route", "del"],
+            "ip failed: Error: FIB table does not exist.\nUnexpected error"
+        ));
+    }
 
     #[test]
     fn agent_route_validation_accepts_numeric_and_symbolic_unreachable_defaults() {
