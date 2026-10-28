@@ -587,11 +587,10 @@ def wait_endpoint(server_cfg, predicate, message, timeout=55):
 
 
 def migrate_endpoint_ip(server_cfg):
-    # Update only the test agent's namespace DNS, then blackhole the old UDP
-    # endpoint at the transit router. Restarting the agent forces stale-peer
-    # endpoint refresh from the persisted enrollment hostname.
+    # Update only agent1's DNS and blackhole its old UDP endpoint. Other
+    # agents still use the original address and must be able to reconnect.
     write(f"/etc/netns/{AGENTS[0]}/hosts", f"127.0.0.1 localhost\n{PUBLIC_V4_NEW} {SERVER_HOST}\n", 0o644)
-    sh_ns(ROUTER, f"nft add rule inet rift_test_filter forward iifname \"eth1\" ip daddr {PUBLIC_V4} udp dport 51820 drop")
+    sh_ns(ROUTER, f"nft add rule inet rift_test_filter forward iifname \"eth1\" ip saddr 172.31.0.2 ip daddr {PUBLIC_V4} udp dport 51820 drop")
     time.sleep(8)
     agent_proc = next(p for p, _, name in PROCS if name == AGENTS[0] and p.poll() is None)
     stop_process(agent_proc, signal.SIGKILL)
