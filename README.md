@@ -89,10 +89,18 @@ docker compose up -d
 docker logs -f rift-server
 ```
 
-Wait for `RIFT server ready`, then leave the log view with Ctrl+C. Commands below run from the project directory unless stated otherwise. Check the server with:
+Wait for `RIFT server ready`, then leave the log view with Ctrl+C. On the **server**, install the host CLI from the checkout:
 
 ```sh
-docker exec rift-server rift --config /etc/rift/config.toml status
+sudo sh deploy/vps/install-cli
+```
+
+This installs `/usr/local/bin/rift` and the site helper under `/usr/local/lib/rift`. It replaces any existing files at those paths. The command runs on the server and forwards administrative arguments to the `rift-server` Docker container; it requires Docker access (use `sudo rift ...` if your user cannot access Docker). `sudo rift site ...` runs the host-side proxy helper and requires Python 3 and administrator access. Ensure `/usr/local/bin` is in your PATH, including sudo's PATH. The original `docker exec rift-server rift --config /etc/rift/config.toml ...` remains available.
+
+Check the server with:
+
+```sh
+rift status
 ```
 
 By default RIFT creates its own enrollment CA and certificate in the persistent `rift-state` volume. This certificate is for agent enrollment, not your website's HTTPS certificate. Keep the volume and its backups private.
@@ -102,7 +110,7 @@ By default RIFT creates its own enrollment CA and certificate in the persistent 
 On the **server**, create a short-lived, single-use invitation. Choose a unique name for each agent:
 
 ```sh
-docker exec rift-server rift --config /etc/rift/config.toml agents add node1 --ttl 15m
+rift agents add node1 --ttl 15m
 ```
 
 The output contains `RIFT_SERVER`, `RIFT_AGENT_NAME` and `RIFT_ENROLLMENT_TOKEN`. Treat the token as a secret and transfer all three lines securely to the agent.
@@ -126,8 +134,8 @@ docker logs -f rift-agent
 On the **server**, verify that the agent becomes `active`:
 
 ```sh
-docker exec rift-server rift --config /etc/rift/config.toml agents list
-docker exec rift-server rift --config /etc/rift/config.toml status
+rift agents list
+rift status
 ```
 
 Once active, remove the token line from the agent's `.env`; preserve its state volume for reconnection. If the invitation expires or is lost, cancel it and create another on the server. Repeat this process with a different name for every additional agent.
@@ -158,7 +166,7 @@ Run administrative commands on the **server**. The following examples use `node1
 Publish an SSH service listening on the agent's port 22 as server port 2222:
 
 ```sh
-docker exec rift-server rift --config /etc/rift/config.toml forwards add \
+rift forwards add \
   --agent node1 --listen 2222 --target 22 --protocol tcp
 ```
 
@@ -169,7 +177,7 @@ Allow TCP 2222 in the relevant upstream firewall. From a separate client, test `
 Publish a UDP service on agent port 27015 as server port 27015:
 
 ```sh
-docker exec rift-server rift --config /etc/rift/config.toml forwards add \
+rift forwards add \
   --agent node1 --listen 27015 --target 27015 --protocol udp
 ```
 
@@ -180,9 +188,9 @@ Allow UDP 27015 upstream and test with the application's own client. UDP and TCP
 If a DNS server on the agent is configured to listen on port 53 for both transports, publish both using two independent grants:
 
 ```sh
-docker exec rift-server rift --config /etc/rift/config.toml forwards add \
+rift forwards add \
   --agent node1 --listen 53 --target 53 --protocol udp
-docker exec rift-server rift --config /etc/rift/config.toml forwards add \
+rift forwards add \
   --agent node1 --listen 53 --target 53 --protocol tcp
 ```
 
@@ -193,15 +201,15 @@ Allow both TCP and UDP 53 in the upstream firewall and use a DNS client to test 
 Ranges use `start-end`; both ranges must have the same length and contain at most 4096 ports. Corresponding ports map in order:
 
 ```sh
-docker exec rift-server rift --config /etc/rift/config.toml forwards add \
+rift forwards add \
   --agent node1 --listen 30000-30002 --target 40000-40002 --protocol udp
 ```
 
 For multiple server addresses, explicitly select a configured address, for example `--listen-ip 203.0.113.10`. Replace it with an actual assigned address. The default is `--mode transparent --ingress public`, and the target family defaults to the listener's IP family. Check the created ID and apply status:
 
 ```sh
-docker exec rift-server rift --config /etc/rift/config.toml forwards list
-docker exec rift-server rift --config /etc/rift/config.toml status
+rift forwards list
+rift status
 ```
 
 A grant may remain pending while the agent applies it. Test from a separate client after it is active; a successful command alone does not prove firewall or application reachability.
@@ -211,7 +219,7 @@ A grant may remain pending while the agent applies it. Test from a separate clie
 Translation requires different listener and target families and must be requested explicitly. For example, an IPv4 listener forwarding to the agent's IPv6 tunnel address:
 
 ```sh
-docker exec rift-server rift --config /etc/rift/config.toml forwards add \
+rift forwards add \
   --agent node1 --listen-ip 203.0.113.10 --listen 8080 --target 8080 \
   --protocol tcp --mode translate --target-family v6
 ```
@@ -220,7 +228,7 @@ Replace the listener with your configured IPv4 address and ensure the applicatio
 
 ## Publish websites with HTTPS
 
-RIFT forwards ports; a reverse proxy provides hostname routing and HTTPS. The repository includes `deploy/vps/rift-site` to configure an **existing** Traefik, Caddy or Nginx proxy. The directory name is historical: the server can run on any suitable Linux host.
+RIFT forwards ports; a reverse proxy provides hostname routing and HTTPS. The installed `rift site` command uses the repository’s `deploy/vps/rift-site` helper to configure an **existing** Traefik, Caddy or Nginx proxy. The directory name is historical: the server can run on any suitable Linux host.
 
 ### Example: a new Caddy proxy in Docker
 
@@ -229,7 +237,7 @@ This example starts a separate Caddy container on the server and uses a manually
 First create the forward on the **server**:
 
 ```sh
-docker exec rift-server rift --config /etc/rift/config.toml forwards add \
+rift forwards add \
   --agent node1 --listen 20000 --target 8081 --protocol tcp --ingress local
 ```
 
@@ -280,7 +288,7 @@ The helper assumes particular proxy layouts: Traefik uses a watched file provide
 On the **server**, from the checkout, choose the proxy that already owns port 443:
 
 ```sh
-sudo deploy/vps/rift-site add node1 app.example.net 8081 --proxy traefik
+sudo rift site add node1 app.example.net 8081 --proxy traefik
 ```
 
 Alternatively, use `--proxy caddy` or `--proxy nginx` with the corresponding existing proxy. The helper allocates a port in `20000-20999`, creates a local-ingress TCP forward and writes a proxy configuration. The allocated port is for the proxy path and should not be opened publicly. Test `https://app.example.net` from an external client and check the proxy certificate and application response.
@@ -290,14 +298,14 @@ Traefik uses its configured certificate resolver. The first add may migrate a re
 To remove a site and its forward:
 
 ```sh
-sudo deploy/vps/rift-site remove app.example.net
+sudo rift site remove app.example.net
 ```
 
 To inspect or change the helper's default proxy:
 
 ```sh
-sudo deploy/vps/rift-site proxy
-sudo deploy/vps/rift-site proxy caddy
+sudo rift site proxy
+sudo rift site proxy caddy
 ```
 
 For a custom reverse proxy, create a transparent TCP forward with `--ingress local` and configure the proxy to connect to the server address and allocated port via an appropriate incoming interface. Local ingress excludes packets arriving on a NIC that owns a configured public address; it is not a general-purpose loopback listener. See [architecture](docs/architecture.md#transparent-packet-path).
@@ -308,22 +316,22 @@ All commands in this section run on the server. IDs are returned by `forwards li
 
 ```sh
 # Inspect agents and their state
-docker exec rift-server rift --config /etc/rift/config.toml agents list
-docker exec rift-server rift --config /etc/rift/config.toml agents show node1
+rift agents list
+rift agents show node1
 
 # Temporarily disable or re-enable an agent
-docker exec rift-server rift --config /etc/rift/config.toml agents disable node1
-docker exec rift-server rift --config /etc/rift/config.toml agents enable node1
+rift agents disable node1
+rift agents enable node1
 
 # Remove an agent, or cancel a pending invitation
-docker exec rift-server rift --config /etc/rift/config.toml agents remove node1
-docker exec rift-server rift --config /etc/rift/config.toml agents cancel-invite node1
+rift agents remove node1
+rift agents cancel-invite node1
 
 # Inspect, disable, enable or remove a forward
-docker exec rift-server rift --config /etc/rift/config.toml forwards list
-docker exec rift-server rift --config /etc/rift/config.toml forwards disable --id 1
-docker exec rift-server rift --config /etc/rift/config.toml forwards enable --id 1
-docker exec rift-server rift --config /etc/rift/config.toml forwards remove --id 1
+rift forwards list
+rift forwards disable --id 1
+rift forwards enable --id 1
+rift forwards remove --id 1
 ```
 
 `agents rename` and `agents rotate` are also available; inspect `rift agents --help` and the relevant subcommand's help before using them. For translated forwards, `bans add --agent NAME --forward-id ID --ip ADDRESS --ttl 1h` blocks an original client address temporarily; `bans list` shows bans. Bans expire by TTL; there is no explicit remove command. Use `--json` for machine-readable administrative output and `rift --help` for the full CLI.
@@ -351,8 +359,8 @@ For external enrollment TLS material, configure `tls_cert`, `tls_key` and `tls_c
 Validate the effective configuration and inspect prerequisites in the relevant running container:
 
 ```sh
-docker exec rift-server rift --config /etc/rift/config.toml config validate
-docker exec rift-server rift --config /etc/rift/config.toml doctor
+rift config validate
+rift doctor
 ```
 
 `reload` reconciles supported mutable settings. Changes to interface, pools, routing reservations, listener ports or TLS identity require a restart. See `src/config.rs` for the full validated configuration and defaults.
@@ -365,8 +373,8 @@ docker exec rift-server rift --config /etc/rift/config.toml doctor
 docker compose ps
 docker logs --tail 100 rift-server
 docker logs --tail 100 rift-agent
-docker exec rift-server rift --config /etc/rift/config.toml status
-docker exec rift-server rift --config /etc/rift/config.toml logs --lines 100
+rift status
+rift logs --lines 100
 ```
 
 Run the container-specific log command on the machine hosting that role.
@@ -387,7 +395,7 @@ docker compose up -d
 docker compose ps
 ```
 
-Check logs, agent status and representative services after the update. Review configuration changes before replacing your local `config.toml` or `.env`.
+On the server, run `sudo sh deploy/vps/install-cli` again after `git pull` to update the installed CLI and site helper. Check logs, agent status and representative services after the update. Review configuration changes before replacing your local `config.toml` or `.env`.
 
 The `rift-state` volume contains identities, keys, certificates and dynamic configuration. Protect and back up the state on **both** server and agent, and test restoration. `docker compose down -v` and volume pruning can delete this state; agents and invitations cannot be recovered merely by restarting. Stopping the daemon intentionally leaves RIFT-owned kernel configuration for restart, so deleting a volume is not a complete uninstall. Use the ownership-aware rollout and rollback procedure in [docs/deploy.md](docs/deploy.md#rollout-and-rollback).
 

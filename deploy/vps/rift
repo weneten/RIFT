@@ -1,0 +1,10 @@
+#!/bin/sh
+# Host-side entry point for server administration.
+set -eu
+
+if [ "${1-}" = site ]; then
+    shift
+    exec /usr/local/lib/rift/rift-site "$@"
+fi
+
+exec docker exec rift-server rift --config /etc/rift/config.toml "$@"
