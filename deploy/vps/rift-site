@@ -300,10 +300,7 @@ def default_state(public_ip):
             "test": ["nginx", "-t"],
             "reload": ["nginx", "-s", "reload"],
         },
-        "npm": {
-            "url": "http://127.0.0.1:81",
-            "credentials_file": "/etc/rift/npm.env",
-        },
+        "npm": {"url": "http://127.0.0.1:81"},
         "sites": {},
     }
 
@@ -394,14 +391,29 @@ def parse_env_file(text):
 SITE_ENV_FILE = Path(os.environ.get("RIFT_SITE_ENV", "/etc/rift/site.env"))
 
 
-def letsencrypt_email():
-    """Shared Let's Encrypt contact from the environment or /etc/rift/site.env."""
-    value = os.environ.get("RIFT_LETSENCRYPT_EMAIL", "").strip()
-    if not value and SITE_ENV_FILE.exists():
-        value = parse_env_file(SITE_ENV_FILE.read_text(encoding="utf-8")).get(
-            "RIFT_LETSENCRYPT_EMAIL", ""
+def site_setting(key, container="rift-server"):
+    """Look a value up in the environment, then the server container (fed by .env), then site.env."""
+    value = os.environ.get(key, "").strip()
+    if value:
+        return value
+    try:
+        completed = subprocess.run(
+            ["docker", "exec", container, "printenv", key],
+            text=True,
+            capture_output=True,
+            check=False,
         )
-    return value.strip()
+    except OSError:
+        completed = None
+    if completed is not None and completed.returncode == 0 and completed.stdout.strip():
+        return completed.stdout.strip()
+    if SITE_ENV_FILE.exists():
+        return parse_env_file(SITE_ENV_FILE.read_text(encoding="utf-8")).get(key, "").strip()
+    return ""
+
+
+def letsencrypt_email(container="rift-server"):
+    return site_setting("RIFT_LETSENCRYPT_EMAIL", container)
 
 
 def certbot_command(host, email):
@@ -412,27 +424,22 @@ def certbot_command(host, email):
 
 
 def npm_settings(state):
-    settings = {"url": "http://127.0.0.1:81", "credentials_file": "/etc/rift/npm.env"}
+    settings = {"url": "http://127.0.0.1:81"}
     settings.update(state.get("npm") or {})
+    settings["container"] = state.get("container", "rift-server")
     return settings
 
 
 def npm_credentials(settings):
-    values = {}
-    path = Path(settings["credentials_file"])
-    if path.exists():
-        values.update(parse_env_file(path.read_text(encoding="utf-8")))
-    for key in ("RIFT_NPM_EMAIL", "RIFT_NPM_PASSWORD", "RIFT_NPM_LETSENCRYPT_EMAIL"):
-        if os.environ.get(key):
-            values[key] = os.environ[key]
-    email = values.get("RIFT_NPM_EMAIL")
-    password = values.get("RIFT_NPM_PASSWORD")
+    container = settings["container"]
+    email = site_setting("RIFT_NPM_EMAIL", container)
+    password = site_setting("RIFT_NPM_PASSWORD", container)
     if not email or not password:
         raise SiteError(
-            f"set RIFT_NPM_EMAIL and RIFT_NPM_PASSWORD in {path} (chmod 600) "
-            "with the login of a Nginx Proxy Manager admin"
+            "set RIFT_NPM_EMAIL and RIFT_NPM_PASSWORD in the server .env "
+            "(or /etc/rift/site.env) with the login of a Nginx Proxy Manager admin"
         )
-    return email, password, values.get("RIFT_NPM_LETSENCRYPT_EMAIL") or letsencrypt_email()
+    return email, password, letsencrypt_email(container)
 
 
 def npm_request(settings, method, path, body=None, token=None):
@@ -504,7 +511,7 @@ def npm_publish(state, host, listen):
         return {"host_id": host_id, "note": None}
     if not le_email:
         note = (
-            "RIFT_NPM_LETSENCRYPT_EMAIL is not set; the proxy host was created without TLS. "
+            "RIFT_LETSENCRYPT_EMAIL is not set; the proxy host was created without TLS. "
             "Request a certificate in the Nginx Proxy Manager UI"
         )
         return {"host_id": host_id, "note": note}
@@ -620,7 +627,7 @@ def reload_proxy(state, proxy, host):
     run(state["nginx"]["test"])
     run(state["nginx"]["reload"])
     if shutil.which("certbot"):
-        run(certbot_command(host, letsencrypt_email()))
+        run(certbot_command(host, letsencrypt_email(state["container"])))
         return None
     return "certbot is not installed; TLS was not requested"
 
