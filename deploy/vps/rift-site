@@ -230,9 +230,18 @@ def traefik_layout(doc):
             source = src
     joined = " ".join(args)
     ready = "providers.file.directory=" in joined and "providers.file.filename=" not in joined
+    # Host directory behind the watched file provider, so site files land where Traefik reads.
+    directory = next(
+        (a.split("=", 1)[1] for a in args if a.startswith("--providers.file.directory=")), None
+    )
+    dynamic_source = None
+    for mount in obj.get("Mounts") or []:
+        if directory and mount.get("Destination") == directory:
+            dynamic_source = mount.get("Source") or None
     return {
         "ready": ready,
         "args": list(args),
+        "dynamic_source": dynamic_source,
         "file_source": source,
         "working_dir": labels.get("com.docker.compose.project.working_dir"),
         "config_files": labels.get("com.docker.compose.project.config_files"),
@@ -720,6 +729,8 @@ def ensure_traefik_provider(state):
     raw = run(["docker", "inspect", "traefik"])
     layout = traefik_layout(json.loads(raw))
     if layout["ready"]:
+        if layout["dynamic_source"]:
+            state["traefik"]["dynamic_dir"] = layout["dynamic_source"]
         return None
     if not layout["config_files"] or not layout["working_dir"]:
         raise SiteError(

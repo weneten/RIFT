@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import json
 import unittest
 from pathlib import Path
 
@@ -258,6 +259,25 @@ class FileProviderTests(unittest.TestCase):
         finally:
             rift_site.site_setting, rift_site.socket.getaddrinfo = original_setting, original_lookup
 
+    def test_site_files_go_where_traefik_actually_reads(self):
+        inspected = json.dumps(
+            [
+                {
+                    "Args": ["--providers.file.directory=/dynamic", "--providers.file.watch=true"],
+                    "Mounts": [{"Source": "/home/ubuntu/service/dynamic", "Destination": "/dynamic"}],
+                    "Config": {"Labels": {}},
+                }
+            ]
+        )
+        state = {"traefik": {"dynamic_dir": rift_site.DEFAULT_TRAEFIK_DIR}}
+        original = rift_site.run
+        rift_site.run = lambda cmd, cwd=None: inspected
+        try:
+            self.assertIsNone(rift_site.ensure_traefik_provider(state))
+        finally:
+            rift_site.run = original
+        self.assertEqual(state["traefik"]["dynamic_dir"], "/home/ubuntu/service/dynamic")
+
     def test_detects_an_existing_file_provider(self):
         self.assertTrue(rift_site.has_file_provider({"args": ["--providers.file.filename=/x.yml"]}))
         self.assertFalse(rift_site.has_file_provider({"args": ["--providers.docker=true"]}))
@@ -296,6 +316,7 @@ class ComposeTests(unittest.TestCase):
             ]
         )
         self.assertTrue(ready["ready"])
+        self.assertEqual(ready["dynamic_source"], "/root/traefik/dynamic")
         pending = rift_site.traefik_layout(
             [
                 {
