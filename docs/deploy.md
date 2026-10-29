@@ -18,12 +18,13 @@ The image provides a Docker healthcheck for both server and agent, so monitoring
 
 ## Publish a home service with a name
 
-The installed `rift site` helper (`deploy/vps/rift-site`) runs on the VPS host, outside the read-only RIFT container. It stores its state in `/var/lib/rift-site/sites.json`. One command allocates a listen port in `20000-20999`, adds a transparent `--ingress local` forward, and writes a site file for Traefik, Caddy, or Nginx.
+The installed `rift site` helper (`deploy/vps/rift-site`) runs on the VPS host, outside the read-only RIFT container. It stores its state in `/var/lib/rift-site/sites.json`. One command allocates a listen port in `20000-20999`, adds a transparent `--ingress local` forward, and writes a site file for Traefik, Caddy, or Nginx, or creates a proxy host through the Nginx Proxy Manager API.
 
 ```sh
-sudo rift site add core app.example 8081 --proxy traefik
-sudo rift site add core app.example 8081 --proxy caddy
-sudo rift site add core app.example 8081 --proxy nginx
+sudo rift site add node1 app.example 8081 --proxy traefik
+sudo rift site add node1 app.example 8081 --proxy caddy
+sudo rift site add node1 app.example 8081 --proxy nginx
+sudo rift site add node1 app.example 8081 --proxy npm
 sudo rift site remove app.example
 ```
 

@@ -352,7 +352,7 @@ Forwards are shown as a compact table, including the ID used for removal, agent,
 
 ```text
 ID  AGENT  PROTO  LISTEN                  TARGET  FAMILY  INGRESS  MODE         STATE
-5   core   TCP    203.0.113.10:25001     5201    v4      local    transparent  enabled
+5   node1  TCP    203.0.113.10:25001     5201    v4      local    transparent  enabled
 ```
 
 Normal commands print concise status and confirmations. Use `rift --json status`, `rift --json forwards list`, or `rift --json doctor` for complete machine-readable data. The `--json` format is also used by the site helper and integration tools.
