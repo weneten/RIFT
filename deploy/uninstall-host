@@ -1,0 +1,89 @@
+#!/bin/sh
+# Remove the host-side parts of RIFT. Run it next to `docker compose down`:
+#
+#   docker compose down            # add -v to also drop the state volume
+#   sudo sh deploy/uninstall-host  # CLI, site helper, sysctl file, leftovers
+#   sudo sh deploy/uninstall-host --purge   # additionally state volume and image
+#
+# Safe to run again. Without --purge the state volume (CA, keys, agents,
+# forwards) is kept so a later install can reconnect.
+set -eu
+
+purge=0
+for arg in "$@"; do
+  case "$arg" in
+    --purge) purge=1 ;;
+    -h | --help)
+      sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      echo "rift: unknown option $arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "rift: run as root: sudo sh deploy/uninstall-host" >&2
+  exit 1
+fi
+
+# Defaults from src/config.rs. Override if config.toml changed them.
+interface=${RIFT_INTERFACE:-rift0}
+route_table=${RIFT_ROUTE_TABLE:-51888}
+rule_priority=${RIFT_RULE_PRIORITY:-11000}
+
+if command -v docker > /dev/null 2>&1; then
+  running=$(docker ps -q --filter name='^rift-(server|agent)$' 2> /dev/null || true)
+  if [ -n "$running" ]; then
+    echo "rift: a RIFT container is still running; run 'docker compose down' first" >&2
+    exit 1
+  fi
+fi
+
+# Network state is normally removed by RIFT on shutdown. This only catches what
+# a crash or kill left behind, and only objects RIFT owns.
+if command -v nft > /dev/null 2>&1 && nft list table inet rift > /dev/null 2>&1; then
+  nft delete table inet rift && echo "rift: removed nft table inet rift"
+fi
+while ip -4 rule del priority "$rule_priority" 2> /dev/null; do :; done
+while ip -6 rule del priority "$rule_priority" 2> /dev/null; do :; done
+ip -4 route flush table "$route_table" 2> /dev/null || true
+ip -6 route flush table "$route_table" 2> /dev/null || true
+if ip link show "$interface" > /dev/null 2>&1; then
+  ip link del "$interface" && echo "rift: removed interface $interface"
+fi
+
+# Host files installed by deploy/prepare-host and deploy/vps/install-cli.
+for f in /usr/local/bin/rift /usr/local/lib/rift/rift-site /etc/sysctl.d/99-rift.conf; do
+  if [ -e "$f" ]; then
+    rm -f "$f" && echo "rift: removed $f"
+  fi
+done
+rmdir /usr/local/lib/rift 2> /dev/null || true
+
+if [ "$purge" -eq 1 ] && command -v docker > /dev/null 2>&1; then
+  for v in $(docker volume ls -q --filter name='rift-state' 2> /dev/null || true); do
+    docker volume rm "$v" > /dev/null && echo "rift: removed volume $v"
+  done
+  for img in rift:local weneten/rift:latest; do
+    if docker image inspect "$img" > /dev/null 2>&1; then
+      docker image rm "$img" > /dev/null && echo "rift: removed image $img"
+    fi
+  done
+fi
+
+cat << 'EOF'
+rift: host cleanup done.
+Not reverted on purpose, because other services may depend on them:
+  - live values of net.ipv4.ip_forward, net.ipv6.conf.all.forwarding and
+    net.ipv4.conf.default.rp_filter (they reset at the next reboot, or set them
+    with sysctl -w)
+  - UFW rules and chain jumps tagged "rift:" (normally removed on shutdown;
+    check 'sudo ufw status' or 'nft list ruleset | grep rift')
+  - .env, config.toml and proxy configs written by 'rift site'
+EOF
+if [ "$purge" -eq 0 ]; then
+  echo "State volume kept. Use --purge (or docker compose down -v) to delete it."
+fi

@@ -410,6 +410,17 @@ On the server, run `sudo sh deploy/vps/install-cli` again after `git pull` to up
 
 The `rift-state` volume contains identities, keys, certificates and dynamic configuration. Protect and back up the state on **both** server and agent, and test restoration. A normal `docker compose down` asks RIFT to remove its owned networking configuration; a subsequent `docker compose up -d` recreates it from the retained volume. A crash, forced kill or cleanup error can leave network state behind; inspect the logs and use the ownership-aware recovery procedure in [docs/deploy.md](docs/deploy.md#rollout-and-rollback). `docker compose down -v` and volume pruning can delete the state; agents and invitations cannot be recovered merely by restarting. Host-wide sysctl settings installed by `deploy/prepare-host` remain in place.
 
+### Uninstall
+
+Stop the containers, then remove the host-side parts (installed CLI, site helper, `/etc/sysctl.d/99-rift.conf`, and any network objects a crash left behind):
+
+```bash
+docker compose down
+sudo sh deploy/uninstall-host
+```
+
+The state volume (CA, keys, agents, forwards) is kept so a later install can reconnect. Add `--purge` to delete the volume and the image as well. The live forwarding sysctls, `.env`, `config.toml` and proxy configuration written by `rift site` are not touched; the script prints what remains.
+
 ## Build and development
 
 The root Compose file pulls `weneten/rift:latest`. To build and use the local source instead, use `deploy/vps/compose.yml` on the server or `deploy/agent/compose.yml` on the agent, with the matching `.env` and configuration; inspect the rendered configuration before starting. To build an image directly:
