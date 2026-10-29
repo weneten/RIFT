@@ -305,7 +305,7 @@ RIFT_NPM_PASSWORD=...
 RIFT_NPM_LETSENCRYPT_EMAIL=admin@example.net
 ```
 
-The same keys also work as environment variables. Without `RIFT_NPM_LETSENCRYPT_EMAIL` the proxy host is created without TLS and you request a certificate in the NPM UI. `rift site remove` deletes the proxy host again but keeps its certificate.
+The same keys also work as environment variables. Without `RIFT_NPM_LETSENCRYPT_EMAIL` the proxy host is created without TLS and you request a certificate in the NPM UI. `rift site remove` deletes the proxy host again, and its certificate too when that was issued for this domain alone and no other host, redirection, 404 host or stream uses it; shared and wildcard certificates are kept.
 
 To remove a site and its forward:
 

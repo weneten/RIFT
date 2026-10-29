@@ -512,23 +512,54 @@ def npm_publish(state, host, listen):
     return {"host_id": host_id, "note": note}
 
 
-def npm_remove(state, host_id):
+NPM_CERTIFICATE_USERS = (
+    "/nginx/proxy-hosts",
+    "/nginx/redirection-hosts",
+    "/nginx/dead-hosts",
+    "/nginx/streams",
+)
+
+
+def npm_remove_certificate(settings, token, certificate_id, host):
+    """Delete the certificate only if it is for this host alone and nothing else uses it."""
+    certificate = npm_request(settings, "GET", f"/nginx/certificates/{certificate_id}", token=token)
+    if (certificate or {}).get("domain_names") != [host]:
+        return None
+    for path in NPM_CERTIFICATE_USERS:
+        for entry in npm_request(settings, "GET", path, token=token) or []:
+            if int(entry.get("certificate_id") or 0) == certificate_id:
+                return None
+    npm_request(settings, "DELETE", f"/nginx/certificates/{certificate_id}", token=token)
+    return None
+
+
+def npm_remove(state, host_id, host):
     if not host_id:
-        return
+        return None
     settings = npm_settings(state)
     token, _ = npm_login(settings)
+    certificate_id = 0
     try:
+        current = npm_request(settings, "GET", f"/nginx/proxy-hosts/{host_id}", token=token)
+        certificate_id = int((current or {}).get("certificate_id") or 0)
         npm_request(settings, "DELETE", f"/nginx/proxy-hosts/{host_id}", token=token)
     except SiteError as error:
         if "HTTP 404" not in str(error):
             raise
+    if not certificate_id:
+        return None
+    try:
+        npm_remove_certificate(settings, token, certificate_id, host)
+    except SiteError as error:
+        return f"the proxy host was removed, but its certificate was kept: {error}"
+    return None
 
 
 def remove_site_config(state, site, host):
     if site["proxy"] == "npm":
-        npm_remove(state, site.get("npm_host_id"))
-    else:
-        site_path(state, site["proxy"], host).unlink(missing_ok=True)
+        return npm_remove(state, site.get("npm_host_id"), host)
+    site_path(state, site["proxy"], host).unlink(missing_ok=True)
+    return None
 
 
 def site_path(state, proxy, host):
@@ -692,10 +723,12 @@ def command_rm(host):
     if state is None or host not in state["sites"]:
         raise SiteError(f"{host} is not a rift-site")
     site = state["sites"][host]
-    remove_site_config(state, site, host)
+    note = remove_site_config(state, site, host)
     remove_forward(state, site.get("forward_id"))
     del state["sites"][host]
     save_state(state)
+    if note:
+        print(note, file=sys.stderr)
     try:
         reload_proxy(state, site["proxy"], host)
     except SiteError as error:

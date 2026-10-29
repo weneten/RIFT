@@ -119,6 +119,33 @@ class NpmTests(unittest.TestCase):
         self.assertEqual(secured["certificate_id"], 7)
         self.assertTrue(secured["ssl_forced"])
 
+    def remove_with(self, certificate_domains, other_users):
+        calls = []
+
+        def fake(settings, method, path, body=None, token=None):
+            calls.append((method, path))
+            if path == "/nginx/certificates/7" and method == "GET":
+                return {"domain_names": certificate_domains}
+            if path == "/nginx/proxy-hosts":
+                return other_users
+            if path.startswith("/nginx/") and method == "GET":
+                return []
+            return None
+
+        original = rift_site.npm_request
+        rift_site.npm_request = fake
+        try:
+            rift_site.npm_remove_certificate({}, "t", 7, "app.example.net")
+        finally:
+            rift_site.npm_request = original
+        return ("DELETE", "/nginx/certificates/7") in calls
+
+    def test_certificate_is_deleted_only_when_exclusive_and_unused(self):
+        self.assertTrue(self.remove_with(["app.example.net"], []))
+        self.assertFalse(self.remove_with(["*.example.net"], []))
+        self.assertFalse(self.remove_with(["app.example.net", "b.example.net"], []))
+        self.assertFalse(self.remove_with(["app.example.net"], [{"certificate_id": 7}]))
+
     def test_env_file_parsing(self):
         values = rift_site.parse_env_file(
             '# c\nRIFT_NPM_EMAIL="a@example.net"\nRIFT_NPM_PASSWORD=pw=1\n\nbad\n'
