@@ -234,6 +234,30 @@ class FileProviderTests(unittest.TestCase):
         self.assertIn("safe to delete", fresh)
         self.assertNotIn("safe to delete", rift_site.backup_notice(compose, backup, False))
 
+    def test_dns_hint_prefers_the_public_endpoint_over_the_bind_address(self):
+        state = {"container": "rift-server", "public_ip": "10.0.0.45"}
+        original_setting, original_lookup = rift_site.site_setting, rift_site.socket.getaddrinfo
+        try:
+            rift_site.site_setting = lambda key, container="rift-server": "rift.example.net"
+            rift_site.socket.getaddrinfo = lambda *a, **k: [(2, 1, 6, "", ("161.118.177.113", 0))]
+            self.assertEqual(
+                rift_site.dns_hint("app.example.net", state),
+                "DNS: app.example.net -> 161.118.177.113 (address of rift.example.net)",
+            )
+            rift_site.site_setting = lambda key, container="rift-server": "203.0.113.5"
+            self.assertIn("203.0.113.5", rift_site.dns_hint("app.example.net", state))
+
+            def fail(*a, **k):
+                raise OSError("no dns")
+
+            rift_site.site_setting = lambda key, container="rift-server": "rift.example.net"
+            rift_site.socket.getaddrinfo = fail
+            self.assertEqual(rift_site.dns_hint("app.example.net", state), "DNS: app.example.net -> 10.0.0.45")
+            rift_site.site_setting = lambda key, container="rift-server": ""
+            self.assertEqual(rift_site.dns_hint("app.example.net", state), "DNS: app.example.net -> 10.0.0.45")
+        finally:
+            rift_site.site_setting, rift_site.socket.getaddrinfo = original_setting, original_lookup
+
     def test_detects_an_existing_file_provider(self):
         self.assertTrue(rift_site.has_file_provider({"args": ["--providers.file.filename=/x.yml"]}))
         self.assertFalse(rift_site.has_file_provider({"args": ["--providers.docker=true"]}))

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import urllib.error
@@ -784,6 +785,27 @@ def remove_forward(state, forward_id):
             raise
 
 
+def dns_hint(host, state):
+    """Where the site's DNS record should point.
+
+    RIFT_PUBLIC_IPS is the address RIFT binds to, which behind a cloud NAT is a private
+    one. RIFT_PUBLIC_ENDPOINT is what agents dial from the internet, so prefer its address.
+    """
+    endpoint = site_setting("RIFT_PUBLIC_ENDPOINT", state["container"])
+    if endpoint:
+        try:
+            ipaddress.ip_address(endpoint)
+            return f"DNS: {host} -> {endpoint} (RIFT_PUBLIC_ENDPOINT)"
+        except ValueError:
+            pass
+        try:
+            address = socket.getaddrinfo(endpoint, None, socket.AF_INET)[0][4][0]
+            return f"DNS: {host} -> {address} (address of {endpoint})"
+        except OSError:
+            pass
+    return f"DNS: {host} -> {state['public_ip']}"
+
+
 def command_add(agent, host, port, proxy):
     if not valid_agent(agent) or not valid_host(host):
         raise SiteError("agent or host is not a usable name")
@@ -856,7 +878,7 @@ def command_add(agent, host, port, proxy):
         raise
     note = reload_proxy(state, chosen, host) or note
     print(f"https://{host}")
-    print(f"DNS: {host} -> {state['public_ip']}")
+    print(dns_hint(host, state))
     if note:
         print(note)
 
