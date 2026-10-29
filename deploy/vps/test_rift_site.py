@@ -146,6 +146,16 @@ class NpmTests(unittest.TestCase):
         self.assertFalse(self.remove_with(["app.example.net", "b.example.net"], []))
         self.assertFalse(self.remove_with(["app.example.net"], [{"certificate_id": 7}]))
 
+    def test_certbot_gets_the_contact_email_only_when_configured(self):
+        self.assertEqual(
+            rift_site.certbot_command("app.example.net", ""),
+            ["certbot", "--nginx", "--non-interactive", "--agree-tos", "-d", "app.example.net"],
+        )
+        self.assertEqual(
+            rift_site.certbot_command("app.example.net", "a@example.net")[4:],
+            ["--email", "a@example.net", "-d", "app.example.net"],
+        )
+
     def test_env_file_parsing(self):
         values = rift_site.parse_env_file(
             '# c\nRIFT_NPM_EMAIL="a@example.net"\nRIFT_NPM_PASSWORD=pw=1\n\nbad\n'

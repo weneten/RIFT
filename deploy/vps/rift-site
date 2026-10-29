@@ -391,6 +391,26 @@ def parse_env_file(text):
     return values
 
 
+SITE_ENV_FILE = Path(os.environ.get("RIFT_SITE_ENV", "/etc/rift/site.env"))
+
+
+def letsencrypt_email():
+    """Shared Let's Encrypt contact from the environment or /etc/rift/site.env."""
+    value = os.environ.get("RIFT_LETSENCRYPT_EMAIL", "").strip()
+    if not value and SITE_ENV_FILE.exists():
+        value = parse_env_file(SITE_ENV_FILE.read_text(encoding="utf-8")).get(
+            "RIFT_LETSENCRYPT_EMAIL", ""
+        )
+    return value.strip()
+
+
+def certbot_command(host, email):
+    command = ["certbot", "--nginx", "--non-interactive", "--agree-tos"]
+    if email:
+        command += ["--email", email]
+    return command + ["-d", host]
+
+
 def npm_settings(state):
     settings = {"url": "http://127.0.0.1:81", "credentials_file": "/etc/rift/npm.env"}
     settings.update(state.get("npm") or {})
@@ -412,7 +432,7 @@ def npm_credentials(settings):
             f"set RIFT_NPM_EMAIL and RIFT_NPM_PASSWORD in {path} (chmod 600) "
             "with the login of a Nginx Proxy Manager admin"
         )
-    return email, password, values.get("RIFT_NPM_LETSENCRYPT_EMAIL", "")
+    return email, password, values.get("RIFT_NPM_LETSENCRYPT_EMAIL") or letsencrypt_email()
 
 
 def npm_request(settings, method, path, body=None, token=None):
@@ -600,7 +620,7 @@ def reload_proxy(state, proxy, host):
     run(state["nginx"]["test"])
     run(state["nginx"]["reload"])
     if shutil.which("certbot"):
-        run(["certbot", "--nginx", "--non-interactive", "--agree-tos", "-d", host])
+        run(certbot_command(host, letsencrypt_email()))
         return None
     return "certbot is not installed; TLS was not requested"
 
