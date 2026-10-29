@@ -21,6 +21,10 @@ pub struct Config {
     pub interface: String,
     pub public_endpoint: String,
     pub public_ips: Vec<IpAddr>,
+    /// For clouds that NAT the public address to a private one on the VM (e.g. Oracle Cloud):
+    /// lets `public_ips` hold the private interface address. Loopback, link-local, multicast
+    /// and unspecified addresses stay forbidden.
+    pub allow_private_listeners: bool,
     pub wg_port: u16,
     pub enrollment_bind: SocketAddr,
     pub enrollment_enabled: bool,
@@ -54,6 +58,7 @@ impl Default for Config {
             interface: "rift0".into(),
             public_endpoint: "".into(),
             public_ips: vec![],
+            allow_private_listeners: false,
             wg_port: 51820,
             enrollment_bind: "0.0.0.0:8443".parse().unwrap(),
             enrollment_enabled: true,
@@ -128,6 +133,7 @@ impl Config {
                 }
             };
         }
+        env_parse!("RIFT_ALLOW_PRIVATE_LISTENERS", allow_private_listeners);
         env_parse!("RIFT_WG_PORT", wg_port);
         env_parse!("RIFT_IPV4_POOL", ipv4_pool);
         env_parse!("RIFT_IPV6_POOL", ipv6_pool);
@@ -225,6 +231,14 @@ impl Config {
                 !ip.is_unspecified() && !ip.is_multicast() && !ip.is_loopback(),
                 "public IP allowlist contains invalid address"
             );
+            let in_tunnel_pool = match ip {
+                IpAddr::V4(v) => self.ipv4_pool.contains(v),
+                IpAddr::V6(v) => self.ipv6_pool.contains(v),
+            };
+            ensure!(
+                !in_tunnel_pool,
+                "public IP {ip} lies inside a tunnel pool; choose different tunnel pools"
+            );
         }
         if let Some(name) = &self.agent_name {
             validate_name(name)?;
@@ -267,6 +281,25 @@ mod tests {
             ..Default::default()
         };
         assert!(c.validate().is_err());
+    }
+    #[test]
+    fn private_listeners_are_off_by_default_and_never_inside_a_tunnel_pool() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(!config.allow_private_listeners);
+        let config: Config = toml::from_str("allow_private_listeners = true\n").unwrap();
+        assert!(config.allow_private_listeners);
+        let ok = Config {
+            allow_private_listeners: true,
+            public_ips: vec!["10.0.0.45".parse().unwrap()],
+            ..Default::default()
+        };
+        ok.validate().unwrap();
+        let inside = Config {
+            allow_private_listeners: true,
+            public_ips: vec!["10.13.0.7".parse().unwrap()],
+            ..Default::default()
+        };
+        assert!(inside.validate().is_err());
     }
     #[test]
     fn host_firewall_defaults_to_auto_and_parses_off() {

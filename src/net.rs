@@ -80,7 +80,7 @@ impl Kernel {
                 f.id,
                 f.listen_ip
             );
-            ensure!(is_public_unicast(f.listen_ip), "forward {} cannot publish a private, local, link-local, shared, ULA, or multicast address", f.id);
+            ensure!(listener_allowed(f.listen_ip, self.config.allow_private_listeners), "forward {} cannot publish a private, local, link-local, shared, ULA, or multicast address (private interface addresses need allow_private_listeners)", f.id);
             let agent = active
                 .get(&f.agent_id)
                 .context("forward references inactive or unknown agent")?;
@@ -346,8 +346,9 @@ impl Kernel {
 
     pub async fn check_port(&self, ip: IpAddr, ports: PortRange, protocol: Protocol) -> Result<()> {
         ensure!(
-            is_public_unicast(ip),
-            "published listener must be a public unicast VPS address"
+            listener_allowed(ip, self.config.allow_private_listeners),
+            "published listener must be a public unicast VPS address \
+             (behind a cloud NAT, set RIFT_ALLOW_PRIVATE_LISTENERS=true to use the private interface address)"
         );
         ports.validate()?;
         ensure!(ports.len() <= 4096, "port range is too large to preflight");
@@ -1526,6 +1527,26 @@ fn nft_addr(ip: IpAddr) -> (&'static str, String) {
         IpAddr::V6(v) => ("ip6", v.to_string()),
     }
 }
+/// Public unicast addresses are always fine. With `allow_private` (cloud NAT) private,
+/// shared and ULA addresses are accepted too; loopback, link-local, multicast and
+/// unspecified addresses never are.
+fn listener_allowed(ip: IpAddr, allow_private: bool) -> bool {
+    if is_public_unicast(ip) {
+        return true;
+    }
+    allow_private
+        && match ip {
+            IpAddr::V4(v) => {
+                !v.is_loopback() && !v.is_link_local() && !v.is_unspecified() && !v.is_multicast()
+            }
+            IpAddr::V6(v) => {
+                !v.is_loopback()
+                    && !v.is_unspecified()
+                    && !v.is_multicast()
+                    && !v.is_unicast_link_local()
+            }
+        }
+}
 fn is_public_unicast(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => {
@@ -2256,6 +2277,20 @@ mod tests {
     use super::*;
     use crate::model::{AgentRecord, AgentStatus};
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn private_listeners_need_the_explicit_opt_in() {
+        let public: IpAddr = "203.0.113.10".parse().unwrap();
+        let private: IpAddr = "10.0.0.45".parse().unwrap();
+        let ula: IpAddr = "fd00::5".parse().unwrap();
+        assert!(listener_allowed(public, false) && listener_allowed(public, true));
+        assert!(!listener_allowed(private, false) && listener_allowed(private, true));
+        assert!(!listener_allowed(ula, false) && listener_allowed(ula, true));
+        for never in ["127.0.0.1", "169.254.1.1", "224.0.0.1", "0.0.0.0", "::1", "fe80::1", "ff02::1"] {
+            let ip: IpAddr = never.parse().unwrap();
+            assert!(!listener_allowed(ip, true), "{never}");
+        }
+    }
 
     #[test]
     fn cleanup_accepts_missing_fib_only_for_route_deletion() {
