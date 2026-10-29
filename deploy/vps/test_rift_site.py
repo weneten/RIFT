@@ -146,15 +146,27 @@ class NpmTests(unittest.TestCase):
         self.assertFalse(self.remove_with(["app.example.net", "b.example.net"], []))
         self.assertFalse(self.remove_with(["app.example.net"], [{"certificate_id": 7}]))
 
-    def test_certbot_gets_the_contact_email_only_when_configured(self):
+    def test_certbot_registers_without_email_when_none_is_configured(self):
         self.assertEqual(
             rift_site.certbot_command("app.example.net", ""),
-            ["certbot", "--nginx", "--non-interactive", "--agree-tos", "-d", "app.example.net"],
+            [
+                "certbot", "--nginx", "--non-interactive", "--agree-tos",
+                "--register-unsafely-without-email", "-d", "app.example.net",
+            ],
         )
         self.assertEqual(
             rift_site.certbot_command("app.example.net", "a@example.net")[4:],
             ["--email", "a@example.net", "-d", "app.example.net"],
         )
+
+    def test_certificate_request_flag(self):
+        original = rift_site.site_setting
+        try:
+            for value, expected in [("", True), ("true", True), ("false", False), ("No", False), ("0", False)]:
+                rift_site.site_setting = lambda key, container="rift-server", v=value: v
+                self.assertEqual(rift_site.request_certificate(), expected, value)
+        finally:
+            rift_site.site_setting = original
 
     def test_env_file_parsing(self):
         values = rift_site.parse_env_file(

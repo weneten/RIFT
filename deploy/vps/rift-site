@@ -416,10 +416,15 @@ def letsencrypt_email(container="rift-server"):
     return site_setting("RIFT_LETSENCRYPT_EMAIL", container)
 
 
+def request_certificate(container="rift-server"):
+    """RIFT_REQUEST_CERTIFICATE: anything but false/0/no/off requests a certificate."""
+    value = site_setting("RIFT_REQUEST_CERTIFICATE", container).lower()
+    return value not in ("false", "0", "no", "off")
+
+
 def certbot_command(host, email):
     command = ["certbot", "--nginx", "--non-interactive", "--agree-tos"]
-    if email:
-        command += ["--email", email]
+    command += ["--email", email] if email else ["--register-unsafely-without-email"]
     return command + ["-d", host]
 
 
@@ -439,7 +444,8 @@ def npm_credentials(settings):
             "set RIFT_NPM_EMAIL and RIFT_NPM_PASSWORD in the server .env "
             "(or /etc/rift/site.env) with the login of a Nginx Proxy Manager admin"
         )
-    return email, password, letsencrypt_email(container)
+    # NPM needs a contact address; fall back to the admin login when no other is set.
+    return email, password, letsencrypt_email(container) or email
 
 
 def npm_request(settings, method, path, body=None, token=None):
@@ -509,9 +515,9 @@ def npm_publish(state, host, listen):
     host_id = saved["id"]
     if certificate_id:
         return {"host_id": host_id, "note": None}
-    if not le_email:
+    if not request_certificate(settings["container"]):
         note = (
-            "RIFT_LETSENCRYPT_EMAIL is not set; the proxy host was created without TLS. "
+            "RIFT_REQUEST_CERTIFICATE is false; the proxy host was created without TLS. "
             "Request a certificate in the Nginx Proxy Manager UI"
         )
         return {"host_id": host_id, "note": note}
@@ -626,6 +632,8 @@ def reload_proxy(state, proxy, host):
         return None
     run(state["nginx"]["test"])
     run(state["nginx"]["reload"])
+    if not request_certificate(state["container"]):
+        return "RIFT_REQUEST_CERTIFICATE is false; TLS was not requested"
     if shutil.which("certbot"):
         run(certbot_command(host, letsencrypt_email(state["container"])))
         return None

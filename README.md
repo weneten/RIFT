@@ -293,18 +293,18 @@ sudo rift site add node1 app.example.net 8081 --proxy traefik
 
 Alternatively, use `--proxy caddy`, `--proxy nginx` or `--proxy npm` (Nginx Proxy Manager) with the corresponding existing proxy. The helper allocates a port in `20000-20999`, creates a local-ingress TCP forward and writes a proxy configuration. The allocated port is for the proxy path and should not be opened publicly. Test `https://app.example.net` from an external client and check the proxy certificate and application response.
 
-Traefik uses its configured certificate resolver. The first add may migrate a recognized single-file Traefik provider to a watched directory and recreate its Compose service; existing Docker-label routes remain. Caddy obtains certificates through its configuration. For Nginx, the helper invokes `certbot --nginx` if available; without it the site is written but TLS is not requested, so configure a certificate separately. Certbot needs a contact address on first use: either register it once yourself, or set the single `RIFT_LETSENCRYPT_EMAIL=you@example.net` in the server `.env`, which the helper passes as `--email` (Nginx Proxy Manager uses the same address). Setting it means you accept the Let's Encrypt terms of service, which the helper accepts with `--agree-tos`. HTTP traffic between proxy and agent is carried inside WireGuard.
+Traefik uses its configured certificate resolver. The first add may migrate a recognized single-file Traefik provider to a watched directory and recreate its Compose service; existing Docker-label routes remain. Caddy obtains certificates through its configuration. For Nginx, the helper invokes `certbot --nginx` if available; without it the site is written but TLS is not requested, so configure a certificate separately. For Nginx and Nginx Proxy Manager, `RIFT_REQUEST_CERTIFICATE` in the server `.env` controls certificates: `true` (default) requests a Let's Encrypt certificate for each new site, which means accepting the Let's Encrypt terms of service (certbot is run with `--agree-tos`); `false` skips it and you handle TLS yourself. The optional `RIFT_LETSENCRYPT_EMAIL=you@example.net` is the contact for expiry notices. Without it certbot registers without an email, and Nginx Proxy Manager, which requires one, uses the admin login address. Traefik and Caddy ignore both settings. HTTP traffic between proxy and agent is carried inside WireGuard.
 
 Nginx Proxy Manager is configured through its API at `http://127.0.0.1:81` (change `npm.url` in `/var/lib/rift-site/sites.json` if needed). Put an NPM admin login and the Let's Encrypt address in the server `.env` (already `chmod 600`) and recreate the server container with `docker compose up -d --force-recreate`:
 
 ```sh
 RIFT_NPM_EMAIL=admin@example.net
 RIFT_NPM_PASSWORD=...
-# With this set, a Let's Encrypt certificate is requested and HTTPS is forced.
+# Optional, see above. Certificate requests are on by default and force HTTPS.
 RIFT_LETSENCRYPT_EMAIL=admin@example.net
 ```
 
-The helper reads these values from the running server container, which Compose fills from `.env`; they are visible to root through `docker inspect`. They also work as environment variables of the `rift site` call or in `/etc/rift/site.env`. Without `RIFT_LETSENCRYPT_EMAIL` the proxy host is created without TLS and you request a certificate in the NPM UI. `rift site remove` deletes the proxy host again, and its certificate too when that was issued for this domain alone and no other host, redirection, 404 host or stream uses it; shared and wildcard certificates are kept.
+The helper reads these values from the running server container, which Compose fills from `.env`; they are visible to root through `docker inspect`. They also work as environment variables of the `rift site` call or in `/etc/rift/site.env`. With `RIFT_REQUEST_CERTIFICATE=false` the proxy host is created without TLS and you request a certificate in the NPM UI. `rift site remove` deletes the proxy host again, and its certificate too when that was issued for this domain alone and no other host, redirection, 404 host or stream uses it; shared and wildcard certificates are kept.
 
 To remove a site and its forward:
 
