@@ -356,11 +356,11 @@ Normal commands print concise status and confirmations. Use `rift --json status`
 | `RIFT_ENROLLMENT_BIND` | `0.0.0.0:8443` | Enrollment listener. |
 | `RIFT_ENROLLMENT_ENABLED` | `true` | Enables enrollment. |
 | `RIFT_WG_PORT` | `51820` | Server. WireGuard UDP port; use another one if 51820 is taken on the host. Restart required. |
-| `RIFT_IPV4_POOL`, `RIFT_SERVER_IPV4` | `10.88.0.0/24`, `10.88.0.1` | Server. Override the IPv4 tunnel pool (e.g. when Podman's `podman0` uses 10.88.0.0/16). The server address must be inside the pool; restart required. |
+| `RIFT_IPV4_POOL`, `RIFT_SERVER_IPV4` | `10.13.0.0/24`, `10.13.0.1` | Server. Override the IPv4 tunnel pool if it overlaps a host network (the default avoids Podman's 10.88.0.0/16, Docker's 172.16/12 and common WireGuard 10.8.0.0/24). The server address must be inside the pool; restart required. |
 | `RIFT_IPV6_POOL`, `RIFT_SERVER_IPV6` | `fd88:5249:4654::/64`, `fd88:5249:4654::1` | Server. Same for IPv6 (ULA pool). |
 | `RIFT_SERVER`, `RIFT_AGENT_NAME`, `RIFT_ENROLLMENT_TOKEN` | Agent | Invitation values; remove token after enrollment. |
 | `interface`, `wg_port`, `control_port` | `rift0`, `51820`, `8444` | WireGuard interface and ports. |
-| `ipv4_pool`, `ipv6_pool` | `10.88.0.0/24`, `fd88:5249:4654::/64` | Tunnel address pools; avoid overlaps. |
+| `ipv4_pool`, `ipv6_pool` | `10.13.0.0/24`, `fd88:5249:4654::/64` | Tunnel address pools; avoid overlaps. |
 | `route_table`, `rule_priority`, `mark`, `mark_mask` | See example TOML | Reserved routing and packet-mark resources. |
 | `mtu`, `host_firewall` | `1380`, `auto` | Tunnel MTU and UFW integration. |
 
