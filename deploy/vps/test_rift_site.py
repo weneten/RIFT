@@ -227,6 +227,13 @@ class FileProviderTests(unittest.TestCase):
         no_volumes = "services:\n  traefik:\n    command:\n      - \"--x\"\n"
         self.assertEqual(rift_site.add_file_provider(no_volumes, "traefik", "/d"), (no_volumes, False))
 
+    def test_backup_notice_says_when_it_is_safe_to_delete(self):
+        compose, backup = Path("/srv/docker-compose.yml"), Path("/srv/docker-compose.yml.rift-bak")
+        fresh = rift_site.backup_notice(compose, backup, True)
+        self.assertIn(str(backup), fresh)
+        self.assertIn("safe to delete", fresh)
+        self.assertNotIn("safe to delete", rift_site.backup_notice(compose, backup, False))
+
     def test_detects_an_existing_file_provider(self):
         self.assertTrue(rift_site.has_file_provider({"args": ["--providers.file.filename=/x.yml"]}))
         self.assertFalse(rift_site.has_file_provider({"args": ["--providers.docker=true"]}))

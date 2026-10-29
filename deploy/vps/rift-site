@@ -719,7 +719,7 @@ def ensure_traefik_provider(state):
     raw = run(["docker", "inspect", "traefik"])
     layout = traefik_layout(json.loads(raw))
     if layout["ready"]:
-        return
+        return None
     if not layout["config_files"] or not layout["working_dir"]:
         raise SiteError(
             "Traefik was not started with Docker Compose, so rift-site cannot change its "
@@ -751,12 +751,26 @@ def ensure_traefik_provider(state):
     if not changed:
         raise SiteError(f"could not rewrite the Traefik file provider in {compose_path}")
     backup = compose_path.with_name(compose_path.name + ".rift-bak")
-    if not backup.exists():
+    created_backup = not backup.exists()
+    if created_backup:
         backup.write_text(original, encoding="utf-8")
     compose_path.write_text(migrated, encoding="utf-8")
     run(
         ["docker", "compose", "-f", str(compose_path), "up", "-d", "--no-deps", layout["service"]],
         cwd=layout["working_dir"],
+    )
+    return backup_notice(compose_path, backup, created_backup)
+
+
+def backup_notice(compose_path, backup, created):
+    if created:
+        return (
+            f"Changed {compose_path} and recreated Traefik. The original is saved as {backup}.\n"
+            "Once you have confirmed that everything works, it is safe to delete that backup."
+        )
+    return (
+        f"Changed {compose_path} and recreated Traefik. An earlier backup from before "
+        f"rift-site's first change is still at {backup}."
     )
 
 
@@ -784,7 +798,9 @@ def command_add(agent, host, port, proxy):
         raise SiteError("proxy must be traefik, caddy, nginx, or npm")
     require_edge(chosen, *capture_edge())
     if chosen == "traefik":
-        ensure_traefik_provider(state)
+        compose_notice = ensure_traefik_provider(state)
+        if compose_notice:
+            print(compose_notice)
     existing = state["sites"].get(host)
     if existing and int(existing["target"]) == target and existing.get("agent") == agent and existing.get("proxy") == chosen:
         listen = int(existing["listen"])
