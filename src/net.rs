@@ -2286,7 +2286,15 @@ mod tests {
         assert!(listener_allowed(public, false) && listener_allowed(public, true));
         assert!(!listener_allowed(private, false) && listener_allowed(private, true));
         assert!(!listener_allowed(ula, false) && listener_allowed(ula, true));
-        for never in ["127.0.0.1", "169.254.1.1", "224.0.0.1", "0.0.0.0", "::1", "fe80::1", "ff02::1"] {
+        for never in [
+            "127.0.0.1",
+            "169.254.1.1",
+            "224.0.0.1",
+            "0.0.0.0",
+            "::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
             let ip: IpAddr = never.parse().unwrap();
             assert!(!listener_allowed(ip, true), "{never}");
         }
