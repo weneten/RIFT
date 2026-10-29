@@ -355,6 +355,7 @@ Normal commands print concise status and confirmations. Use `rift --json status`
 | `RIFT_PUBLIC_IPS` | Server | Comma-separated addresses assigned to server interfaces for listeners. |
 | `RIFT_ENROLLMENT_BIND` | `0.0.0.0:8443` | Enrollment listener. |
 | `RIFT_ENROLLMENT_ENABLED` | `true` | Enables enrollment. |
+| `RIFT_WG_PORT` | `51820` | Server. WireGuard UDP port; use another one if 51820 is taken on the host. Restart required. |
 | `RIFT_IPV4_POOL`, `RIFT_SERVER_IPV4` | `10.88.0.0/24`, `10.88.0.1` | Server. Override the IPv4 tunnel pool (e.g. when Podman's `podman0` uses 10.88.0.0/16). The server address must be inside the pool; restart required. |
 | `RIFT_IPV6_POOL`, `RIFT_SERVER_IPV6` | `fd88:5249:4654::/64`, `fd88:5249:4654::1` | Server. Same for IPv6 (ULA pool). |
 | `RIFT_SERVER`, `RIFT_AGENT_NAME`, `RIFT_ENROLLMENT_TOKEN` | Agent | Invitation values; remove token after enrollment. |

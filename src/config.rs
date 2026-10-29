@@ -128,6 +128,7 @@ impl Config {
                 }
             };
         }
+        env_parse!("RIFT_WG_PORT", wg_port);
         env_parse!("RIFT_IPV4_POOL", ipv4_pool);
         env_parse!("RIFT_IPV6_POOL", ipv6_pool);
         env_parse!("RIFT_SERVER_IPV4", server_ipv4);
