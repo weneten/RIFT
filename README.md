@@ -312,6 +312,8 @@ To remove a site and its forward:
 sudo rift site remove app.example.net
 ```
 
+`sudo rift site list` shows the sites the helper manages and whether each forward still exists. Manage these forwards only through `rift site`: if you delete one with `rift forwards remove`, `list` shows it as `missing` and running `rift site add` for the same site creates it again.
+
 To inspect or change the helper's default proxy:
 
 ```sh

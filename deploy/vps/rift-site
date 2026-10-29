@@ -835,7 +835,14 @@ def command_add(agent, host, port, proxy):
         if compose_notice:
             print(compose_notice)
     existing = state["sites"].get(host)
-    if existing and int(existing["target"]) == target and existing.get("agent") == agent and existing.get("proxy") == chosen:
+    # A forward removed by hand (rift forwards remove) must be created again, not trusted.
+    if (
+        existing
+        and int(existing["target"]) == target
+        and existing.get("agent") == agent
+        and existing.get("proxy") == chosen
+        and site_forward_alive(existing, rift(state, "forwards", "list") or [])
+    ):
         listen = int(existing["listen"])
         forward_id = existing.get("forward_id")
     else:
@@ -911,6 +918,37 @@ def command_rm(host):
         print(f"proxy reload: {error}", file=sys.stderr)
 
 
+def site_forward_alive(site, forwards):
+    forward_id = site.get("forward_id")
+    return forward_id is not None and any(f.get("id") == forward_id for f in forwards)
+
+
+def command_list():
+    state = load_state()
+    sites = (state or {}).get("sites") or {}
+    if not sites:
+        print("No sites.")
+        return
+    try:
+        forwards = rift(state, "forwards", "list") or []
+    except SiteError:
+        forwards = None
+    rows = [("HOST", "AGENT", "TARGET", "LISTEN", "PROXY", "FORWARD")]
+    for host, site in sorted(sites.items()):
+        if forwards is None:
+            status = "unknown"
+        else:
+            status = "ok" if site_forward_alive(site, forwards) else "missing"
+        rows.append(
+            (host, site["agent"], str(site["target"]), str(site["listen"]), site["proxy"], status)
+        )
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    for row in rows:
+        print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
+    if any(row[5] == "missing" for row in rows[1:]):
+        print("A missing forward is created again by 'rift site add AGENT HOST PORT'.")
+
+
 def command_proxy(name):
     state = load_state() or default_state("")
     if not name:
@@ -929,6 +967,7 @@ def usage():
     return (
         "usage: rift-site add AGENT HOST PORT [--proxy traefik|caddy|nginx|npm]\n"
         "       rift-site remove HOST\n"
+        "       rift-site list\n"
         "       rift-site proxy [traefik|caddy|nginx|npm]"
     )
 
@@ -950,6 +989,9 @@ def main(argv):
         return
     if command in ("remove", "rm") and len(argv) == 3:
         command_rm(argv[2])
+        return
+    if command == "list" and len(argv) == 2:
+        command_list()
         return
     if command == "proxy" and len(argv) in (2, 3):
         command_proxy(argv[2] if len(argv) == 3 else None)

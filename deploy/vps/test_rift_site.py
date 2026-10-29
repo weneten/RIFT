@@ -278,6 +278,12 @@ class FileProviderTests(unittest.TestCase):
             rift_site.run = original
         self.assertEqual(state["traefik"]["dynamic_dir"], "/home/ubuntu/service/dynamic")
 
+    def test_a_site_forward_removed_by_hand_is_not_trusted(self):
+        site = {"forward_id": 2}
+        self.assertTrue(rift_site.site_forward_alive(site, [{"id": 1}, {"id": 2}]))
+        self.assertFalse(rift_site.site_forward_alive(site, [{"id": 1}]))
+        self.assertFalse(rift_site.site_forward_alive({}, [{"id": 1}]))
+
     def test_detects_an_existing_file_provider(self):
         self.assertTrue(rift_site.has_file_provider({"args": ["--providers.file.filename=/x.yml"]}))
         self.assertFalse(rift_site.has_file_provider({"args": ["--providers.docker=true"]}))
