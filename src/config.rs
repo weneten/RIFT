@@ -116,6 +116,22 @@ impl Config {
                 config.enrollment_enabled = v.parse()?;
             }
         }
+        macro_rules! env_parse {
+            ($key:literal,$field:ident) => {
+                if let Ok(v) = std::env::var($key) {
+                    if !v.trim().is_empty() {
+                        config.$field = v
+                            .trim()
+                            .parse()
+                            .with_context(|| format!("invalid {}", $key))?;
+                    }
+                }
+            };
+        }
+        env_parse!("RIFT_IPV4_POOL", ipv4_pool);
+        env_parse!("RIFT_IPV6_POOL", ipv6_pool);
+        env_parse!("RIFT_SERVER_IPV4", server_ipv4);
+        env_parse!("RIFT_SERVER_IPV6", server_ipv6);
         if let Ok(v) = std::env::var("RIFT_HOST_FIREWALL") {
             if !v.is_empty() {
                 config.host_firewall = match v.to_ascii_lowercase().as_str() {

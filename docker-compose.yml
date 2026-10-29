@@ -33,6 +33,10 @@ services:
       RIFT_PUBLIC_IPS: ${RIFT_PUBLIC_IPS:-}
       RIFT_ENROLLMENT_BIND: ${RIFT_ENROLLMENT_BIND:-0.0.0.0:8443}
       RIFT_ENROLLMENT_ENABLED: ${RIFT_ENROLLMENT_ENABLED:-true}
+      RIFT_IPV4_POOL: ${RIFT_IPV4_POOL:-}
+      RIFT_IPV6_POOL: ${RIFT_IPV6_POOL:-}
+      RIFT_SERVER_IPV4: ${RIFT_SERVER_IPV4:-}
+      RIFT_SERVER_IPV6: ${RIFT_SERVER_IPV6:-}
     command: ["--config", "/etc/rift/config.toml", "server"]
   agent:
     <<: *rift
