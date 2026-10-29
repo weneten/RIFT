@@ -291,9 +291,21 @@ On the **server**, from the checkout, choose the proxy that already owns port 44
 sudo rift site add node1 app.example.net 8081 --proxy traefik
 ```
 
-Alternatively, use `--proxy caddy` or `--proxy nginx` with the corresponding existing proxy. The helper allocates a port in `20000-20999`, creates a local-ingress TCP forward and writes a proxy configuration. The allocated port is for the proxy path and should not be opened publicly. Test `https://app.example.net` from an external client and check the proxy certificate and application response.
+Alternatively, use `--proxy caddy`, `--proxy nginx` or `--proxy npm` (Nginx Proxy Manager) with the corresponding existing proxy. The helper allocates a port in `20000-20999`, creates a local-ingress TCP forward and writes a proxy configuration. The allocated port is for the proxy path and should not be opened publicly. Test `https://app.example.net` from an external client and check the proxy certificate and application response.
 
 Traefik uses its configured certificate resolver. The first add may migrate a recognized single-file Traefik provider to a watched directory and recreate its Compose service; existing Docker-label routes remain. Caddy obtains certificates through its configuration. For Nginx, the helper invokes `certbot --nginx` if available; without it the site is written but TLS is not requested, so configure a certificate separately. HTTP traffic between proxy and agent is carried inside WireGuard.
+
+Nginx Proxy Manager is configured through its API at `http://127.0.0.1:81` (change `npm.url` in `/var/lib/rift-site/sites.json` if needed). Put an NPM admin login in `/etc/rift/npm.env` and restrict it with `chmod 600`:
+
+```sh
+RIFT_NPM_EMAIL=admin@example.net
+RIFT_NPM_PASSWORD=...
+# Optional: with this set, a Let's Encrypt certificate is requested and HTTPS is forced.
+# Setting it means you accept the Let's Encrypt terms of service.
+RIFT_NPM_LETSENCRYPT_EMAIL=admin@example.net
+```
+
+The same keys also work as environment variables. Without `RIFT_NPM_LETSENCRYPT_EMAIL` the proxy host is created without TLS and you request a certificate in the NPM UI. `rift site remove` deletes the proxy host again but keeps its certificate.
 
 To remove a site and its forward:
 

@@ -93,6 +93,39 @@ class EdgeTests(unittest.TestCase):
         self.assertEqual(rift_site.listeners_from_ss(text), ["docker-proxy", "docker-proxy"])
 
 
+class NpmTests(unittest.TestCase):
+    def test_nginx_proxy_manager_is_not_mistaken_for_plain_nginx(self):
+        npm = [
+            {
+                "name": "nginx-proxy-manager-app-1",
+                "image": "jc21/nginx-proxy-manager:latest",
+                "ports": "0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp, 0.0.0.0:81->81/tcp",
+            }
+        ]
+        self.assertEqual(rift_site.edge_holders(npm, ["docker-proxy"]), ["npm"])
+        rift_site.require_edge("npm", npm, ["docker-proxy"])
+        with self.assertRaises(rift_site.SiteError):
+            rift_site.require_edge("nginx", npm, ["docker-proxy"])
+        self.assertEqual(rift_site.proxy_kind("npm", "jc21/nginx-proxy-manager"), "npm")
+        self.assertEqual(rift_site.proxy_kind("web", "nginx:alpine"), "nginx")
+
+    def test_proxy_host_points_at_the_local_forward(self):
+        payload = rift_site.npm_host_payload("app.example.net", "203.0.113.10", 20000, 0)
+        self.assertEqual(payload["domain_names"], ["app.example.net"])
+        self.assertEqual(payload["forward_host"], "203.0.113.10")
+        self.assertEqual(payload["forward_port"], 20000)
+        self.assertFalse(payload["ssl_forced"])
+        secured = rift_site.npm_host_payload("app.example.net", "203.0.113.10", 20000, 7)
+        self.assertEqual(secured["certificate_id"], 7)
+        self.assertTrue(secured["ssl_forced"])
+
+    def test_env_file_parsing(self):
+        values = rift_site.parse_env_file(
+            '# c\nRIFT_NPM_EMAIL="a@example.net"\nRIFT_NPM_PASSWORD=pw=1\n\nbad\n'
+        )
+        self.assertEqual(values, {"RIFT_NPM_EMAIL": "a@example.net", "RIFT_NPM_PASSWORD": "pw=1"})
+
+
 class ComposeTests(unittest.TestCase):
     def test_single_file_provider_becomes_a_watched_directory(self):
         original = """services:
