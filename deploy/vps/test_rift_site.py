@@ -175,6 +175,63 @@ class NpmTests(unittest.TestCase):
         self.assertEqual(values, {"RIFT_NPM_EMAIL": "a@example.net", "RIFT_NPM_PASSWORD": "pw=1"})
 
 
+LABEL_ONLY_COMPOSE = """services:
+  traefik:
+    image: traefik:v3
+    container_name: traefik
+    command:
+      - "--providers.docker=true"
+      # comment between items
+      - "--certificatesresolvers.myresolver.acme.email=${ACME_EMAIL}" # via .env
+      - "--log.level=DEBUG"
+    ports:
+      - "80:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/acme.json:/acme.json
+    restart: unless-stopped
+
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy
+    command:
+      - "--other"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+"""
+
+
+class FileProviderTests(unittest.TestCase):
+    def test_label_only_traefik_gets_a_watched_file_provider(self):
+        text, changed = rift_site.add_file_provider(
+            LABEL_ONLY_COMPOSE, "traefik", "/home/ubuntu/service/dynamic"
+        )
+        self.assertTrue(changed)
+        self.assertIn(
+            '      - "--log.level=DEBUG"\n'
+            '      - "--providers.file.directory=/dynamic"\n'
+            '      - "--providers.file.watch=true"\n',
+            text,
+        )
+        self.assertIn(
+            "      - ./traefik/acme.json:/acme.json\n"
+            "      - /home/ubuntu/service/dynamic:/dynamic:ro\n",
+            text,
+        )
+        self.assertIn("${ACME_EMAIL}", text)
+        # The neighbouring service stays untouched.
+        self.assertEqual(text.count("/dynamic"), 3)
+        self.assertEqual(text.split("docker-proxy:")[1], LABEL_ONLY_COMPOSE.split("docker-proxy:")[1])
+
+    def test_unknown_service_or_missing_lists_change_nothing(self):
+        self.assertEqual(rift_site.add_file_provider(LABEL_ONLY_COMPOSE, "nope", "/d"), (LABEL_ONLY_COMPOSE, False))
+        no_volumes = "services:\n  traefik:\n    command:\n      - \"--x\"\n"
+        self.assertEqual(rift_site.add_file_provider(no_volumes, "traefik", "/d"), (no_volumes, False))
+
+    def test_detects_an_existing_file_provider(self):
+        self.assertTrue(rift_site.has_file_provider({"args": ["--providers.file.filename=/x.yml"]}))
+        self.assertFalse(rift_site.has_file_provider({"args": ["--providers.docker=true"]}))
+
+
 class ComposeTests(unittest.TestCase):
     def test_single_file_provider_becomes_a_watched_directory(self):
         original = """services:
