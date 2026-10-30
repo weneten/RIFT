@@ -98,7 +98,7 @@ Wait for `RIFT server ready`, then leave the log view with Ctrl+C. On the **serv
 sudo sh deploy/vps/install-cli
 ```
 
-This installs `/usr/local/bin/rift` and the site helper under `/usr/local/lib/rift`. It replaces any existing files at those paths. The command runs on the server and forwards administrative arguments to the `rift-server` Docker container; it requires Docker access (use `sudo rift ...` if your user cannot access Docker). `sudo rift site ...` runs the host-side proxy helper and requires Python 3 and administrator access. Ensure `/usr/local/bin` is in your PATH, including sudo's PATH. The original `docker exec rift-server rift --config /etc/rift/config.toml ...` remains available.
+This installs `/usr/local/bin/rift` and the site helper under `/usr/local/lib/rift`. It replaces any existing files at those paths. The command runs on the server and forwards administrative arguments to the `rift-server` Docker container; it requires Docker access (use `sudo rift ...` if your user cannot access Docker). `sudo rift add site ...` and the other site commands run the host-side proxy helper and requires Python 3 and administrator access. Ensure `/usr/local/bin` is in your PATH, including sudo's PATH. The original `docker exec rift-server rift --config /etc/rift/config.toml ...` remains available.
 
 Check the server with:
 
@@ -113,7 +113,7 @@ By default RIFT creates its own enrollment CA and certificate in the persistent 
 On the **server**, create a short-lived, single-use invitation. Choose a unique name for each agent:
 
 ```sh
-rift agents add node1 --ttl 15m
+rift add agent node1 --ttl 15m
 ```
 
 The output contains `RIFT_SERVER`, `RIFT_AGENT_NAME` and `RIFT_ENROLLMENT_TOKEN`. Treat the token as a secret and transfer all three lines securely to the agent.
@@ -139,7 +139,7 @@ docker logs -f rift-agent
 On the **server**, verify that the agent becomes `active`:
 
 ```sh
-rift agents list
+rift list agents
 rift status
 ```
 
@@ -158,8 +158,8 @@ The secure default for subnets is deliberate: until you list a network, no devic
 
 The agent reports both lists to the server with every sync, so the server knows them too:
 
-- `rift forwards add` and `rift vpn allow` (and the web panel) still add an entry outside the limits but warn at once, for example `forward 1 was added, but agent core will refuse it: the agent allows only ports 3001,1337,8090 (RIFT_AGENT_ALLOW_PORTS); add 8081/tcp`.
-- `rift forwards list` shows such a forward as `refused`, `rift status` names the reason, and `rift vpn peer list` marks refused grants. The server does not publish a refused forward, so no public port opens without a service behind it; other forwards are unaffected. Once you allow the port on the agent, the forward becomes active on the next sync.
+- `rift add forward` and `rift vpn allow` (and the web panel) still add an entry outside the limits but warn at once, for example `forward 1 was added, but agent core will refuse it: the agent allows only ports 3001,1337,8090 (RIFT_AGENT_ALLOW_PORTS); add 8081/tcp`.
+- `rift list forwards` shows such a forward as `refused`, `rift status` names the reason, and `rift list devices` marks refused grants. The server does not publish a refused forward, so no public port opens without a service behind it; other forwards are unaffected. Once you allow the port on the agent, the forward becomes active on the next sync.
 
 The agent still enforces its lists itself, whatever the server sends; the server's view only serves the warnings.
 
@@ -184,7 +184,7 @@ Protocols that negotiate additional ports or embed addresses, such as FTP in som
 
 Run administrative commands on the **server**. The following examples use `node1`. Replace ports with those used by your services. A forward listens on the server's first IPv4 address in `RIFT_PUBLIC_IPS`. With an IPv6 address there too, a short-form spec can end in `/v6` (IPv6 only) or `/all` (IPv4 and IPv6, one forward each); `/v4` is the default and may be written out.
 
-`forwards add` also has a short form: `rift forwards add AGENT SPEC...`, where each `SPEC` is `LISTEN[:TARGET]/tcp`, `/udp` or `/both`, optionally followed by `/v4`, `/v6` or `/all` for the server address. The protocol is always required; `both` creates a TCP and a UDP forward. The target defaults to the listen port. Ranges such as `5000-5002/udp` work. For example, `rift forwards add node1 53/both 8080:80/tcp/all` creates TCP and UDP 53 on IPv4 plus 8080 → 80 on IPv4 and IPv6. Options such as `--ingress` and `--mode` still apply to every forward of the command.
+`add forward` also has a short form: `rift add forward AGENT SPEC...`, where each `SPEC` is `LISTEN[:TARGET]/tcp`, `/udp` or `/both`, optionally followed by `/v4`, `/v6` or `/all` for the server address. The protocol is always required; `both` creates a TCP and a UDP forward. The target defaults to the listen port. Ranges such as `5000-5002/udp` work. For example, `rift add forward node1 53/both 8080:80/tcp/all` creates TCP and UDP 53 on IPv4 plus 8080 → 80 on IPv4 and IPv6. Options such as `--ingress` and `--mode` still apply to every forward of the command.
 
 Every forward is transparent unless you add `--mode translate`: the service sees the client's real address. For an IPv6 listener the service must therefore accept IPv6 on the agent's tunnel address (listen on `::`; Docker-published ports usually do). If it only listens on IPv4, add `--mode translate`; that runs in userspace and the service sees the server's tunnel address instead of the client's. The server logs the original address, but tools on the agent that block by source address, such as Fail2ban or CrowdSec, can then no longer tell clients apart and would block the server for everyone. Use translation only where that does not matter.
 
@@ -195,7 +195,7 @@ The short form cannot be mixed with `--agent`, `--listen`, `--target` or `--prot
 Publish an SSH service listening on the agent's port 22 as server port 2222:
 
 ```sh
-rift forwards add \
+rift add forward \
   --agent node1 --listen 2222 --target 22 --protocol tcp
 ```
 
@@ -206,7 +206,7 @@ Allow TCP 2222 in the relevant upstream firewall. From a separate client, test `
 Publish a UDP service on agent port 27015 as server port 27015:
 
 ```sh
-rift forwards add \
+rift add forward \
   --agent node1 --listen 27015 --target 27015 --protocol udp
 ```
 
@@ -217,9 +217,9 @@ Allow UDP 27015 upstream and test with the application's own client. UDP and TCP
 If a DNS server on the agent is configured to listen on port 53 for both transports, publish both using two independent grants:
 
 ```sh
-rift forwards add \
+rift add forward \
   --agent node1 --listen 53 --target 53 --protocol udp
-rift forwards add \
+rift add forward \
   --agent node1 --listen 53 --target 53 --protocol tcp
 ```
 
@@ -230,14 +230,14 @@ Allow both TCP and UDP 53 in the upstream firewall and use a DNS client to test 
 Ranges use `start-end`; both ranges must have the same length and contain at most 4096 ports. Corresponding ports map in order:
 
 ```sh
-rift forwards add \
+rift add forward \
   --agent node1 --listen 30000-30002 --target 40000-40002 --protocol udp
 ```
 
 `--listen-ip ADDRESS` picks one specific configured address instead of `/v4`, `/v6` or `/all`; it is only needed with several addresses of the same family. The default ingress is `public`; the mode is transparent unless `--mode translate` is given (see above). Check the created ID and apply status:
 
 ```sh
-rift forwards list
+rift list forwards
 rift status
 ```
 
@@ -248,7 +248,7 @@ A grant may remain pending while the agent applies it. Test from a separate clie
 Translation bridges different listener and target families. It must be requested explicitly. For example, an IPv4 listener forwarding to the agent's IPv6 tunnel address:
 
 ```sh
-rift forwards add \
+rift add forward \
   --agent node1 --listen-ip 203.0.113.10 --listen 8080 --target 8080 \
   --protocol tcp --mode translate --target-family v6
 ```
@@ -257,7 +257,7 @@ Replace the listener with your configured IPv4 address and ensure the applicatio
 
 ### Agent at home with IPv6 only
 
-An agent whose Internet connection has no public IPv4 address (for example DS-Lite or an IPv6-only fibre line) still works, and its services become reachable over IPv4 through the server. The tunnel itself carries IPv4 and IPv6 regardless of the home connection, so a normal forward such as `rift forwards add node1 8080:80/tcp` publishes the service on the server's IPv4 address. Requirements:
+An agent whose Internet connection has no public IPv4 address (for example DS-Lite or an IPv6-only fibre line) still works, and its services become reachable over IPv4 through the server. The tunnel itself carries IPv4 and IPv6 regardless of the home connection, so a normal forward such as `rift add forward node1 8080:80/tcp` publishes the service on the server's IPv4 address. Requirements:
 
 - the server has IPv6, and `RIFT_PUBLIC_ENDPOINT` has an AAAA record (agents dial that name; an A record alone is not enough);
 - UDP 51820 and TCP 8443 are allowed over IPv6 in the cloud firewall too (the enrollment port listens on IPv6 whenever `RIFT_ENROLLMENT_BIND` is `0.0.0.0:…`, the default; RIFT opens both in UFW);
@@ -267,7 +267,7 @@ An agent whose Internet connection has no public IPv4 address (for example DS-Li
 
 ## Publish websites with HTTPS
 
-RIFT forwards ports; a reverse proxy provides hostname routing and HTTPS. The installed `rift site` command uses the repository’s `deploy/vps/rift-site` helper to configure an **existing** Traefik, Caddy or Nginx proxy. The directory name is historical: the server can run on any suitable Linux host.
+RIFT forwards ports; a reverse proxy provides hostname routing and HTTPS. The installed `rift add site`, `rift remove site` and `rift list sites` commands use the repository’s `deploy/vps/rift-site` helper to configure an **existing** Traefik, Caddy or Nginx proxy. The directory name is historical: the server can run on any suitable Linux host.
 
 ### Example: a new Caddy proxy in Docker
 
@@ -276,7 +276,7 @@ This example starts a separate Caddy container on the server and uses a manually
 First create the forward on the **server**:
 
 ```sh
-rift forwards add \
+rift add forward \
   --agent node1 --listen 20000 --target 8081 --protocol tcp --ingress local
 ```
 
@@ -311,7 +311,7 @@ docker compose -f caddy/compose.yml logs -f
 
 Replace `203.0.113.10` in the Caddyfile with the same actual interface address used by the forward. Caddy's Docker bridge traffic must enter the host through a non-public interface so the local-ingress rule can match it. Confirm this path and any host firewall rules on your system. After Caddy obtains its certificate, test `https://app.example.net` externally. For another site, create another local-ingress forward on a different unused port and add another domain block to the Caddyfile; restart the Caddy Compose service after editing it. Keep Caddy's data volume for certificate persistence. To remove a site, remove its block, restart Caddy, then remove the corresponding forward by ID.
 
-### Using the `rift site` helper
+### Using the site commands
 
 ### Prepare the website and proxy
 
@@ -327,7 +327,7 @@ The helper assumes particular proxy layouts: Traefik uses a watched file provide
 On the **server**, from the checkout, choose the proxy that already owns port 443:
 
 ```sh
-sudo rift site add node1 app.example.net 8081 --proxy traefik
+sudo rift add site node1 app.example.net 8081 --proxy traefik
 ```
 
 Alternatively, use `--proxy caddy`, `--proxy nginx` or `--proxy npm` (Nginx Proxy Manager) with the corresponding existing proxy. The helper allocates a port in `20000-20999`, creates a local-ingress TCP forward and writes a proxy configuration. The allocated port is for the proxy path and should not be opened publicly. Test `https://app.example.net` from an external client and check the proxy certificate and application response.
@@ -343,50 +343,52 @@ RIFT_NPM_PASSWORD=...
 RIFT_LETSENCRYPT_EMAIL=admin@example.net
 ```
 
-The helper reads these values from the running server container, which Compose fills from `.env`; they are visible to root through `docker inspect`. They also work as environment variables of the `rift site` call or in `/etc/rift/site.env`. With `RIFT_REQUEST_CERTIFICATE=false` the proxy host is created without TLS and you request a certificate in the NPM UI. `rift site remove` deletes the proxy host again, and its certificate too when that was issued for this domain alone and no other host, redirection, 404 host or stream uses it; shared and wildcard certificates are kept.
+The helper reads these values from the running server container, which Compose fills from `.env`; they are visible to root through `docker inspect`. They also work as environment variables of the site command or in `/etc/rift/site.env`. With `RIFT_REQUEST_CERTIFICATE=false` the proxy host is created without TLS and you request a certificate in the NPM UI. `rift remove site` deletes the proxy host again, and its certificate too when that was issued for this domain alone and no other host, redirection, 404 host or stream uses it; shared and wildcard certificates are kept.
 
 To remove a site and its forward:
 
 ```sh
-sudo rift site remove app.example.net
+sudo rift remove site app.example.net
 ```
 
-`sudo rift site list` shows the sites the helper manages with their forward ID and whether that forward still exists. On the server, `rift forwards list` (the installed CLI) adds a SITE column with the domain and proxy of each forward that `rift site` created; `rift --json forwards list` and the command inside the container are unchanged. Manage these forwards only through `rift site`: if you delete one with `rift forwards remove`, `list` shows it as `missing` and running `rift site add` for the same site creates it again.
+The helper remembers which RIFT installation its site records belong to. After a fresh installation (for example `docker compose down -v`), the next site command removes the old records and their proxy configuration and says so, so no domain keeps pointing at a dead port.
+
+`sudo rift list sites` shows the sites the helper manages with their forward ID and whether that forward still exists. On the server, `rift list forwards` (the installed CLI) adds a SITE column with the domain and proxy of each forward that `rift add site` created; `rift --json list forwards` and the command inside the container are unchanged. Manage these forwards only through the site commands: if you delete one with `rift remove forward`, `list` shows it as `missing` and running `rift add site` for the same site creates it again.
 
 To inspect or change the helper's default proxy:
 
 ```sh
-sudo rift site proxy
-sudo rift site proxy caddy
+sudo rift proxy
+sudo rift proxy caddy
 ```
 
 For a custom reverse proxy, create a transparent TCP forward with `--ingress local` and configure the proxy to connect to the server address and allocated port via an appropriate incoming interface. Local ingress excludes packets arriving on a NIC that owns a configured public address; it is not a general-purpose loopback listener. See [architecture](docs/architecture.md#transparent-packet-path).
 
 ## Manage agents and forwards
 
-All commands in this section run on the server. IDs are returned by `forwards list` and `forwards add`; replace `1` with the actual ID.
+All commands in this section run on the server. IDs are returned by `rift list forwards` and `rift add forward`; replace `1` with the actual ID.
 
 ```sh
 # Inspect agents and their state
-rift agents list
-rift agents show node1
+rift list agents
+rift show agent node1
 
 # Temporarily disable or re-enable an agent
-rift agents disable node1
-rift agents enable node1
+rift disable agent node1
+rift enable agent node1
 
 # Remove an agent, or cancel a pending invitation
-rift agents remove node1
-rift agents cancel-invite node1
+rift remove agent node1
+rift remove invite node1
 
 # Inspect, disable, enable or remove a forward
-rift forwards list
-rift forwards disable --id 1
-rift forwards enable --id 1
-rift forwards remove --id 1
+rift list forwards
+rift disable forward 1
+rift enable forward 1
+rift remove forward 1
 ```
 
-`agents rename` and `agents rotate` are also available; inspect `rift agents --help` and the relevant subcommand's help before using them. For translated forwards, `bans add --agent NAME --forward-id ID --ip ADDRESS --ttl 1h` blocks an original client address temporarily; `bans list` shows bans. Bans expire by TTL; there is no explicit remove command. Use `--json` for machine-readable administrative output and `rift --help` for the full CLI.
+`rift rename agent OLD NEW` and `rift rotate agent NAME` are also available; `rift --help` lists every command. For translated forwards, `rift add ban AGENT FORWARD_ID ADDRESS --ttl 1h` blocks an original client address temporarily; `rift list bans` shows bans. Bans expire by TTL; there is no explicit remove command. Use `--json` for machine-readable administrative output and `rift --help` for the full CLI.
 
 Forwards are shown as a compact table, including the ID used for removal, agent, listener, target port, ingress and state. Agent names are resolved when available; an ID is shown if they cannot be retrieved. For example:
 
@@ -395,7 +397,7 @@ ID  AGENT  PROTO  LISTEN                  TARGET  FAMILY  INGRESS  MODE         
 5   node1  TCP    203.0.113.10:25001     5201    v4      local    transparent  enabled
 ```
 
-Normal commands print concise status and confirmations. Use `rift --json status`, `rift --json forwards list`, or `rift --json doctor` for complete machine-readable data. The `--json` format is also used by the site helper and integration tools.
+Normal commands print concise status and confirmations. Use `rift --json status`, `rift --json list forwards`, or `rift --json doctor` for complete machine-readable data. The `--json` format is also used by the site helper and integration tools.
 
 ## Private VPN access
 
@@ -409,7 +411,7 @@ phone ── WireGuard ──> RIFT server ── existing tunnel ──> RIFT a
 Everything is denied until you allow it. A device reaches only what a grant names, and devices cannot reach each other or the server itself. Run on the **server**:
 
 ```sh
-rift vpn peer add iphone                       # key pair + address from the VPN pool
+rift add device iphone                       # key pair + address from the VPN pool
 rift vpn allow iphone home server             # the home server itself
 rift vpn config qr iphone                      # scan in the WireGuard app
 rift vpn config export iphone > iphone.conf    # or export a file (contains the private key)
@@ -426,7 +428,7 @@ rift vpn config export iphone > iphone.conf    # or export a file (contains the 
 
 The long options `--agent`, `--server`, `--full`, `--port` and `--subnet` still work.
 
-Manage devices with `rift vpn peer list`, `peer disable NAME` / `peer enable NAME` (reversible) and `peer revoke NAME` (deletes the device, its key and its grants). `rift vpn deny NAME AGENT [TARGET...]` withdraws grants; without selectors it withdraws everything on that agent. Revocation and denial close the path on the server in the same reconcile pass; the agent follows on its next sync.
+Manage devices with `rift list devices`, `rift disable device NAME` / `rift enable device NAME` (reversible) and `rift remove device NAME` (deletes the device, its key and its grants). `rift vpn deny NAME AGENT [TARGET...]` withdraws grants; without selectors it withdraws everything on that agent. Revocation and denial close the path on the server in the same reconcile pass; the agent follows on its next sync.
 
 Client configurations are split-tunnel: `AllowedIPs` lists only the granted addresses, never `0.0.0.0/0`. Exported files and QR codes contain the device's private key, which stays in a mode-0600 file under the state volume and is never logged.
 
@@ -480,7 +482,7 @@ Once it is on, the login form has a code field, and a wrong password and a wrong
 - a connection from loopback without proxy headers: on the server itself or through an SSH tunnel, or
 - a VPN device with panel access (`rift panel connect`, `rift panel allow`).
 
-Everything else is read-only: public addresses, `RIFT_WEBPANEL_ALLOW` entries and any request carrying `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto` or `X-Real-IP`. That last rule exists because a reverse proxy on the same host also connects from loopback. A proxy that strips or never sends these headers would make its clients look local, so do not put such a proxy in front of the panel. `RIFT_WEBPANEL_CONTROL=off` makes the panel read-only for everyone; there is deliberately no setting that allows changes over the public path. A trusted device plus the password is administrator access to your network: it can publish ports, invite agents and create VPN devices. If such a device is lost, revoke it with `rift vpn peer revoke NAME` and change the password.
+Everything else is read-only: public addresses, `RIFT_WEBPANEL_ALLOW` entries and any request carrying `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto` or `X-Real-IP`. That last rule exists because a reverse proxy on the same host also connects from loopback. A proxy that strips or never sends these headers would make its clients look local, so do not put such a proxy in front of the panel. `RIFT_WEBPANEL_CONTROL=off` makes the panel read-only for everyone; there is deliberately no setting that allows changes over the public path. A trusted device plus the password is administrator access to your network: it can publish ports, invite agents and create VPN devices. If such a device is lost, remove it with `rift remove device NAME` and change the password.
 
 **Private mode from your own computer.** Either use an SSH tunnel and open `http://127.0.0.1:8090`:
 
@@ -495,7 +497,7 @@ rift panel connect laptop            # creates the VPN device if needed, grants 
 rift panel connect laptop --export > laptop.conf   # the same as a file (contains the private key)
 ```
 
-Import the configuration into the WireGuard app, connect, and open `http://10.13.0.1:8090` (the server's `RIFT_SERVER_IPV4`). The device reaches only that port on the server; its configuration routes only the server's tunnel address, plus whatever `rift vpn allow` grants it on agents. `rift panel allow NAME` grants an existing VPN device; re-import its configuration afterwards so it routes the server address. `rift panel deny NAME` withdraws panel access and keeps the device's other grants. Disabling or revoking the device in `rift vpn peer` also ends its panel access.
+Import the configuration into the WireGuard app, connect, and open `http://10.13.0.1:8090` (the server's `RIFT_SERVER_IPV4`). The device reaches only that port on the server; its configuration routes only the server's tunnel address, plus whatever `rift vpn allow` grants it on agents. `rift panel allow NAME` grants an existing VPN device; re-import its configuration afterwards so it routes the server address. `rift panel deny NAME` withdraws panel access and keeps the device's other grants. Disabling or removing the device also ends its panel access.
 
 **Public mode** opens the port in UFW when RIFT manages it (`host_firewall = "auto"`); open it in any upstream firewall or cloud security group yourself. The panel speaks plain HTTP. In public mode the password and session cookie cross the network unencrypted, so prefer private mode, restrict `RIFT_WEBPANEL_ALLOW`, or put a TLS reverse proxy in front (the cookie is marked `Secure` when the proxy sends `X-Forwarded-Proto: https`). Public sessions are read-only, so a password read off the network alone allows no changes; it still shows your agents, ports and devices.
 
@@ -508,7 +510,7 @@ The panel port (default 8090, `RIFT_WEBPANEL_PORT`) must differ from the control
 | Setting | Default / role | Purpose |
 | --- | --- | --- |
 | `RIFT_PUBLIC_ENDPOINT` | Server | Reachable DNS name or IP, without port; enrollment certificate identity. |
-| `RIFT_PUBLIC_IPS` | Server | Comma-separated addresses assigned to server interfaces for listeners; forwards use the first IPv4 (`/v6`, `/all` for IPv6), `rift site` the first IPv4. |
+| `RIFT_PUBLIC_IPS` | Server | Comma-separated addresses assigned to server interfaces for listeners; forwards use the first IPv4 (`/v6`, `/all` for IPv6), `rift add site` the first IPv4. |
 | `RIFT_ENROLLMENT_BIND` | `0.0.0.0:8443` | Enrollment listener. |
 | `RIFT_ENROLLMENT` | `auto` | `auto`: listen on the enrollment port only while an invitation is open; `always`: always; `off`: no enrollment. |
 | `RIFT_ALLOW_PRIVATE_LISTENERS` | `false` | Server. Set `true` behind a cloud NAT (e.g. Oracle Cloud), where the public address is not assigned to the interface: put the private interface address in `RIFT_PUBLIC_IPS`, keep the public DNS name in `RIFT_PUBLIC_ENDPOINT`, and open the ports in the cloud's firewall. Allows private and ULA listener addresses; loopback, link-local, multicast and unspecified stay forbidden, as does an address inside a tunnel pool. |
@@ -587,7 +589,7 @@ docker compose down
 sudo sh deploy/uninstall-host
 ```
 
-The state volume (CA, keys, agents, forwards) is kept so a later install can reconnect. Add `--purge` to delete the volume and the image as well. The live forwarding sysctls, `.env`, `config.toml` and proxy configuration written by `rift site` are not touched; the script prints what remains.
+The state volume (CA, keys, agents, forwards) and the site records are kept so a later install can reconnect. Add `--purge` to delete the volume and the image as well; it also removes the proxy configuration written by `rift add site` and the helper's state in `/var/lib/rift-site` (a Nginx Proxy Manager host has to be deleted in its interface). The live forwarding sysctls, `.env` and `config.toml` are not touched; the script prints what remains.
 
 ## Build and development
 

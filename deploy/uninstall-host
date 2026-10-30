@@ -3,10 +3,12 @@
 #
 #   docker compose down            # add -v to also drop the state volume
 #   sudo sh deploy/uninstall-host  # CLI, site helper, sysctl file, leftovers
-#   sudo sh deploy/uninstall-host --purge   # additionally state volume and image
+#   sudo sh deploy/uninstall-host --purge   # additionally state volume, image and sites
 #
 # Safe to run again. Without --purge the state volume (CA, keys, agents,
-# forwards) is kept so a later install can reconnect.
+# forwards) and the site records are kept so a later install can reconnect.
+# --purge also removes the proxy configuration written by 'rift add site' and
+# the helper's state in /var/lib/rift-site.
 set -eu
 
 purge=0
@@ -14,7 +16,7 @@ for arg in "$@"; do
   case "$arg" in
     --purge) purge=1 ;;
     -h | --help)
-      sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -55,6 +57,12 @@ if ip link show "$interface" > /dev/null 2>&1; then
   ip link del "$interface" && echo "rift: removed interface $interface"
 fi
 
+# The site helper's proxy files and state go first, while the helper still exists.
+# It does not need the RIFT container for this.
+if [ "$purge" -eq 1 ] && [ -x /usr/local/lib/rift/rift-site ]; then
+  /usr/local/lib/rift/rift-site purge || echo "rift: could not purge the site helper's state" >&2
+fi
+
 # Host files installed by deploy/prepare-host and deploy/vps/install-cli.
 for f in /usr/local/bin/rift /usr/local/lib/rift/rift-site /etc/sysctl.d/99-rift.conf; do
   if [ -e "$f" ]; then
@@ -82,7 +90,8 @@ Not reverted on purpose, because other services may depend on them:
     with sysctl -w)
   - UFW rules and chain jumps tagged "rift:" (normally removed on shutdown;
     check 'sudo ufw status' or 'nft list ruleset | grep rift')
-  - .env, config.toml and proxy configs written by 'rift site'
+  - .env and config.toml; without --purge also the site records and proxy
+    configs written by 'rift add site', and any Nginx Proxy Manager hosts
 EOF
 if [ "$purge" -eq 0 ]; then
   echo "State volume kept. Use --purge (or docker compose down -v) to delete it."

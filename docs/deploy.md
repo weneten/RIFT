@@ -18,17 +18,17 @@ The image provides a Docker healthcheck for both server and agent, so monitoring
 
 ## Publish a home service with a name
 
-The installed `rift site` helper (`deploy/vps/rift-site`) runs on the VPS host, outside the read-only RIFT container. It stores its state in `/var/lib/rift-site/sites.json`. One command allocates a listen port in `20000-20999`, adds a transparent `--ingress local` forward, and writes a site file for Traefik, Caddy, or Nginx, or creates a proxy host through the Nginx Proxy Manager API.
+The installed site commands (`rift add site`, `rift remove site`, `rift list sites`) use the helper `deploy/vps/rift-site`, which runs on the VPS host, outside the read-only RIFT container. It stores its state in `/var/lib/rift-site/sites.json`. One command allocates a listen port in `20000-20999`, adds a transparent `--ingress local` forward, and writes a site file for Traefik, Caddy, or Nginx, or creates a proxy host through the Nginx Proxy Manager API.
 
 ```sh
-sudo rift site add node1 app.example 8081 --proxy traefik
-sudo rift site add node1 app.example 8081 --proxy caddy
-sudo rift site add node1 app.example 8081 --proxy nginx
-sudo rift site add node1 app.example 8081 --proxy npm
-sudo rift site remove app.example
+sudo rift add site node1 app.example 8081 --proxy traefik
+sudo rift add site node1 app.example 8081 --proxy caddy
+sudo rift add site node1 app.example 8081 --proxy nginx
+sudo rift add site node1 app.example 8081 --proxy npm
+sudo rift remove site app.example
 ```
 
-Without `--proxy`, the command uses the saved default (`traefik` until `sudo rift site proxy caddy` or `sudo rift site proxy nginx`). The chosen proxy must be the process listening on TCP 443. Otherwise the command exits before it creates a forward and names the proxy that does hold 443. It does not start a second proxy.
+Without `--proxy`, the command uses the saved default (`traefik` until `sudo rift proxy caddy` or `sudo rift proxy nginx`). The chosen proxy must be the process listening on TCP 443. Otherwise the command exits before it creates a forward and names the proxy that does hold 443. It does not start a second proxy.
 
 The home service must listen on the target port for the agent tunnel address, for example `0.0.0.0`. The proxy reaches the service through the VPS public address so prerouting DNAT still applies. Packets from the internet to the allocated high port are not forwarded. Traefik uses the existing certificate resolver. Caddy obtains the certificate itself. Nginx runs `certbot --nginx` when `certbot` is on the host; if it is missing, the site file is still written and the command says that TLS was not requested.
 
@@ -66,7 +66,7 @@ The release gate should include:
 | Policy routing | Marked client traffic selects the RIFT table and WireGuard; unmarked traffic uses the same baseline route and public egress before/after. The WireGuard UDP endpoint remains on the underlay. |
 | Endpoint/NAT change | Change the remote endpoint IPv4 and the translated UDP source port in a NAT namespace; prove handshake and bidirectional traffic recover without changing the VPS default route. |
 | Three agents | Enroll three agents and exercise each agent's independent public TCP/UDP forwards. The current echo response verifies client source preservation, not the selected agent identity, so a dedicated cross-agent isolation assertion remains outstanding. |
-| Coexistence | The namespace harness installs a separate Fail2ban-style nftables table on an agent with exact-client INPUT and FORWARD drops. It checks that the banned client's services fail, the other client and RIFT control state remain available, RIFT policy re-apply leaves the foreign table intact, and deleting the foreign table restores access. Separately, `rift bans add --agent NAME --forward-id ID --ip ADDRESS --ttl DURATION` sends a restricted ban request to the selected agent for an active translated forward; the namespace test checks source isolation and automatic TTL expiry. There is no explicit remove subcommand; expiry is time-based. |
+| Coexistence | The namespace harness installs a separate Fail2ban-style nftables table on an agent with exact-client INPUT and FORWARD drops. It checks that the banned client's services fail, the other client and RIFT control state remain available, RIFT policy re-apply leaves the foreign table intact, and deleting the foreign table restores access. Separately, `rift add ban AGENT FORWARD_ID ADDRESS --ttl DURATION` sends a restricted ban request to the selected agent for an active translated forward; the namespace test checks source isolation and automatic TTL expiry. There is no explicit remove subcommand; expiry is time-based. |
 | Crash/restart | Kill/restart an agent after apply and verify it restores saved forwarding policy; restart the server and verify its admin socket returns while unrelated nftables/IP rule state survives. Forwarding after server restart and startup-interruption rollback remain staging checks. |
 | Enrollment and TLS | The harness rejects wrong-CA TLS and replay of a consumed invitation, and checks generated server private-key file permissions. Expired-token rejection and a plaintext-secret scan are not currently asserted. |
 

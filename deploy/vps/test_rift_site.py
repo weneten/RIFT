@@ -1,8 +1,10 @@
 import importlib.machinery
 import importlib.util
 import json
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).with_name("rift-site")
 loader = importlib.machinery.SourceFileLoader("rift_site", str(SCRIPT))
@@ -322,7 +324,7 @@ class FileProviderTests(unittest.TestCase):
                 rift_site.parse_add_args(bad)
 
     def test_messages_name_the_command_not_the_file(self):
-        self.assertIn("usage: rift site add", rift_site.usage())
+        self.assertIn("usage: rift add site", rift_site.usage())
         self.assertNotIn("rift-site", rift_site.usage())
 
     def test_a_site_forward_removed_by_hand_is_not_trusted(self):
@@ -405,6 +407,67 @@ class ComposeTests(unittest.TestCase):
         self.assertFalse(pending["ready"])
         self.assertEqual(pending["file_source"], "/root/traefik/dynamic_conf.yml")
         self.assertEqual(pending["service"], "traefik")
+
+
+class InstallationTests(unittest.TestCase):
+    def alive(self, forward_id, listen, target):
+        return {"forward_id": forward_id, "listen": listen, "target": target}
+
+    def test_stale_records_follow_the_server_identity(self):
+        sites = {"a.example": self.alive(1, 20000, 80), "b.example": self.alive(2, 20001, 81)}
+        forwards = [
+            {"id": 1, "listen_ports": {"start": 20000, "end": 20000}, "target_ports": {"start": 80}},
+        ]
+        stale = rift_site.stale_hosts
+        # Same installation: nothing changes. Unreadable identity: nothing changes.
+        self.assertEqual(stale("k1", "k1", sites, forwards), [])
+        self.assertEqual(stale("k1", "", sites, forwards), [])
+        # A new identity means a fresh installation: everything goes, even matching forwards.
+        self.assertEqual(stale("k1", "k2", sites, forwards), ["a.example", "b.example"])
+        # No stored identity (older helper): only records without a forward go.
+        self.assertEqual(stale(None, "k2", sites, forwards), ["b.example"])
+
+    def test_sync_removes_old_files_and_stores_the_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "a.example.yml"
+            old.write_text("x")
+            state = {
+                "container": "rift-server",
+                "server_id": "k1",
+                "traefik": {"dynamic_dir": tmp},
+                "sites": {"a.example": {**self.alive(1, 20000, 80), "proxy": "traefik"}},
+            }
+            with mock.patch.object(rift_site, "STATE_PATH", Path(tmp) / "state" / "sites.json"), \
+                    mock.patch.object(rift_site, "read_server_id", return_value="k2"):
+                rift_site.sync_installation(state)
+            self.assertFalse(old.exists())
+            self.assertEqual(state["sites"], {})
+            self.assertEqual(state["server_id"], "k2")
+
+    def test_purge_removes_proxy_files_and_state_without_the_container(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dynamic = Path(tmp) / "dynamic"
+            dynamic.mkdir()
+            (dynamic / "a.example.yml").write_text("x")
+            state_dir = Path(tmp) / "rift-site"
+            state_dir.mkdir()
+            state_path = state_dir / "sites.json"
+            state = {
+                "container": "rift-server",
+                "traefik": {"dynamic_dir": str(dynamic)},
+                "sites": {
+                    "a.example": {**self.alive(1, 20000, 80), "proxy": "traefik"},
+                    "n.example": {**self.alive(2, 20001, 81), "proxy": "npm"},
+                },
+            }
+            state_path.write_text(json.dumps(state))
+            with mock.patch.object(rift_site, "STATE_PATH", state_path), \
+                    mock.patch.object(rift_site.subprocess, "run", side_effect=AssertionError("no processes")) as sp, \
+                    mock.patch.object(rift_site, "run", side_effect=AssertionError("no processes")):
+                rift_site.command_purge()
+                sp.assert_not_called()
+            self.assertFalse((dynamic / "a.example.yml").exists())
+            self.assertFalse(state_dir.exists())
 
 
 if __name__ == "__main__":

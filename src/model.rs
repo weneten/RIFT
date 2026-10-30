@@ -410,7 +410,7 @@ pub enum ListenOn {
     All,
 }
 
-/// One port mapping of a `forwards add`. `on` is `None` when the spec did not name one.
+/// One port mapping of a `add forward`. `on` is `None` when the spec did not name one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ForwardPlan {
     pub listen: PortRange,
@@ -462,7 +462,7 @@ pub fn parse_forward_specs(specs: &[String]) -> anyhow::Result<Vec<ForwardPlan>>
     Ok(plans)
 }
 
-/// Choices of one `forwards add` that apply to all its forwards. `None` means automatic.
+/// Choices of one `add forward` that apply to all its forwards. `None` means automatic.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ForwardOptions {
     /// An explicit server address instead of `/v4`, `/v6` or `/all`.
@@ -474,7 +474,7 @@ pub struct ForwardOptions {
     pub ingress: Ingress,
 }
 
-/// The forwards one `forwards add` creates, validated, with IDs still to be assigned.
+/// The forwards one `add forward` creates, validated, with IDs still to be assigned.
 ///
 /// Without an explicit mode every forward is transparent: it reaches the agent's tunnel
 /// address of the listener's family and the service sees the client's address. `translate`

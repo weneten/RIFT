@@ -240,7 +240,7 @@ fn status(data: &Value) -> String {
                 ("always", true) => format!("Enrollment: {port} always open."),
                 ("auto", true) => format!("Enrollment: {port} open while an invitation is open."),
                 ("auto", false) => {
-                    "Enrollment: closed; opens with the next 'rift agents add'.".into()
+                    "Enrollment: closed; opens with the next 'rift add agent'.".into()
                 }
                 (_, false) => {
                     format!("Enrollment: {port} should be open but is not; see the logs.")
@@ -261,7 +261,7 @@ fn status(data: &Value) -> String {
             lines.push(format!("Open invitations: {}", invites.join(", ")));
         }
         lines.push(format!(
-            "Forwards: {} total. Use 'rift forwards list' for details.",
+            "Forwards: {} total. Use 'rift list forwards' for details.",
             snapshot["forwards"].as_array().map_or(0, Vec::len)
         ));
         lines.push("Use 'rift --json status' for full diagnostics.".into());

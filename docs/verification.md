@@ -38,7 +38,7 @@ The `rift vpn` feature has unit coverage only: rule rendering and ordering, stat
 2. A key that is not registered gets no handshake; a registered device cannot reach another agent, a non-granted port, or a subnet without a grant.
 3. A device with only `--server` cannot reach any LAN host; with `--subnet` it can, with and without `--snat` (and with a static route on the LAN router for the non-NAT case).
 4. Two devices cannot reach each other; a device cannot reach the server's tunnel address or control port.
-5. `peer revoke`, `peer disable` and `deny` cut established and new flows immediately.
+5. `rift remove device`, `rift disable device` and `rift vpn deny` cut established and new flows immediately.
 6. Server and agent restarts restore the same access; a failed apply leaves public forwards working.
 7. Existing public forwards behave as before, with the home router still closed to inbound connections.
 8. UFW with `host_firewall = "auto"`: device traffic works and unrelated drops remain.
@@ -48,14 +48,14 @@ The `rift vpn` feature has unit coverage only: rule rendering and ordering, stat
 The web panel has unit coverage (configuration parsing, source checks, read/write separation, proxy headers, nft and UFW rule rendering, client AllowedIPs, HTTP parsing limits, login, session, CSRF header, action list, short-form forwards, password file mode, and two-factor login against the RFC 6238 test vectors: window, replay, lockout, required mode; this is unit-tested only, with no real authenticator app) and was driven in headless Chromium against a fake backend (login, invitation, forwards, devices with QR code, grants, cancel, log, diagnostics, read-only view behind a proxy header, light/dark, 390 px width, no CSP violations). It has not run inside a real server container. Before relying on it, check on a disposable server:
 
 1. `RIFT_WEBPANEL=true` with `private`: the panel answers on `127.0.0.1` and through `ssh -L`, but not on the public address.
-2. `rift panel connect` yields a working WireGuard configuration; the device opens `http://10.13.0.1:8090` but still cannot reach the control port, other devices or ungranted agents; `rift panel deny`, `vpn peer disable` and `revoke` cut it off.
+2. `rift panel connect` yields a working WireGuard configuration; the device opens `http://10.13.0.1:8090` but still cannot reach the control port, other devices or ungranted agents; `rift panel deny`, `rift disable device` and `rift remove device` cut it off.
 3. An agent or a device without the panel flag cannot connect to the panel port.
 4. `public` with and without `RIFT_WEBPANEL_ALLOW`, with UFW active and with `host_firewall = "off"`.
 5. Changes from a public address, an allow-listed address and loopback behind a reverse proxy are refused; from loopback and a panel device they work, including an invitation, a forward, a device with QR code and a grant.
 
 ## Enrollment port in `auto` mode: not yet verified on a kernel
 
-Unit tests cover the configuration parsing; the listener lifecycle has not run in a container. Check that 8443 is closed at start without invitations, opens with `rift agents add` and with an invitation from the panel, stays open until the agent is active, and closes after activation, `cancel-invite`, agent removal and expiry (within about 10 s). With UFW, RIFT's `rift:enrollment` rule should appear and disappear with it. `RIFT_ENROLLMENT=always` keeps it open; `off` refuses invitations.
+Unit tests cover the configuration parsing; the listener lifecycle has not run in a container. Check that 8443 is closed at start without invitations, opens with `rift add agent` and with an invitation from the panel, stays open until the agent is active, and closes after activation, `rift remove invite`, agent removal and expiry (within about 10 s). With UFW, RIFT's `rift:enrollment` rule should appear and disappear with it. `RIFT_ENROLLMENT=always` keeps it open; `off` refuses invitations.
 
 ## Agent allowlists: unit-tested only
 

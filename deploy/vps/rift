@@ -2,16 +2,28 @@
 # Host-side entry point for server administration.
 set -eu
 
-if [ "${1-}" = site ]; then
+site=/usr/local/lib/rift/rift-site
+
+# Sites live on the host: the helper writes the proxy configuration.
+case "${1-} ${2-}" in
+    "add site" | "remove site")
+        cmd=$1
+        shift 2
+        exec "$site" "$cmd" "$@"
+        ;;
+    "list sites")
+        exec "$site" list
+        ;;
+esac
+if [ "${1-}" = proxy ]; then
     shift
-    exec /usr/local/lib/rift/rift-site "$@"
+    exec "$site" proxy "$@"
 fi
 
-if [ "${1-}" = forwards ] && [ "${2-}" = list ] && [ "$#" -eq 2 ] \
-    && [ -x /usr/local/lib/rift/rift-site ]; then
-    # The same table with a SITE column for forwards that `rift site` manages. Any problem
+if [ "${1-}" = list ] && [ "${2-}" = forwards ] && [ "$#" -eq 2 ] && [ -x "$site" ]; then
+    # The same table with a SITE column for forwards that `rift add site` manages. Any problem
     # falls through to the plain command below.
-    /usr/local/lib/rift/rift-site forwards 2> /dev/null && exit 0
+    "$site" forwards 2> /dev/null && exit 0
 fi
 
 exec docker exec rift-server rift --config /etc/rift/config.toml "$@"

@@ -155,7 +155,7 @@ def main():
 
             vps_command = ["rift", "--config", "/etc/rift/config.toml", "--json", "status"]
             wait_for("server admin socket", lambda: docker("exec", VPS, *vps_command, check=False).returncode == 0)
-            invite = json.loads(exec_cli("agents", "add", "core", "--ttl", "15m").stdout)
+            invite = json.loads(exec_cli("add", "agent", "core", "--ttl", "15m").stdout)
             docker("run", "-d", "--name", AGENT, *common,
                    "--ip", AGENT4, "--ip6", AGENT6,
                    "--mount", f"type=bind,src={agent_cfg},dst=/etc/rift/config.toml,readonly",
@@ -176,7 +176,7 @@ def main():
             forwards = [(VPS4, 18080, "tcp"), (VPS4, 18081, "udp"),
                         (VPS6, 18082, "tcp"), (VPS6, 18083, "udp")]
             for ip, port, proto in forwards:
-                exec_cli("forwards", "add", "--agent", "core", "--listen-ip", ip,
+                exec_cli("add", "forward", "--agent", "core", "--listen-ip", ip,
                          "--listen", str(port), "--target", "19080" if proto == "tcp" else "19081",
                          "--protocol", proto)
             def applied():

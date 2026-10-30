@@ -26,21 +26,48 @@ enum Command {
     Status,
     /// Inspect kernel tools and networking prerequisites.
     Doctor,
-    /// Manage agent identities and enrollment invitations on the VPS.
-    Agents {
+    /// List agents, forwards, bans or VPN devices.
+    List {
         #[command(subcommand)]
-        command: Agents,
+        what: ListWhat,
     },
-    /// Manage published TCP and UDP services on the VPS.
-    Forwards {
+    /// Show one agent in detail.
+    Show {
         #[command(subcommand)]
-        command: Forwards,
+        what: ShowWhat,
     },
-    /// Block an original client address for a translated forward.
-    Bans {
+    /// Add an agent invitation, forward, ban, VPN device or site.
+    Add {
         #[command(subcommand)]
-        command: Bans,
+        what: AddWhat,
     },
+    /// Remove an agent, invitation, forward, VPN device or site.
+    Remove {
+        #[command(subcommand)]
+        what: RemoveWhat,
+    },
+    /// Switch an agent, forward or VPN device off without deleting it.
+    Disable {
+        #[command(subcommand)]
+        what: ToggleWhat,
+    },
+    /// Switch a disabled agent, forward or VPN device on again.
+    Enable {
+        #[command(subcommand)]
+        what: ToggleWhat,
+    },
+    /// Rename an agent.
+    Rename {
+        #[command(subcommand)]
+        what: RenameWhat,
+    },
+    /// Issue a new credential for an agent.
+    Rotate {
+        #[command(subcommand)]
+        what: RotateWhat,
+    },
+    /// Show or change the reverse proxy that `rift add site` uses (host command).
+    Proxy { name: Option<String> },
     /// Give phones and laptops private access to chosen agents through the VPS.
     Vpn {
         #[command(subcommand)]
@@ -66,11 +93,6 @@ enum Command {
 }
 #[derive(Subcommand)]
 enum Vpn {
-    /// Register, list, disable or revoke devices.
-    Peer {
-        #[command(subcommand)]
-        command: VpnPeers,
-    },
     /// Let a device reach an agent: `rift vpn allow DEVICE AGENT TARGET...`, for example
     /// `rift vpn allow iphone core 22/tcp 53/both`. Without an allow, a device reaches nothing.
     Allow(VpnAccessArgs),
@@ -80,24 +102,6 @@ enum Vpn {
     Config {
         #[command(subcommand)]
         command: VpnConfig,
-    },
-}
-#[derive(Subcommand)]
-enum VpnPeers {
-    Add {
-        name: String,
-    },
-    List,
-    Enable {
-        name: String,
-    },
-    /// Keep the device and its grants but cut it off until it is enabled again.
-    Disable {
-        name: String,
-    },
-    /// Delete the device, its key and its grants. This cannot be undone.
-    Revoke {
-        name: String,
     },
 }
 #[derive(Subcommand)]
@@ -211,43 +215,31 @@ enum ConfigCommand {
     Validate,
 }
 #[derive(Subcommand)]
-enum Agents {
-    List,
-    Show {
-        name: String,
-    },
-    Add {
+enum ListWhat {
+    Agents,
+    Forwards,
+    Bans,
+    /// VPN devices.
+    Devices,
+    /// Sites (host command only).
+    Sites,
+}
+#[derive(Subcommand)]
+enum ShowWhat {
+    Agent { name: String },
+}
+#[derive(Subcommand)]
+enum AddWhat {
+    /// Create an agent and print its single-use invitation.
+    Agent {
         name: String,
         #[arg(long, default_value = "15m")]
         ttl: String,
     },
-    Remove {
-        name: String,
-    },
-    Disable {
-        name: String,
-    },
-    Enable {
-        name: String,
-    },
-    Rename {
-        name: String,
-        new_name: String,
-    },
-    Rotate {
-        name: String,
-    },
-    CancelInvite {
-        name: String,
-    },
-}
-#[derive(Subcommand)]
-enum Forwards {
-    List,
     /// Add forwards. Short form: AGENT SPEC..., where SPEC is LISTEN[:TARGET]/tcp|udp|both
     /// with an optional /v4 (default), /v6 or /all for the server address, for example
-    /// `rift forwards add node1 53/both 8080:80/tcp/all`. The long options are the alternative.
-    Add {
+    /// `rift add forward node1 53/both 8080:80/tcp/all`. The long options are the alternative.
+    Forward {
         #[arg(
             value_name = "AGENT SPEC",
             conflicts_with_all = ["agent", "listen", "target", "protocol"]
@@ -272,32 +264,66 @@ enum Forwards {
         #[arg(long, default_value = "public", value_parser = ["public", "local"])]
         ingress: String,
     },
-    Remove {
-        #[arg(long)]
-        id: u64,
-    },
-    Disable {
-        #[arg(long)]
-        id: u64,
-    },
-    Enable {
-        #[arg(long)]
-        id: u64,
-    },
-}
-#[derive(Subcommand)]
-enum Bans {
-    List,
-    Add {
-        #[arg(long)]
+    /// Block an original client address for a translated forward.
+    Ban {
         agent: String,
-        #[arg(long)]
         forward_id: u64,
-        #[arg(long)]
         ip: IpAddr,
         #[arg(long, default_value = "1h")]
         ttl: String,
     },
+    /// Register a VPN device.
+    Device { name: String },
+    /// Publish a domain through the reverse proxy (host command only).
+    Site {
+        agent: String,
+        host: String,
+        port: u16,
+        #[arg(long)]
+        proxy: Option<String>,
+    },
+}
+#[derive(Subcommand)]
+enum RemoveWhat {
+    Agent {
+        name: String,
+    },
+    /// Cancel an open invitation.
+    Invite {
+        name: String,
+    },
+    Forward {
+        id: u64,
+    },
+    /// Delete the device, its key and its grants. This cannot be undone.
+    Device {
+        name: String,
+    },
+    /// Remove a site (host command only).
+    Site {
+        host: String,
+    },
+}
+#[derive(Subcommand)]
+enum ToggleWhat {
+    Agent {
+        name: String,
+    },
+    Forward {
+        id: u64,
+    },
+    /// Disabling keeps the device and its grants but cuts it off.
+    Device {
+        name: String,
+    },
+}
+#[derive(Subcommand)]
+enum RenameWhat {
+    Agent { name: String, new_name: String },
+}
+#[derive(Subcommand)]
+enum RotateWhat {
+    Agent { name: String },
 }
 
 #[tokio::main]
@@ -319,11 +345,11 @@ async fn run() -> Result<()> {
     let config = Config::load(&cli.config)?;
     let invitation = matches!(
         &cli.command,
-        Command::Agents {
-            command: Agents::Add { .. }
+        Command::Add {
+            what: AddWhat::Agent { .. }
         }
     );
-    // Further forwards of one short-form `forwards add`, sent after the first one.
+    // Further forwards of one short-form `add forward`, sent after the first one.
     let mut more: Vec<AdminRequest> = Vec::new();
     let request = match cli.command {
         Command::Server => return rift::daemon::run_server(config, cli.config).await,
@@ -388,19 +414,6 @@ async fn run() -> Result<()> {
             PanelCommand::Connect { .. } => unreachable!("handled above"),
         },
         Command::Vpn { command } => match command {
-            Vpn::Peer { command } => match command {
-                VpnPeers::Add { name } => AdminRequest::VpnPeerAdd { name },
-                VpnPeers::List => AdminRequest::VpnPeerList,
-                VpnPeers::Enable { name } => AdminRequest::VpnPeerEnable {
-                    name,
-                    enabled: true,
-                },
-                VpnPeers::Disable { name } => AdminRequest::VpnPeerEnable {
-                    name,
-                    enabled: false,
-                },
-                VpnPeers::Revoke { name } => AdminRequest::VpnPeerRevoke { name },
-            },
             Vpn::Allow(args) => {
                 let mut requests =
                     args.accesses()?
@@ -439,26 +452,20 @@ async fn run() -> Result<()> {
         Command::Logs { lines } => AdminRequest::Logs {
             lines: lines.min(1000),
         },
-        Command::Agents { command } => match command {
-            Agents::List => AdminRequest::AgentsList,
-            Agents::Show { name } => AdminRequest::AgentsShow { name },
-            Agents::Add { name, ttl } => AdminRequest::Invite {
+        Command::List { what } => match what {
+            ListWhat::Agents => AdminRequest::AgentsList,
+            ListWhat::Forwards => AdminRequest::ForwardsList,
+            ListWhat::Bans => AdminRequest::BansList,
+            ListWhat::Devices => AdminRequest::VpnPeerList,
+            ListWhat::Sites => bail!("sites are managed by the host command; run it on the server, not inside the container"),
+        },
+        Command::Show { what: ShowWhat::Agent { name } } => AdminRequest::AgentsShow { name },
+        Command::Add { what } => match what {
+            AddWhat::Agent { name, ttl } => AdminRequest::Invite {
                 name,
                 ttl_seconds: duration(&ttl)?,
             },
-            Agents::Remove { name } => AdminRequest::AgentRemove { name },
-            Agents::Disable { name } => AdminRequest::AgentDisable { name },
-            Agents::Enable { name } => AdminRequest::AgentEnable { name },
-            Agents::Rename { name, new_name } => AdminRequest::AgentRename { name, new_name },
-            Agents::Rotate { name } => AdminRequest::AgentRotate { name },
-            Agents::CancelInvite { name } => AdminRequest::CancelInvite { name },
-        },
-        Command::Forwards { command } => match command {
-            Forwards::List => AdminRequest::ForwardsList,
-            Forwards::Remove { id } => AdminRequest::ForwardRemove { id },
-            Forwards::Disable { id } => AdminRequest::ForwardEnable { id, enabled: false },
-            Forwards::Enable { id } => AdminRequest::ForwardEnable { id, enabled: true },
-            Forwards::Add {
+            AddWhat::Forward {
                 short,
                 agent,
                 listen,
@@ -472,7 +479,7 @@ async fn run() -> Result<()> {
                 let (agent, plans) = if let Some((name, specs)) = short.split_first() {
                     anyhow::ensure!(
                             !specs.is_empty(),
-                            "name at least one port with its protocol, for example: rift forwards add {name} 8080:80/tcp"
+                            "name at least one port with its protocol, for example: rift add forward {name} 8080:80/tcp"
                         );
                     (name.clone(), parse_forward_specs(specs)?)
                 } else {
@@ -515,10 +522,7 @@ async fn run() -> Result<()> {
                 more.extend(requests);
                 first
             }
-        },
-        Command::Bans { command } => match command {
-            Bans::List => AdminRequest::BansList,
-            Bans::Add {
+            AddWhat::Ban {
                 agent,
                 forward_id,
                 ip,
@@ -529,7 +533,31 @@ async fn run() -> Result<()> {
                 ip,
                 ttl_seconds: duration(&ttl)?,
             },
+            AddWhat::Device { name } => AdminRequest::VpnPeerAdd { name },
+            AddWhat::Site { .. } => bail!("sites are managed by the host command; run it on the server, not inside the container"),
         },
+        Command::Remove { what } => match what {
+            RemoveWhat::Agent { name } => AdminRequest::AgentRemove { name },
+            RemoveWhat::Invite { name } => AdminRequest::CancelInvite { name },
+            RemoveWhat::Forward { id } => AdminRequest::ForwardRemove { id },
+            RemoveWhat::Device { name } => AdminRequest::VpnPeerRevoke { name },
+            RemoveWhat::Site { .. } => bail!("sites are managed by the host command; run it on the server, not inside the container"),
+        },
+        Command::Disable { what } => match what {
+            ToggleWhat::Agent { name } => AdminRequest::AgentDisable { name },
+            ToggleWhat::Forward { id } => AdminRequest::ForwardEnable { id, enabled: false },
+            ToggleWhat::Device { name } => AdminRequest::VpnPeerEnable { name, enabled: false },
+        },
+        Command::Enable { what } => match what {
+            ToggleWhat::Agent { name } => AdminRequest::AgentEnable { name },
+            ToggleWhat::Forward { id } => AdminRequest::ForwardEnable { id, enabled: true },
+            ToggleWhat::Device { name } => AdminRequest::VpnPeerEnable { name, enabled: true },
+        },
+        Command::Rename { what: RenameWhat::Agent { name, new_name } } => {
+            AdminRequest::AgentRename { name, new_name }
+        }
+        Command::Rotate { what: RotateWhat::Agent { name } } => AdminRequest::AgentRotate { name },
+        Command::Proxy { .. } => bail!("sites are managed by the host command; run it on the server, not inside the container"),
     };
     let response = rift::daemon::admin_call(&config, request.clone()).await?;
     if !response.ok {
@@ -687,9 +715,11 @@ mod tests {
     #[test]
     fn vpn_cli_parses() {
         for args in [
-            vec!["rift", "vpn", "peer", "add", "iphone"],
-            vec!["rift", "vpn", "peer", "list"],
-            vec!["rift", "vpn", "peer", "revoke", "iphone"],
+            vec!["rift", "add", "device", "iphone"],
+            vec!["rift", "list", "devices"],
+            vec!["rift", "enable", "device", "iphone"],
+            vec!["rift", "disable", "device", "iphone"],
+            vec!["rift", "remove", "device", "iphone"],
             vec![
                 "rift", "vpn", "allow", "iphone", "--agent", "home", "--server",
             ],
@@ -824,8 +854,8 @@ mod tests {
     fn documented_cli_parses() {
         Cli::try_parse_from([
             "rift",
-            "forwards",
             "add",
+            "forward",
             "--agent",
             "nas",
             "--listen",
@@ -841,8 +871,8 @@ mod tests {
     fn translation_is_explicit() {
         Cli::try_parse_from([
             "rift",
-            "forwards",
             "add",
+            "forward",
             "--agent",
             "core",
             "--listen",
@@ -899,18 +929,18 @@ mod tests {
     }
     #[test]
     fn short_form_and_long_options_do_not_mix() {
-        Cli::try_parse_from(["rift", "forwards", "add", "node1", "53/both"]).unwrap();
+        Cli::try_parse_from(["rift", "add", "forward", "node1", "53/both"]).unwrap();
         assert!(
-            Cli::try_parse_from(["rift", "forwards", "add", "node1", "53", "--listen", "80"])
+            Cli::try_parse_from(["rift", "add", "forward", "node1", "53", "--listen", "80"])
                 .is_err()
         );
-        assert!(Cli::try_parse_from(["rift", "forwards", "add"]).is_err());
-        assert!(Cli::try_parse_from(["rift", "forwards", "add", "--agent", "a"]).is_err());
+        assert!(Cli::try_parse_from(["rift", "add", "forward"]).is_err());
+        assert!(Cli::try_parse_from(["rift", "add", "forward", "--agent", "a"]).is_err());
     }
     #[test]
     fn rejects_invalid_range() {
         assert!(Cli::try_parse_from([
-            "rift", "forwards", "add", "--agent", "core", "--listen", "0", "--target", "22"
+            "rift", "add", "forward", "--agent", "core", "--listen", "0", "--target", "22"
         ])
         .is_err());
     }
@@ -918,8 +948,8 @@ mod tests {
     fn local_ingress_is_explicit() {
         let cli = Cli::try_parse_from([
             "rift",
-            "forwards",
             "add",
+            "forward",
             "--agent",
             "core",
             "--listen",
@@ -930,12 +960,90 @@ mod tests {
             "local",
         ])
         .unwrap();
-        let Command::Forwards {
-            command: Forwards::Add { ingress, .. },
+        let Command::Add {
+            what: AddWhat::Forward { ingress, .. },
         } = cli.command
         else {
-            panic!("forwards add");
+            panic!("add forward");
         };
         assert_eq!(ingress, "local");
+    }
+    #[test]
+    fn verb_first_commands_parse() {
+        for args in [
+            vec!["rift", "list", "agents"],
+            vec!["rift", "list", "forwards"],
+            vec!["rift", "list", "bans"],
+            vec!["rift", "list", "devices"],
+            vec!["rift", "show", "agent", "core"],
+            vec!["rift", "add", "agent", "core"],
+            vec!["rift", "add", "agent", "core", "--ttl", "15m"],
+            vec!["rift", "remove", "invite", "core"],
+            vec!["rift", "remove", "agent", "core"],
+            vec!["rift", "disable", "agent", "core"],
+            vec!["rift", "enable", "agent", "core"],
+            vec!["rift", "rename", "agent", "core", "home"],
+            vec!["rift", "rotate", "agent", "core"],
+            vec!["rift", "remove", "forward", "3"],
+            vec!["rift", "disable", "forward", "3"],
+            vec!["rift", "enable", "forward", "3"],
+            vec![
+                "rift",
+                "add",
+                "ban",
+                "core",
+                "3",
+                "203.0.113.9",
+                "--ttl",
+                "1h",
+            ],
+            vec!["rift", "add", "ban", "core", "3", "203.0.113.9"],
+            vec!["rift", "list", "sites"],
+            vec!["rift", "add", "site", "core", "app.example.org", "8080"],
+            vec!["rift", "remove", "site", "app.example.org"],
+            vec!["rift", "proxy"],
+            vec!["rift", "proxy", "caddy"],
+        ] {
+            Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        }
+        let cli = Cli::try_parse_from(["rift", "add", "ban", "core", "3", "203.0.113.9"]).unwrap();
+        let Command::Add {
+            what:
+                AddWhat::Ban {
+                    agent,
+                    forward_id,
+                    ttl,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("add ban");
+        };
+        assert_eq!(
+            (agent.as_str(), forward_id, ttl.as_str()),
+            ("core", 3, "1h")
+        );
+        let cli = Cli::try_parse_from(["rift", "remove", "forward", "7"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Remove {
+                what: RemoveWhat::Forward { id: 7 }
+            }
+        ));
+        assert!(Cli::try_parse_from(["rift", "remove", "forward", "--id", "7"]).is_err());
+        assert!(Cli::try_parse_from(["rift", "remove", "forward", "x"]).is_err());
+    }
+    #[test]
+    fn old_command_forms_are_gone() {
+        for args in [
+            vec!["rift", "forwards", "list"],
+            vec!["rift", "agents", "add", "x"],
+            vec!["rift", "agents", "list"],
+            vec!["rift", "bans", "list"],
+            vec!["rift", "vpn", "peer", "list"],
+            vec!["rift", "site", "list"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+        }
     }
 }

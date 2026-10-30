@@ -355,7 +355,7 @@ def add_forwards(server_cfg, agent_names):
         cases = [(PUBLIC_V4, first, "tcp", 19080), (PUBLIC_V4, first + 1, "udp", 19081),
                  (PUBLIC_V6, first + 2, "tcp", 19080), (PUBLIC_V6, first + 3, "udp", 19081)]
         for listen_ip, listen_port, proto, target_port in cases:
-            cli(VPS, server_cfg, "forwards", "add", "--agent", name,
+            cli(VPS, server_cfg, "add", "forward", "--agent", name,
                 "--listen-ip", listen_ip, "--listen", str(listen_port),
                 "--target", str(target_port), "--protocol", proto,
                 env={"RIFT_PUBLIC_ENDPOINT": SERVER_HOST,
@@ -401,7 +401,7 @@ got=s.recv(256).decode(); print(got); assert got==src,(got,src)
 
 def translation_ban_test(server_cfg):
     result = json.loads(cli(
-        VPS, server_cfg, "forwards", "add", "--agent", "agent1",
+        VPS, server_cfg, "add", "forward", "--agent", "agent1",
         "--listen-ip", PUBLIC_V4, "--listen", "18100", "--target", "19080",
         "--protocol", "tcp", "--mode", "translate", "--target-family", "v6",
         env={"RIFT_PUBLIC_ENDPOINT": SERVER_HOST,
@@ -422,11 +422,11 @@ except OSError as e:
 '''
     result = ns(CLIENT, "python3", "-c", client, PUBLIC_V4, "allowed").stdout.strip()
     assert result.startswith("fd88:5249:4654::1"), f"translated return path failed: {result}"
-    cli(VPS, server_cfg, "bans", "add", "--agent", "agent1",
-        "--forward-id", str(forward_id), "--ip", "198.18.0.10", "--ttl", "4s",
+    cli(VPS, server_cfg, "add", "ban", "agent1",
+        str(forward_id), "198.18.0.10", "--ttl", "4s",
         env={"RIFT_PUBLIC_ENDPOINT": SERVER_HOST,
              "RIFT_PUBLIC_IPS": f"{PUBLIC_V4},{PUBLIC_V4_NEW},{PUBLIC_V6}"})
-    bans = json.loads(cli(VPS, server_cfg, "bans", "list").stdout)
+    bans = json.loads(cli(VPS, server_cfg, "list", "bans").stdout)
     assert any(b["forward_id"] == forward_id and b["ip"] == "198.18.0.10" for b in bans)
     blocked = ns(CLIENT, "python3", "-c", client, PUBLIC_V4, "blocked", check=False)
     assert blocked.returncode == 0, f"translated path was not blocked: {blocked.stderr}"
@@ -438,7 +438,7 @@ except OSError as e:
 
 def agent_local_ban_test(server_cfg):
     forward = json.loads(cli(
-        VPS, server_cfg, "forwards", "add", "--agent", "agent3",
+        VPS, server_cfg, "add", "forward", "--agent", "agent3",
         "--listen-ip", PUBLIC_V4, "--listen", "18096", "--target", "19080",
         "--protocol", "tcp", "--mode", "translate", "--target-family", "v6",
         env={"RIFT_PUBLIC_ENDPOINT": SERVER_HOST,
@@ -450,8 +450,8 @@ s.bind((sys.argv[1],0)); s.connect(("198.18.0.1",18096)); s.sendall(b"agent-ban"
 got=s.recv(128).decode(); print(got); assert got.startswith("fd88:5249:4654::1"),got
 '''
     assert ns(CLIENT, "python3", "-c", probe, "198.18.0.10").stdout.strip().startswith("fd88:5249:4654::1")
-    cli(VPS, server_cfg, "bans", "add", "--agent", "agent3",
-        "--forward-id", str(forward["id"]), "--ip", "198.18.0.10", "--ttl", "4s",
+    cli(VPS, server_cfg, "add", "ban", "agent3",
+        str(forward["id"]), "198.18.0.10", "--ttl", "4s",
         env={"RIFT_PUBLIC_ENDPOINT": SERVER_HOST,
              "RIFT_PUBLIC_IPS": f"{PUBLIC_V4},{PUBLIC_V4_NEW},{PUBLIC_V6}"})
     blocked = ns(CLIENT, "python3", "-c", probe, "198.18.0.10", check=False)
@@ -468,7 +468,7 @@ got=s.recv(128).decode(); print(got); assert got.startswith("fd88:5249:4654::1")
 
 def fail2ban_coexistence_test(server_cfg, ports):
     forward = json.loads(cli(
-        VPS, server_cfg, "forwards", "add", "--agent", "agent3",
+        VPS, server_cfg, "add", "forward", "--agent", "agent3",
         "--listen-ip", PUBLIC_V4, "--listen", "18092", "--target", "19082",
         "--protocol", "tcp",
         env={"RIFT_PUBLIC_ENDPOINT": SERVER_HOST,
@@ -519,9 +519,9 @@ got=s.recv(128).decode(); print(got); assert got==sys.argv[1],(got,sys.argv[1])
     assert active["status"] == "active", "agent control state was affected by the service-only ban"
 
     # Force a real policy re-apply while the unrelated Fail2ban table exists.
-    cli(VPS, server_cfg, "forwards", "disable", "--id", str(forward_id))
+    cli(VPS, server_cfg, "disable", "forward", str(forward_id))
     wait_policy(server_cfg, 3)
-    cli(VPS, server_cfg, "forwards", "enable", "--id", str(forward_id))
+    cli(VPS, server_cfg, "enable", "forward", str(forward_id))
     wait_policy(server_cfg, 3)
     assert ns(AGENTS[2], "nft", "list", "table", "inet", "f2b_test").stdout == f2b_before, \
         "RIFT policy re-apply overwrote an independent Fail2ban table"
@@ -636,7 +636,7 @@ def wait_initial_nat_port(server_cfg):
 
 
 def replay_and_wrong_ca(server_cfg, replay_token):
-    token = json.loads(cli(VPS, server_cfg, "agents", "add", "badca", "--ttl", "15m",
+    token = json.loads(cli(VPS, server_cfg, "add", "agent", "badca", "--ttl", "15m",
                            env={"RIFT_PUBLIC_ENDPOINT": SERVER_HOST,
                                 "RIFT_PUBLIC_IPS": f"{PUBLIC_V4},{PUBLIC_V4_NEW},{PUBLIC_V6}"}).stdout)["token"]
     wrong = WORK / "wrong-ca.crt"
@@ -670,13 +670,13 @@ def replay_and_wrong_ca(server_cfg, replay_token):
 
 
 def disable_remove_test(server_cfg):
-    cli(VPS, server_cfg, "agents", "disable", "agent3")
+    cli(VPS, server_cfg, "disable", "agent", "agent3")
     wait_until(lambda: next((a for a in status(server_cfg)["snapshot"]["agents"]
                              if a["name"] == "agent3"), {}).get("status") == "disabled",
                "agent3 to be disabled")
     expect_tcp_unreachable(18088, PUBLIC_V4)
     expect_tcp_unreachable(18090, PUBLIC_V6)
-    cli(VPS, server_cfg, "agents", "remove", "agent3")
+    cli(VPS, server_cfg, "remove", "agent", "agent3")
     wait_until(lambda: not any(a["name"] == "agent3"
                                for a in status(server_cfg)["snapshot"]["agents"]),
                "agent3 and its forwards to be removed")
@@ -733,7 +733,7 @@ def main():
         for idx, name in enumerate(AGENTS, start=1):
             agent_cfg = config(WORK / f"state-agent{idx}", server=False)
             agent_cfgs.append(agent_cfg)
-            token = json.loads(cli(VPS, server_cfg, "agents", "add", f"agent{idx}", "--ttl", "15m",
+            token = json.loads(cli(VPS, server_cfg, "add", "agent", f"agent{idx}", "--ttl", "15m",
                                    env=server_env).stdout)["token"]
             tokens[f"agent{idx}"] = token
             daemon(name, agent_cfg, ["agent"], {"RIFT_SERVER": f"{SERVER_HOST}:8443",

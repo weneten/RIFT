@@ -440,7 +440,7 @@ def used_ports(state):
     used = set()
     for site in state["sites"].values():
         used.add(int(site["listen"]))
-    listed = rift(state, "forwards", "list") or []
+    listed = rift(state, "list", "forwards") or []
     for forward in listed:
         used.update(listen_ports_of(forward))
     return used
@@ -735,7 +735,7 @@ def ensure_traefik_provider(state):
         return None
     if not layout["config_files"] or not layout["working_dir"]:
         raise SiteError(
-            "Traefik was not started with Docker Compose, so rift site cannot change its "
+            "Traefik was not started with Docker Compose, so 'rift add site' cannot change its "
             "configuration. Add --providers.file.directory=/dynamic and "
             "--providers.file.watch=true with a /dynamic volume yourself."
         )
@@ -758,8 +758,8 @@ def ensure_traefik_provider(state):
         migrated, changed = add_file_provider(original, layout["service"], str(dynamic))
     else:
         raise SiteError(
-            "Traefik uses a file provider that rift site does not recognise. "
-            "Point it at a watched /dynamic directory before rift site can add a name."
+            "Traefik uses a file provider that 'rift add site' does not recognise. "
+            "Point it at a watched /dynamic directory before 'rift add site' can add a name."
         )
     if not changed:
         raise SiteError(f"could not rewrite the Traefik file provider in {compose_path}")
@@ -783,7 +783,7 @@ def backup_notice(compose_path, backup, created):
         )
     return (
         f"Changed {compose_path} and recreated Traefik. An earlier backup from before "
-        f"rift site's first change is still at {backup}."
+        f"the first change by 'rift add site' is still at {backup}."
     )
 
 
@@ -791,7 +791,7 @@ def remove_forward(state, forward_id):
     if not forward_id:
         return
     try:
-        rift(state, "forwards", "remove", "--id", str(forward_id))
+        rift(state, "remove", "forward", str(forward_id))
     except SiteError as error:
         if "not found" not in str(error):
             raise
@@ -818,6 +818,93 @@ def dns_hint(host, state):
     return f"DNS: {host} -> {state['public_ip']}"
 
 
+SERVER_ID_PATH = "/var/lib/rift/wireguard.pub"
+
+
+def read_server_id(state):
+    """The server's identity: its WireGuard public key. A fresh state volume gets a new one."""
+    completed = subprocess.run(
+        ["docker", "exec", state["container"], "cat", SERVER_ID_PATH],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return completed.stdout.strip() if completed.returncode == 0 else ""
+
+
+def stale_hosts(stored_id, current_id, sites, forwards):
+    """Hosts whose records belong to an earlier RIFT installation.
+
+    A different server identity means a fresh installation: every record is stale. Records
+    written before the identity was stored are stale when their forward no longer exists.
+    """
+    if not current_id or stored_id == current_id:
+        return []
+    if stored_id:
+        return sorted(sites)
+    return sorted(host for host, site in sites.items() if not site_forward_alive(site, forwards))
+
+
+def reload_only(state, proxy):
+    if proxy == "caddy":
+        run(state["caddy"]["reload"])
+    elif proxy == "nginx":
+        run(state["nginx"]["test"])
+        run(state["nginx"]["reload"])
+
+
+def sync_installation(state):
+    """Drop site records (and their proxy files) left over from an earlier installation."""
+    sites = state.get("sites") or {}
+    current = read_server_id(state)
+    if not current or state.get("server_id") == current:
+        return
+    stored = state.get("server_id")
+    forwards = (rift(state, "list", "forwards") or []) if sites and not stored else []
+    reload = set()
+    for host in stale_hosts(stored, current, sites, forwards):
+        site = sites.pop(host)
+        try:
+            note = remove_site_config(state, site, host)
+        except SiteError as error:
+            note = f"its proxy configuration could not be removed: {error}"
+        reload.add(site["proxy"])
+        print(f"Removed {host}: it belonged to an earlier RIFT installation.")
+        if note:
+            print(note, file=sys.stderr)
+    state["server_id"] = current
+    if STATE_PATH.exists() or reload:
+        save_state(state)
+    for proxy in sorted(reload):
+        try:
+            reload_only(state, proxy)
+        except SiteError as error:
+            print(f"proxy reload: {error}", file=sys.stderr)
+
+
+def command_purge():
+    """Remove every generated proxy configuration and the helper's state. Never calls the container."""
+    state = load_state()
+    reload = set()
+    for host, site in sorted(((state or {}).get("sites") or {}).items()):
+        if site["proxy"] == "npm":
+            print(f"Kept the Nginx Proxy Manager host {host}: delete it in the NPM interface.")
+            continue
+        path = site_path(state, site["proxy"], host)
+        if path.exists():
+            path.unlink()
+            reload.add(site["proxy"])
+            print(f"Removed {path}")
+    for proxy in sorted(reload):
+        try:
+            reload_only(state, proxy)
+        except SiteError as error:
+            print(f"proxy reload: {error}", file=sys.stderr)
+    if STATE_PATH.parent.exists():
+        shutil.rmtree(STATE_PATH.parent)
+        print(f"Removed {STATE_PATH.parent}")
+
+
 def command_add(agent, host, port, proxy):
     if not valid_agent(agent) or not valid_host(host):
         raise SiteError("agent or host is not a usable name")
@@ -827,6 +914,7 @@ def command_add(agent, host, port, proxy):
     state = load_state()
     if state is None:
         state = default_state(read_server_public_ip())
+    sync_installation(state)
     chosen = proxy or state.get("proxy") or "traefik"
     if chosen not in PROXIES:
         raise SiteError("proxy must be traefik, caddy, nginx, or npm")
@@ -836,13 +924,13 @@ def command_add(agent, host, port, proxy):
         if compose_notice:
             print(compose_notice)
     existing = state["sites"].get(host)
-    # A forward removed by hand (rift forwards remove) must be created again, not trusted.
+    # A forward removed by hand (rift remove forward) must be created again, not trusted.
     if (
         existing
         and int(existing["target"]) == target
         and existing.get("agent") == agent
         and existing.get("proxy") == chosen
-        and site_forward_alive(existing, rift(state, "forwards", "list") or [])
+        and site_forward_alive(existing, rift(state, "list", "forwards") or [])
     ):
         listen = int(existing["listen"])
         forward_id = existing.get("forward_id")
@@ -855,8 +943,8 @@ def command_add(agent, host, port, proxy):
         try:
             created = rift(
                 state,
-                "forwards",
                 "add",
+                "forward",
                 "--agent",
                 agent,
                 "--listen",
@@ -904,8 +992,10 @@ def command_add(agent, host, port, proxy):
 
 def command_rm(host):
     state = load_state()
+    if state is not None:
+        sync_installation(state)
     if state is None or host not in state["sites"]:
-        raise SiteError(f"{host} is not a site managed by rift site")
+        raise SiteError(f"{host} is not a site managed by 'rift add site'")
     site = state["sites"][host]
     note = remove_site_config(state, site, host)
     remove_forward(state, site.get("forward_id"))
@@ -948,7 +1038,7 @@ def port_range(ports):
 
 
 def forward_rows(forwards, agents, sites):
-    """The `rift forwards list` table plus a SITE column for forwards that rift site manages."""
+    """The `rift list forwards` table plus a SITE column for forwards that 'rift add site' manages."""
     names = {a.get("id"): a.get("name") for a in agents}
     by_forward = {
         site.get("forward_id"): f"{host} ({site['proxy']})"
@@ -977,23 +1067,29 @@ def forward_rows(forwards, agents, sites):
 
 
 def command_forwards():
-    state = load_state() or default_state("")
-    forwards = rift(state, "forwards", "list") or []
+    state = load_state()
+    if state is not None:
+        sync_installation(state)
+    else:
+        state = default_state("")
+    forwards = rift(state, "list", "forwards") or []
     if not forwards:
         print("No forwards configured.")
         return
-    agents = rift(state, "agents", "list") or []
+    agents = rift(state, "list", "agents") or []
     print_table(forward_rows(forwards, agents, state.get("sites") or {}))
 
 
 def command_list():
     state = load_state()
+    if state is not None:
+        sync_installation(state)
     sites = (state or {}).get("sites") or {}
     if not sites:
         print("No sites.")
         return
     try:
-        forwards = rift(state, "forwards", "list") or []
+        forwards = rift(state, "list", "forwards") or []
     except SiteError:
         forwards = None
     rows = [("HOST", "AGENT", "TARGET", "LISTEN", "PROXY", "FORWARD")]
@@ -1008,7 +1104,7 @@ def command_list():
         )
     print_table(rows)
     if any(row[5].endswith("missing") for row in rows[1:]):
-        print("A missing forward is created again by 'rift site add AGENT HOST PORT'.")
+        print("A missing forward is created again by 'rift add site AGENT HOST PORT'.")
 
 
 def command_proxy(name):
@@ -1027,11 +1123,10 @@ def command_proxy(name):
 
 def usage():
     return (
-        "usage: rift site add AGENT HOST PORT [--proxy traefik|caddy|nginx|npm]\n"
-        "       rift site remove HOST\n"
-        "       rift site list\n"
-        "       rift site forwards\n"
-        "       rift site proxy [traefik|caddy|nginx|npm]"
+        "usage: rift add site AGENT HOST PORT [--proxy traefik|caddy|nginx|npm]\n"
+        "       rift remove site HOST\n"
+        "       rift list sites\n"
+        "       rift proxy [traefik|caddy|nginx|npm]"
     )
 
 
@@ -1060,6 +1155,7 @@ def parse_add_args(args):
 
 
 def main(argv):
+    """Commands as the host `rift` wrapper passes them: add, remove, list, forwards, proxy, purge."""
     if len(argv) < 2:
         raise SiteError(usage())
     command = argv[1]
@@ -1067,7 +1163,7 @@ def main(argv):
         args, proxy = parse_add_args(argv[2:])
         command_add(args[0], args[1], args[2], proxy)
         return
-    if command in ("remove", "rm") and len(argv) == 3:
+    if command == "remove" and len(argv) == 3:
         command_rm(argv[2])
         return
     if command == "list" and len(argv) == 2:
@@ -1079,6 +1175,9 @@ def main(argv):
     if command == "proxy" and len(argv) in (2, 3):
         command_proxy(argv[2] if len(argv) == 3 else None)
         return
+    if command == "purge" and len(argv) == 2:
+        command_purge()
+        return
     raise SiteError(usage())
 
 
@@ -1086,5 +1185,5 @@ if __name__ == "__main__":
     try:
         main(sys.argv)
     except (SiteError, json.JSONDecodeError, KeyError, ValueError) as error:
-        print(f"rift site: {error}", file=sys.stderr)
+        print(f"rift: {error}", file=sys.stderr)
         sys.exit(1)
