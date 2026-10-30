@@ -21,14 +21,14 @@ The image provides a Docker healthcheck for both server and agent, so monitoring
 The installed site commands (`rift add site`, `rift remove site`, `rift list sites`) use the helper `deploy/vps/rift-site`, which runs on the VPS host, outside the read-only RIFT container. It stores its state in `/var/lib/rift-site/sites.json`. One command allocates a listen port in `20000-20999`, adds a transparent `--ingress local` forward, and writes a site file for Traefik, Caddy, or Nginx, or creates a proxy host through the Nginx Proxy Manager API.
 
 ```sh
-sudo rift add site node1 app.example 8081 --proxy traefik
-sudo rift add site node1 app.example 8081 --proxy caddy
-sudo rift add site node1 app.example 8081 --proxy nginx
-sudo rift add site node1 app.example 8081 --proxy npm
+sudo rift add site node1 app.example 8081 traefik
+sudo rift add site node1 app.example 8081 caddy
+sudo rift add site node1 app.example 8081 nginx
+sudo rift add site node1 app.example 8081 npm
 sudo rift remove site app.example
 ```
 
-Without `--proxy`, the command uses the saved default (`traefik` until `sudo rift proxy caddy` or `sudo rift proxy nginx`). The chosen proxy must be the process listening on TCP 443. Otherwise the command exits before it creates a forward and names the proxy that does hold 443. It does not start a second proxy.
+Without a proxy word, the command uses the saved default (`traefik` until `sudo rift proxy caddy` or `sudo rift proxy nginx`). The chosen proxy must be the process listening on TCP 443. Otherwise the command exits before it creates a forward and names the proxy that does hold 443. It does not start a second proxy.
 
 The home service must listen on the target port for the agent tunnel address, for example `0.0.0.0`. The proxy reaches the service through the VPS public address so prerouting DNAT still applies. Packets from the internet to the allocated high port are not forwarded. Traefik uses the existing certificate resolver. Caddy obtains the certificate itself. Nginx runs `certbot --nginx` when `certbot` is on the host; if it is missing, the site file is still written and the command says that TLS was not requested.
 

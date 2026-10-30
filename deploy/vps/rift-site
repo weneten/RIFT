@@ -1123,7 +1123,7 @@ def command_proxy(name):
 
 def usage():
     return (
-        "usage: rift add site AGENT HOST PORT [--proxy traefik|caddy|nginx|npm]\n"
+        "usage: rift add site AGENT HOST PORT [traefik|caddy|nginx|npm]\n"
         "       rift remove site HOST\n"
         "       rift list sites\n"
         "       rift proxy [traefik|caddy|nginx|npm]"
@@ -1131,27 +1131,13 @@ def usage():
 
 
 def parse_add_args(args):
-    """Split `add` arguments into (AGENT, HOST, PORT) and the optional --proxy value."""
-    proxy = None
-    positional = []
-    items = iter(args)
-    for arg in items:
-        if arg == "--proxy":
-            proxy = next(items, None)
-            if proxy is None:
-                raise SiteError("--proxy needs a value: traefik, caddy, nginx or npm")
-        elif arg.startswith("--proxy="):
-            proxy = arg.split("=", 1)[1]
-        elif arg.startswith("--proxy"):
-            hint = arg[len("--proxy") :].lstrip("-")
-            raise SiteError(f"unknown option {arg}; use --proxy {hint} (with a space)")
-        elif arg.startswith("--"):
-            raise SiteError(f"unknown option {arg}\n{usage()}")
-        else:
-            positional.append(arg)
-    if len(positional) != 3:
+    """Split `add` arguments into (AGENT, HOST, PORT) and the optional proxy, the fourth word."""
+    if any(arg.startswith("-") for arg in args) or len(args) not in (3, 4):
         raise SiteError(usage())
-    return positional, proxy
+    proxy = args[3] if len(args) == 4 else None
+    if proxy is not None and proxy not in PROXIES:
+        raise SiteError(f"unknown proxy {proxy}; use traefik, caddy, nginx or npm")
+    return list(args[:3]), proxy
 
 
 def main(argv):

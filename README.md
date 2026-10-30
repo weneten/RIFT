@@ -36,7 +36,7 @@ The agent initiates the connection to the server. RIFT manages the tunnel, expli
 - **Transparent forwarding:** the default for matching address families; the service can see the original client IP. The service must accept traffic addressed to the agent's tunnel address. A Docker service may instead publish its port on the agent host.
 - **Translation:** explicitly bridges IPv4 and IPv6 using a userspace forwarder. The service sees the server's tunnel address instead of the original client address; the server logs the original address.
 
-For example, `--listen 2222 --target 22 --protocol tcp` publishes TCP port 2222 on the server to TCP port 22 on the chosen agent. A forward does not install, configure or secure the destination application.
+For example, `rift add forward node1 2222:22/tcp` publishes TCP port 2222 on the server to TCP port 22 on the chosen agent. A forward does not install, configure or secure the destination application.
 
 ## Requirements
 
@@ -188,15 +188,14 @@ Run administrative commands on the **server**. The following examples use `node1
 
 Every forward is transparent unless you add `--mode translate`: the service sees the client's real address. For an IPv6 listener the service must therefore accept IPv6 on the agent's tunnel address (listen on `::`; Docker-published ports usually do). If it only listens on IPv4, add `--mode translate`; that runs in userspace and the service sees the server's tunnel address instead of the client's. The server logs the original address, but tools on the agent that block by source address, such as Fail2ban or CrowdSec, can then no longer tell clients apart and would block the server for everyone. Use translation only where that does not matter.
 
-The short form cannot be mixed with `--agent`, `--listen`, `--target` or `--protocol`. If a later forward of one command fails, the earlier ones stay created.
+For scripts there is also a long form (`--agent node1 --listen 2222 --target 22 --protocol tcp`); it cannot be mixed with the short form. If a later forward of one command fails, the earlier ones stay created.
 
 ### TCP example
 
 Publish an SSH service listening on the agent's port 22 as server port 2222:
 
 ```sh
-rift add forward \
-  --agent node1 --listen 2222 --target 22 --protocol tcp
+rift add forward node1 2222:22/tcp
 ```
 
 Allow TCP 2222 in the relevant upstream firewall. From a separate client, test `ssh -p 2222 USER@rift.example.net` and verify the SSH host key through a trusted channel. Configure authentication and access controls in the SSH service itself.
@@ -206,21 +205,17 @@ Allow TCP 2222 in the relevant upstream firewall. From a separate client, test `
 Publish a UDP service on agent port 27015 as server port 27015:
 
 ```sh
-rift add forward \
-  --agent node1 --listen 27015 --target 27015 --protocol udp
+rift add forward node1 27015/udp
 ```
 
 Allow UDP 27015 upstream and test with the application's own client. UDP and TCP are separate grants: if an application requires both, add one forward for each protocol and allow both in the firewall.
 
 ### DNS example: TCP and UDP
 
-If a DNS server on the agent is configured to listen on port 53 for both transports, publish both using two independent grants:
+If a DNS server on the agent is configured to listen on port 53 for both transports, `both` creates one forward per transport:
 
 ```sh
-rift add forward \
-  --agent node1 --listen 53 --target 53 --protocol udp
-rift add forward \
-  --agent node1 --listen 53 --target 53 --protocol tcp
+rift add forward node1 53/both
 ```
 
 Allow both TCP and UDP 53 in the upstream firewall and use a DNS client to test both modes against the server address. Ensure neither port conflicts with existing services, and configure the DNS server's access controls before exposing it.
@@ -230,8 +225,7 @@ Allow both TCP and UDP 53 in the upstream firewall and use a DNS client to test 
 Ranges use `start-end`; both ranges must have the same length and contain at most 4096 ports. Corresponding ports map in order:
 
 ```sh
-rift add forward \
-  --agent node1 --listen 30000-30002 --target 40000-40002 --protocol udp
+rift add forward node1 30000-30002:40000-40002/udp
 ```
 
 `--listen-ip ADDRESS` picks one specific configured address instead of `/v4`, `/v6` or `/all`; it is only needed with several addresses of the same family. The default ingress is `public`; the mode is transparent unless `--mode translate` is given (see above). Check the created ID and apply status:
@@ -248,12 +242,10 @@ A grant may remain pending while the agent applies it. Test from a separate clie
 Translation bridges different listener and target families. It must be requested explicitly. For example, an IPv4 listener forwarding to the agent's IPv6 tunnel address:
 
 ```sh
-rift add forward \
-  --agent node1 --listen-ip 203.0.113.10 --listen 8080 --target 8080 \
-  --protocol tcp --mode translate --target-family v6
+rift add forward node1 8080/tcp --mode translate --target-family v6
 ```
 
-Replace the listener with your configured IPv4 address and ensure the application listens on the agent's IPv6 tunnel address. For the opposite direction, use a configured IPv6 `--listen-ip` and `--target-family v4`. Translation runs in userspace and changes the source address visible to the destination. `--ingress local` is supported only for transparent forwards.
+Ensure the application listens on the agent's IPv6 tunnel address. For the opposite direction, an IPv6 listener to an IPv4-only service, use `rift add forward node1 8080/tcp/v6 --mode translate`. Translation runs in userspace and changes the source address visible to the destination. `--ingress local` is supported only for transparent forwards.
 
 ### Agent at home with IPv6 only
 
@@ -276,8 +268,7 @@ This example starts a separate Caddy container on the server and uses a manually
 First create the forward on the **server**:
 
 ```sh
-rift add forward \
-  --agent node1 --listen 20000 --target 8081 --protocol tcp --ingress local
+rift add forward node1 20000:8081/tcp --ingress local
 ```
 
 The forward listens on the first IPv4 address in `RIFT_PUBLIC_IPS`. Port 20000 must be available; choose another if needed. Do not open it publicly. Then create a separate proxy project on the server:
@@ -327,10 +318,10 @@ The helper assumes particular proxy layouts: Traefik uses a watched file provide
 On the **server**, from the checkout, choose the proxy that already owns port 443:
 
 ```sh
-sudo rift add site node1 app.example.net 8081 --proxy traefik
+sudo rift add site node1 app.example.net 8081 traefik
 ```
 
-Alternatively, use `--proxy caddy`, `--proxy nginx` or `--proxy npm` (Nginx Proxy Manager) with the corresponding existing proxy. The helper allocates a port in `20000-20999`, creates a local-ingress TCP forward and writes a proxy configuration. The allocated port is for the proxy path and should not be opened publicly. Test `https://app.example.net` from an external client and check the proxy certificate and application response.
+Alternatively, end the command with `caddy`, `nginx` or `npm` (Nginx Proxy Manager) with the corresponding existing proxy. The helper allocates a port in `20000-20999`, creates a local-ingress TCP forward and writes a proxy configuration. The allocated port is for the proxy path and should not be opened publicly. Test `https://app.example.net` from an external client and check the proxy certificate and application response.
 
 Traefik uses its configured certificate resolver. The first add may migrate a recognized single-file Traefik provider to a watched directory, or add a watched file provider (`--providers.file.directory=/dynamic`, plus a volume for `<compose project>/dynamic`) to a Traefik that only uses Docker labels; it edits the Compose file (keeping a `.rift-bak` copy) and recreates the Traefik service, so expect a short interruption. Existing Docker-label routes remain. This needs Traefik to run from a Compose file with the container name `traefik` and a list-style `command:` and `volumes:`. Caddy obtains certificates through its configuration. For Nginx, the helper invokes `certbot --nginx` if available; without it the site is written but TLS is not requested, so configure a certificate separately. For Nginx and Nginx Proxy Manager, `RIFT_REQUEST_CERTIFICATE` in the server `.env` controls certificates: `true` (default) requests a Let's Encrypt certificate for each new site, which means accepting the Let's Encrypt terms of service (certbot is run with `--agree-tos`); `false` skips it and you handle TLS yourself. The optional `RIFT_LETSENCRYPT_EMAIL=you@example.net` is the contact for expiry notices. Without it certbot registers without an email, and Nginx Proxy Manager, which requires one, uses the admin login address. Traefik and Caddy ignore both settings. HTTP traffic between proxy and agent is carried inside WireGuard.
 

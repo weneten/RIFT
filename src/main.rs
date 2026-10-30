@@ -279,7 +279,7 @@ enum AddWhat {
         agent: String,
         host: String,
         port: u16,
-        #[arg(long)]
+        /// traefik, caddy, nginx or npm; default: the one `rift proxy` shows.
         proxy: Option<String>,
     },
 }
