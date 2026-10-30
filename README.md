@@ -163,9 +163,11 @@ Protocols that negotiate additional ports or embed addresses, such as FTP in som
 
 ## Publish services
 
-Run administrative commands on the **server**. The following examples use `node1`. Replace ports with those used by your services. Without `--listen-ip`, a forward listens on the first address in `RIFT_PUBLIC_IPS`; with several addresses (for example IPv4 and IPv6), add `--listen-ip` to publish on another one. A service that should answer on both IPv4 and IPv6 needs one forward per address.
+Run administrative commands on the **server**. The following examples use `node1`. Replace ports with those used by your services. A forward listens on the server's first IPv4 address in `RIFT_PUBLIC_IPS`. With an IPv6 address there too, a short-form spec can end in `/v6` (IPv6 only) or `/all` (IPv4 and IPv6, one forward each); `/v4` is the default and may be written out.
 
-`forwards add` also has a short form: `rift forwards add AGENT SPEC...`, where each `SPEC` is `LISTEN[:TARGET]/tcp`, `/udp` or `/both`. The protocol is always required; `both` creates a TCP and a UDP forward. The target defaults to the listen port. Ranges such as `5000-5002/udp` work. For example, `rift forwards add node1 53/both 8080:80/tcp` replaces the two long `--agent … --protocol …` commands for port 53 plus a forward from 8080 to 80. Options such as `--listen-ip`, `--ingress` and `--mode` still apply to every forward of the command. The short form cannot be mixed with `--agent`, `--listen`, `--target` or `--protocol`. If a later forward of one command fails, the earlier ones stay created.
+`forwards add` also has a short form: `rift forwards add AGENT SPEC...`, where each `SPEC` is `LISTEN[:TARGET]/tcp`, `/udp` or `/both`, optionally followed by `/v4`, `/v6` or `/all` for the server address. The protocol is always required; `both` creates a TCP and a UDP forward. The target defaults to the listen port. Ranges such as `5000-5002/udp` work. For example, `rift forwards add node1 53/both 8080:80/tcp/all` creates TCP and UDP 53 on IPv4 plus 8080 → 80 on IPv4 and IPv6. Options such as `--ingress` and `--mode` still apply to every forward of the command.
+
+How IPv6 clients reach the agent: by default an IPv6 listener translates to the agent's IPv4 tunnel address, because most services listen on IPv4 only. That works with every service, but it runs in userspace and the service sees the server's tunnel address instead of the client's (the server logs the original address). Add `--mode transparent` to keep the client address in the kernel path; the service must then accept IPv6 on the agent's tunnel address (for example listen on `::`, which Docker-published ports do). The short form cannot be mixed with `--agent`, `--listen`, `--target` or `--protocol`. If a later forward of one command fails, the earlier ones stay created.
 
 ### TCP example
 
@@ -211,7 +213,7 @@ rift forwards add \
   --agent node1 --listen 30000-30002 --target 40000-40002 --protocol udp
 ```
 
-To listen on another configured address than the first, pass it explicitly, for example `--listen-ip 2001:db8::10`. The default is `--mode transparent --ingress public`, and the target family defaults to the listener's IP family. Check the created ID and apply status:
+`--listen-ip ADDRESS` picks one specific configured address instead of `/v4`, `/v6` or `/all`; it is only needed with several addresses of the same family. The default ingress is `public`; the mode is transparent for IPv4 listeners and translate for IPv6 listeners (see above). Check the created ID and apply status:
 
 ```sh
 rift forwards list
@@ -222,7 +224,7 @@ A grant may remain pending while the agent applies it. Test from a separate clie
 
 ### IPv4-to-IPv6 and IPv6-to-IPv4
 
-Translation requires different listener and target families and must be requested explicitly. For example, an IPv4 listener forwarding to the agent's IPv6 tunnel address:
+Translation bridges different listener and target families. It is the default for IPv6 listeners (to the agent's IPv4); in the other direction it must be requested explicitly. For example, an IPv4 listener forwarding to the agent's IPv6 tunnel address:
 
 ```sh
 rift forwards add \
@@ -231,6 +233,16 @@ rift forwards add \
 ```
 
 Replace the listener with your configured IPv4 address and ensure the application listens on the agent's IPv6 tunnel address. For the opposite direction, use a configured IPv6 `--listen-ip` and `--target-family v4`. Translation runs in userspace and changes the source address visible to the destination. `--ingress local` is supported only for transparent forwards.
+
+### Agent at home with IPv6 only
+
+An agent whose Internet connection has no public IPv4 address (for example DS-Lite or an IPv6-only fibre line) still works, and its services become reachable over IPv4 through the server. The tunnel itself carries IPv4 and IPv6 regardless of the home connection, so a normal forward such as `rift forwards add node1 8080:80/tcp` publishes the service on the server's IPv4 address. Requirements:
+
+- the server has IPv6, and `RIFT_PUBLIC_ENDPOINT` has an AAAA record (agents dial that name; an A record alone is not enough);
+- UDP 51820 and TCP 8443 are allowed over IPv6 in the cloud firewall too (the enrollment port listens on IPv6 whenever `RIFT_ENROLLMENT_BIND` is `0.0.0.0:…`, the default; RIFT opens both in UFW);
+- the service on the agent listens on `0.0.0.0` or on the agent's tunnel address, as for any forward.
+
+`RIFT_PUBLIC_IPS` needs the server's IPv6 address only if you also want `/v6` or `/all` forwards.
 
 ## Publish websites with HTTPS
 
@@ -247,7 +259,7 @@ rift forwards add \
   --agent node1 --listen 20000 --target 8081 --protocol tcp --ingress local
 ```
 
-If the first address in `RIFT_PUBLIC_IPS` is not IPv4, add `--listen-ip` with an IPv4 address. Port 20000 must be available; choose another if needed. Do not open it publicly. Then create a separate proxy project on the server:
+The forward listens on the first IPv4 address in `RIFT_PUBLIC_IPS`. Port 20000 must be available; choose another if needed. Do not open it publicly. Then create a separate proxy project on the server:
 
 ```sh
 mkdir -p caddy
@@ -461,7 +473,7 @@ The panel port (default 8090, `RIFT_WEBPANEL_PORT`) must differ from the control
 | Setting | Default / role | Purpose |
 | --- | --- | --- |
 | `RIFT_PUBLIC_ENDPOINT` | Server | Reachable DNS name or IP, without port; enrollment certificate identity. |
-| `RIFT_PUBLIC_IPS` | Server | Comma-separated addresses assigned to server interfaces for listeners; forwards default to the first, `rift site` uses the first IPv4. |
+| `RIFT_PUBLIC_IPS` | Server | Comma-separated addresses assigned to server interfaces for listeners; forwards use the first IPv4 (`/v6`, `/all` for IPv6), `rift site` the first IPv4. |
 | `RIFT_ENROLLMENT_BIND` | `0.0.0.0:8443` | Enrollment listener. |
 | `RIFT_ENROLLMENT` | `auto` | `auto`: listen on the enrollment port only while an invitation is open; `always`: always; `off`: no enrollment. |
 | `RIFT_ALLOW_PRIVATE_LISTENERS` | `false` | Server. Set `true` behind a cloud NAT (e.g. Oracle Cloud), where the public address is not assigned to the interface: put the private interface address in `RIFT_PUBLIC_IPS`, keep the public DNS name in `RIFT_PUBLIC_ENDPOINT`, and open the ports in the cloud's firewall. Allows private and ULA listener addresses; loopback, link-local, multicast and unspecified stay forbidden, as does an address inside a tunnel pool. |

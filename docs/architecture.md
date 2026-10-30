@@ -46,7 +46,7 @@ Authentication is a single password (environment or a generated mode-0600 file i
 
 ## Enrollment port
 
-`enrollment` (`RIFT_ENROLLMENT`) is `auto`, `always` or `off`. In `auto` (the default) every reconcile opens the enrollment listener when an invitation is unconsumed and unexpired, and closes it otherwise; the invitation is consumed when the agent activates over the tunnel, so an agent whose enrollment response was lost can still retry until then. Invitations, cancellations, activation and agent removal reconcile at once; expiry is noticed by the periodic reconcile. RIFT's UFW accept for the port follows the listener. RIFT does not change cloud firewalls.
+`enrollment` (`RIFT_ENROLLMENT`) is `auto`, `always` or `off`. In `auto` (the default) every reconcile opens the enrollment listener when an invitation is unconsumed and unexpired, and closes it otherwise; the invitation is consumed when the agent activates over the tunnel, so an agent whose enrollment response was lost can still retry until then. Invitations, cancellations, activation and agent removal reconcile at once; expiry is noticed by the periodic reconcile. RIFT's UFW accept for the port follows the listener. When the bind address is `0.0.0.0`, the server adds an IPv6-only listener on the same port (if the host has IPv6), so agents with only IPv6 can enroll; UFW opens the port in both families. RIFT does not change cloud firewalls.
 
 ## Configuration and recovery
 

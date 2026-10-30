@@ -93,8 +93,15 @@ pub fn accesses(
             !spec.contains(':'),
             "{spec:?} must be PORT/tcp, PORT/udp or PORT/both"
         );
-        for (ports, _, protocol) in parse_forward_specs(std::slice::from_ref(spec))? {
-            out.push(VpnAccess::Port { protocol, ports });
+        for plan in parse_forward_specs(std::slice::from_ref(spec))? {
+            ensure!(
+                plan.on.is_none(),
+                "{spec:?}: /v4, /v6 and /all apply only to forwards"
+            );
+            out.push(VpnAccess::Port {
+                protocol: plan.protocol,
+                ports: plan.listen,
+            });
         }
     }
     for net in subnets {

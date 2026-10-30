@@ -434,9 +434,6 @@ const PROXY_HEADERS: [&str; 5] = [
 fn default_lines() -> usize {
     200
 }
-fn transparent() -> ForwardMode {
-    ForwardMode::Transparent
-}
 fn seconds(text: &str) -> Result<u64> {
     let seconds = humantime::parse_duration(text.trim())
         .with_context(|| format!("invalid duration {text:?}; use e.g. 15m or 1h"))?
@@ -483,16 +480,15 @@ enum Action {
     AgentRotate {
         name: String,
     },
-    /// `specs` uses the CLI's short form: `LISTEN[:TARGET]/tcp|udp|both`, several allowed.
+    /// `specs` uses the CLI's short form: `LISTEN[:TARGET]/tcp|udp|both[/v4|v6|all]`;
+    /// `on` applies to specs that name no address.
     ForwardAdd {
         agent: String,
         specs: String,
         #[serde(default)]
-        listen_ip: Option<IpAddr>,
+        on: Option<ListenOn>,
         #[serde(default)]
-        target_family: Option<Family>,
-        #[serde(default = "transparent")]
-        mode: ForwardMode,
+        mode: Option<ForwardMode>,
         #[serde(default)]
         ingress: Ingress,
     },
@@ -608,8 +604,7 @@ impl Action {
             Self::ForwardAdd {
                 agent,
                 specs,
-                listen_ip,
-                target_family,
+                on,
                 mode,
                 ingress,
             } => {
@@ -618,18 +613,17 @@ impl Action {
                     !specs.is_empty(),
                     "name at least one port with its protocol, for example 8080:80/tcp"
                 );
-                let plans = parse_forward_specs(&specs)?;
-                let ips = &panel.config.public_ips;
-                let ip = listen_ip
-                    .or_else(|| ips.first().copied())
-                    .context("RIFT_PUBLIC_IPS is empty")?;
-                let forwards = build_forwards(
-                    &agent,
-                    &plans,
-                    ip,
-                    target_family.unwrap_or(Family::of(ip)),
+                let options = ForwardOptions {
+                    on,
                     mode,
                     ingress,
+                    ..Default::default()
+                };
+                let forwards = build_forwards(
+                    &agent,
+                    &parse_forward_specs(&specs)?,
+                    &panel.config.public_ips,
+                    options,
                 )?;
                 let mut created = Vec::new();
                 for forward in forwards {

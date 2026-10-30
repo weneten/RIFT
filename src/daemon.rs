@@ -209,12 +209,30 @@ async fn sync_enrollment(s: &Server) -> Result<()> {
         let listener = TcpListener::bind(config.enrollment_bind)
             .await
             .with_context(|| format!("bind enrollment endpoint {}", config.enrollment_bind))?;
-        let state = s.state.clone();
-        let public = s.server_public_key.clone();
-        let kernel = s.kernel.clone();
-        let cfg = config.clone();
+        // 0.0.0.0 also listens on IPv6, so agents with only IPv6 can enroll. A host without
+        // IPv6 simply lacks that listener.
+        let listener6 = match config.enrollment_bind.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() => {
+                ipv6_only_listener(config.enrollment_bind.port()).ok()
+            }
+            _ => None,
+        };
+        let serve = |listener| {
+            enrollment::serve(
+                listener,
+                s.state.clone(),
+                config.clone(),
+                s.server_public_key.clone(),
+                s.kernel.clone(),
+            )
+        };
+        let (v4, v6) = (serve(listener), listener6.map(serve));
         *running = Some(tokio::spawn(async move {
-            if let Err(e) = enrollment::serve(listener, state, cfg, public, kernel).await {
+            let result = match v6 {
+                Some(v6) => tokio::try_join!(v4, v6).map(|_| ()),
+                None => v4.await,
+            };
+            if let Err(e) = result {
                 tracing::error!("enrollment endpoint stopped: {e:#}");
             }
         }));
@@ -235,6 +253,17 @@ async fn sync_enrollment(s: &Server) -> Result<()> {
         s.enrollment_open.store(false, Ordering::SeqCst);
     }
     Ok(())
+}
+
+fn ipv6_only_listener(port: u16) -> Result<TcpListener> {
+    use socket2::{Domain, Socket, Type};
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, None)?;
+    socket.set_only_v6(true)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), port).into())?;
+    socket.listen(128)?;
+    socket.set_nonblocking(true)?;
+    Ok(TcpListener::from_std(socket.into())?)
 }
 
 async fn reconcile(s: &Server) -> Result<()> {

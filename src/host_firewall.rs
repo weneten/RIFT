@@ -457,6 +457,10 @@ fn enrollment_match(family: &str, bind: SocketAddr) -> Option<String> {
         ("ip" | "inet", IpAddr::V4(ip)) => {
             Some(format!("ip daddr {ip} tcp dport {} ", bind.port()))
         }
+        // The server also listens on IPv6 when it binds 0.0.0.0.
+        ("ip6", IpAddr::V4(ip)) if ip.is_unspecified() => {
+            Some(format!("tcp dport {} ", bind.port()))
+        }
         ("ip6" | "inet", IpAddr::V6(ip)) if ip.is_unspecified() => {
             Some(format!("tcp dport {} ", bind.port()))
         }
@@ -592,6 +596,10 @@ mod tests {
         assert!(plan.jumps.contains("ufw-user-forward"));
         assert!(plan.jumps.contains("ufw6-user-input"));
         assert!(plan.create.contains("add chain ip6 filter rift-host-in"));
+        // Enrollment on 0.0.0.0 also listens on IPv6, so the IPv6 chain opens it too.
+        assert!(plan.fill.contains(
+            "add rule ip6 filter rift-host-in iifname \"eth0\" tcp dport 8443 accept comment \"rift:enrollment\""
+        ));
         assert!(!plan.create.contains("add chain ip filter rift-host-in"));
     }
 

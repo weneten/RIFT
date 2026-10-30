@@ -196,8 +196,9 @@ enum Agents {
 #[derive(Subcommand)]
 enum Forwards {
     List,
-    /// Add forwards. Short form: AGENT SPEC..., where SPEC is LISTEN[:TARGET]/tcp|udp|both,
-    /// for example `rift forwards add node1 53/both 8080:80/tcp`. The long options are the alternative.
+    /// Add forwards. Short form: AGENT SPEC..., where SPEC is LISTEN[:TARGET]/tcp|udp|both
+    /// with an optional /v4 (default), /v6 or /all for the server address, for example
+    /// `rift forwards add node1 53/both 8080:80/tcp/all`. The long options are the alternative.
     Add {
         #[arg(
             value_name = "AGENT SPEC",
@@ -212,12 +213,14 @@ enum Forwards {
         target: Option<PortRange>,
         #[arg(long)]
         protocol: Option<Protocol>,
+        /// A specific server address instead of /v4, /v6 or /all. Rarely needed.
         #[arg(long)]
         listen_ip: Option<IpAddr>,
         #[arg(long,value_parser=["v4","v6"])]
         target_family: Option<String>,
-        #[arg(long,default_value="transparent",value_parser=["transparent","translate"])]
-        mode: String,
+        /// Default: transparent for IPv4 listeners, translate (to the agent's IPv4) for IPv6.
+        #[arg(long,value_parser=["transparent","translate"])]
+        mode: Option<String>,
         #[arg(long, default_value = "public", value_parser = ["public", "local"])]
         ingress: String,
     },
@@ -390,71 +393,69 @@ async fn run() -> Result<()> {
             Agents::Rotate { name } => AdminRequest::AgentRotate { name },
             Agents::CancelInvite { name } => AdminRequest::CancelInvite { name },
         },
-        Command::Forwards { command } => {
-            match command {
-                Forwards::List => AdminRequest::ForwardsList,
-                Forwards::Remove { id } => AdminRequest::ForwardRemove { id },
-                Forwards::Disable { id } => AdminRequest::ForwardEnable { id, enabled: false },
-                Forwards::Enable { id } => AdminRequest::ForwardEnable { id, enabled: true },
-                Forwards::Add {
-                    short,
-                    agent,
-                    listen,
-                    target,
-                    protocol,
-                    listen_ip,
-                    target_family,
-                    mode,
-                    ingress,
-                } => {
-                    let (agent, plans) = if let Some((name, specs)) = short.split_first() {
-                        anyhow::ensure!(
+        Command::Forwards { command } => match command {
+            Forwards::List => AdminRequest::ForwardsList,
+            Forwards::Remove { id } => AdminRequest::ForwardRemove { id },
+            Forwards::Disable { id } => AdminRequest::ForwardEnable { id, enabled: false },
+            Forwards::Enable { id } => AdminRequest::ForwardEnable { id, enabled: true },
+            Forwards::Add {
+                short,
+                agent,
+                listen,
+                target,
+                protocol,
+                listen_ip,
+                target_family,
+                mode,
+                ingress,
+            } => {
+                let (agent, plans) = if let Some((name, specs)) = short.split_first() {
+                    anyhow::ensure!(
                             !specs.is_empty(),
                             "name at least one port with its protocol, for example: rift forwards add {name} 8080:80/tcp"
                         );
-                        (name.clone(), parse_forward_specs(specs)?)
-                    } else {
-                        (
-                            agent.context("--agent is required")?,
-                            vec![(
-                                listen.context("--listen is required")?,
-                                target.context("--target is required")?,
-                                protocol.unwrap_or(Protocol::Tcp),
-                            )],
-                        )
-                    };
-                    // Without --listen-ip the first address of RIFT_PUBLIC_IPS is the default.
-                    let ip = listen_ip
-                        .or_else(|| config.public_ips.first().copied())
-                        .context("RIFT_PUBLIC_IPS is empty; set it or pass --listen-ip")?;
-                    let family = match target_family.as_deref() {
-                        Some("v4") => Family::V4,
-                        Some("v6") => Family::V6,
-                        _ => Family::of(ip),
-                    };
-                    let forwards = build_forwards(
-                        &agent,
-                        &plans,
-                        ip,
-                        family,
-                        if mode == "translate" {
+                    (name.clone(), parse_forward_specs(specs)?)
+                } else {
+                    (
+                        agent.context("--agent is required")?,
+                        vec![ForwardPlan {
+                            listen: listen.context("--listen is required")?,
+                            target: target.context("--target is required")?,
+                            protocol: protocol.unwrap_or(Protocol::Tcp),
+                            on: None,
+                        }],
+                    )
+                };
+                let options = ForwardOptions {
+                    listen_ip,
+                    on: None,
+                    mode: mode.map(|m| {
+                        if m == "translate" {
                             ForwardMode::Translate
                         } else {
                             ForwardMode::Transparent
-                        },
-                        if ingress == "local" {
-                            Ingress::Local
+                        }
+                    }),
+                    target_family: target_family.map(|f| {
+                        if f == "v6" {
+                            Family::V6
                         } else {
-                            Ingress::Public
-                        },
-                    )?;
-                    let mut requests = forwards.into_iter().map(AdminRequest::ForwardAdd);
-                    let first = requests.next().context("nothing to add")?;
-                    more.extend(requests);
-                    first
-                }
+                            Family::V4
+                        }
+                    }),
+                    ingress: if ingress == "local" {
+                        Ingress::Local
+                    } else {
+                        Ingress::Public
+                    },
+                };
+                let forwards = build_forwards(&agent, &plans, &config.public_ips, options)?;
+                let mut requests = forwards.into_iter().map(AdminRequest::ForwardAdd);
+                let first = requests.next().context("nothing to add")?;
+                more.extend(requests);
+                first
             }
-        }
+        },
         Command::Bans { command } => match command {
             Bans::List => AdminRequest::BansList,
             Bans::Add {
@@ -712,7 +713,15 @@ mod tests {
         let plans = parse_forward_specs(&specs).unwrap();
         let shown: Vec<_> = plans
             .iter()
-            .map(|(l, t, p)| (l.start, l.end, t.start, t.end, *p == Protocol::Udp))
+            .map(|p| {
+                (
+                    p.listen.start,
+                    p.listen.end,
+                    p.target.start,
+                    p.target.end,
+                    p.protocol == Protocol::Udp,
+                )
+            })
             .collect();
         assert_eq!(
             shown,

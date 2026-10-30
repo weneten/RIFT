@@ -215,22 +215,21 @@ function forwardDialog() {
   }
   const agent = select(agents, agents[0][0]);
   const specs = el("input", { required: true, placeholder: "8080:80/tcp 53/both 5000-5002/udp" });
-  const ips = (data.public_ips || []).map((ip) => [ip, ip]);
-  const listen = select(ips, ips.length ? ips[0][0] : "");
-  const mode = select([["transparent", "transparent (client IP visible)"], ["translate", "translate (IPv4 ↔ IPv6)"]], "transparent");
+  const ips = data.public_ips || [];
+  const hasV6 = ips.some((ip) => ip.includes(":"));
+  const on = select([["v4", "IPv4"], ...(hasV6 ? [["v6", "IPv6"], ["all", "IPv4 and IPv6"]] : [])], "v4");
+  const mode = select([["", "automatic"], ["transparent", "transparent (client IP visible)"], ["translate", "translate (IPv4 ↔ IPv6)"]], "");
   const ingress = select([["public", "public"], ["local", "local (for a proxy on this server)"]], "public");
-  const family = select([["", "same as listen IP"], ["v4", "IPv4"], ["v6", "IPv6"]], "");
   openModal("Add forwards", form([
     row("Agent", agent),
     row("Ports", specs),
-    el("p", { class: "hint" }, "LISTEN[:TARGET]/tcp, /udp or /both, several separated by spaces. The target defaults to the listen port."),
-    el("div", { class: "row inline" }, row("Listen IP", listen), row("Mode", mode)),
-    el("div", { class: "row inline" }, row("Ingress", ingress), row("Target family", family)),
-    el("p", { class: "hint" }, "Open the public ports in your cloud or upstream firewall as well."),
+    el("p", { class: "hint" }, "LISTEN[:TARGET]/tcp, /udp or /both, several separated by spaces. The target defaults to the listen port. A port may end in /v4, /v6 or /all to override the server address below."),
+    el("div", { class: "row inline" }, row("Server address", on), row("Mode", mode)),
+    row("Ingress", ingress),
+    el("p", { class: "hint" }, "Automatic: IPv4 clients reach the agent transparently; IPv6 clients are translated to the agent's IPv4 address, so the service sees the server instead of the client. Open the public ports in your cloud firewall as well."),
   ], "Add", async () => {
-    const body = { action: "forward_add", agent: agent.value, specs: specs.value, mode: mode.value, ingress: ingress.value };
-    if (listen.value) body.listen_ip = listen.value;
-    if (family.value) body.target_family = family.value;
+    const body = { action: "forward_add", agent: agent.value, specs: specs.value, on: on.value, ingress: ingress.value };
+    if (mode.value) body.mode = mode.value;
     await act(body);
     closeModal();
     await load();
