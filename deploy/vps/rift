@@ -7,4 +7,11 @@ if [ "${1-}" = site ]; then
     exec /usr/local/lib/rift/rift-site "$@"
 fi
 
+if [ "${1-}" = forwards ] && [ "${2-}" = list ] && [ "$#" -eq 2 ] \
+    && [ -x /usr/local/lib/rift/rift-site ]; then
+    # The same table with a SITE column for forwards that `rift site` manages. Any problem
+    # falls through to the plain command below.
+    /usr/local/lib/rift/rift-site forwards 2> /dev/null && exit 0
+fi
+
 exec docker exec rift-server rift --config /etc/rift/config.toml "$@"

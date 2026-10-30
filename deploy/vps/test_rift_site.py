@@ -278,6 +278,27 @@ class FileProviderTests(unittest.TestCase):
             rift_site.run = original
         self.assertEqual(state["traefik"]["dynamic_dir"], "/home/ubuntu/service/dynamic")
 
+    def test_forward_table_names_the_site_behind_each_forward(self):
+        forwards = [
+            {"id": 1, "agent_id": "a1", "protocol": "tcp", "listen_ip": "10.0.0.207",
+             "listen_ports": {"start": 20000, "end": 20000}, "target_ports": {"start": 8091, "end": 8091},
+             "target_family": "v4", "ingress": "local", "mode": "transparent", "enabled": True},
+            {"id": 3, "agent_id": "a1", "protocol": "tcp", "listen_ip": "2001:db8::1",
+             "listen_ports": {"start": 1337, "end": 1339}, "target_ports": {"start": 1337, "end": 1339},
+             "target_family": "v6", "ingress": "public", "mode": "transparent", "enabled": False},
+        ]
+        agents = [{"id": "a1", "name": "heim"}]
+        sites = {"beszel.example.net": {"forward_id": 1, "proxy": "traefik"}}
+        rows = rift_site.forward_rows(forwards, agents, sites)
+        self.assertEqual(rows[0][-1], "SITE")
+        self.assertEqual(
+            rows[1],
+            ("1", "heim", "TCP", "10.0.0.207:20000", "8091", "v4", "local", "transparent", "enabled",
+             "beszel.example.net (traefik)"),
+        )
+        self.assertEqual(rows[2][3], "[2001:db8::1]:1337-1339")
+        self.assertEqual(rows[2][8:], ("disabled", ""))
+
     def test_a_site_forward_removed_by_hand_is_not_trusted(self):
         site = {"forward_id": 2}
         self.assertTrue(rift_site.site_forward_alive(site, [{"id": 1}, {"id": 2}]))

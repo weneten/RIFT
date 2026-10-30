@@ -923,6 +923,56 @@ def site_forward_alive(site, forwards):
     return forward_id is not None and any(f.get("id") == forward_id for f in forwards)
 
 
+def print_table(rows):
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    for row in rows:
+        print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
+
+
+def port_range(ports):
+    start, end = ports.get("start", 0), ports.get("end", ports.get("start", 0))
+    return str(start) if start == end else f"{start}-{end}"
+
+
+def forward_rows(forwards, agents, sites):
+    """The `rift forwards list` table plus a SITE column for forwards that rift site manages."""
+    names = {a.get("id"): a.get("name") for a in agents}
+    by_forward = {
+        site.get("forward_id"): f"{host} ({site['proxy']})"
+        for host, site in sites.items()
+        if site.get("forward_id") is not None
+    }
+    rows = [("ID", "AGENT", "PROTO", "LISTEN", "TARGET", "FAMILY", "INGRESS", "MODE", "STATE", "SITE")]
+    for f in forwards:
+        ip = str(f.get("listen_ip", ""))
+        ip = f"[{ip}]" if ":" in ip else ip
+        rows.append(
+            (
+                str(f.get("id", "")),
+                str(names.get(f.get("agent_id")) or f.get("agent_id", "")),
+                str(f.get("protocol", "")).upper(),
+                f"{ip}:{port_range(f.get('listen_ports') or {})}",
+                port_range(f.get("target_ports") or {}),
+                str(f.get("target_family", "")),
+                str(f.get("ingress", "")),
+                str(f.get("mode", "")),
+                "enabled" if f.get("enabled") else "disabled",
+                by_forward.get(f.get("id"), ""),
+            )
+        )
+    return rows
+
+
+def command_forwards():
+    state = load_state() or default_state("")
+    forwards = rift(state, "forwards", "list") or []
+    if not forwards:
+        print("No forwards configured.")
+        return
+    agents = rift(state, "agents", "list") or []
+    print_table(forward_rows(forwards, agents, state.get("sites") or {}))
+
+
 def command_list():
     state = load_state()
     sites = (state or {}).get("sites") or {}
@@ -939,13 +989,12 @@ def command_list():
             status = "unknown"
         else:
             status = "ok" if site_forward_alive(site, forwards) else "missing"
+        forward = f"#{site['forward_id']} {status}" if site.get("forward_id") else status
         rows.append(
-            (host, site["agent"], str(site["target"]), str(site["listen"]), site["proxy"], status)
+            (host, site["agent"], str(site["target"]), str(site["listen"]), site["proxy"], forward)
         )
-    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
-    for row in rows:
-        print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
-    if any(row[5] == "missing" for row in rows[1:]):
+    print_table(rows)
+    if any(row[5].endswith("missing") for row in rows[1:]):
         print("A missing forward is created again by 'rift site add AGENT HOST PORT'.")
 
 
@@ -968,6 +1017,7 @@ def usage():
         "usage: rift-site add AGENT HOST PORT [--proxy traefik|caddy|nginx|npm]\n"
         "       rift-site remove HOST\n"
         "       rift-site list\n"
+        "       rift-site forwards\n"
         "       rift-site proxy [traefik|caddy|nginx|npm]"
     )
 
@@ -992,6 +1042,9 @@ def main(argv):
         return
     if command == "list" and len(argv) == 2:
         command_list()
+        return
+    if command == "forwards" and len(argv) == 2:
+        command_forwards()
         return
     if command == "proxy" and len(argv) in (2, 3):
         command_proxy(argv[2] if len(argv) == 3 else None)
