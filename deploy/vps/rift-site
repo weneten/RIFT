@@ -184,10 +184,11 @@ def require_ip(address):
 
 def resolve_public_ip(toml_text, env_value):
     # The server uses RIFT_PUBLIC_IPS from .env when it is set, and the TOML list otherwise.
+    # The proxy reaches RIFT through a local hop, so one address suffices for every client
+    # family: the first IPv4 address, or the first address when there is no IPv4.
     from_env = addresses_from_env(env_value)
-    if len(from_env) > 1:
-        raise SiteError("RIFT_PUBLIC_IPS must contain one address for rift site")
-    address = from_env[0] if from_env else public_ip_from_toml(toml_text)
+    ipv4 = [a for a in from_env if ":" not in a]
+    address = (ipv4 or from_env or [public_ip_from_toml(toml_text)])[0]
     if not address:
         raise SiteError(
             "RIFT_PUBLIC_IPS is missing from .env, and public_ips is missing from the RIFT config"

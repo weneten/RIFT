@@ -163,7 +163,7 @@ Protocols that negotiate additional ports or embed addresses, such as FTP in som
 
 ## Publish services
 
-Run administrative commands on the **server**. The following examples use `node1` and assume one address in `RIFT_PUBLIC_IPS`. Replace ports with those used by your services. With multiple configured addresses, add `--listen-ip` with the desired address to every `forwards add` command.
+Run administrative commands on the **server**. The following examples use `node1`. Replace ports with those used by your services. Without `--listen-ip`, a forward listens on the first address in `RIFT_PUBLIC_IPS`; with several addresses (for example IPv4 and IPv6), add `--listen-ip` to publish on another one. A service that should answer on both IPv4 and IPv6 needs one forward per address.
 
 `forwards add` also has a short form: `rift forwards add AGENT SPEC...`, where each `SPEC` is `LISTEN[:TARGET]/tcp`, `/udp` or `/both`. The protocol is always required; `both` creates a TCP and a UDP forward. The target defaults to the listen port. Ranges such as `5000-5002/udp` work. For example, `rift forwards add node1 53/both 8080:80/tcp` replaces the two long `--agent … --protocol …` commands for port 53 plus a forward from 8080 to 80. Options such as `--listen-ip`, `--ingress` and `--mode` still apply to every forward of the command. The short form cannot be mixed with `--agent`, `--listen`, `--target` or `--protocol`. If a later forward of one command fails, the earlier ones stay created.
 
@@ -211,7 +211,7 @@ rift forwards add \
   --agent node1 --listen 30000-30002 --target 40000-40002 --protocol udp
 ```
 
-For multiple server addresses, explicitly select a configured address, for example `--listen-ip 203.0.113.10`. Replace it with an actual assigned address. The default is `--mode transparent --ingress public`, and the target family defaults to the listener's IP family. Check the created ID and apply status:
+To listen on another configured address than the first, pass it explicitly, for example `--listen-ip 2001:db8::10`. The default is `--mode transparent --ingress public`, and the target family defaults to the listener's IP family. Check the created ID and apply status:
 
 ```sh
 rift forwards list
@@ -247,7 +247,7 @@ rift forwards add \
   --agent node1 --listen 20000 --target 8081 --protocol tcp --ingress local
 ```
 
-If the server has multiple configured addresses, add `--listen-ip` with the desired IPv4 address. Port 20000 must be available; choose another if needed. Do not open it publicly. Then create a separate proxy project on the server:
+If the first address in `RIFT_PUBLIC_IPS` is not IPv4, add `--listen-ip` with an IPv4 address. Port 20000 must be available; choose another if needed. Do not open it publicly. Then create a separate proxy project on the server:
 
 ```sh
 mkdir -p caddy
@@ -287,7 +287,7 @@ Replace `203.0.113.10` in the Caddyfile with the same actual interface address u
 3. Set up one supported proxy on the server and confirm it owns TCP 443. Open TCP 443 and, if required for certificates, TCP 80. Configure certificate issuance for your domain.
 4. Ensure the proxy can reach the server public address through an interface other than the public-address NIC, such as a Docker bridge. The helper creates a `local` ingress forward which matches packets entering on such an interface; a host-local connection that bypasses prerouting is not equivalent. Verify the actual packet path for your proxy setup.
 
-The helper assumes particular proxy layouts: Traefik uses a watched file provider, entrypoints `web` and `websecure`, and certificate resolver `myresolver`; Caddy and Nginx must load the generated site directories (`/etc/caddy/rift-sites` and `/etc/nginx/rift-sites`). Adapt your proxy configuration to those paths and reload commands. The helper stores its settings and site records in `/var/lib/rift-site/sites.json`. It expects exactly one configured server public address. Inspect the helper and back up proxy configuration before using it on an existing installation.
+The helper assumes particular proxy layouts: Traefik uses a watched file provider, entrypoints `web` and `websecure`, and certificate resolver `myresolver`; Caddy and Nginx must load the generated site directories (`/etc/caddy/rift-sites` and `/etc/nginx/rift-sites`). Adapt your proxy configuration to those paths and reload commands. The helper stores its settings and site records in `/var/lib/rift-site/sites.json`. It uses the first IPv4 address in `RIFT_PUBLIC_IPS` for the proxy's local hop; clients can still reach the site over IPv6 when the proxy listens on IPv6 and the domain has an AAAA record. Inspect the helper and back up proxy configuration before using it on an existing installation.
 
 ### Add a site
 
@@ -426,7 +426,7 @@ Without `RIFT_WEBPANEL_PASSWORD` RIFT generates a 24-character password once and
 | `private` (default) | `127.0.0.1` (and `::1`) and the server tunnel address (`10.13.0.1`) | loopback, VPN devices granted with `rift panel allow`, and `RIFT_WEBPANEL_ALLOW` |
 | `public` | every address | everyone if `RIFT_WEBPANEL_ALLOW` is empty; otherwise loopback, granted VPN devices and `RIFT_WEBPANEL_ALLOW` |
 
-`RIFT_WEBPANEL_ALLOW` takes comma-separated addresses or networks, for example `10.14.0.5,198.51.100.0/24`. In private mode only addresses that arrive through the tunnel can use it (agents or VPN devices); an address on the Internet needs public mode.
+`RIFT_WEBPANEL_ALLOW` is rarely needed: devices from `rift panel connect` are always allowed without an entry. It takes comma-separated addresses or networks, which may only read. In public mode a non-empty list restricts the panel to these addresses (for example your fixed home IP) plus the server and the panel devices. In private mode only addresses arriving through the tunnel can use it, which in practice means an agent host (`10.13.0.x`).
 
 **Who can change things.** Every logged-in session can read. Changes, and anything that shows a secret (invitation tokens, a device's private key), need a trusted connection as well:
 
@@ -461,7 +461,7 @@ The panel port (default 8090, `RIFT_WEBPANEL_PORT`) must differ from the control
 | Setting | Default / role | Purpose |
 | --- | --- | --- |
 | `RIFT_PUBLIC_ENDPOINT` | Server | Reachable DNS name or IP, without port; enrollment certificate identity. |
-| `RIFT_PUBLIC_IPS` | Server | Comma-separated addresses assigned to server interfaces for listeners. |
+| `RIFT_PUBLIC_IPS` | Server | Comma-separated addresses assigned to server interfaces for listeners; forwards default to the first, `rift site` uses the first IPv4. |
 | `RIFT_ENROLLMENT_BIND` | `0.0.0.0:8443` | Enrollment listener. |
 | `RIFT_ENROLLMENT` | `auto` | `auto`: listen on the enrollment port only while an invitation is open; `always`: always; `off`: no enrollment. |
 | `RIFT_ALLOW_PRIVATE_LISTENERS` | `false` | Server. Set `true` behind a cloud NAT (e.g. Oracle Cloud), where the public address is not assigned to the interface: put the private interface address in `RIFT_PUBLIC_IPS`, keep the public DNS name in `RIFT_PUBLIC_ENDPOINT`, and open the ports in the cloud's firewall. Allows private and ULA listener addresses; loopback, link-local, multicast and unspecified stay forbidden, as does an address inside a tunnel pool. |

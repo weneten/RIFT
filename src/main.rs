@@ -423,7 +423,10 @@ async fn run() -> Result<()> {
                             )],
                         )
                     };
-                    let ip = listen_ip.or_else(|| if config.public_ips.len() == 1 { config.public_ips.first().copied() } else { None }).context("use --listen-ip when the VPS has zero or multiple configured public IPs")?;
+                    // Without --listen-ip the first address of RIFT_PUBLIC_IPS is the default.
+                    let ip = listen_ip
+                        .or_else(|| config.public_ips.first().copied())
+                        .context("RIFT_PUBLIC_IPS is empty; set it or pass --listen-ip")?;
                     let family = match target_family.as_deref() {
                         Some("v4") => Family::V4,
                         Some("v6") => Family::V6,

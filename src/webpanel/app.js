@@ -216,7 +216,7 @@ function forwardDialog() {
   const agent = select(agents, agents[0][0]);
   const specs = el("input", { required: true, placeholder: "8080:80/tcp 53/both 5000-5002/udp" });
   const ips = (data.public_ips || []).map((ip) => [ip, ip]);
-  const listen = select(ips.length > 1 ? [["", "choose…"], ...ips] : ips, ips.length === 1 ? ips[0][0] : "");
+  const listen = select(ips, ips.length ? ips[0][0] : "");
   const mode = select([["transparent", "transparent (client IP visible)"], ["translate", "translate (IPv4 ↔ IPv6)"]], "transparent");
   const ingress = select([["public", "public"], ["local", "local (for a proxy on this server)"]], "public");
   const family = select([["", "same as listen IP"], ["v4", "IPv4"], ["v6", "IPv6"]], "");

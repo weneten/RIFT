@@ -621,8 +621,8 @@ impl Action {
                 let plans = parse_forward_specs(&specs)?;
                 let ips = &panel.config.public_ips;
                 let ip = listen_ip
-                    .or_else(|| (ips.len() == 1).then(|| ips[0]))
-                    .context("choose a listen IP; the server has zero or several public IPs")?;
+                    .or_else(|| ips.first().copied())
+                    .context("RIFT_PUBLIC_IPS is empty")?;
                 let forwards = build_forwards(
                     &agent,
                     &plans,

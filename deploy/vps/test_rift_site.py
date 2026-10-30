@@ -36,12 +36,17 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(rift_site.resolve_public_ip(toml, "198.51.100.10"), "198.51.100.10")
         self.assertEqual(rift_site.resolve_public_ip(toml, ""), "203.0.113.10")
         self.assertEqual(rift_site.resolve_public_ip("", " 198.51.100.10 "), "198.51.100.10")
+        # Dual stack: the first IPv4 address, wherever it is listed.
+        self.assertEqual(
+            rift_site.resolve_public_ip("", "2001:db8::1, 198.51.100.10"), "198.51.100.10"
+        )
+        self.assertEqual(rift_site.resolve_public_ip("", "2001:db8::1"), "2001:db8::1")
         with self.assertRaises(rift_site.SiteError):
             rift_site.resolve_public_ip("", "")
         with self.assertRaises(rift_site.SiteError):
             rift_site.resolve_public_ip("", "rift.example.net")
         with self.assertRaises(rift_site.SiteError):
-            rift_site.resolve_public_ip("", "198.51.100.10,203.0.113.10")
+            rift_site.resolve_public_ip("", "2001:db8::1,rift.example.net")
 
     def test_missing_agent_says_enrollment_is_unfinished(self):
         self.assertIn(
