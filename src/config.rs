@@ -66,6 +66,26 @@ impl std::str::FromStr for PanelControl {
     }
 }
 
+/// Whether the web panel's login needs a one-time code. `optional`: only once someone turned
+/// it on; `required`: no login at all until a secret is set up with `rift panel 2fa setup`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PanelTwoFactor {
+    #[default]
+    Optional,
+    Required,
+}
+impl std::str::FromStr for PanelTwoFactor {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim() {
+            "optional" => Ok(Self::Optional),
+            "required" => Ok(Self::Required),
+            _ => bail!("web panel two-factor login must be optional or required"),
+        }
+    }
+}
+
 /// Who can open the web panel. `private` listens on the VPS's loopback and its tunnel
 /// address only; `public` listens on every address.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -205,6 +225,7 @@ pub struct Config {
     pub webpanel_access: PanelAccess,
     pub webpanel_port: u16,
     pub webpanel_control: PanelControl,
+    pub webpanel_2fa: PanelTwoFactor,
     /// Extra source addresses that may open the panel besides loopback and the VPN devices
     /// granted with `rift panel allow`. In public mode a non-empty list restricts the panel to it.
     pub webpanel_allow: Vec<IpNet>,
@@ -255,6 +276,7 @@ impl Default for Config {
             webpanel_access: PanelAccess::Private,
             webpanel_port: 8090,
             webpanel_control: PanelControl::Private,
+            webpanel_2fa: PanelTwoFactor::Optional,
             webpanel_allow: vec![],
             webpanel_password: None,
             agent_name: None,
@@ -323,6 +345,7 @@ impl Config {
         env_parse!("RIFT_WEBPANEL_ACCESS", webpanel_access);
         env_parse!("RIFT_WEBPANEL_PORT", webpanel_port);
         env_parse!("RIFT_WEBPANEL_CONTROL", webpanel_control);
+        env_parse!("RIFT_WEBPANEL_2FA", webpanel_2fa);
         if let Ok(v) = std::env::var("RIFT_WEBPANEL_ALLOW") {
             config.webpanel_allow = parse_allow_list(&v).context("invalid RIFT_WEBPANEL_ALLOW")?;
         }
@@ -617,6 +640,12 @@ mod tests {
         assert!("true".parse::<EnrollmentMode>().is_err());
         assert_eq!("off".parse::<PanelControl>().unwrap(), PanelControl::Off);
         assert!("none".parse::<PanelControl>().is_err());
+        assert_eq!(
+            "required".parse::<PanelTwoFactor>().unwrap(),
+            PanelTwoFactor::Required
+        );
+        assert!("on".parse::<PanelTwoFactor>().is_err());
+        assert_eq!(Config::default().webpanel_2fa, PanelTwoFactor::Optional);
         assert_eq!(
             "public".parse::<PanelAccess>().unwrap(),
             PanelAccess::Public

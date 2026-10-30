@@ -157,6 +157,23 @@ enum PanelCommand {
     Allow { name: String },
     /// Withdraw a device's panel access. Its other VPN grants stay.
     Deny { name: String },
+    /// Two-factor (one-time code) login for the panel.
+    #[command(name = "2fa")]
+    TwoFactor {
+        #[command(subcommand)]
+        command: TwoFactorCommand,
+    },
+}
+#[derive(Subcommand)]
+enum TwoFactorCommand {
+    /// Show whether two-factor login is on and whether it is required.
+    Status,
+    /// Create a secret and print it as a QR code for an authenticator app.
+    Setup,
+    /// Turn two-factor login on with a code from the app.
+    Confirm { code: String },
+    /// Delete the secret and end all panel sessions. The way back in if the app is lost.
+    Reset,
 }
 #[derive(Subcommand)]
 enum ConfigCommand {
@@ -314,6 +331,12 @@ async fn run() -> Result<()> {
         Command::Panel {
             command: PanelCommand::Connect { name, export },
         } => return panel_connect(&config, cli.json, name, export).await,
+        Command::Panel {
+            command:
+                PanelCommand::TwoFactor {
+                    command: TwoFactorCommand::Setup,
+                },
+        } => return two_factor_setup(&config, cli.json).await,
         Command::Panel { command } => match command {
             PanelCommand::Status => AdminRequest::PanelStatus,
             PanelCommand::Password => AdminRequest::PanelPassword,
@@ -324,6 +347,12 @@ async fn run() -> Result<()> {
             PanelCommand::Deny { name } => AdminRequest::PanelAllow {
                 name,
                 allowed: false,
+            },
+            PanelCommand::TwoFactor { command } => match command {
+                TwoFactorCommand::Status => AdminRequest::PanelTwoFactorStatus,
+                TwoFactorCommand::Confirm { code } => AdminRequest::PanelTwoFactorConfirm { code },
+                TwoFactorCommand::Reset => AdminRequest::PanelTwoFactorReset,
+                TwoFactorCommand::Setup => unreachable!("handled above"),
             },
             PanelCommand::Connect { .. } => unreachable!("handled above"),
         },
@@ -540,6 +569,24 @@ async fn panel_connect(config: &Config, json: bool, name: String, export: bool) 
     }
     Ok(())
 }
+/// Prints the new secret as a QR code, like `vpn config qr`. Codes are never shown here: a
+/// code readable on the server would not be a second factor.
+async fn two_factor_setup(config: &Config, json: bool) -> Result<()> {
+    let data = admin_ok(config, AdminRequest::PanelTwoFactorSetup).await?;
+    if json {
+        println!("{}", serde_json::to_string(&data)?);
+        return Ok(());
+    }
+    let uri = data["uri"].as_str().unwrap_or_default();
+    println!("{}", rift::vpn::qr(uri)?);
+    println!("Secret: {}", data["secret"].as_str().unwrap_or_default());
+    println!("Link:   {uri}");
+    eprintln!(
+        "Scan the code with an authenticator app, or type the secret in. The secret is shown once."
+    );
+    eprintln!("Then turn two-factor login on with: rift panel 2fa confirm CODE");
+    Ok(())
+}
 async fn vpn_config(config: &Config, json: bool, name: String, qr: bool) -> Result<()> {
     let data = admin_ok(config, AdminRequest::VpnConfig { name }).await?;
     let text = data["config"].as_str().unwrap_or_default();
@@ -636,6 +683,10 @@ mod tests {
             vec!["rift", "panel", "connect", "laptop", "--export"],
             vec!["rift", "panel", "allow", "laptop"],
             vec!["rift", "panel", "deny", "laptop"],
+            vec!["rift", "panel", "2fa", "status"],
+            vec!["rift", "panel", "2fa", "setup"],
+            vec!["rift", "panel", "2fa", "confirm", "123456"],
+            vec!["rift", "panel", "2fa", "reset"],
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }

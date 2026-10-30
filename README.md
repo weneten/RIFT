@@ -443,7 +443,17 @@ rift panel status
 rift panel password
 ```
 
-Without `RIFT_WEBPANEL_PASSWORD` RIFT generates a 24-character password once and keeps it in the state volume (`webpanel.password`, mode 0600); `rift panel password` prints it. A password you set yourself needs at least 12 characters. Logins are serialised and a wrong password costs one second; a session lasts 12 hours and ends with a restart.
+Without `RIFT_WEBPANEL_PASSWORD` RIFT generates a 24-character password once and keeps it in the state volume (`webpanel.password`, mode 0600); `rift panel password` prints it. A password you set yourself needs at least 12 characters. Logins are serialised and a wrong password costs one second; a session lasts 12 hours and ends with a restart. After 10 failed logins in a row, all logins are refused for 15 minutes.
+
+**Two-factor login.** The panel can ask for a one-time code from an authenticator app (TOTP: SHA-1, 6 digits, 30 seconds) in addition to the password. Turn it on in the panel (Panel section, Enable: scan the QR code, enter the current code) or on the server:
+
+```bash
+rift panel 2fa setup        # prints a QR code and the secret
+rift panel 2fa confirm 123456
+rift panel 2fa status
+```
+
+Once it is on, the login form has a code field, and a wrong password and a wrong code give the same error. A code works once. Turning it off in the panel needs a current code. With `RIFT_WEBPANEL_2FA=required` nobody can log in until it has been set up with the CLI, and the panel cannot turn it off. If the authenticator app is lost, run `rift panel 2fa reset` on the server (root access to the server is the recovery path); it deletes the secret (`webpanel.totp` in the state volume) and ends all panel sessions. The CLI never prints current codes.
 
 **Who can connect.** Every connection is checked against its source address before anything else:
 
@@ -500,6 +510,7 @@ The panel port (default 8090, `RIFT_WEBPANEL_PORT`) must differ from the control
 | `RIFT_WEBPANEL_PORT` | `8090` | Server. TCP port of the panel. |
 | `RIFT_WEBPANEL_CONTROL` | `private` | Server. `private`: changes from loopback without proxy headers and from panel VPN devices; `off`: read-only everywhere. |
 | `RIFT_WEBPANEL_ALLOW` | empty | Server. Extra allowed source addresses or networks, comma-separated. |
+| `RIFT_WEBPANEL_2FA` | `optional` | Server. `optional`: one-time code at login once someone turned it on; `required`: no login until `rift panel 2fa setup` and `confirm` ran. Restart required. |
 | `RIFT_WEBPANEL_PASSWORD` | generated | Server. Panel password, at least 12 characters; `rift panel password` shows the effective one. |
 | `RIFT_SERVER`, `RIFT_AGENT_NAME`, `RIFT_ENROLLMENT_TOKEN` | Agent | Invitation values; remove token after enrollment. |
 | `RIFT_AGENT_ALLOW_PORTS` | empty | Agent. Ports the agent may open for forwards and VPN grants, e.g. `22/tcp,80,27015-27020/udp`; empty means no limit. See [Harden the agent](#harden-the-agent). |

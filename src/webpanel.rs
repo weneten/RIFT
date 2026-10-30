@@ -9,14 +9,19 @@
 //! The HTTP server is deliberately small: one request per connection, bounded headers and
 //! bodies, no keep-alive. Panel actions go through the same admin requests as the CLI.
 //!
+//! Login needs the password and, once two-factor login is on, a current one-time code
+//! (`crate::totp`). `RIFT_WEBPANEL_2FA=required` refuses every login until a secret exists.
+//! Ten failed logins in a row lock all logins for 15 minutes.
+//!
 //! Every logged-in session may read. Changes, and anything that reveals a secret (an
 //! invitation token, a device's private key), additionally need a trusted connection: loopback
 //! without proxy headers or a panel VPN device, and `RIFT_WEBPANEL_CONTROL=private`.
 
 use crate::{
-    config::{Config, PanelAccess, PanelControl},
+    config::{Config, PanelAccess, PanelControl, PanelTwoFactor},
     model::*,
     protocol::AdminRequest,
+    totp::TwoFactor,
 };
 use anyhow::{bail, ensure, Context, Result};
 use ipnet::{IpNet, Ipv4Net};
@@ -217,16 +222,24 @@ pub struct Panel<B> {
     sessions: std::sync::Mutex<HashMap<String, i64>>,
     /// Serialises logins, so a wrong password costs every guesser the same second.
     login: tokio::sync::Mutex<()>,
+    two_factor: Arc<TwoFactor>,
+    /// The `two_factor` epoch the sessions belong to; a reset or disable ends them all.
+    epoch: std::sync::atomic::AtomicU64,
+    /// How long a failed login waits before it is answered.
+    penalty: Duration,
 }
 
 impl<B: Backend> Panel<B> {
-    pub fn new(backend: B, config: Config, password: &str) -> Self {
+    pub fn new(backend: B, config: Config, password: &str, two_factor: Arc<TwoFactor>) -> Self {
         Self {
             backend,
             config,
             password: Sha256::digest(password.as_bytes()).into(),
             sessions: Default::default(),
             login: Default::default(),
+            epoch: two_factor.epoch().into(),
+            two_factor,
+            penalty: Duration::from_secs(1),
         }
     }
 
@@ -284,7 +297,7 @@ impl<B: Backend> Panel<B> {
             ("GET", "/app.css") => Response::asset("text/css", APP_CSS),
             ("GET", "/api/session") => Response::json(
                 200,
-                &json!({"authenticated": self.session(&request), "can_write": self.trusted(&request, source)}),
+                &json!({"authenticated": self.session(&request), "can_write": self.trusted(&request, source), "two_factor": self.two_factor.enabled()}),
             ),
             ("POST", path) if request.header(CSRF_HEADER) != Some("1") => {
                 tracing::warn!("web panel refused {path} from {source}: missing {CSRF_HEADER}");
@@ -347,7 +360,12 @@ impl<B: Backend> Panel<B> {
     }
 
     fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, i64>> {
-        self.sessions.lock().unwrap_or_else(|e| e.into_inner())
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let epoch = self.two_factor.epoch();
+        if self.epoch.swap(epoch, std::sync::atomic::Ordering::SeqCst) != epoch {
+            sessions.clear();
+        }
+        sessions
     }
 
     fn session(&self, request: &Request) -> bool {
@@ -363,22 +381,44 @@ impl<B: Backend> Panel<B> {
         #[derive(Deserialize)]
         struct Login {
             password: String,
+            #[serde(default)]
+            code: String,
         }
         let Ok(login) = serde_json::from_slice::<Login>(&request.body) else {
-            return Response::error(400, "expected {\"password\": ...}");
+            return Response::error(400, "expected {\"password\": ..., \"code\": ...}");
         };
         let _serial = self.login.lock().await;
+        if self.two_factor.locked(now()) {
+            return Response::error(429, "too many failed logins; try again later");
+        }
+        if self.config.webpanel_2fa == PanelTwoFactor::Required && !self.two_factor.enabled() {
+            return Response::error(
+                403,
+                "two-factor login is required; set it up with `rift panel 2fa setup`",
+            );
+        }
         let given: [u8; 32] = Sha256::digest(login.password.as_bytes()).into();
         // Compare digests without an early exit.
         let mismatch = given
             .iter()
             .zip(self.password.iter())
             .fold(0u8, |acc, (a, b)| acc | (a ^ b));
-        if mismatch != 0 {
+        // The code is only checked, and its step only used up, after the right password.
+        let code_ok = !self.two_factor.enabled()
+            || (mismatch == 0 && self.two_factor.verify_login(&login.code, now()));
+        if mismatch != 0 || !code_ok {
             tracing::warn!("web panel login failed from {source}");
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            return Response::error(401, "wrong password");
+            if self.two_factor.failed(now()) {
+                tracing::warn!(
+                    "web panel: {} failed logins in a row, all logins are locked for {} minutes",
+                    crate::totp::MAX_FAILURES,
+                    crate::totp::LOCKOUT_SECONDS / 60
+                );
+            }
+            tokio::time::sleep(self.penalty).await;
+            return Response::error(401, "wrong password or code");
         }
+        self.two_factor.succeeded();
         let token = {
             use rand::{rngs::OsRng, RngCore};
             let mut bytes = [0u8; 32];
@@ -413,6 +453,10 @@ impl<B: Backend> Panel<B> {
         let mut overview = compose_overview(&status, &peers, &panel);
         overview["can_write"] = can_write.into();
         overview["public_ips"] = json!(self.config.public_ips);
+        overview["two_factor"] = json!({
+            "enabled": self.two_factor.enabled(),
+            "required": self.config.webpanel_2fa == PanelTwoFactor::Required,
+        });
         Ok(overview)
     }
 
@@ -547,7 +591,27 @@ enum Action {
         name: String,
         allowed: bool,
     },
+    /// Starts turning two-factor login on: a new pending secret to scan.
+    TwoFactorSetup,
+    TwoFactorConfirm {
+        code: Code,
+    },
+    /// Needs a current code; refused when `RIFT_WEBPANEL_2FA=required`.
+    TwoFactorDisable {
+        code: Code,
+    },
 }
+
+/// A one-time code, kept out of the action log.
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct Code(String);
+impl std::fmt::Debug for Code {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+
 impl Action {
     fn writes(&self) -> bool {
         !matches!(self, Self::Logs { .. } | Self::Diagnostics)
@@ -742,6 +806,22 @@ impl Action {
                 panel
                     .admin(AdminRequest::PanelAllow { name, allowed })
                     .await?
+            }
+            Self::TwoFactorSetup => {
+                let setup = panel.two_factor.setup(crate::totp::host(&panel.config))?;
+                json!({"secret": setup.secret, "uri": setup.uri, "qr_svg": crate::vpn::qr_svg(&setup.uri)?})
+            }
+            Self::TwoFactorConfirm { code } => {
+                panel.two_factor.confirm(&code.0, now())?;
+                json!({"enabled": true})
+            }
+            Self::TwoFactorDisable { code } => {
+                ensure!(
+                    panel.config.webpanel_2fa != PanelTwoFactor::Required,
+                    "two-factor login is required by the server; only `rift panel 2fa reset` on the server turns it off"
+                );
+                panel.two_factor.disable(&code.0, now())?;
+                json!({"enabled": false})
             }
         })
     }
@@ -954,6 +1034,7 @@ impl Response {
             403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            429 => "Too Many Requests",
             _ => "Internal Server Error",
         };
         let mut head = format!(
@@ -988,6 +1069,7 @@ mod tests {
     struct Fake {
         peers: Vec<IpAddr>,
         calls: std::sync::Mutex<Vec<String>>,
+        dir: tempfile::TempDir,
     }
     impl Backend for Arc<Fake> {
         async fn admin(&self, request: AdminRequest) -> Result<Value> {
@@ -1032,11 +1114,12 @@ mod tests {
         let fake = Arc::new(Fake {
             peers: vec!["10.14.0.2".parse().unwrap()],
             calls: Default::default(),
+            dir: tempfile::tempdir().unwrap(),
         });
-        (
-            Panel::new(fake.clone(), config, "correct horse battery"),
-            fake,
-        )
+        let two_factor = Arc::new(TwoFactor::new(fake.dir.path().join("webpanel.totp")));
+        let mut panel = Panel::new(fake.clone(), config, "correct horse battery", two_factor);
+        panel.penalty = Duration::ZERO;
+        (panel, fake)
     }
 
     async fn exchange(panel: &Panel<Arc<Fake>>, source: &str, raw: &str) -> String {
@@ -1177,6 +1260,7 @@ mod tests {
         )
         .await;
         assert!(wrong.starts_with("HTTP/1.1 401") && !wrong.contains("Set-Cookie"));
+        assert!(wrong.contains("wrong password or code"));
         let ok = exchange(
             &panel,
             "127.0.0.1",
@@ -1437,6 +1521,226 @@ mod tests {
         assert!(exchange(&panel, "127.0.0.1", "GET /nope HTTP/1.1\r\n\r\n")
             .await
             .starts_with("HTTP/1.1 404"));
+    }
+
+    /// Turns two-factor login on directly and returns the secret.
+    fn enable_two_factor(panel: &Panel<Arc<Fake>>) -> Vec<u8> {
+        let setup = panel.two_factor.setup("server").unwrap();
+        let secret = crate::totp::base32_decode(&setup.secret).unwrap();
+        let step = crate::totp::step_at(now());
+        let code = format!("{:06}", crate::totp::code_at(&secret, step));
+        panel.two_factor.confirm(&code, now()).unwrap();
+        secret
+    }
+
+    fn code_for(secret: &[u8], offset: u64) -> String {
+        format!(
+            "{:06}",
+            crate::totp::code_at(secret, crate::totp::step_at(now()) + offset)
+        )
+    }
+
+    async fn try_login(panel: &Panel<Arc<Fake>>, password: &str, code: Option<&str>) -> String {
+        let body = match code {
+            Some(code) => json!({"password": password, "code": code}),
+            None => json!({"password": password}),
+        };
+        exchange(
+            panel,
+            "127.0.0.1",
+            &post("/api/login", &body.to_string(), "X-Rift-Panel: 1\r\n"),
+        )
+        .await
+    }
+
+    const PASSWORD: &str = "correct horse battery";
+
+    #[tokio::test]
+    async fn login_needs_the_code_once_two_factor_is_on() {
+        let (panel, _fake) = panel(config(PanelAccess::Private, ""));
+        let session = exchange(&panel, "127.0.0.1", "GET /api/session HTTP/1.1\r\n\r\n").await;
+        assert!(session.contains("\"two_factor\":false"), "{session}");
+        assert!(try_login(&panel, PASSWORD, None)
+            .await
+            .starts_with("HTTP/1.1 200"));
+
+        let secret = enable_two_factor(&panel);
+        let session = exchange(&panel, "127.0.0.1", "GET /api/session HTTP/1.1\r\n\r\n").await;
+        assert!(session.contains("\"two_factor\":true"), "{session}");
+        for (password, code) in [
+            (PASSWORD, None),
+            (PASSWORD, Some("000000")),
+            ("nope", Some(code_for(&secret, 1).as_str())),
+        ] {
+            let out = try_login(&panel, password, code).await;
+            assert!(
+                out.starts_with("HTTP/1.1 401") && out.contains("wrong password or code"),
+                "{out}"
+            );
+            assert!(!out.contains("Set-Cookie"));
+        }
+        // A wrong password does not use the code up.
+        let good = code_for(&secret, 1);
+        let ok = try_login(&panel, PASSWORD, Some(&good)).await;
+        assert!(
+            ok.starts_with("HTTP/1.1 200") && ok.contains("Set-Cookie"),
+            "{ok}"
+        );
+        // The same code cannot log in twice.
+        assert!(try_login(&panel, PASSWORD, Some(&good))
+            .await
+            .starts_with("HTTP/1.1 401"));
+    }
+
+    #[tokio::test]
+    async fn ten_failed_logins_lock_everyone_out() {
+        let (panel, _fake) = panel(config(PanelAccess::Private, ""));
+        for _ in 0..9 {
+            assert!(try_login(&panel, "nope", None)
+                .await
+                .starts_with("HTTP/1.1 401"));
+        }
+        // A success resets the count.
+        assert!(try_login(&panel, PASSWORD, None)
+            .await
+            .starts_with("HTTP/1.1 200"));
+        for _ in 0..10 {
+            assert!(try_login(&panel, "nope", None)
+                .await
+                .starts_with("HTTP/1.1 401"));
+        }
+        let locked = try_login(&panel, PASSWORD, None).await;
+        assert!(
+            locked.starts_with("HTTP/1.1 429") && locked.contains("try again later"),
+            "{locked}"
+        );
+        assert!(!locked.contains("Set-Cookie"));
+    }
+
+    #[tokio::test]
+    async fn required_two_factor_refuses_logins_until_a_secret_exists() {
+        let mut cfg = config(PanelAccess::Private, "");
+        cfg.webpanel_2fa = PanelTwoFactor::Required;
+        let (panel, _fake) = panel(cfg);
+        let refused = try_login(&panel, PASSWORD, None).await;
+        assert!(
+            refused.starts_with("HTTP/1.1 403") && refused.contains("rift panel 2fa setup"),
+            "{refused}"
+        );
+        let secret = enable_two_factor(&panel);
+        assert!(try_login(&panel, PASSWORD, None)
+            .await
+            .starts_with("HTTP/1.1 401"));
+        let ok = try_login(&panel, PASSWORD, Some(&code_for(&secret, 1))).await;
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        // The panel cannot turn a required factor off, and the overview says so.
+        let cookie = session_cookie(&ok);
+        let disable = format!(
+            r#"{{"action":"two_factor_disable","code":"{}"}}"#,
+            code_for(&secret, 2)
+        );
+        let out = act(&panel, "127.0.0.1", &cookie, &disable, "").await;
+        assert!(
+            out.starts_with("HTTP/1.1 400") && out.contains("required"),
+            "{out}"
+        );
+        assert!(panel.two_factor.enabled());
+        let overview = exchange(
+            &panel,
+            "127.0.0.1",
+            &format!("GET /api/overview HTTP/1.1\r\nCookie: {cookie}\r\n\r\n"),
+        )
+        .await;
+        assert!(
+            overview.contains(r#""two_factor":{"enabled":true,"required":true}"#),
+            "{overview}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_factor_setup_and_disable_run_from_a_trusted_connection() {
+        let (panel, _fake) = panel(config(PanelAccess::Public, ""));
+        let cookie = logged_in(&panel).await;
+        let setup = r#"{"action":"two_factor_setup"}"#;
+        // Reading the status is open; changing it is not.
+        let refused = act(&panel, "203.0.113.7", &cookie, setup, "").await;
+        assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+        assert!(act(
+            &panel,
+            "127.0.0.1",
+            &cookie,
+            setup,
+            "X-Real-IP: 1.2.3.4\r\n"
+        )
+        .await
+        .starts_with("HTTP/1.1 403"));
+        let shown = act(&panel, "127.0.0.1", &cookie, setup, "").await;
+        assert!(
+            shown.starts_with("HTTP/1.1 200")
+                && shown.contains("<svg")
+                && shown.contains("otpauth://totp/RIFT:server?secret="),
+            "{shown}"
+        );
+        let body: Value = serde_json::from_str(shown.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let secret = crate::totp::base32_decode(body["secret"].as_str().unwrap()).unwrap();
+
+        let confirm =
+            |code: String| format!(r#"{{"action":"two_factor_confirm","code":"{code}"}}"#);
+        let wrong = act(&panel, "127.0.0.1", &cookie, &confirm("000000".into()), "").await;
+        assert!(
+            wrong.starts_with("HTTP/1.1 400") && wrong.contains("wrong code"),
+            "{wrong}"
+        );
+        assert!(!panel.two_factor.enabled());
+        let good = confirm(code_for(&secret, 0));
+        assert!(act(&panel, "203.0.113.7", &cookie, &good, "")
+            .await
+            .starts_with("HTTP/1.1 403"));
+        assert!(!panel.two_factor.enabled());
+        let done = act(&panel, "10.14.0.2", &cookie, &good, "").await;
+        assert!(done.starts_with("HTTP/1.1 200"), "{done}");
+        assert!(panel.two_factor.enabled());
+
+        let disable = format!(
+            r#"{{"action":"two_factor_disable","code":"{}"}}"#,
+            code_for(&secret, 1)
+        );
+        assert!(act(&panel, "203.0.113.7", &cookie, &disable, "")
+            .await
+            .starts_with("HTTP/1.1 403"));
+        assert!(panel.two_factor.enabled());
+        let wrong = r#"{"action":"two_factor_disable","code":"000000"}"#;
+        assert!(act(&panel, "127.0.0.1", &cookie, wrong, "")
+            .await
+            .starts_with("HTTP/1.1 400"));
+        assert!(act(&panel, "127.0.0.1", &cookie, &disable, "")
+            .await
+            .starts_with("HTTP/1.1 200"));
+        assert!(!panel.two_factor.enabled());
+        // Turning it off ends every session.
+        let after = exchange(
+            &panel,
+            "127.0.0.1",
+            &format!("GET /api/overview HTTP/1.1\r\nCookie: {cookie}\r\n\r\n"),
+        )
+        .await;
+        assert!(after.starts_with("HTTP/1.1 401"), "{after}");
+    }
+
+    #[tokio::test]
+    async fn a_reset_from_the_cli_ends_the_sessions() {
+        let (panel, _fake) = panel(config(PanelAccess::Private, ""));
+        let secret = enable_two_factor(&panel);
+        let ok = try_login(&panel, PASSWORD, Some(&code_for(&secret, 1))).await;
+        let cookie = session_cookie(&ok);
+        let overview = format!("GET /api/overview HTTP/1.1\r\nCookie: {cookie}\r\n\r\n");
+        assert!(exchange(&panel, "127.0.0.1", &overview)
+            .await
+            .starts_with("HTTP/1.1 200"));
+        panel.two_factor.reset().unwrap();
+        assert!(exchange(&panel, "127.0.0.1", &overview)
+            .await
+            .starts_with("HTTP/1.1 401"));
     }
 
     #[test]

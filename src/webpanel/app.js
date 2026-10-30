@@ -285,6 +285,39 @@ async function configDialog(name) {
       button("Done", closeModal, "primary"))));
 }
 
+// Turning two-factor login on: scan the new secret, then prove it works with a code.
+async function twoFactorDialog() {
+  let result;
+  try {
+    result = await act({ action: "two_factor_setup" });
+  } catch (e) {
+    showBanner(`Two-factor setup: ${e.message}`);
+    return;
+  }
+  const image = el("img", { alt: "Authenticator QR code", src: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(result.qr_svg)}` });
+  const code = el("input", { required: true, inputmode: "numeric", autocomplete: "one-time-code", pattern: "[0-9 ]{6,7}", maxlength: "7", placeholder: "123456" });
+  openModal("Enable two-factor login",
+    el("p", { class: "hint" }, "Scan the code with an authenticator app, or type the secret in. Then enter the current code to turn it on."),
+    el("div", { class: "qr" }, image),
+    el("pre", { class: "pre" }, result.secret),
+    form([row("Code", code)], "Enable", async () => {
+      await act({ action: "two_factor_confirm", code: code.value });
+      closeModal();
+      await load();
+    }));
+}
+
+function twoFactorOffDialog() {
+  const code = el("input", { required: true, inputmode: "numeric", autocomplete: "one-time-code", pattern: "[0-9 ]{6,7}", maxlength: "7", placeholder: "123456" });
+  openModal("Disable two-factor login", form([
+    row("Current code", code),
+    el("p", { class: "hint" }, "All sessions end, including this one."),
+  ], "Disable", async () => {
+    await act({ action: "two_factor_disable", code: code.value });
+    showLogin();
+  }));
+}
+
 function grantsDialog(name) {
   const peer = (data.vpn_peers || []).find((p) => p.name === name);
   if (!peer) { closeModal(); return; }
@@ -484,6 +517,14 @@ function render() {
     urls.append(el("li", {}, el("span", { class: "muted" }, "Allowed addresses:"), panel.allow.join(", ")));
   }
 
+  const factor = data.two_factor || {};
+  $("two-factor").replaceChildren(
+    el("span", { class: "muted" }, "Two-factor login: "),
+    factor.enabled ? pill("on", "ok") : pill("off", "off"),
+    factor.required ? el("span", { class: "muted small" }, factor.enabled ? " required by the server" : " required; set it up on the server with rift panel 2fa setup") : null,
+    canWrite && !factor.required ? " " : null,
+    canWrite && !factor.required ? (factor.enabled ? button("Disable", twoFactorOffDialog, "danger") : button("Enable", twoFactorDialog)) : null);
+
   $("updated").textContent = `Updated ${new Date().toLocaleTimeString()}`;
 }
 
@@ -516,11 +557,22 @@ function schedule() {
   timer = setInterval(() => { if (!document.hidden) load(); }, REFRESH_MS);
 }
 
+// The code field is only there while the server asks for a code.
+async function updateLoginForm() {
+  try {
+    const session = await api("/api/session");
+    $("code-row").hidden = !session.two_factor;
+    $("code").required = !!session.two_factor;
+  } catch (_) { /* keep the form as it is */ }
+}
+
 function showLogin() {
   clearInterval(timer);
   closeModal();
   $("app").hidden = true;
   $("login").hidden = false;
+  $("code").value = "";
+  updateLoginForm();
   $("password").focus();
 }
 
@@ -538,11 +590,14 @@ document.addEventListener("DOMContentLoaded", async () => {
     submit.disabled = true;
     $("login-error").textContent = "";
     try {
-      await api("/api/login", { password: $("password").value });
+      const body = { password: $("password").value };
+      if (!$("code-row").hidden) body.code = $("code").value;
+      await api("/api/login", body);
       $("password").value = "";
+      $("code").value = "";
       await showApp();
     } catch (e) {
-      $("login-error").textContent = e.message === "wrong password" ? "Wrong password." : e.message;
+      $("login-error").textContent = e.message;
     } finally {
       submit.disabled = false;
     }
