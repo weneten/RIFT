@@ -341,7 +341,7 @@ def run_datapath(server_cfg, agent_cfg):
             port = PORTS[name]
             admin(NS, server_cfg, "forwards", "add", "--agent", "host-agent",
                   "--listen-ip", ip, "--listen", str(port), "--target", str(port),
-                  "--protocol", proto)
+                  "--protocol", proto, "--mode", "transparent")
     def applied():
         state = json.loads(admin(NS, server_cfg, "status").stdout)
         snap = state["snapshot"]
@@ -388,7 +388,8 @@ def wait_policy(server_cfg):
 def add_app_forward(server_cfg, listen_ip, listen_port, target_port):
     result = json.loads(admin(NS, server_cfg, "forwards", "add", "--agent", "host-agent",
                               "--listen-ip", listen_ip, "--listen", str(listen_port),
-                              "--target", str(target_port), "--protocol", "tcp").stdout)
+                              "--target", str(target_port), "--protocol", "tcp",
+                              "--mode", "transparent").stdout)
     wait_policy(server_cfg)
     return result
 
