@@ -10,3 +10,4 @@ pub mod state;
 pub mod tls_material;
 pub mod translation;
 pub mod vpn;
+pub mod webpanel;

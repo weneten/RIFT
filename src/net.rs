@@ -257,6 +257,11 @@ impl Kernel {
         } else {
             Vec::new()
         };
+        let mut vpn_rules = vpn::server_rules(self.interface(), self.config.vpn_pool, snapshot);
+        // Panel access sits ahead of the rule that keeps VPN peers off the VPS.
+        vpn_rules
+            .input
+            .insert_str(0, &crate::webpanel::input_rules(&self.config, snapshot));
         let rules = render_server_rules(
             self.interface(),
             self.config.mark,
@@ -267,7 +272,7 @@ impl Kernel {
             &forwards,
             &peers,
             &uplinks,
-            &vpn::server_rules(self.interface(), self.config.vpn_pool, snapshot),
+            &vpn_rules,
         )?;
         self.replace_nft_table(&rules).await?;
         self.sync_server_host_firewall(local_ingress, !vpn_grants.is_empty())
@@ -563,6 +568,13 @@ impl Kernel {
                 uplinks: &uplinks,
                 local_ingress,
                 vpn,
+                panel: self
+                    .config
+                    .webpanel
+                    .then_some(crate::host_firewall::PanelSpec {
+                        port: self.config.webpanel_port,
+                        public: self.config.webpanel_access == crate::config::PanelAccess::Public,
+                    }),
             },
         )?;
         self.apply_host_plan(&plan).await
@@ -2746,6 +2758,7 @@ mod tests {
                 ipv4: Ipv4Addr::new(10, 14, 0, 2),
                 enabled: true,
                 created_at: 0,
+                panel: false,
             }],
             vpn_grants: vec![VpnGrant {
                 peer: "iphone".into(),

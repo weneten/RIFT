@@ -279,12 +279,15 @@ fn vpn_peers(data: &Value) -> String {
                 Some(t) if t > 0 => format!("{}s ago", (now - t).max(0)),
                 _ => "never".into(),
             };
-            let grants = p["grants"]
+            let mut grants = p["grants"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .map(|g| format!("{}: {}", field(g, "agent"), vpn_access(&g["access"])))
                 .collect::<Vec<_>>();
+            if p["panel"].as_bool() == Some(true) {
+                grants.insert(0, "web panel".into());
+            }
             vec![
                 field(p, "name"),
                 field(p, "ipv4"),
@@ -308,6 +311,51 @@ fn vpn_peers(data: &Value) -> String {
         rows,
         "No VPN devices registered.",
     )
+}
+
+fn panel_status(data: &Value) -> String {
+    if data["enabled"].as_bool() != Some(true) {
+        return format!("Web panel is off. To turn it on, {}.", field(data, "hint"));
+    }
+    let mut lines = vec![format!(
+        "Web panel is on ({} access, port {}).",
+        field(data, "access"),
+        field(data, "port")
+    )];
+    for url in data["urls"].as_array().into_iter().flatten() {
+        lines.push(format!("  {}  {}", field(url, "url"), field(url, "via")));
+    }
+    let devices: Vec<String> = data["devices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|d| {
+            if d["enabled"].as_bool() == Some(true) {
+                field(d, "name")
+            } else {
+                format!("{} (disabled)", field(d, "name"))
+            }
+        })
+        .collect();
+    lines.push(format!(
+        "Devices with panel access: {}",
+        if devices.is_empty() {
+            "none (add one with rift panel connect NAME)".into()
+        } else {
+            devices.join(", ")
+        }
+    ));
+    let allow: Vec<String> = data["allow"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(text)
+        .collect();
+    if !allow.is_empty() {
+        lines.push(format!("Allowed addresses: {}", allow.join(", ")));
+    }
+    lines.push(format!("Password: {}", field(data, "password")));
+    lines.join("\n")
 }
 
 pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>) -> String {
@@ -336,6 +384,13 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
         AdminRequest::VpnPeerRevoke { name } => format!("VPN device {name} revoked. Its key and grants are gone."),
         AdminRequest::VpnAllow { peer, agent, access } => format!("{peer} may now reach {agent}: {}.", vpn_access(&serde_json::to_value(access).unwrap_or_default())),
         AdminRequest::VpnDeny { peer, agent, .. } => format!("Access of {peer} to {agent} withdrawn."),
+        AdminRequest::PanelStatus => panel_status(data),
+        AdminRequest::PanelPassword => field(data, "password"),
+        AdminRequest::PanelAllow { name, allowed: true } => {
+            let url = data["urls"].as_array().and_then(|u| u.get(1)).map(|u| field(u, "url")).unwrap_or_default();
+            format!("{name} may now open the web panel at {url}.\nIf the device was set up before, re-import its configuration: rift vpn config qr {name}")
+        }
+        AdminRequest::PanelAllow { name, allowed: false } => format!("{name} can no longer open the web panel."),
         AdminRequest::Reload => format!("Configuration reconciled (generation {}).", field(data, "generation")),
         AdminRequest::Status => status(data),
         AdminRequest::Logs { .. } => {

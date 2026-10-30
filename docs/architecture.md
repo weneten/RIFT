@@ -36,6 +36,14 @@ Revocation, disabling and denial remove the WireGuard peer, AllowedIPs, route an
 
 Trust boundary: the agent identifies a device by its VPN source address, delivered by the server. A compromised server can forge any granted address, so agent-side rules protect against configuration mistakes and a stolen device key, not a hostile server. Stronger protection needs end-to-end authentication between device and agent. A device key alone gives access to exactly what that device is granted; there is no per-device second factor.
 
+## Web panel
+
+The optional panel (`RIFT_WEBPANEL=true`) runs inside the server process and acts through the same admin requests as the CLI, limited to an explicit list: status, VPN device list, enabling and disabling agents, forwards and devices, and removing forwards. Invitations, keys, grants and device configurations (which contain private keys) are not reachable through it.
+
+Access is checked in three places. The listener set depends on `RIFT_WEBPANEL_ACCESS`: `private` binds loopback and the server's IPv4 tunnel address only, `public` binds every address. Each connection's source must be loopback, an enabled VPN device with the panel flag, or inside `RIFT_WEBPANEL_ALLOW`; in public mode an empty allow list admits everyone. On `rift0`, `inet rift` accepts the panel port only from those devices and from allow-listed tunnel sources, ahead of the rule that drops VPN devices on input; agents and other devices still hit the final drop. A device with the panel flag gets the server tunnel address in its AllowedIPs and nothing else beyond its agent grants.
+
+Authentication is a single password (environment or a generated mode-0600 file in the state directory). Logins are serialised with a one-second penalty for a wrong password. Sessions are random 256-bit tokens in an `HttpOnly`, `SameSite=Strict` cookie, held in memory for 12 hours. State-changing requests also need a custom header, which a cross-site page cannot send without a CORS preflight the panel never answers. Responses carry a strict Content-Security-Policy; the page loads no external resources. The server speaks plain HTTP: confidentiality comes from loopback, an SSH tunnel or WireGuard in private mode, and only from a TLS proxy in public mode.
+
 ## Configuration and recovery
 
 TOML and documented environment overrides own static deployment settings. SQLite owns agents, invitations, bans and dynamic forward grants; TOML reload never replaces those rows. CLI changes commit desired state transactionally. The operation journal and separately confirmed snapshot distinguish requested configuration from successfully reconciled kernel configuration. New publications wait for the agent's generation ACK. `status` reports pending forwards and apply failures.

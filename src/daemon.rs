@@ -30,6 +30,31 @@ struct Server {
     kernel: Arc<Mutex<Kernel>>,
     translation: Mutex<TranslationManager>,
     server_public_key: String,
+    /// Set when the web panel is on.
+    panel_password: Option<String>,
+}
+
+/// The web panel acts through the same admin requests as the CLI.
+struct PanelBackend(Arc<Server>);
+impl crate::webpanel::Backend for PanelBackend {
+    async fn admin(&self, request: AdminRequest) -> Result<serde_json::Value> {
+        admin_call_impl(&self.0, request)
+            .await
+            .map_err(|e| anyhow!(sanitize_error(&e.to_string())))
+    }
+    fn panel_peers(&self) -> Vec<IpAddr> {
+        self.0
+            .state
+            .snapshot()
+            .map(|snap| {
+                snap.vpn_peers
+                    .iter()
+                    .filter(|p| p.enabled && p.panel)
+                    .map(|p| IpAddr::V4(p.ipv4))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[cfg_attr(not(unix), allow(clippy::let_unit_value))]
@@ -43,6 +68,11 @@ pub async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
     }
     let (server_public_key, _private_path) = ensure_server_keypair(&config).await?;
     let state = Arc::new(StateStore::open(&config.state_dir.join("state.db"))?);
+    let panel_password = if config.webpanel {
+        Some(crate::webpanel::password(&config)?)
+    } else {
+        None
+    };
     let server = Arc::new(Server {
         config: tokio::sync::RwLock::new(config.clone()),
         config_path: config_path.clone(),
@@ -50,6 +80,7 @@ pub async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
         kernel: Arc::new(Mutex::new(Kernel::new(config.clone()))),
         translation: Mutex::new(TranslationManager::new()),
         server_public_key,
+        panel_password,
     });
     reconcile(&server).await?;
     let admin = bind_admin(config.socket_path()).await?;
@@ -92,6 +123,25 @@ pub async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
                 tracing::error!("enrollment endpoint stopped: {e:#}");
             }
         }));
+    }
+    if let Some(password) = &server.panel_password {
+        let listeners = crate::webpanel::bind(&config).await?;
+        let panel = Arc::new(crate::webpanel::Panel::new(
+            PanelBackend(server.clone()),
+            config.clone(),
+            password,
+        ));
+        for listener in listeners {
+            let address = listener.local_addr()?;
+            tracing::info!(
+                "web panel ({}) listening on {address}",
+                config.webpanel_access
+            );
+            tasks.push(tokio::spawn(panel.clone().serve(listener)));
+        }
+        if config.webpanel_access == crate::config::PanelAccess::Public {
+            tracing::warn!("the web panel is public over plain HTTP; its password crosses the network unencrypted unless a TLS proxy is in front of it");
+        }
     }
     tracing::info!("RIFT server ready; config={}", config_path.display());
     let poll = Duration::from_secs(config.poll_seconds);
@@ -242,6 +292,10 @@ async fn reload_config(s: &Server) -> Result<u64> {
         || next.server_ipv4 != current.server_ipv4
         || next.server_ipv6 != current.server_ipv6
         || next.vpn_pool != current.vpn_pool
+        || next.webpanel != current.webpanel
+        || next.webpanel_access != current.webpanel_access
+        || next.webpanel_port != current.webpanel_port
+        || next.webpanel_allow != current.webpanel_allow
         || next.route_table != current.route_table
         || next.rule_priority != current.rule_priority
         || next.mark != current.mark
@@ -249,7 +303,7 @@ async fn reload_config(s: &Server) -> Result<u64> {
         || next.tls_cert != current.tls_cert
         || next.tls_key != current.tls_key
         || next.tls_ca != current.tls_ca;
-    anyhow::ensure!(!immutable_changed,"configuration change requires a service restart (interface, endpoint, pools, ports, routing, or TLS identity)");
+    anyhow::ensure!(!immutable_changed,"configuration change requires a service restart (interface, endpoint, pools, ports, routing, web panel, or TLS identity)");
     *s.config.write().await = next.clone();
     *s.kernel.lock().await = Kernel::new(next);
     if let Err(error) = reconcile(s).await {
@@ -787,6 +841,24 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
         AdminRequest::Logs { lines } => {
             serde_json::json!({"lines":crate::audit::recent(lines.min(1000)),"persistent":false,"source":"process-local ring; Docker/journald retains container or service logs"})
         }
+        AdminRequest::PanelStatus => {
+            let cfg = s.config.read().await.clone();
+            if !cfg.webpanel {
+                serde_json::json!({"enabled":false,"hint":"set RIFT_WEBPANEL=true in the server .env and recreate the container"})
+            } else {
+                let devices: Vec<_> = snap
+                    .vpn_peers
+                    .iter()
+                    .filter(|p| p.panel)
+                    .map(|p| serde_json::json!({"name":p.name,"ipv4":p.ipv4,"enabled":p.enabled}))
+                    .collect();
+                serde_json::json!({"enabled":true,"access":cfg.webpanel_access,"port":cfg.webpanel_port,"urls":crate::webpanel::urls(&cfg),"allow":cfg.webpanel_allow,"devices":devices,"password":if cfg.webpanel_password.is_some() {"RIFT_WEBPANEL_PASSWORD"} else {"generated; show it with `rift panel password`"}})
+            }
+        }
+        AdminRequest::PanelPassword => {
+            let password = s.panel_password.clone().ok_or_else(|| anyhow!("the web panel is off; set RIFT_WEBPANEL=true in the server .env and recreate the container"))?;
+            serde_json::json!({"password":password})
+        }
         vpn_request => vpn_admin(s, &snap, vpn_request).await?,
     };
     Ok(data)
@@ -831,6 +903,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                     ipv4,
                     enabled: true,
                     created_at: now(),
+                    panel: false,
                 });
                 Ok(())
             });
@@ -853,7 +926,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                     let agent = snap.agents.iter().find(|a| a.id == g.agent_id).map(|a| a.name.clone());
                     serde_json::json!({"agent":agent,"access":g.access})
                 }).collect();
-                serde_json::json!({"name":p.name,"ipv4":p.ipv4,"enabled":p.enabled,"public_key":p.public_key,"last_handshake":handshake,"grants":grants})
+                serde_json::json!({"name":p.name,"ipv4":p.ipv4,"enabled":p.enabled,"panel":p.panel,"public_key":p.public_key,"last_handshake":handshake,"grants":grants})
             }).collect();
             serde_json::Value::Array(rows)
         }
@@ -953,8 +1026,25 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                 &s.server_public_key,
                 &host_port(&cfg.public_endpoint, cfg.wg_port),
                 cfg.mtu,
+                cfg.webpanel.then_some(cfg.server_ipv4),
             )?;
             serde_json::json!({"name":name,"config":config})
+        }
+        AdminRequest::PanelAllow { name, allowed } => {
+            find_peer(&name)?;
+            anyhow::ensure!(
+                cfg.webpanel || !allowed,
+                "the web panel is off; set RIFT_WEBPANEL=true in the server .env and recreate the container"
+            );
+            s.state.mutate("panel-allow", |x| {
+                x.vpn_peers
+                    .iter_mut()
+                    .filter(|p| p.name == name)
+                    .for_each(|p| p.panel = allowed);
+                Ok(())
+            })?;
+            reconcile(s).await?;
+            serde_json::json!({"name":name,"panel":allowed,"urls":if allowed {crate::webpanel::urls(&cfg)} else {Vec::new()}})
         }
         _ => unreachable!("not a VPN request"),
     };
@@ -1458,7 +1548,7 @@ fn secure_dir(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn atomic_write(path: &Path, data: &[u8], _mode: u32) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, data: &[u8], _mode: u32) -> Result<()> {
     use std::io::Write;
     let parent = path
         .parent()
@@ -1497,6 +1587,7 @@ mod tests {
             ipv4: "10.14.0.2".parse().unwrap(),
             enabled,
             created_at: 0,
+            panel: false,
         }
     }
     fn grant(name: &str, access: VpnAccess) -> VpnGrant {

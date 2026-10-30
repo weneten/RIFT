@@ -59,6 +59,16 @@ pub struct ServerSpec<'a> {
     pub local_ingress: bool,
     /// VPN peers reach agents through `rift0` and leave by `rift0` again.
     pub vpn: bool,
+    /// The web panel's TCP port, when it is on. Who may connect is decided in the RIFT
+    /// table and by the panel itself; UFW only has to let the port through.
+    pub panel: Option<PanelSpec>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PanelSpec {
+    pub port: u16,
+    /// Also open the port on the uplinks, not only on the tunnel address.
+    pub public: bool,
 }
 
 pub struct AgentSpec<'a> {
@@ -140,7 +150,21 @@ pub fn plan_server(obs: &Observation, spec: &ServerSpec<'_>) -> Result<Plan> {
                 spec.interface, spec.server_v6, spec.control_port
             ));
         }
+        if let Some(panel) = spec.panel {
+            if chain.family == "ip" || chain.family == "inet" {
+                rules.push(format!(
+                    "iifname \"{}\" ip daddr {} tcp dport {} accept comment \"rift:panel\"",
+                    spec.interface, spec.server_v4, panel.port
+                ));
+            }
+        }
         for prefix in iface_prefixes(spec.uplinks) {
+            if let Some(panel) = spec.panel.filter(|panel| panel.public) {
+                rules.push(format!(
+                    "{prefix}tcp dport {} accept comment \"rift:panel\"",
+                    panel.port
+                ));
+            }
             rules.push(format!(
                 "{prefix}udp dport {} accept comment \"rift:wireguard\"",
                 spec.wg_port
@@ -535,6 +559,7 @@ mod tests {
             uplinks,
             local_ingress: false,
             vpn: false,
+            panel: None,
         }
     }
 
@@ -568,6 +593,34 @@ mod tests {
         assert!(plan.jumps.contains("ufw6-user-input"));
         assert!(plan.create.contains("add chain ip6 filter rift-host-in"));
         assert!(!plan.create.contains("add chain ip filter rift-host-in"));
+    }
+
+    #[test]
+    fn the_panel_port_opens_on_the_tunnel_and_only_in_public_mode_on_the_uplink() {
+        let obs = observe(&ruleset()).unwrap();
+        let uplinks = vec!["eth0".to_string()];
+        let mut spec = server_spec(&uplinks);
+        assert!(!plan_server(&obs, &spec)
+            .unwrap()
+            .fill
+            .contains("rift:panel"));
+        spec.panel = Some(PanelSpec {
+            port: 8090,
+            public: false,
+        });
+        let private = plan_server(&obs, &spec).unwrap();
+        assert!(private.fill.contains(
+            "iifname \"rift0\" ip daddr 10.88.0.1 tcp dport 8090 accept comment \"rift:panel\""
+        ));
+        assert!(!private.fill.contains("iifname \"eth0\" tcp dport 8090"));
+        spec.panel = Some(PanelSpec {
+            port: 8090,
+            public: true,
+        });
+        let public = plan_server(&obs, &spec).unwrap();
+        assert!(public
+            .fill
+            .contains("iifname \"eth0\" tcp dport 8090 accept comment \"rift:panel\""));
     }
 
     #[test]

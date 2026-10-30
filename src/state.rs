@@ -662,6 +662,7 @@ mod tests {
             ipv4: Ipv4Addr::new(10, 14, 0, 2),
             enabled: true,
             created_at: 0,
+            panel: false,
         };
         let grant = |agent: &str, access| VpnGrant {
             peer: "iphone".into(),

@@ -1,5 +1,5 @@
 use anyhow::{bail, ensure, Context, Result};
-use ipnet::{Ipv4Net, Ipv6Net};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -12,6 +12,34 @@ pub enum HostFirewall {
     #[default]
     Auto,
     Off,
+}
+
+/// Who can open the web panel. `private` listens on the VPS's loopback and its tunnel
+/// address only; `public` listens on every address.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PanelAccess {
+    #[default]
+    Private,
+    Public,
+}
+impl std::str::FromStr for PanelAccess {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "private" | "local" | "localhost" => Ok(Self::Private),
+            "public" | "all" => Ok(Self::Public),
+            _ => bail!("web panel access must be private or public"),
+        }
+    }
+}
+impl std::fmt::Display for PanelAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Private => "private",
+            Self::Public => "public",
+        })
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -45,6 +73,16 @@ pub struct Config {
     pub poll_seconds: u64,
     /// `auto` extends UFW user chains when they exist. `off` leaves the host firewall untouched.
     pub host_firewall: HostFirewall,
+    /// Server only. Serves the web panel; off unless enabled.
+    pub webpanel: bool,
+    pub webpanel_access: PanelAccess,
+    pub webpanel_port: u16,
+    /// Extra source addresses that may open the panel besides loopback and the VPN devices
+    /// granted with `rift panel allow`. In public mode a non-empty list restricts the panel to it.
+    pub webpanel_allow: Vec<IpNet>,
+    /// From the environment only. Without it a generated password lives in the state directory.
+    #[serde(skip)]
+    pub webpanel_password: Option<String>,
     pub agent_name: Option<String>,
     pub server_address: Option<String>,
     #[serde(skip)]
@@ -79,6 +117,11 @@ impl Default for Config {
             handshake_timeout: 180,
             poll_seconds: 10,
             host_firewall: HostFirewall::Auto,
+            webpanel: false,
+            webpanel_access: PanelAccess::Private,
+            webpanel_port: 8090,
+            webpanel_allow: vec![],
+            webpanel_password: None,
             agent_name: None,
             server_address: None,
             enrollment_token: None,
@@ -143,6 +186,12 @@ impl Config {
         env_parse!("RIFT_SERVER_IPV4", server_ipv4);
         env_parse!("RIFT_SERVER_IPV6", server_ipv6);
         env_parse!("RIFT_VPN_POOL", vpn_pool);
+        env_parse!("RIFT_WEBPANEL", webpanel);
+        env_parse!("RIFT_WEBPANEL_ACCESS", webpanel_access);
+        env_parse!("RIFT_WEBPANEL_PORT", webpanel_port);
+        if let Ok(v) = std::env::var("RIFT_WEBPANEL_ALLOW") {
+            config.webpanel_allow = parse_allow_list(&v).context("invalid RIFT_WEBPANEL_ALLOW")?;
+        }
         if let Ok(v) = std::env::var("RIFT_HOST_FIREWALL") {
             if !v.is_empty() {
                 config.host_firewall = match v.to_ascii_lowercase().as_str() {
@@ -156,6 +205,7 @@ impl Config {
             ("RIFT_AGENT_NAME", &mut config.agent_name),
             ("RIFT_SERVER", &mut config.server_address),
             ("RIFT_ENROLLMENT_TOKEN", &mut config.enrollment_token),
+            ("RIFT_WEBPANEL_PASSWORD", &mut config.webpanel_password),
         ] {
             if let Ok(v) = std::env::var(key) {
                 if !v.is_empty() {
@@ -253,6 +303,20 @@ impl Config {
         if let Some(name) = &self.agent_name {
             validate_name(name)?;
         }
+        if self.webpanel {
+            ensure!(
+                self.webpanel_port != 0
+                    && self.webpanel_port != self.control_port
+                    && self.webpanel_port != self.enrollment_bind.port(),
+                "web panel port must be nonzero and differ from the control and enrollment ports"
+            );
+            if let Some(password) = &self.webpanel_password {
+                ensure!(
+                    password.chars().count() >= 12,
+                    "RIFT_WEBPANEL_PASSWORD must have at least 12 characters"
+                );
+            }
+        }
         Ok(())
     }
     /// Checked only once VPN peers exist, so a deployment that never uses the VPN is not
@@ -276,6 +340,19 @@ impl Config {
     pub fn identity_path(&self) -> PathBuf {
         self.state_dir.join("identity.json")
     }
+}
+/// Comma-separated addresses or networks; a bare address means that single host.
+pub fn parse_allow_list(text: &str) -> Result<Vec<IpNet>> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .map(|x| {
+            x.parse::<IpNet>()
+                .or_else(|_| x.parse::<IpAddr>().map(IpNet::from))
+                .map(|net| net.trunc())
+                .with_context(|| format!("{x:?} is not an address or network"))
+        })
+        .collect()
 }
 pub fn validate_name(name: &str) -> Result<()> {
     ensure!(
@@ -344,6 +421,38 @@ mod tests {
             ..Default::default()
         };
         assert!(public.validate().is_err());
+    }
+    #[test]
+    fn webpanel_is_off_and_private_by_default() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(!config.webpanel);
+        assert_eq!(config.webpanel_access, PanelAccess::Private);
+        assert_eq!("all".parse::<PanelAccess>().unwrap(), PanelAccess::Public);
+        assert_eq!(
+            "localhost".parse::<PanelAccess>().unwrap(),
+            PanelAccess::Private
+        );
+        assert!("everyone".parse::<PanelAccess>().is_err());
+        let clash = Config {
+            webpanel: true,
+            webpanel_port: 8444,
+            ..Default::default()
+        };
+        assert!(clash.validate().is_err());
+        let short = Config {
+            webpanel: true,
+            webpanel_password: Some("short".into()),
+            ..Default::default()
+        };
+        assert!(short.validate().is_err());
+    }
+    #[test]
+    fn allow_list_accepts_hosts_and_networks() {
+        let list = parse_allow_list(" 10.14.0.5, 192.168.1.7/24 ,,2001:db8::1").unwrap();
+        let shown: Vec<_> = list.iter().map(ToString::to_string).collect();
+        assert_eq!(shown, ["10.14.0.5/32", "192.168.1.0/24", "2001:db8::1/128"]);
+        assert!(parse_allow_list("example.net").is_err());
+        assert!(parse_allow_list("").unwrap().is_empty());
     }
     #[test]
     fn rejects_non_ula() {

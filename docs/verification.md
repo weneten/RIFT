@@ -43,6 +43,15 @@ The `rift vpn` feature has unit coverage only: rule rendering and ordering, stat
 7. Existing public forwards behave as before, with the home router still closed to inbound connections.
 8. UFW with `host_firewall = "auto"`: device traffic works and unrelated drops remain.
 
+## Web panel: not yet verified on a kernel
+
+The web panel has unit coverage (configuration parsing, source checks, nft and UFW rule rendering, client AllowedIPs, HTTP parsing limits, login, session, CSRF header, action allow-list, password file mode) and was driven in headless Chromium against a fake backend (login, wrong password, enable/disable, remove, reload, logout, light/dark, 390 px width, no CSP violations). It has not run inside a real server container. Before relying on it, check on a disposable server:
+
+1. `RIFT_WEBPANEL=true` with `private`: the panel answers on `127.0.0.1` and through `ssh -L`, but not on the public address.
+2. `rift panel connect` yields a working WireGuard configuration; the device opens `http://10.13.0.1:8090` but still cannot reach the control port, other devices or ungranted agents; `rift panel deny`, `vpn peer disable` and `revoke` cut it off.
+3. An agent or a device without the panel flag cannot connect to the panel port.
+4. `public` with and without `RIFT_WEBPANEL_ALLOW`, with UFW active and with `host_firewall = "off"`.
+
 ## Release gates
 
 Run the configured Linux and Docker jobs, review failures and archive their results. Before production acceptance, additionally exercise full host reboots, startup-interruption fault injection, existing management SSH and the intended host-firewall/Docker-backend combination. Collect iperf3 measurements against ordinary WireGuard on representative hardware. No throughput, downtime or production-safety benchmark is claimed in this repository.

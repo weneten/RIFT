@@ -22,6 +22,7 @@ The agent initiates the connection to the server. RIFT manages the tunnel, expli
 - [Publish websites with HTTPS](#publish-websites-with-https)
 - [Manage agents and forwards](#manage-agents-and-forwards)
 - [Private VPN access](#private-vpn-access)
+- [Web panel](#web-panel)
 - [Configuration](#configuration)
 - [Operations and troubleshooting](#operations-and-troubleshooting)
 - [Build and development](#build-and-development)
@@ -399,6 +400,51 @@ The agent host itself answers on its LAN address too, as long as that address li
 
 **Trust boundary.** The server authenticates devices by WireGuard key, and the agent enforces its own input and forwarding rules by the device's VPN source address. A compromised server can forge an allowed source address, so the agent-side rules limit mistakes and stolen device keys, not a hostile server. Protecting against that needs end-to-end authentication between device and agent, which RIFT does not provide. Only IPv4 is supported for VPN devices, and the first version has no full-tunnel mode.
 
+## Web panel
+
+The server can serve a small web panel: agents with their connection state, forwards, VPN devices and the apply status. It can enable and disable agents, forwards and VPN devices and remove forwards; everything else stays with the CLI. The panel is **off** by default. Enable it in the server `.env` and recreate the container:
+
+```dotenv
+RIFT_WEBPANEL=true
+RIFT_WEBPANEL_ACCESS=private   # or public
+```
+
+```sh
+docker compose up -d --force-recreate
+rift panel status
+rift panel password
+```
+
+Without `RIFT_WEBPANEL_PASSWORD` RIFT generates a 24-character password once and keeps it in the state volume (`webpanel.password`, mode 0600); `rift panel password` prints it. A password you set yourself needs at least 12 characters. Logins are serialised and a wrong password costs one second; a session lasts 12 hours and ends with a restart.
+
+**Who can connect.** Every connection is checked against its source address before anything else:
+
+| `RIFT_WEBPANEL_ACCESS` | Listens on | Allowed sources |
+| --- | --- | --- |
+| `private` (default) | `127.0.0.1` (and `::1`) and the server tunnel address (`10.13.0.1`) | loopback, VPN devices granted with `rift panel allow`, and `RIFT_WEBPANEL_ALLOW` |
+| `public` | every address | everyone if `RIFT_WEBPANEL_ALLOW` is empty; otherwise loopback, granted VPN devices and `RIFT_WEBPANEL_ALLOW` |
+
+`RIFT_WEBPANEL_ALLOW` takes comma-separated addresses or networks, for example `10.14.0.5,198.51.100.0/24`. In private mode only addresses that arrive through the tunnel can use it (agents or VPN devices); an address on the Internet needs public mode.
+
+**Private mode from your own computer.** Either use an SSH tunnel and open `http://127.0.0.1:8090`:
+
+```sh
+ssh -L 8090:127.0.0.1:8090 user@rift.example.net
+```
+
+or add a WireGuard device for the panel in one step on the server:
+
+```sh
+rift panel connect laptop            # creates the VPN device if needed, grants the panel, prints a QR code
+rift panel connect laptop --export > laptop.conf   # the same as a file (contains the private key)
+```
+
+Import the configuration into the WireGuard app, connect, and open `http://10.13.0.1:8090` (the server's `RIFT_SERVER_IPV4`). The device reaches only that port on the server; its configuration routes only the server's tunnel address, plus whatever `rift vpn allow` grants it on agents. `rift panel allow NAME` grants an existing VPN device; re-import its configuration afterwards so it routes the server address. `rift panel deny NAME` withdraws panel access and keeps the device's other grants. Disabling or revoking the device in `rift vpn peer` also ends its panel access.
+
+**Public mode** opens the port in UFW when RIFT manages it (`host_firewall = "auto"`); open it in any upstream firewall or cloud security group yourself. The panel speaks plain HTTP. In public mode the password and session cookie cross the network unencrypted, so prefer private mode, restrict `RIFT_WEBPANEL_ALLOW`, or put a TLS reverse proxy in front (the cookie is marked `Secure` when the proxy sends `X-Forwarded-Proto: https`). Everyone who has the password can change forwards and agents.
+
+The panel port (default 8090, `RIFT_WEBPANEL_PORT`) must differ from the control and enrollment ports. Panel settings need a restart; `rift reload` refuses to change them.
+
 ## Configuration
 
 `config.toml` contains static settings; `.env` supplies the Compose profile and the documented environment overrides. Compose reads the project `.env` automatically. Agents, invitations and forwards are stored in the persistent state volume rather than in TOML.
@@ -414,6 +460,11 @@ The agent host itself answers on its LAN address too, as long as that address li
 | `RIFT_IPV4_POOL`, `RIFT_SERVER_IPV4` | `10.13.0.0/24`, `10.13.0.1` | Server. Override the IPv4 tunnel pool if it overlaps a host network (the default avoids Podman's 10.88.0.0/16, Docker's 172.16/12 and common WireGuard 10.8.0.0/24). The server address must be inside the pool; restart required. |
 | `RIFT_IPV6_POOL`, `RIFT_SERVER_IPV6` | `fd88:5249:4654::/64`, `fd88:5249:4654::1` | Server. Same for IPv6 (ULA pool). |
 | `RIFT_VPN_POOL` | `10.14.0.0/24` | Server. Addresses for [private VPN devices](#private-vpn-access); must not overlap the IPv4 tunnel pool or a granted LAN; restart required. |
+| `RIFT_WEBPANEL` | `false` | Server. Serves the [web panel](#web-panel). Restart required. |
+| `RIFT_WEBPANEL_ACCESS` | `private` | Server. `private`: loopback and tunnel address only; `public`: every address. |
+| `RIFT_WEBPANEL_PORT` | `8090` | Server. TCP port of the panel. |
+| `RIFT_WEBPANEL_ALLOW` | empty | Server. Extra allowed source addresses or networks, comma-separated. |
+| `RIFT_WEBPANEL_PASSWORD` | generated | Server. Panel password, at least 12 characters; `rift panel password` shows the effective one. |
 | `RIFT_SERVER`, `RIFT_AGENT_NAME`, `RIFT_ENROLLMENT_TOKEN` | Agent | Invitation values; remove token after enrollment. |
 | `interface`, `wg_port`, `control_port` | `rift0`, `51820`, `8444` | WireGuard interface and ports. |
 | `ipv4_pool`, `ipv6_pool` | `10.13.0.0/24`, `fd88:5249:4654::/64` | Tunnel address pools; avoid overlaps. |

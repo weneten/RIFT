@@ -46,6 +46,11 @@ enum Command {
         #[command(subcommand)]
         command: Vpn,
     },
+    /// The optional web panel on the VPS (RIFT_WEBPANEL=true in the server .env).
+    Panel {
+        #[command(subcommand)]
+        command: PanelCommand,
+    },
     /// Validate the local TOML configuration and environment overrides.
     Config {
         #[command(subcommand)]
@@ -149,6 +154,25 @@ impl VpnAccessArgs {
         }
         Ok(out)
     }
+}
+#[derive(Subcommand)]
+enum PanelCommand {
+    /// Show whether the panel is on, its addresses and the devices that may open it.
+    Status,
+    /// Print the panel password.
+    Password,
+    /// Create a VPN device for the panel (or reuse an existing one), grant it access and
+    /// print its WireGuard configuration as a QR code.
+    Connect {
+        name: String,
+        /// Print the configuration file instead of a QR code.
+        #[arg(long)]
+        export: bool,
+    },
+    /// Let an existing VPN device open the panel.
+    Allow { name: String },
+    /// Withdraw a device's panel access. Its other VPN grants stay.
+    Deny { name: String },
 }
 #[derive(Subcommand)]
 enum ConfigCommand {
@@ -300,6 +324,22 @@ async fn run() -> Result<()> {
             };
             return vpn_config(&config, cli.json, name, qr).await;
         }
+        Command::Panel {
+            command: PanelCommand::Connect { name, export },
+        } => return panel_connect(&config, cli.json, name, export).await,
+        Command::Panel { command } => match command {
+            PanelCommand::Status => AdminRequest::PanelStatus,
+            PanelCommand::Password => AdminRequest::PanelPassword,
+            PanelCommand::Allow { name } => AdminRequest::PanelAllow {
+                name,
+                allowed: true,
+            },
+            PanelCommand::Deny { name } => AdminRequest::PanelAllow {
+                name,
+                allowed: false,
+            },
+            PanelCommand::Connect { .. } => unreachable!("handled above"),
+        },
         Command::Vpn { command } => match command {
             Vpn::Peer { command } => match command {
                 VpnPeers::Add { name } => AdminRequest::VpnPeerAdd { name },
@@ -475,17 +515,58 @@ async fn run() -> Result<()> {
     }
     Ok(())
 }
-async fn vpn_config(config: &Config, json: bool, name: String, qr: bool) -> Result<()> {
-    let response = rift::daemon::admin_call(config, AdminRequest::VpnConfig { name }).await?;
+async fn admin_ok(config: &Config, request: AdminRequest) -> Result<serde_json::Value> {
+    let response = rift::daemon::admin_call(config, request).await?;
     if !response.ok {
         bail!(
             "{}",
             response.error.unwrap_or_else(|| "operation failed".into())
         );
     }
-    let text = response.data["config"].as_str().unwrap_or_default();
+    Ok(response.data)
+}
+/// The short way onto the panel: one device, panel access, and its configuration.
+async fn panel_connect(config: &Config, json: bool, name: String, export: bool) -> Result<()> {
+    let status = admin_ok(config, AdminRequest::PanelStatus).await?;
+    anyhow::ensure!(
+        status["enabled"].as_bool() == Some(true),
+        "the web panel is off; set RIFT_WEBPANEL=true in the server .env and recreate the container"
+    );
+    let peers = admin_ok(config, AdminRequest::VpnPeerList).await?;
+    let exists = peers
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|p| p["name"].as_str() == Some(name.as_str()));
+    if !exists {
+        admin_ok(config, AdminRequest::VpnPeerAdd { name: name.clone() }).await?;
+        eprintln!("VPN device {name} created.");
+    }
+    let granted = admin_ok(
+        config,
+        AdminRequest::PanelAllow {
+            name: name.clone(),
+            allowed: true,
+        },
+    )
+    .await?;
+    vpn_config(config, json, name, !export).await?;
+    if !json {
+        if let Some(url) = granted["urls"]
+            .as_array()
+            .and_then(|urls| urls.get(1))
+            .and_then(|u| u["url"].as_str())
+        {
+            eprintln!("Once the device is connected, open {url}. Password: rift panel password");
+        }
+    }
+    Ok(())
+}
+async fn vpn_config(config: &Config, json: bool, name: String, qr: bool) -> Result<()> {
+    let data = admin_ok(config, AdminRequest::VpnConfig { name }).await?;
+    let text = data["config"].as_str().unwrap_or_default();
     if json {
-        println!("{}", serde_json::to_string(&response.data)?);
+        println!("{}", serde_json::to_string(&data)?);
     } else if qr {
         println!("{}", rift::vpn::qr(text)?);
         eprintln!("Scan this in the WireGuard app. The code contains the device's private key.");
@@ -595,6 +676,12 @@ mod tests {
             vec!["rift", "vpn", "deny", "iphone", "--agent", "home"],
             vec!["rift", "vpn", "config", "export", "iphone"],
             vec!["rift", "vpn", "config", "qr", "iphone"],
+            vec!["rift", "panel", "status"],
+            vec!["rift", "panel", "password"],
+            vec!["rift", "panel", "connect", "laptop"],
+            vec!["rift", "panel", "connect", "laptop", "--export"],
+            vec!["rift", "panel", "allow", "laptop"],
+            vec!["rift", "panel", "deny", "laptop"],
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }

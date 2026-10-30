@@ -132,6 +132,14 @@ pub enum AdminRequest {
     VpnConfig {
         name: String,
     },
+    /// Whether the web panel is on, where it listens and which devices may open it.
+    PanelStatus,
+    PanelPassword,
+    /// Let a VPN device open the web panel, or withdraw that again.
+    PanelAllow {
+        name: String,
+        allowed: bool,
+    },
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AdminResponse {

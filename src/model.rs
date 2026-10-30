@@ -197,6 +197,9 @@ pub struct VpnPeer {
     pub ipv4: Ipv4Addr,
     pub enabled: bool,
     pub created_at: i64,
+    /// May open the web panel on the VPS's tunnel address. Missing on older state means no.
+    #[serde(default)]
+    pub panel: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

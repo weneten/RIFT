@@ -179,6 +179,7 @@ pub fn agent_nft_rules(interface: &str, tunnel: Ipv4Addr, rules: &[AgentVpnRule]
 }
 
 /// WireGuard configuration for one device. Split tunnel: only addresses the peer may reach.
+/// `panel` is the VPS's tunnel address when the web panel is on and this device may open it.
 pub fn client_config(
     snap: &StateSnapshot,
     peer: &VpnPeer,
@@ -186,8 +187,12 @@ pub fn client_config(
     server_public_key: &str,
     endpoint: &str,
     mtu: u16,
+    panel: Option<Ipv4Addr>,
 ) -> Result<String> {
     let mut routes = BTreeSet::new();
+    if let Some(server) = panel.filter(|_| peer.panel) {
+        routes.insert(format!("{server}/32"));
+    }
     for grant in snap.vpn_grants.iter().filter(|g| g.peer == peer.name) {
         let Some(agent) = snap.agents.iter().find(|a| a.id == grant.agent_id) else {
             continue;
@@ -199,7 +204,7 @@ pub fn client_config(
     }
     ensure!(
         !routes.is_empty(),
-        "{} has no access yet; grant some with `rift vpn allow`",
+        "{} has no access yet; grant some with `rift vpn allow` or `rift panel allow`",
         peer.name
     );
     Ok(format!(
@@ -251,6 +256,7 @@ mod tests {
             ipv4: Ipv4Addr::new(10, 14, 0, last),
             enabled,
             created_at: 0,
+            panel: false,
         }
     }
     fn grant(peer: &str, agent: &str, access: VpnAccess) -> VpnGrant {
@@ -363,12 +369,31 @@ mod tests {
             "PUB",
             "vps.example:51820",
             1380,
+            Some(Ipv4Addr::new(10, 13, 0, 1)),
         )
         .unwrap();
         assert!(text.contains("Address = 10.14.0.2/32"));
         assert!(text.contains("AllowedIPs = 10.13.0.2/32, 192.168.178.0/24\n"));
         assert!(!text.contains("0.0.0.0/0"));
-        assert!(client_config(&snap, &peer("new", 9, true), "k", "p", "e", 1380).is_err());
+        assert!(client_config(&snap, &peer("new", 9, true), "k", "p", "e", 1380, None).is_err());
+    }
+
+    #[test]
+    fn a_panel_device_routes_only_the_vps_tunnel_address() {
+        let snap = snapshot();
+        let mut admin = peer("laptop", 9, true);
+        admin.panel = true;
+        let server = Some(Ipv4Addr::new(10, 13, 0, 1));
+        let text = client_config(&snap, &admin, "k", "p", "e", 1380, server).unwrap();
+        assert!(text.contains("AllowedIPs = 10.13.0.1/32\n"), "{text}");
+        // Panel switched off on the VPS: the device has nothing to route.
+        assert!(client_config(&snap, &admin, "k", "p", "e", 1380, None).is_err());
+        // Without the flag the server address is never routed.
+        assert!(
+            client_config(&snap, &snap.vpn_peers[0], "k", "p", "e", 1380, server)
+                .unwrap()
+                .contains("AllowedIPs = 10.13.0.2/32\n")
+        );
     }
 
     #[test]

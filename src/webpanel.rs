@@ -1,0 +1,959 @@
+//! Optional web panel on the VPS. Off unless `RIFT_WEBPANEL=true`.
+//!
+//! Access is layered. `private` listens only on loopback and the VPS's tunnel address, so it
+//! is reached on the VPS itself, through an SSH tunnel, or from a VPN device granted with
+//! `rift panel allow`. `public` listens on every address. In both modes the source address
+//! is checked again here, the RIFT table only lets granted tunnel sources reach the port,
+//! and every request past the login needs the panel password.
+//!
+//! The HTTP server is deliberately small: one request per connection, bounded headers and
+//! bodies, no keep-alive. Panel actions go through the same admin requests as the CLI.
+
+use crate::{
+    config::{Config, PanelAccess},
+    model::*,
+    protocol::AdminRequest,
+};
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use ipnet::{IpNet, Ipv4Net};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeSet, HashMap},
+    future::Future,
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::TcpListener,
+    sync::Semaphore,
+    time::timeout,
+};
+
+const INDEX: &str = include_str!("webpanel/index.html");
+const APP_JS: &str = include_str!("webpanel/app.js");
+const APP_CSS: &str = include_str!("webpanel/app.css");
+
+const MAX_HEAD: usize = 8 * 1024;
+const MAX_BODY: usize = 16 * 1024;
+const SESSION_SECONDS: i64 = 12 * 3600;
+const MAX_SESSIONS: usize = 32;
+const COOKIE: &str = "rift_panel";
+/// Panel requests that change state must carry this header. A cross-site page cannot set
+/// it without a CORS preflight, which the panel never answers.
+const CSRF_HEADER: &str = "x-rift-panel";
+
+/// What the panel needs from the running server.
+pub trait Backend: Send + Sync + 'static {
+    fn admin(&self, request: AdminRequest) -> impl Future<Output = Result<Value>> + Send;
+    /// Tunnel addresses of enabled VPN devices that may open the panel.
+    fn panel_peers(&self) -> Vec<IpAddr>;
+}
+
+/// The password from `RIFT_WEBPANEL_PASSWORD`, or one generated once and kept in the state
+/// directory (mode 0600). `rift panel password` shows it.
+pub fn password(config: &Config) -> Result<String> {
+    if let Some(password) = &config.webpanel_password {
+        return Ok(password.clone());
+    }
+    let path = password_path(config);
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let text = text.trim();
+        if !text.is_empty() {
+            return Ok(text.into());
+        }
+    }
+    use rand::{distributions::Alphanumeric, rngs::OsRng, Rng};
+    let generated: String = OsRng
+        .sample_iter(&Alphanumeric)
+        .take(24)
+        .map(char::from)
+        .collect();
+    crate::daemon::atomic_write(&path, generated.as_bytes(), 0o600)
+        .context("store the generated web panel password")?;
+    Ok(generated)
+}
+
+pub fn password_path(config: &Config) -> std::path::PathBuf {
+    config.state_dir.join("webpanel.password")
+}
+
+/// Addresses the panel can be opened at, with how each one is reached.
+pub fn urls(config: &Config) -> Vec<Value> {
+    let port = config.webpanel_port;
+    let mut out = vec![
+        json!({"url": format!("http://127.0.0.1:{port}"), "via": "on the VPS itself or through an SSH tunnel"}),
+        json!({"url": format!("http://{}:{port}", config.server_ipv4), "via": "from a VPN device granted with rift panel allow"}),
+    ];
+    if config.webpanel_access == PanelAccess::Public {
+        let hosts: Vec<String> = if config.public_endpoint.is_empty() {
+            config.public_ips.iter().map(|ip| host(*ip)).collect()
+        } else {
+            vec![config.public_endpoint.clone()]
+        };
+        for name in hosts {
+            out.push(json!({"url": format!("http://{name}:{port}"), "via": "public, from any allowed address"}));
+        }
+    }
+    out
+}
+
+fn host(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V6(v6) => format!("[{v6}]"),
+        IpAddr::V4(v4) => v4.to_string(),
+    }
+}
+
+/// Whether a connection from `source` may talk to the panel at all.
+pub fn source_allowed(config: &Config, panel_peers: &[IpAddr], source: IpAddr) -> bool {
+    let source = source.to_canonical();
+    source.is_loopback()
+        || panel_peers.contains(&source)
+        || config
+            .webpanel_allow
+            .iter()
+            .any(|net| net.contains(&source))
+        || (config.webpanel_access == PanelAccess::Public && config.webpanel_allow.is_empty())
+}
+
+/// RIFT table input rules that let granted tunnel sources reach the panel port. They must
+/// precede the rule that drops VPN peers on their way to the VPS, and the final tunnel drop.
+pub fn input_rules(config: &Config, snap: &StateSnapshot) -> String {
+    if !config.webpanel {
+        return String::new();
+    }
+    let (interface, port) = (&config.interface, config.webpanel_port);
+    let mut v4: BTreeSet<Ipv4Net> = snap
+        .vpn_peers
+        .iter()
+        .filter(|p| p.enabled && p.panel)
+        .map(|p| Ipv4Net::from(p.ipv4))
+        .collect();
+    let mut v6 = BTreeSet::new();
+    for net in &config.webpanel_allow {
+        match net {
+            IpNet::V4(net) => {
+                v4.insert(*net);
+            }
+            IpNet::V6(net) => {
+                v6.insert(*net);
+            }
+        }
+    }
+    let mut out = String::new();
+    for net in v4 {
+        out.push_str(&format!(
+            "add rule inet rift input iifname \"{interface}\" ip saddr {net} ip daddr {} tcp dport {port} accept\n",
+            config.server_ipv4
+        ));
+    }
+    // Only a public panel listens on the tunnel's IPv6 address.
+    if config.webpanel_access == PanelAccess::Public {
+        for net in v6 {
+            out.push_str(&format!(
+                "add rule inet rift input iifname \"{interface}\" ip6 saddr {net} ip6 daddr {} tcp dport {port} accept\n",
+                config.server_ipv6
+            ));
+        }
+    }
+    out
+}
+
+/// Opens the panel's listeners. Call after the tunnel address is configured.
+pub async fn bind(config: &Config) -> Result<Vec<TcpListener>> {
+    let port = config.webpanel_port;
+    let mut out = Vec::new();
+    match config.webpanel_access {
+        PanelAccess::Private => {
+            for ip in [IpAddr::from([127, 0, 0, 1]), config.server_ipv4.into()] {
+                let address = SocketAddr::new(ip, port);
+                out.push(
+                    TcpListener::bind(address)
+                        .await
+                        .with_context(|| format!("bind web panel to {address}"))?,
+                );
+            }
+            // Browsers try ::1 first for `localhost`; a host without IPv6 simply lacks it.
+            if let Ok(listener) = TcpListener::bind((Ipv6Addr::LOCALHOST, port)).await {
+                out.push(listener);
+            }
+        }
+        PanelAccess::Public => {
+            let listener = match dual_stack(port) {
+                Ok(listener) => listener,
+                Err(_) => TcpListener::bind(("0.0.0.0", port))
+                    .await
+                    .with_context(|| format!("bind web panel to port {port}"))?,
+            };
+            out.push(listener);
+        }
+    }
+    Ok(out)
+}
+
+fn dual_stack(port: u16) -> Result<TcpListener> {
+    use socket2::{Domain, Socket, Type};
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, None)?;
+    socket.set_only_v6(false)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port).into())?;
+    socket.listen(128)?;
+    socket.set_nonblocking(true)?;
+    Ok(TcpListener::from_std(socket.into())?)
+}
+
+pub struct Panel<B> {
+    backend: B,
+    config: Config,
+    password: [u8; 32],
+    sessions: std::sync::Mutex<HashMap<String, i64>>,
+    /// Serialises logins, so a wrong password costs every guesser the same second.
+    login: tokio::sync::Mutex<()>,
+}
+
+impl<B: Backend> Panel<B> {
+    pub fn new(backend: B, config: Config, password: &str) -> Self {
+        Self {
+            backend,
+            config,
+            password: Sha256::digest(password.as_bytes()).into(),
+            sessions: Default::default(),
+            login: Default::default(),
+        }
+    }
+
+    pub async fn serve(self: Arc<Self>, listener: TcpListener) {
+        let permits = Arc::new(Semaphore::new(64));
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            while connections.try_join_next().is_some() {}
+            let (stream, remote) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("web panel accept: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let Ok(permit) = permits.clone().try_acquire_owned() else {
+                continue;
+            };
+            let panel = self.clone();
+            connections.spawn(async move {
+                let _permit = permit;
+                let mut stream = stream;
+                let _ = timeout(
+                    Duration::from_secs(30),
+                    panel.connection(&mut stream, remote.ip()),
+                )
+                .await;
+            });
+        }
+    }
+
+    async fn connection<S: AsyncRead + AsyncWrite + Unpin>(&self, stream: &mut S, source: IpAddr) {
+        let response = match timeout(Duration::from_secs(10), read_request(stream)).await {
+            Ok(Ok(request)) => {
+                if source_allowed(&self.config, &self.backend.panel_peers(), source) {
+                    self.handle(request, source).await
+                } else {
+                    tracing::warn!("web panel refused {source}: address not allowed");
+                    Response::text(403, "This address may not open the RIFT panel.\n")
+                }
+            }
+            Ok(Err(e)) => Response::text(400, &format!("{e}\n")),
+            Err(_) => return,
+        };
+        let _ = stream.write_all(&response.to_bytes()).await;
+        let _ = stream.shutdown().await;
+    }
+
+    async fn handle(&self, request: Request, source: IpAddr) -> Response {
+        let secure = request.header("x-forwarded-proto") == Some("https");
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/" | "/index.html") => Response::asset("text/html", INDEX),
+            ("GET", "/app.js") => Response::asset("text/javascript", APP_JS),
+            ("GET", "/app.css") => Response::asset("text/css", APP_CSS),
+            ("GET", "/api/session") => {
+                Response::json(200, &json!({"authenticated": self.session(&request)}))
+            }
+            ("POST", path) if request.header(CSRF_HEADER) != Some("1") => {
+                tracing::warn!("web panel refused {path} from {source}: missing {CSRF_HEADER}");
+                Response::error(403, "missing request header")
+            }
+            ("POST", "/api/login") => self.login(&request, source, secure).await,
+            ("POST", "/api/logout") => {
+                if let Some(token) = request.cookie(COOKIE) {
+                    self.lock_sessions().remove(token);
+                }
+                let mut response = Response::json(200, &json!({"authenticated": false}));
+                response.cookie = Some(cookie("", 0, secure));
+                response
+            }
+            (_, "/api/overview" | "/api/action") if !self.session(&request) => {
+                Response::error(401, "log in first")
+            }
+            ("GET", "/api/overview") => match self.overview().await {
+                Ok(data) => Response::json(200, &data),
+                Err(e) => Response::error(500, &e.to_string()),
+            },
+            ("POST", "/api/action") => match self.action(&request, source).await {
+                Ok(data) => Response::json(200, &data),
+                Err(e) => Response::error(400, &e.to_string()),
+            },
+            (
+                _,
+                "/" | "/index.html" | "/app.js" | "/app.css" | "/api/session" | "/api/login"
+                | "/api/logout" | "/api/overview" | "/api/action",
+            ) => Response::error(405, "method not allowed"),
+            _ => Response::error(404, "not found"),
+        }
+    }
+
+    fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, i64>> {
+        self.sessions.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn session(&self, request: &Request) -> bool {
+        let Some(token) = request.cookie(COOKIE) else {
+            return false;
+        };
+        let mut sessions = self.lock_sessions();
+        sessions.retain(|_, expires| *expires > now());
+        sessions.contains_key(token)
+    }
+
+    async fn login(&self, request: &Request, source: IpAddr, secure: bool) -> Response {
+        #[derive(Deserialize)]
+        struct Login {
+            password: String,
+        }
+        let Ok(login) = serde_json::from_slice::<Login>(&request.body) else {
+            return Response::error(400, "expected {\"password\": ...}");
+        };
+        let _serial = self.login.lock().await;
+        let given: [u8; 32] = Sha256::digest(login.password.as_bytes()).into();
+        // Compare digests without an early exit.
+        let mismatch = given
+            .iter()
+            .zip(self.password.iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+        if mismatch != 0 {
+            tracing::warn!("web panel login failed from {source}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            return Response::error(401, "wrong password");
+        }
+        let token = {
+            use rand::{rngs::OsRng, RngCore};
+            let mut bytes = [0u8; 32];
+            OsRng.fill_bytes(&mut bytes);
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        {
+            let mut sessions = self.lock_sessions();
+            sessions.retain(|_, expires| *expires > now());
+            while sessions.len() >= MAX_SESSIONS {
+                let oldest = sessions
+                    .iter()
+                    .min_by_key(|(_, expires)| **expires)
+                    .map(|(token, _)| token.clone());
+                match oldest {
+                    Some(token) => sessions.remove(&token),
+                    None => break,
+                };
+            }
+            sessions.insert(token.clone(), now() + SESSION_SECONDS);
+        }
+        tracing::info!("web panel login from {source}");
+        let mut response = Response::json(200, &json!({"authenticated": true}));
+        response.cookie = Some(cookie(&token, SESSION_SECONDS, secure));
+        response
+    }
+
+    async fn overview(&self) -> Result<Value> {
+        let status = self.backend.admin(AdminRequest::Status).await?;
+        let peers = self.backend.admin(AdminRequest::VpnPeerList).await?;
+        let panel = self.backend.admin(AdminRequest::PanelStatus).await?;
+        Ok(compose_overview(&status, &peers, &panel))
+    }
+
+    async fn action(&self, request: &Request, source: IpAddr) -> Result<Value> {
+        let action: Action = serde_json::from_slice(&request.body)
+            .map_err(|e| anyhow!("unknown or malformed action: {e}"))?;
+        tracing::info!("web panel action from {source}: {action:?}");
+        self.backend.admin(action.request()).await
+    }
+}
+
+/// The only changes the panel can make. Everything else stays with the CLI.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum Action {
+    ForwardEnable { id: u64, enabled: bool },
+    ForwardRemove { id: u64 },
+    AgentEnable { name: String, enabled: bool },
+    VpnPeerEnable { name: String, enabled: bool },
+}
+impl Action {
+    fn request(self) -> AdminRequest {
+        match self {
+            Self::ForwardEnable { id, enabled } => AdminRequest::ForwardEnable { id, enabled },
+            Self::ForwardRemove { id } => AdminRequest::ForwardRemove { id },
+            Self::AgentEnable {
+                name,
+                enabled: true,
+            } => AdminRequest::AgentEnable { name },
+            Self::AgentEnable {
+                name,
+                enabled: false,
+            } => AdminRequest::AgentDisable { name },
+            Self::VpnPeerEnable { name, enabled } => AdminRequest::VpnPeerEnable { name, enabled },
+        }
+    }
+}
+
+/// The subset of status the panel shows, with agent names resolved.
+fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> Value {
+    let snapshot = &status["snapshot"];
+    let empty = Vec::new();
+    let health = status["agent_health"].as_array().unwrap_or(&empty);
+    let agent_list = snapshot["agents"].as_array().unwrap_or(&empty);
+    let name_of = |id: &Value| {
+        agent_list
+            .iter()
+            .find(|a| a["id"] == *id)
+            .map(|a| a["name"].clone())
+            .unwrap_or_else(|| id.clone())
+    };
+    let agents: Vec<Value> = agent_list
+        .iter()
+        .map(|a| {
+            let h = health.iter().find(|h| h["id"] == a["id"]);
+            json!({
+                "id": a["id"],
+                "name": a["name"],
+                "status": a["status"],
+                "tunnel_ipv4": a["tunnel_ipv4"],
+                "tunnel_ipv6": a["tunnel_ipv6"],
+                "online": h.map(|h| h["online"].clone()).unwrap_or(Value::Bool(false)),
+                "configuration_ready": h.map(|h| h["configuration_ready"].clone()).unwrap_or(Value::Bool(false)),
+                "last_handshake": h.map(|h| h["last_handshake"].clone()).unwrap_or(Value::Null),
+                "last_error": a["last_error"],
+            })
+        })
+        .collect();
+    let pending = status["pending_forwards"].as_array().unwrap_or(&empty);
+    let forwards: Vec<Value> = snapshot["forwards"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .map(|f| {
+            json!({
+                "id": f["id"],
+                "agent": name_of(&f["agent_id"]),
+                "protocol": f["protocol"],
+                "listen_ip": f["listen_ip"],
+                "listen_ports": f["listen_ports"],
+                "target_ports": f["target_ports"],
+                "target_family": f["target_family"],
+                "mode": f["mode"],
+                "ingress": f["ingress"],
+                "enabled": f["enabled"],
+                "pending": pending.contains(&f["id"]),
+            })
+        })
+        .collect();
+    json!({
+        "generation": snapshot["generation"],
+        "fully_applied": status["fully_applied"],
+        "apply_error": status["apply_error"],
+        "agents": agents,
+        "forwards": forwards,
+        "vpn_peers": peers,
+        "panel": panel,
+        "time": now(),
+    })
+}
+
+fn cookie(token: &str, max_age: i64, secure: bool) -> String {
+    format!(
+        "{COOKIE}={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Strict{}",
+        if secure { "; Secure" } else { "" }
+    )
+}
+
+#[derive(Debug)]
+struct Request {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+impl Request {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+    fn cookie(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .filter(|(n, _)| n == "cookie")
+            .flat_map(|(_, v)| v.split(';'))
+            .filter_map(|pair| pair.trim().split_once('='))
+            .find(|(n, v)| *n == name && !v.is_empty())
+            .map(|(_, v)| v)
+    }
+}
+
+async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Request> {
+    let mut buffer = Vec::with_capacity(1024);
+    let head_end = loop {
+        if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+            break end;
+        }
+        ensure!(buffer.len() < MAX_HEAD, "request header too large");
+        let mut chunk = [0u8; 2048];
+        let n = stream.read(&mut chunk).await?;
+        ensure!(n > 0, "connection closed before the request ended");
+        buffer.extend_from_slice(&chunk[..n]);
+    };
+    ensure!(head_end <= MAX_HEAD, "request header too large");
+    let head = std::str::from_utf8(&buffer[..head_end]).context("request header is not UTF-8")?;
+    let mut lines = head.split("\r\n");
+    let mut first = lines.next().unwrap_or_default().split(' ');
+    let (Some(method), Some(target), Some(version), None) =
+        (first.next(), first.next(), first.next(), first.next())
+    else {
+        bail!("malformed request line");
+    };
+    ensure!(version.starts_with("HTTP/1."), "unsupported HTTP version");
+    let path = target.split(['?', '#']).next().unwrap_or("/").to_string();
+    let mut headers = Vec::new();
+    for line in lines {
+        let (name, value) = line.split_once(':').context("malformed header")?;
+        headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+    }
+    let mut request = Request {
+        method: method.to_string(),
+        path,
+        headers,
+        body: Vec::new(),
+    };
+    ensure!(
+        request.header("transfer-encoding").is_none(),
+        "chunked bodies are not supported"
+    );
+    let length: usize = match request.header("content-length") {
+        Some(value) => value.parse().context("invalid content length")?,
+        None => 0,
+    };
+    ensure!(length <= MAX_BODY, "request body too large");
+    let mut body = buffer.split_off(head_end + 4);
+    ensure!(body.len() <= length, "more data than the content length");
+    let already = body.len();
+    body.resize(length, 0);
+    stream.read_exact(&mut body[already..]).await?;
+    request.body = body;
+    Ok(request)
+}
+
+struct Response {
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
+    cookie: Option<String>,
+    cache: bool,
+}
+impl Response {
+    fn asset(content_type: &'static str, body: &str) -> Self {
+        Self {
+            status: 200,
+            content_type,
+            body: body.as_bytes().to_vec(),
+            cookie: None,
+            cache: true,
+        }
+    }
+    fn text(status: u16, body: &str) -> Self {
+        Self {
+            status,
+            content_type: "text/plain",
+            body: body.as_bytes().to_vec(),
+            cookie: None,
+            cache: false,
+        }
+    }
+    fn json(status: u16, value: &Value) -> Self {
+        Self {
+            status,
+            content_type: "application/json",
+            body: serde_json::to_vec(value).unwrap_or_default(),
+            cookie: None,
+            cache: false,
+        }
+    }
+    fn error(status: u16, message: &str) -> Self {
+        let message: String = message
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(300)
+            .collect();
+        Self::json(status, &json!({"error": message}))
+    }
+    fn to_bytes(&self) -> Vec<u8> {
+        let reason = match self.status {
+            200 => "OK",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            404 => "Not Found",
+            405 => "Method Not Allowed",
+            _ => "Internal Server Error",
+        };
+        let mut head = format!(
+            "HTTP/1.1 {} {reason}\r\n\
+             Content-Type: {}; charset=utf-8\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             Cache-Control: {}\r\n\
+             X-Content-Type-Options: nosniff\r\n\
+             X-Frame-Options: DENY\r\n\
+             Referrer-Policy: no-referrer\r\n\
+             Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n",
+            self.status,
+            self.content_type,
+            self.body.len(),
+            if self.cache { "no-cache" } else { "no-store" },
+        );
+        if let Some(cookie) = &self.cookie {
+            head.push_str(&format!("Set-Cookie: {cookie}\r\n"));
+        }
+        head.push_str("\r\n");
+        let mut out = head.into_bytes();
+        out.extend_from_slice(&self.body);
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fake {
+        peers: Vec<IpAddr>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+    impl Backend for Arc<Fake> {
+        async fn admin(&self, request: AdminRequest) -> Result<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{:?}", serde_json::to_value(&request)?));
+            Ok(match request {
+                AdminRequest::Status => json!({
+                    "snapshot": {"generation": 7, "agents": [{"id": "a1", "name": "home", "status": "active", "tunnel_ipv4": "10.13.0.2"}],
+                                 "forwards": [{"id": 3, "agent_id": "a1", "protocol": "tcp", "enabled": true}]},
+                    "agent_health": [{"id": "a1", "online": true, "configuration_ready": true, "last_handshake": 100}],
+                    "pending_forwards": [3], "fully_applied": false, "apply_error": null
+                }),
+                AdminRequest::VpnPeerList => json!([]),
+                AdminRequest::PanelStatus => json!({"enabled": true}),
+                _ => json!({"ok": true}),
+            })
+        }
+        fn panel_peers(&self) -> Vec<IpAddr> {
+            self.peers.clone()
+        }
+    }
+
+    fn config(access: PanelAccess, allow: &str) -> Config {
+        Config {
+            webpanel: true,
+            webpanel_access: access,
+            webpanel_allow: crate::config::parse_allow_list(allow).unwrap(),
+            ..Default::default()
+        }
+    }
+
+    fn panel(config: Config) -> (Panel<Arc<Fake>>, Arc<Fake>) {
+        let fake = Arc::new(Fake {
+            peers: vec!["10.14.0.2".parse().unwrap()],
+            calls: Default::default(),
+        });
+        (
+            Panel::new(fake.clone(), config, "correct horse battery"),
+            fake,
+        )
+    }
+
+    async fn exchange(panel: &Panel<Arc<Fake>>, source: &str, raw: &str) -> String {
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        client.write_all(raw.as_bytes()).await.unwrap();
+        panel.connection(&mut server, source.parse().unwrap()).await;
+        drop(server);
+        let mut out = String::new();
+        client.read_to_string(&mut out).await.unwrap();
+        out
+    }
+
+    fn post(path: &str, body: &str, extra: &str) -> String {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn session_cookie(response: &str) -> String {
+        let line = response
+            .lines()
+            .find(|l| l.starts_with("Set-Cookie: "))
+            .expect("a session cookie");
+        line["Set-Cookie: ".len()..]
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn private_mode_admits_loopback_granted_devices_and_the_allow_list_only() {
+        let peers = ["10.14.0.2".parse().unwrap()];
+        let private = config(PanelAccess::Private, "10.14.0.9");
+        for ok in [
+            "127.0.0.1",
+            "::1",
+            "10.14.0.2",
+            "10.14.0.9",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                source_allowed(&private, &peers, ok.parse().unwrap()),
+                "{ok}"
+            );
+        }
+        for bad in ["10.14.0.3", "10.13.0.2", "203.0.113.7"] {
+            assert!(
+                !source_allowed(&private, &peers, bad.parse().unwrap()),
+                "{bad}"
+            );
+        }
+        let open = config(PanelAccess::Public, "");
+        assert!(source_allowed(&open, &[], "203.0.113.7".parse().unwrap()));
+        let restricted = config(PanelAccess::Public, "198.51.100.0/24");
+        assert!(source_allowed(
+            &restricted,
+            &[],
+            "198.51.100.20".parse().unwrap()
+        ));
+        assert!(!source_allowed(
+            &restricted,
+            &[],
+            "203.0.113.7".parse().unwrap()
+        ));
+        assert!(source_allowed(
+            &restricted,
+            &peers,
+            "10.14.0.2".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn nft_rules_name_only_granted_devices_and_the_allow_list() {
+        let mut cfg = config(PanelAccess::Private, "10.13.0.5, fd00::/64");
+        let peer = |name: &str, last: u8, enabled: bool, panel: bool| VpnPeer {
+            name: name.into(),
+            public_key: format!("k-{name}"),
+            ipv4: std::net::Ipv4Addr::new(10, 14, 0, last),
+            enabled,
+            created_at: 0,
+            panel,
+        };
+        let snap = StateSnapshot {
+            vpn_peers: vec![
+                peer("laptop", 2, true, true),
+                peer("phone", 3, true, false),
+                peer("old", 4, false, true),
+            ],
+            ..Default::default()
+        };
+        let rules = input_rules(&cfg, &snap);
+        assert!(rules.contains(
+            "input iifname \"rift0\" ip saddr 10.14.0.2/32 ip daddr 10.13.0.1 tcp dport 8090 accept"
+        ));
+        assert!(rules.contains("ip saddr 10.13.0.5/32 ip daddr 10.13.0.1 tcp dport 8090 accept"));
+        assert!(!rules.contains("10.14.0.3") && !rules.contains("10.14.0.4"));
+        assert!(
+            !rules.contains("ip6"),
+            "a private panel has no IPv6 tunnel listener"
+        );
+        cfg.webpanel_access = PanelAccess::Public;
+        assert!(input_rules(&cfg, &snap)
+            .contains("ip6 saddr fd00::/64 ip6 daddr fd88:5249:4654::1 tcp dport 8090 accept"));
+        cfg.webpanel = false;
+        assert!(input_rules(&cfg, &snap).is_empty());
+    }
+
+    #[tokio::test]
+    async fn refused_sources_get_nothing_but_a_403() {
+        let (panel, fake) = panel(config(PanelAccess::Private, ""));
+        let out = exchange(&panel, "203.0.113.7", "GET /api/overview HTTP/1.1\r\n\r\n").await;
+        assert!(out.starts_with("HTTP/1.1 403"), "{out}");
+        assert!(fake.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_api_needs_a_session_and_actions_need_the_header() {
+        let (panel, fake) = panel(config(PanelAccess::Private, ""));
+        let out = exchange(&panel, "127.0.0.1", "GET /api/overview HTTP/1.1\r\n\r\n").await;
+        assert!(out.starts_with("HTTP/1.1 401"), "{out}");
+        let index = exchange(&panel, "127.0.0.1", "GET / HTTP/1.1\r\n\r\n").await;
+        assert!(index.starts_with("HTTP/1.1 200") && index.contains("<title>"));
+        assert!(index.contains("Content-Security-Policy: default-src 'none'"));
+
+        let login = r#"{"password":"correct horse battery"}"#;
+        let refused = exchange(&panel, "127.0.0.1", &post("/api/login", login, "")).await;
+        assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+        let wrong = exchange(
+            &panel,
+            "127.0.0.1",
+            &post(
+                "/api/login",
+                r#"{"password":"nope"}"#,
+                "X-Rift-Panel: 1\r\n",
+            ),
+        )
+        .await;
+        assert!(wrong.starts_with("HTTP/1.1 401") && !wrong.contains("Set-Cookie"));
+        let ok = exchange(
+            &panel,
+            "127.0.0.1",
+            &post("/api/login", login, "X-Rift-Panel: 1\r\n"),
+        )
+        .await;
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        assert!(ok.contains("HttpOnly; SameSite=Strict"));
+        let cookie = session_cookie(&ok);
+
+        let overview = exchange(
+            &panel,
+            "10.14.0.2",
+            &format!("GET /api/overview HTTP/1.1\r\nCookie: theme=dark; {cookie}\r\n\r\n"),
+        )
+        .await;
+        assert!(overview.starts_with("HTTP/1.1 200"), "{overview}");
+        let body: Value = serde_json::from_str(overview.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["agents"][0]["online"], true);
+        assert_eq!(body["forwards"][0]["agent"], "home");
+        assert_eq!(body["forwards"][0]["pending"], true);
+
+        let action = r#"{"action":"forward_enable","id":3,"enabled":false}"#;
+        let no_header = exchange(
+            &panel,
+            "127.0.0.1",
+            &post("/api/action", action, &format!("Cookie: {cookie}\r\n")),
+        )
+        .await;
+        assert!(no_header.starts_with("HTTP/1.1 403"), "{no_header}");
+        let done = exchange(
+            &panel,
+            "127.0.0.1",
+            &post(
+                "/api/action",
+                action,
+                &format!("Cookie: {cookie}\r\nX-Rift-Panel: 1\r\n"),
+            ),
+        )
+        .await;
+        assert!(done.starts_with("HTTP/1.1 200"), "{done}");
+        assert!(fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains("ForwardEnable")));
+        let unknown = exchange(
+            &panel,
+            "127.0.0.1",
+            &post(
+                "/api/action",
+                r#"{"action":"vpn_config","name":"x"}"#,
+                &format!("Cookie: {cookie}\r\nX-Rift-Panel: 1\r\n"),
+            ),
+        )
+        .await;
+        assert!(unknown.starts_with("HTTP/1.1 400"), "{unknown}");
+
+        let logout = exchange(
+            &panel,
+            "127.0.0.1",
+            &post(
+                "/api/logout",
+                "",
+                &format!("Cookie: {cookie}\r\nX-Rift-Panel: 1\r\n"),
+            ),
+        )
+        .await;
+        assert!(logout.contains("Max-Age=0"));
+        let after = exchange(
+            &panel,
+            "127.0.0.1",
+            &format!("GET /api/overview HTTP/1.1\r\nCookie: {cookie}\r\n\r\n"),
+        )
+        .await;
+        assert!(after.starts_with("HTTP/1.1 401"), "{after}");
+    }
+
+    #[tokio::test]
+    async fn oversized_and_malformed_requests_are_rejected() {
+        let (panel, _) = panel(config(PanelAccess::Private, ""));
+        let huge = format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(MAX_HEAD));
+        assert!(exchange(&panel, "127.0.0.1", &huge)
+            .await
+            .starts_with("HTTP/1.1 400"));
+        let body = post("/api/login", "{}", "").replace(
+            "Content-Length: 2",
+            &format!("Content-Length: {}", MAX_BODY + 1),
+        );
+        assert!(exchange(&panel, "127.0.0.1", &body)
+            .await
+            .starts_with("HTTP/1.1 400"));
+        assert!(exchange(&panel, "127.0.0.1", "GARBAGE\r\n\r\n")
+            .await
+            .starts_with("HTTP/1.1 400"));
+        assert!(exchange(&panel, "127.0.0.1", "GET /nope HTTP/1.1\r\n\r\n")
+            .await
+            .starts_with("HTTP/1.1 404"));
+    }
+
+    #[test]
+    fn a_generated_password_is_kept_private_and_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            state_dir: dir.path().into(),
+            ..Default::default()
+        };
+        let first = password(&cfg).unwrap();
+        assert_eq!(first.len(), 24);
+        assert_eq!(password(&cfg).unwrap(), first);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(password_path(&cfg))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let set = Config {
+            webpanel_password: Some("from the environment".into()),
+            ..cfg
+        };
+        assert_eq!(password(&set).unwrap(), "from the environment");
+    }
+}
