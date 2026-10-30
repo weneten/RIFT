@@ -117,7 +117,7 @@ rift agents add node1 --ttl 15m
 
 The output contains `RIFT_SERVER`, `RIFT_AGENT_NAME` and `RIFT_ENROLLMENT_TOKEN`. Treat the token as a secret and transfer all three lines securely to the agent.
 
-The enrollment port opens with the invitation. With the default `RIFT_ENROLLMENT_ENABLED=auto` the server listens on TCP 8443 (and RIFT's UFW rule for it exists) only while at least one invitation is open. It closes again as soon as the last agent is active or the last invitation has expired or been cancelled; expiry is noticed within one reconcile interval (10 s). RIFT can only close the port on the server itself: a rule in your cloud firewall or security group stays open, but nothing listens behind it. Set `RIFT_ENROLLMENT_ENABLED=true` (or `always`) to keep the port open permanently, or `false` to turn enrollment off. `rift status` shows the port's state and the open invitations.
+The enrollment port opens with the invitation. With the default `RIFT_ENROLLMENT=auto` the server listens on TCP 8443 (and RIFT's UFW rule for it exists) only while at least one invitation is open. It closes again as soon as the last agent is active or the last invitation has expired or been cancelled; expiry is noticed within one reconcile interval (10 s). RIFT can only close the port on the server itself: a rule in your cloud firewall or security group stays open, but nothing listens behind it. Set `RIFT_ENROLLMENT=always` to keep the port open permanently, or `off` to turn enrollment off. `rift status` shows the port's state and the open invitations.
 
 On the **agent**, from its own checkout:
 
@@ -463,7 +463,7 @@ The panel port (default 8090, `RIFT_WEBPANEL_PORT`) must differ from the control
 | `RIFT_PUBLIC_ENDPOINT` | Server | Reachable DNS name or IP, without port; enrollment certificate identity. |
 | `RIFT_PUBLIC_IPS` | Server | Comma-separated addresses assigned to server interfaces for listeners. |
 | `RIFT_ENROLLMENT_BIND` | `0.0.0.0:8443` | Enrollment listener. |
-| `RIFT_ENROLLMENT_ENABLED` | `auto` | `auto`: listen on the enrollment port only while an invitation is open; `true`/`always`: always; `false`: off. In `config.toml`, the old template line `enrollment_enabled = true` means `auto`; only `"always"` keeps the port open there. |
+| `RIFT_ENROLLMENT` | `auto` | `auto`: listen on the enrollment port only while an invitation is open; `always`: always; `off`: no enrollment. |
 | `RIFT_ALLOW_PRIVATE_LISTENERS` | `false` | Server. Set `true` behind a cloud NAT (e.g. Oracle Cloud), where the public address is not assigned to the interface: put the private interface address in `RIFT_PUBLIC_IPS`, keep the public DNS name in `RIFT_PUBLIC_ENDPOINT`, and open the ports in the cloud's firewall. Allows private and ULA listener addresses; loopback, link-local, multicast and unspecified stay forbidden, as does an address inside a tunnel pool. |
 | `RIFT_WG_PORT` | `51820` | Server. WireGuard UDP port; use another one if 51820 is taken on the host. Restart required. |
 | `RIFT_IPV4_POOL`, `RIFT_SERVER_IPV4` | `10.13.0.0/24`, `10.13.0.1` | Server. Override the IPv4 tunnel pool if it overlaps a host network (the default avoids Podman's 10.88.0.0/16, Docker's 172.16/12 and common WireGuard 10.8.0.0/24). The server address must be inside the pool; restart required. |

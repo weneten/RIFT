@@ -55,7 +55,7 @@ The web panel has unit coverage (configuration parsing, source checks, read/writ
 
 ## Enrollment port in `auto` mode: not yet verified on a kernel
 
-Unit tests cover the configuration parsing; the listener lifecycle has not run in a container. Check that 8443 is closed at start without invitations, opens with `rift agents add` and with an invitation from the panel, stays open until the agent is active, and closes after activation, `cancel-invite`, agent removal and expiry (within about 10 s). With UFW, RIFT's `rift:enrollment` rule should appear and disappear with it. `RIFT_ENROLLMENT_ENABLED=true` keeps it open; `false` refuses invitations.
+Unit tests cover the configuration parsing; the listener lifecycle has not run in a container. Check that 8443 is closed at start without invitations, opens with `rift agents add` and with an invitation from the panel, stays open until the agent is active, and closes after activation, `cancel-invite`, agent removal and expiry (within about 10 s). With UFW, RIFT's `rift:enrollment` rule should appear and disappear with it. `RIFT_ENROLLMENT=always` keeps it open; `off` refuses invitations.
 
 ## Release gates
 

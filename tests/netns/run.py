@@ -91,7 +91,7 @@ def config(state_dir, *, server=False):
         values += [f'public_endpoint = "{SERVER_HOST}"',
                    f'public_ips = ["{PUBLIC_V4}", "{PUBLIC_V4_NEW}", "{PUBLIC_V6}"]',
                    'enrollment_bind = "0.0.0.0:8443"',
-                   'enrollment_enabled = true']
+                   'enrollment = "always"']
     return write(WORK / f"{pathlib.Path(state_dir).name}.toml", "\n".join(values) + "\n")
 
 
@@ -720,7 +720,7 @@ def main():
         server_env = {"RIFT_PUBLIC_ENDPOINT": SERVER_HOST,
                       "RIFT_PUBLIC_IPS": f"{PUBLIC_V4},{PUBLIC_V4_NEW},{PUBLIC_V6}",
                       "RIFT_ENROLLMENT_BIND": "0.0.0.0:8443",
-                      "RIFT_ENROLLMENT_ENABLED": "true"}
+                      "RIFT_ENROLLMENT": "always"}
         server_proc = daemon(VPS, server_cfg, ["server"], server_env)
         wait_until(lambda: cli(VPS, server_cfg, "status", env=server_env).returncode == 0,
                    "RIFT server admin socket", timeout=35)

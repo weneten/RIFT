@@ -125,7 +125,7 @@ def main():
         tmp = pathlib.Path(tmp)
         vps_cfg = tmp / "vps.toml"
         agent_cfg = tmp / "agent.toml"
-        cfg = 'state_dir = "/var/lib/rift"\ninterface = "rift0"\nwg_port = 51820\ncontrol_port = 8444\nroute_table = 51888\nrule_priority = 11000\nmark = 1380515840\nmark_mask = 4294901760\nmtu = 1380\nenrollment_bind = "0.0.0.0:8443"\nenrollment_enabled = true\n'
+        cfg = 'state_dir = "/var/lib/rift"\ninterface = "rift0"\nwg_port = 51820\ncontrol_port = 8444\nroute_table = 51888\nrule_priority = 11000\nmark = 1380515840\nmark_mask = 4294901760\nmtu = 1380\nenrollment_bind = "0.0.0.0:8443"\nenrollment = "always"\n'
         vps_cfg.write_text(cfg, encoding="utf-8")
         agent_cfg.write_text(cfg, encoding="utf-8")
         try:
@@ -147,7 +147,7 @@ def main():
                    "--mount", f"type=bind,src={vps_cfg},dst=/etc/rift/config.toml,readonly",
                    "--mount", f"type=volume,src={TAG}-vps-state,dst=/var/lib/rift",
                    "--env", "RIFT_PUBLIC_ENDPOINT=rift-vps", "--env", f"RIFT_PUBLIC_IPS={IPS}",
-                   "--env", "RIFT_ENROLLMENT_BIND=0.0.0.0:8443", "--env", "RIFT_ENROLLMENT_ENABLED=true",
+                   "--env", "RIFT_ENROLLMENT_BIND=0.0.0.0:8443", "--env", "RIFT_ENROLLMENT=always",
                    "--network-alias", "rift-vps", TAG,
                    "--config", "/etc/rift/config.toml", "server")
             docker("run", "-d", "--name", CLIENT, "--network", NET, "--ip", CLIENT4,

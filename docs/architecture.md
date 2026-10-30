@@ -46,7 +46,7 @@ Authentication is a single password (environment or a generated mode-0600 file i
 
 ## Enrollment port
 
-`enrollment_enabled` is `auto`, `always` or `off`. In `auto` (the default) every reconcile opens the enrollment listener when an invitation is unconsumed and unexpired, and closes it otherwise; the invitation is consumed when the agent activates over the tunnel, so an agent whose enrollment response was lost can still retry until then. Invitations, cancellations, activation and agent removal reconcile at once; expiry is noticed by the periodic reconcile. RIFT's UFW accept for the port follows the listener. RIFT does not change cloud firewalls. In the environment `true` means `always`, because the environment is where an operator decides deliberately; in TOML a bare `true` was the old template default and means `auto`.
+`enrollment` (`RIFT_ENROLLMENT`) is `auto`, `always` or `off`. In `auto` (the default) every reconcile opens the enrollment listener when an invitation is unconsumed and unexpired, and closes it otherwise; the invitation is consumed when the agent activates over the tunnel, so an agent whose enrollment response was lost can still retry until then. Invitations, cancellations, activation and agent removal reconcile at once; expiry is noticed by the periodic reconcile. RIFT's UFW accept for the port follows the listener. RIFT does not change cloud firewalls.
 
 ## Configuration and recovery
 

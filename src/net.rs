@@ -3002,13 +3002,6 @@ mod tests {
         assert!(!rift_interface_alias("rift:not a token"));
     }
     #[test]
-    fn forward_without_ingress_stays_public() {
-        let raw = r#"{"id":1,"agent_id":"a","listen_ip":"203.0.113.1","listen_ports":{"start":80,"end":80},"target_ports":{"start":80,"end":80},"protocol":"tcp","mode":"transparent","target_family":"v4","enabled":true,"generation":1}"#;
-        let parsed: Forward = serde_json::from_str(raw).unwrap();
-        assert_eq!(parsed.ingress, Ingress::Public);
-        parsed.validate().unwrap();
-    }
-    #[test]
     fn agent_renderer_classifies_translate_only_from_vps_tunnel_source() {
         let w = Welcome {
             agent_id: "a1".into(),

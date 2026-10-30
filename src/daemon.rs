@@ -65,7 +65,7 @@ pub async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
     let mut config = config;
     config.validate()?;
     secure_dir(&config.state_dir)?;
-    if config.enrollment_enabled != EnrollmentMode::Off {
+    if config.enrollment != EnrollmentMode::Off {
         crate::tls_material::prepare(&mut config)?;
         let _ = enrollment::server_tls(&config)?;
     }
@@ -117,7 +117,7 @@ pub async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
     tasks.push(tokio::spawn(
         async move { accept_control(control6, s).await },
     ));
-    if config.enrollment_enabled == EnrollmentMode::Always {
+    if config.enrollment == EnrollmentMode::Always {
         anyhow::ensure!(
             server.enrollment_open.load(Ordering::SeqCst),
             "enrollment endpoint {} could not be opened",
@@ -198,7 +198,7 @@ async fn ensure_server_keypair(config: &Config) -> Result<(String, PathBuf)> {
 /// invitation is open (until activation, expiry or cancellation), `off` never.
 async fn sync_enrollment(s: &Server) -> Result<()> {
     let config = s.config.read().await.clone();
-    let wanted = match config.enrollment_enabled {
+    let wanted = match config.enrollment {
         EnrollmentMode::Always => true,
         EnrollmentMode::Off => false,
         EnrollmentMode::Auto => !s.state.open_invites()?.is_empty(),
@@ -222,7 +222,7 @@ async fn sync_enrollment(s: &Server) -> Result<()> {
         tracing::info!(
             "enrollment endpoint {} open ({})",
             config.enrollment_bind,
-            config.enrollment_enabled
+            config.enrollment
         );
     } else if !wanted {
         if let Some(task) = running.take() {
@@ -335,7 +335,7 @@ async fn reload_config(s: &Server) -> Result<u64> {
         || next.public_endpoint != current.public_endpoint
         || next.wg_port != current.wg_port
         || next.enrollment_bind != current.enrollment_bind
-        || next.enrollment_enabled != current.enrollment_enabled
+        || next.enrollment != current.enrollment
         || next.control_port != current.control_port
         || next.ipv4_pool != current.ipv4_pool
         || next.ipv6_pool != current.ipv6_pool
@@ -695,7 +695,7 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
                 .into_iter()
                 .map(|(name, expires_at)| serde_json::json!({"name":name,"expires_at":expires_at}))
                 .collect();
-            let enrollment = serde_json::json!({"mode":cfg.enrollment_enabled,"open":s.enrollment_open.load(Ordering::SeqCst),"bind":cfg.enrollment_bind});
+            let enrollment = serde_json::json!({"mode":cfg.enrollment,"open":s.enrollment_open.load(Ordering::SeqCst),"bind":cfg.enrollment_bind});
             serde_json::json!({"snapshot":snap,"enrollment":enrollment,"invites":invites,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"fully_applied":fully_applied,"connection_history":s.state.health()?})
         }
         AdminRequest::AgentsList => serde_json::to_value(snap.agents)?,
@@ -711,15 +711,15 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
             let cfg = s.config.read().await.clone();
             validate_name(&name)?;
             anyhow::ensure!(
-                cfg.enrollment_enabled != EnrollmentMode::Off,
-                "enrollment is off; set RIFT_ENROLLMENT_ENABLED=auto in the server .env and recreate the container"
+                cfg.enrollment != EnrollmentMode::Off,
+                "enrollment is off; set RIFT_ENROLLMENT=auto in the server .env and recreate the container"
             );
             let token = enrollment::create_invite(&cfg, &s.state, &name, ttl_seconds)?;
             sync_enrollment(s)
                 .await
                 .context("invitation created, but the enrollment port could not be opened")?;
             reconcile(s).await?;
-            serde_json::json!({"name":name,"token":token,"expires_at":now()+ttl_seconds as i64,"server":host_port(&cfg.public_endpoint,cfg.enrollment_bind.port()),"enrollment":cfg.enrollment_enabled})
+            serde_json::json!({"name":name,"token":token,"expires_at":now()+ttl_seconds as i64,"server":host_port(&cfg.public_endpoint,cfg.enrollment_bind.port()),"enrollment":cfg.enrollment})
         }
         AdminRequest::CancelInvite { name } => {
             s.state.cancel_invite(&name)?;

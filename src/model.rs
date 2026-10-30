@@ -136,8 +136,6 @@ pub struct Forward {
     pub protocol: Protocol,
     pub mode: ForwardMode,
     /// `local` DNATs only packets that did not arrive on a public-address NIC.
-    /// Missing on older state means `public`.
-    #[serde(default)]
     pub ingress: Ingress,
     pub target_family: Family,
     pub enabled: bool,
@@ -198,8 +196,7 @@ pub struct VpnPeer {
     pub ipv4: Ipv4Addr,
     pub enabled: bool,
     pub created_at: i64,
-    /// May open the web panel on the VPS's tunnel address. Missing on older state means no.
-    #[serde(default)]
+    /// May open the web panel on the VPS's tunnel address.
     pub panel: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -240,19 +237,15 @@ pub struct StateSnapshot {
     pub agents: Vec<AgentRecord>,
     pub forwards: Vec<Forward>,
     pub bans: Vec<Ban>,
-    #[serde(default)]
     pub vpn_peers: Vec<VpnPeer>,
-    #[serde(default)]
     pub vpn_grants: Vec<VpnGrant>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct AgentPolicy {
     pub generation: u64,
     pub forwards: Vec<Forward>,
-    /// Missing on policies from older servers, which means no VPN access.
-    #[serde(default)]
+    /// None only in the empty policy an agent applies before its first sync.
     pub vpn_pool: Option<Ipv4Net>,
-    #[serde(default)]
     pub vpn: Vec<AgentVpnRule>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]

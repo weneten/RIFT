@@ -256,7 +256,7 @@ def create_network():
            'wg_port = 51820\ncontrol_port = 8444\nroute_table = 51888\nrule_priority = 11000\n'
            f'mark = {int(MARK, 16)}\nmark_mask = 4294901760\nmtu = 1380\n'
            f'public_endpoint = "{SERVER4}"\npublic_ips = ["{VPSVIP4}", "{VPSVIP6}"]\n'
-           'enrollment_bind = "0.0.0.0:8443"\nenrollment_enabled = true\n')
+           'enrollment_bind = "0.0.0.0:8443"\nenrollment = "always"\n')
     server_cfg = write(WORK / "server.toml", cfg)
     agent_cfg = write(WORK / "agent.toml", cfg.replace(str(WORK / "vps-state"), str(WORK / "agent-state")))
     return server_cfg, agent_cfg
@@ -307,7 +307,7 @@ def run_datapath(server_cfg, agent_cfg):
     server_env = {"RIFT_PUBLIC_ENDPOINT": SERVER4,
                   "RIFT_PUBLIC_IPS": f"{VPSVIP4},{VPSVIP6}",
                   "RIFT_ENROLLMENT_BIND": "0.0.0.0:8443",
-                  "RIFT_ENROLLMENT_ENABLED": "true"}
+                  "RIFT_ENROLLMENT": "always"}
     server_proc = daemon(NS, server_cfg, ["server"], server_env)
     wait_for("VPS admin socket", lambda: admin(NS, server_cfg, "status").returncode == 0)
     token = json.loads(admin(NS, server_cfg, "agents", "add", "host-agent", "--ttl", "15m").stdout)["token"]

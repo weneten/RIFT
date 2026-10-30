@@ -40,7 +40,7 @@ impl StateStore {
             CREATE TABLE IF NOT EXISTS rotations (agent_id TEXT PRIMARY KEY, rotation_id TEXT NOT NULL, new_key TEXT, committed INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS applied (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL, error TEXT);
             CREATE TABLE IF NOT EXISTS health (agent_id TEXT PRIMARY KEY, online INTEGER NOT NULL, last_disconnect INTEGER, last_handshake INTEGER NOT NULL);
-            INSERT OR IGNORE INTO snapshot(id,generation,body) VALUES(1,0,'{\"generation\":0,\"agents\":[],\"forwards\":[],\"bans\":[]}');")?;
+            INSERT OR IGNORE INTO snapshot(id,generation,body) VALUES(1,0,'{\"generation\":0,\"agents\":[],\"forwards\":[],\"bans\":[],\"vpn_peers\":[],\"vpn_grants\":[]}');")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -705,11 +705,6 @@ mod tests {
         let mut s = base.clone();
         s.vpn_peers[0].public_key = "k-a".into();
         assert!(validate_snapshot(&s).is_err(), "key shared with an agent");
-        // Older snapshots have no VPN fields at all.
-        let old: StateSnapshot =
-            serde_json::from_str(r#"{"generation":4,"agents":[],"forwards":[],"bans":[]}"#)
-                .unwrap();
-        assert!(old.vpn_peers.is_empty() && old.vpn_grants.is_empty());
     }
     #[test]
     fn forward_ids_fill_gaps_before_growing() {
