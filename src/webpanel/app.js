@@ -93,7 +93,7 @@ function closeModal() {
 
 function openModal(title, ...content) {
   $("modal-title").textContent = title;
-  $("modal-body").replaceChildren(...content);
+  $("modal-body").replaceChildren(...content.filter(Boolean));
   $("modal").hidden = false;
   const first = $("modal-body").querySelector("input, select, button");
   if (first) first.focus();
@@ -518,12 +518,13 @@ function render() {
   }
 
   const factor = data.two_factor || {};
-  $("two-factor").replaceChildren(
+  $("two-factor").replaceChildren(...[
     el("span", { class: "muted" }, "Two-factor login: "),
     factor.enabled ? pill("on", "ok") : pill("off", "off"),
     factor.required ? el("span", { class: "muted small" }, factor.enabled ? " required by the server" : " required; set it up on the server with rift panel 2fa setup") : null,
     canWrite && !factor.required ? " " : null,
-    canWrite && !factor.required ? (factor.enabled ? button("Disable", twoFactorOffDialog, "danger") : button("Enable", twoFactorDialog)) : null);
+    canWrite && !factor.required ? (factor.enabled ? button("Disable", twoFactorOffDialog, "danger") : button("Enable", twoFactorDialog)) : null,
+  ].filter(Boolean));
 
   $("updated").textContent = `Updated ${new Date().toLocaleTimeString()}`;
 }
