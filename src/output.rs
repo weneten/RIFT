@@ -222,6 +222,11 @@ fn status(data: &Value) -> String {
             rows,
             "No agents configured.",
         ));
+        for a in data["agent_health"].as_array().into_iter().flatten() {
+            if let Some(error) = a["last_error"].as_str() {
+                lines.push(format!("Agent {}: {error}", field(a, "name")));
+            }
+        }
         if let Some(enrollment) = data.get("enrollment") {
             let port = field(enrollment, "bind");
             let open = enrollment["open"].as_bool() == Some(true);

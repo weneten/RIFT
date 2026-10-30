@@ -154,7 +154,7 @@ The server tells each agent which ports to forward and which VPN grants to enfor
 | `RIFT_AGENT_ALLOW_PORTS` | empty (no limit) | Comma-separated `PORT` or `PORT-PORT`, each optionally with `/tcp`, `/udp` or `/both` (default both), for example `22/tcp,80,443,27015-27020/udp`. The agent refuses forwards and VPN port grants that are not entirely inside this list. It also refuses `--server` and `--full` grants, because they reach every port. |
 | `RIFT_AGENT_ALLOW_SUBNETS` | empty (no LAN access) | Comma-separated private IPv4 networks behind the agent, for example `192.168.178.0/24`. A VPN `--subnet` grant works only when its network lies inside one of these. |
 
-The secure default for subnets is deliberate: until you list a network, no device can reach your LAN through this agent, whatever the server grants. A refused forward stays pending on the server. Refusals are logged once per change and show up as the agent's last error in `rift status` and `rift agents list`. Restart the agent after changing `.env`.
+The secure default for subnets is deliberate: until you list a network, no device can reach your LAN through this agent, whatever the server grants. A refused forward stays pending on the server. Refusals are logged once per change and show up as the agent's last error in `rift status`. Restart the agent after changing `.env`.
 
 ## Supported protocols
 

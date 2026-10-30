@@ -701,7 +701,7 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
             let health:Vec<_>=snap.agents.iter().map(|a|{
                 let peer=peers.iter().find(|p|p.public_key==a.public_key);
                 let online=peer.is_some_and(|p|p.last_handshake>0 && now().saturating_sub(p.last_handshake)<=180);
-                serde_json::json!({"id":a.id,"name":a.name,"online":online,"configuration_ready":a.applied_generation>=a.generation,"last_handshake":peer.map(|p|p.last_handshake)})
+                serde_json::json!({"id":a.id,"name":a.name,"online":online,"configuration_ready":a.applied_generation>=a.generation,"last_error":a.last_error,"last_handshake":peer.map(|p|p.last_handshake)})
             }).collect();
             let pending_forwards: Vec<_> = snap
                 .forwards
