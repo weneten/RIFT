@@ -428,7 +428,7 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
             let rows = data.as_array().into_iter().flatten().map(|b| vec![field(b, "id"), field(b, "forward_id"), field(b, "ip"), field(b, "expires_at")]).collect();
             table(&["ID", "FORWARD", "ADDRESS", "EXPIRES (UNIX)"], rows, "No active bans.")
         },
-        AdminRequest::VpnPeerAdd { name } => format!("VPN device {name} registered with address {}.\nNext: rift vpn allow {name} --agent AGENT --server, then rift vpn config qr {name}", field(data, "ipv4")),
+        AdminRequest::VpnPeerAdd { name } => format!("VPN device {name} registered with address {}.\nNext: rift vpn allow {name} AGENT 22/tcp (or server), then rift vpn config qr {name}", field(data, "ipv4")),
         AdminRequest::VpnPeerList => vpn_peers(data),
         AdminRequest::VpnPeerEnable { name, enabled } => format!("VPN device {name} {}.", if *enabled { "enabled" } else { "disabled; it can no longer connect" }),
         AdminRequest::VpnPeerRevoke { name } => format!("VPN device {name} revoked. Its key and grants are gone."),

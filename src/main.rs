@@ -71,9 +71,10 @@ enum Vpn {
         #[command(subcommand)]
         command: VpnPeers,
     },
-    /// Let a device reach an agent. Without an allow, a device reaches nothing.
+    /// Let a device reach an agent: `rift vpn allow DEVICE AGENT TARGET...`, for example
+    /// `rift vpn allow iphone core 22/tcp 53/both`. Without an allow, a device reaches nothing.
     Allow(VpnAccessArgs),
-    /// Withdraw access again. Without --server/--full/--port/--subnet, withdraws all of it on that agent.
+    /// Withdraw access again. Without a target, withdraws all of it on that agent.
     Deny(VpnAccessArgs),
     /// Export the WireGuard configuration of a device.
     Config {
@@ -110,12 +111,23 @@ enum VpnConfig {
 struct VpnAccessArgs {
     /// Device name.
     peer: String,
-    #[arg(long)]
-    agent: String,
-    /// TCP, UDP and ping to the agent host itself.
+    /// Agent name (or --agent).
+    #[arg(
+        value_name = "AGENT",
+        required_unless_present = "agent",
+        conflicts_with = "agent"
+    )]
+    agent_name: Option<String>,
+    /// What to allow: PORT/tcp, PORT/udp or PORT/both (ranges like 8000-8010/tcp), `server`,
+    /// `full`, or a network behind the agent such as 192.168.178.0/24. Several are allowed.
+    #[arg(value_name = "TARGET")]
+    targets: Vec<String>,
+    #[arg(long, hide = true)]
+    agent: Option<String>,
+    /// TCP, UDP and ping to the agent host itself (same as the target `server`).
     #[arg(long)]
     server: bool,
-    /// Every IP protocol to the agent host itself. Not its LAN.
+    /// Every IP protocol to the agent host itself, not its LAN (same as the target `full`).
     #[arg(long)]
     full: bool,
     /// One port or range on the agent host, as PORT/tcp, PORT/udp or PORT/both. Repeatable.
@@ -125,18 +137,37 @@ struct VpnAccessArgs {
     #[arg(long = "subnet", value_name = "CIDR")]
     subnets: Vec<Ipv4Net>,
     /// Masquerade the device's address on the agent, for LANs without a route to the VPN pool.
-    #[arg(long, requires = "subnets")]
+    #[arg(long)]
     snat: bool,
 }
 impl VpnAccessArgs {
+    fn agent(&self) -> String {
+        self.agent_name
+            .clone()
+            .or_else(|| self.agent.clone())
+            .unwrap_or_default()
+    }
     fn accesses(&self) -> Result<Vec<VpnAccess>> {
-        rift::vpn::accesses(
-            self.server,
-            self.full,
-            &self.ports,
-            &self.subnets,
-            self.snat,
-        )
+        let (mut server, mut full) = (self.server, self.full);
+        let mut ports = self.ports.clone();
+        let mut subnets = self.subnets.clone();
+        for target in &self.targets {
+            match target.as_str() {
+                "server" => server = true,
+                "full" => full = true,
+                t if t.contains('/') && t.split('/').nth(1).is_some_and(|p| !p.chars().all(|c| c.is_ascii_digit())) => {
+                    ports.push(t.to_string())
+                }
+                t => subnets.push(t.parse().with_context(|| {
+                    format!("{t:?} is not PORT/tcp|udp|both, server, full or a network like 192.168.178.0/24")
+                })?),
+            }
+        }
+        anyhow::ensure!(
+            !self.snat || !subnets.is_empty(),
+            "--snat applies only to a network such as 192.168.178.0/24"
+        );
+        rift::vpn::accesses(server, full, &ports, &subnets, self.snat)
     }
 }
 #[derive(Subcommand)]
@@ -376,11 +407,11 @@ async fn run() -> Result<()> {
                         .into_iter()
                         .map(|access| AdminRequest::VpnAllow {
                             peer: args.peer.clone(),
-                            agent: args.agent.clone(),
+                            agent: args.agent(),
                             access,
                         });
                 let first = requests.next().context(
-                    "choose what to allow: --server, --full, --port PORT/PROTO or --subnet CIDR",
+                    "choose what to allow, for example: 22/tcp, server, full or 192.168.178.0/24",
                 )?;
                 more.extend(requests);
                 first
@@ -394,7 +425,7 @@ async fn run() -> Result<()> {
                 };
                 let mut requests = selected.into_iter().map(|access| AdminRequest::VpnDeny {
                     peer: args.peer.clone(),
-                    agent: args.agent.clone(),
+                    agent: args.agent(),
                     access,
                 });
                 let first = requests.next().context("nothing to deny")?;
@@ -693,11 +724,77 @@ mod tests {
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }
-        // --snat only makes sense together with a subnet.
-        assert!(Cli::try_parse_from([
-            "rift", "vpn", "allow", "iphone", "--agent", "home", "--server", "--snat"
+        // --snat only makes sense together with a network.
+        let snat = Cli::try_parse_from([
+            "rift", "vpn", "allow", "iphone", "--agent", "home", "--server", "--snat",
         ])
-        .is_err());
+        .unwrap();
+        let Command::Vpn {
+            command: Vpn::Allow(args),
+        } = snat.command
+        else {
+            unreachable!()
+        };
+        assert!(args.accesses().is_err());
+    }
+    #[test]
+    fn vpn_short_form_names_device_agent_and_targets() {
+        let parse = |argv: &[&str]| match Cli::try_parse_from(argv).map(|c| c.command) {
+            Ok(Command::Vpn {
+                command: Vpn::Allow(args) | Vpn::Deny(args),
+            }) => Some((args.agent(), args.accesses())),
+            _ => None,
+        };
+        let (agent, accesses) = parse(&[
+            "rift",
+            "vpn",
+            "allow",
+            "iphone",
+            "core",
+            "22/tcp",
+            "53/both",
+            "server",
+            "192.168.178.0/24",
+            "--snat",
+        ])
+        .unwrap();
+        assert_eq!(agent, "core");
+        assert_eq!(
+            accesses.unwrap(),
+            vec![
+                VpnAccess::Server,
+                VpnAccess::Port {
+                    protocol: Protocol::Tcp,
+                    ports: "22".parse().unwrap()
+                },
+                VpnAccess::Port {
+                    protocol: Protocol::Tcp,
+                    ports: "53".parse().unwrap()
+                },
+                VpnAccess::Port {
+                    protocol: Protocol::Udp,
+                    ports: "53".parse().unwrap()
+                },
+                VpnAccess::Subnet {
+                    net: "192.168.178.0/24".parse().unwrap(),
+                    snat: true
+                },
+            ]
+        );
+        // Without targets, deny withdraws everything on that agent.
+        let (agent, accesses) = parse(&["rift", "vpn", "deny", "iphone", "core"]).unwrap();
+        assert_eq!((agent.as_str(), accesses.unwrap().len()), ("core", 0));
+        assert!(parse(&["rift", "vpn", "allow", "iphone", "core", "22"])
+            .unwrap()
+            .1
+            .is_err());
+        assert!(parse(&["rift", "vpn", "allow", "iphone", "core", "nas"])
+            .unwrap()
+            .1
+            .is_err());
+        // The agent is required, positionally or with --agent, but not both.
+        assert!(parse(&["rift", "vpn", "allow", "iphone"]).is_none());
+        assert!(parse(&["rift", "vpn", "allow", "iphone", "core", "--agent", "x"]).is_none());
     }
     #[test]
     fn vpn_selectors_become_accesses() {

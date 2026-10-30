@@ -410,23 +410,27 @@ Everything is denied until you allow it. A device reaches only what a grant name
 
 ```sh
 rift vpn peer add iphone                       # key pair + address from the VPN pool
-rift vpn allow iphone --agent home --server    # the home server itself
+rift vpn allow iphone home server             # the home server itself
 rift vpn config qr iphone                      # scan in the WireGuard app
 rift vpn config export iphone > iphone.conf    # or export a file (contains the private key)
 ```
 
-| Grant | Reaches |
-| --- | --- |
-| `--server` | TCP, UDP and ping to the agent host's tunnel address. |
-| `--port 22/tcp` | Only that port or range (`8000-8010/tcp`, `53/both`) on the agent host. Repeatable. |
-| `--full` | Every IP protocol to the agent host. Still not its LAN. |
-| `--subnet 192.168.178.0/24` | An explicitly named private network behind the agent. Repeatable. |
+`rift vpn allow DEVICE AGENT TARGET...` takes one or more targets, for example `rift vpn allow iphone home 22/tcp 53/both`:
 
-Manage devices with `rift vpn peer list`, `peer disable NAME` / `peer enable NAME` (reversible) and `peer revoke NAME` (deletes the device, its key and its grants). `rift vpn deny NAME --agent AGENT [selectors]` withdraws grants; without selectors it withdraws everything on that agent. Revocation and denial close the path on the server in the same reconcile pass; the agent follows on its next sync.
+| Target | Reaches |
+| --- | --- |
+| `server` | TCP, UDP and ping to the agent host's tunnel address. |
+| `22/tcp` | Only that port or range (`8000-8010/tcp`, `53/both`) on the agent host. |
+| `full` | Every IP protocol to the agent host. Still not its LAN. |
+| `192.168.178.0/24` | An explicitly named private network behind the agent; add `--snat` if the LAN router has no route back (see below). |
+
+The long options `--agent`, `--server`, `--full`, `--port` and `--subnet` still work.
+
+Manage devices with `rift vpn peer list`, `peer disable NAME` / `peer enable NAME` (reversible) and `peer revoke NAME` (deletes the device, its key and its grants). `rift vpn deny NAME AGENT [TARGET...]` withdraws grants; without selectors it withdraws everything on that agent. Revocation and denial close the path on the server in the same reconcile pass; the agent follows on its next sync.
 
 Client configurations are split-tunnel: `AllowedIPs` lists only the granted addresses, never `0.0.0.0/0`. Exported files and QR codes contain the device's private key, which stays in a mode-0600 file under the state volume and is never logged.
 
-**Reaching the LAN.** `--subnet` forwards through the agent host and is the only grant that touches the LAN. The agent refuses it unless its owner lists the network in `RIFT_AGENT_ALLOW_SUBNETS` (see [Harden the agent](#harden-the-agent)). Then choose one:
+**Reaching the LAN.** A network grant (for example `rift vpn allow iphone home 192.168.178.0/24`) forwards through the agent host and is the only grant that touches the LAN. The agent refuses it unless its owner lists the network in `RIFT_AGENT_ALLOW_SUBNETS` (see [Harden the agent](#harden-the-agent)). Then choose one:
 
 - Add a static route on the home router for the VPN pool (default `10.14.0.0/24`) via the agent host's LAN address, so LAN hosts can answer. Source addresses stay visible.
 - Or add `--snat`: the agent masquerades the device behind its own LAN address and no router change is needed. NAT applies only to the granted device and network.
