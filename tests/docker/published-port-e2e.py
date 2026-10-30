@@ -339,9 +339,8 @@ def run_datapath(server_cfg, agent_cfg):
             suffix = family[-1]
             name = proto + suffix
             port = PORTS[name]
-            admin(NS, server_cfg, "add", "forward", "--agent", "host-agent",
-                  "--listen-ip", ip, "--listen", str(port), "--target", str(port),
-                  "--protocol", proto)
+            admin(NS, server_cfg, "add", "forward", "host-agent", f"{port}/{proto}",
+                  "--listen-ip", ip)
     def applied():
         state = json.loads(admin(NS, server_cfg, "status").stdout)
         snap = state["snapshot"]
@@ -386,9 +385,9 @@ def wait_policy(server_cfg):
 
 
 def add_app_forward(server_cfg, listen_ip, listen_port, target_port):
-    result = json.loads(admin(NS, server_cfg, "add", "forward", "--agent", "host-agent",
-                              "--listen-ip", listen_ip, "--listen", str(listen_port),
-                              "--target", str(target_port), "--protocol", "tcp").stdout)
+    result = json.loads(admin(NS, server_cfg, "add", "forward", "host-agent",
+                              f"{listen_port}:{target_port}/tcp",
+                              "--listen-ip", listen_ip).stdout)
     wait_policy(server_cfg)
     return result
 

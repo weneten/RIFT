@@ -942,21 +942,12 @@ def command_add(agent, host, port, proxy):
         )
         try:
             created = rift(
-                state,
-                "add",
-                "forward",
-                "--agent",
-                agent,
-                "--listen",
-                str(listen),
-                "--target",
-                str(target),
-                "--ingress",
-                "local",
+                state, "add", "forward", agent, f"{listen}:{target}/tcp", "--ingress", "local"
             )
         except SiteError as error:
             raise SiteError(missing_agent_message(agent, str(error))) from None
         forward_id = created["id"]
+    warn_if_refused(state, forward_id)
     created_forward = not existing or existing.get("forward_id") != forward_id
     if existing and existing.get("proxy") != chosen:
         remove_site_config(state, existing, host)
@@ -1007,6 +998,23 @@ def command_rm(host):
         reload_proxy(state, site["proxy"], host)
     except SiteError as error:
         print(f"proxy reload: {error}", file=sys.stderr)
+
+
+def refusal(forwards, forward_id):
+    """Why the agent refuses this forward (outside its RIFT_AGENT_ALLOW_PORTS), if it does."""
+    for forward in forwards:
+        if forward.get("id") == forward_id and forward.get("state") == "refused":
+            return forward.get("refused") or "the agent does not allow this port"
+    return None
+
+
+def warn_if_refused(state, forward_id):
+    try:
+        reason = refusal(rift(state, "list", "forwards") or [], forward_id)
+    except SiteError:
+        return
+    if reason:
+        print(f"Warning: the agent refuses this site's forward: {reason}", file=sys.stderr)
 
 
 def site_forward_alive(site, forwards):
@@ -1097,7 +1105,12 @@ def command_list():
         if forwards is None:
             status = "unknown"
         else:
-            status = "ok" if site_forward_alive(site, forwards) else "missing"
+            if not site_forward_alive(site, forwards):
+                status = "missing"
+            elif refusal(forwards, site.get("forward_id")):
+                status = "refused"
+            else:
+                status = "ok"
         forward = f"#{site['forward_id']} {status}" if site.get("forward_id") else status
         rows.append(
             (host, site["agent"], str(site["target"]), str(site["listen"]), site["proxy"], forward)
@@ -1105,6 +1118,8 @@ def command_list():
     print_table(rows)
     if any(row[5].endswith("missing") for row in rows[1:]):
         print("A missing forward is created again by 'rift add site AGENT HOST PORT'.")
+    if any(row[5].endswith("refused") for row in rows[1:]):
+        print("A refused forward needs its target port in the agent's RIFT_AGENT_ALLOW_PORTS.")
 
 
 def command_proxy(name):

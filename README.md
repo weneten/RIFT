@@ -151,8 +151,8 @@ The server tells each agent which ports to forward and which VPN grants to enfor
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `RIFT_AGENT_ALLOW_PORTS` | empty (no limit) | Comma-separated `PORT` or `PORT-PORT`, each optionally with `/tcp`, `/udp` or `/both` (default both), for example `22/tcp,80,443,27015-27020/udp`. The agent refuses forwards and VPN port grants that are not entirely inside this list. It also refuses `--server` and `--full` grants, because they reach every port. |
-| `RIFT_AGENT_ALLOW_SUBNETS` | empty (no LAN access) | Comma-separated private IPv4 networks behind the agent, for example `192.168.178.0/24`. A VPN `--subnet` grant works only when its network lies inside one of these. |
+| `RIFT_AGENT_ALLOW_PORTS` | empty (no limit) | Comma-separated `PORT` or `PORT-PORT`, each optionally with `/tcp`, `/udp` or `/both` (default both), for example `22/tcp,80,443,27015-27020/udp`. The agent refuses forwards and VPN port grants that are not entirely inside this list. It also refuses `server` and `full` VPN grants, because they reach every port. |
+| `RIFT_AGENT_ALLOW_SUBNETS` | empty (no LAN access) | Comma-separated private IPv4 networks behind the agent, for example `192.168.178.0/24`. A VPN network grant works only when its network lies inside one of these. |
 
 The secure default for subnets is deliberate: until you list a network, no device can reach your LAN through this agent, whatever the server grants. Restart the agent after changing `.env` (`docker compose up -d --force-recreate`).
 
@@ -188,7 +188,7 @@ Run administrative commands on the **server**. The following examples use `node1
 
 Every forward is transparent unless you add `--mode translate`: the service sees the client's real address. For an IPv6 listener the service must therefore accept IPv6 on the agent's tunnel address (listen on `::`; Docker-published ports usually do). If it only listens on IPv4, add `--mode translate`; that runs in userspace and the service sees the server's tunnel address instead of the client's. The server logs the original address, but tools on the agent that block by source address, such as Fail2ban or CrowdSec, can then no longer tell clients apart and would block the server for everyone. Use translation only where that does not matter.
 
-For scripts there is also a long form (`--agent node1 --listen 2222 --target 22 --protocol tcp`); it cannot be mixed with the short form. If a later forward of one command fails, the earlier ones stay created.
+If a later forward of one command fails, the earlier ones stay created.
 
 ### TCP example
 
@@ -417,8 +417,6 @@ rift vpn config export iphone > iphone.conf    # or export a file (contains the 
 | `full` | Every IP protocol to the agent host. Still not its LAN. |
 | `192.168.178.0/24` | An explicitly named private network behind the agent; add `--snat` if the LAN router has no route back (see below). |
 
-The long options `--agent`, `--server`, `--full`, `--port` and `--subnet` still work.
-
 Manage devices with `rift list devices`, `rift disable device NAME` / `rift enable device NAME` (reversible) and `rift remove device NAME` (deletes the device, its key and its grants). `rift vpn deny NAME AGENT [TARGET...]` withdraws grants; without selectors it withdraws everything on that agent. Revocation and denial close the path on the server in the same reconcile pass; the agent follows on its next sync.
 
 Client configurations are split-tunnel: `AllowedIPs` lists only the granted addresses, never `0.0.0.0/0`. Exported files and QR codes contain the device's private key, which stays in a mode-0600 file under the state volume and is never logged.
@@ -518,7 +516,7 @@ The panel port (default 8090, `RIFT_WEBPANEL_PORT`) must differ from the control
 | `RIFT_WEBPANEL_PASSWORD` | generated | Server. Panel password, at least 12 characters; `rift panel password` shows the effective one. |
 | `RIFT_SERVER`, `RIFT_AGENT_NAME`, `RIFT_ENROLLMENT_TOKEN` | Agent | Invitation values; remove token after enrollment. |
 | `RIFT_AGENT_ALLOW_PORTS` | empty | Agent. Ports the agent may open for forwards and VPN grants, e.g. `22/tcp,80,27015-27020/udp`; empty means no limit. See [Harden the agent](#harden-the-agent). |
-| `RIFT_AGENT_ALLOW_SUBNETS` | empty | Agent. Networks behind the agent that VPN `--subnet` grants may reach; empty means no LAN access. |
+| `RIFT_AGENT_ALLOW_SUBNETS` | empty | Agent. Networks behind the agent that VPN network grants may reach; empty means no LAN access. |
 | `interface`, `wg_port`, `control_port` | `rift0`, `51820`, `8444` | WireGuard interface and ports. |
 | `ipv4_pool`, `ipv6_pool` | `10.13.0.0/24`, `fd88:5249:4654::/64` | Tunnel address pools; avoid overlaps. |
 | `route_table`, `rule_priority`, `mark`, `mark_mask` | See example TOML | Reserved routing and packet-mark resources. |

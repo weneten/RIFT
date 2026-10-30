@@ -115,54 +115,34 @@ enum VpnConfig {
 struct VpnAccessArgs {
     /// Device name.
     peer: String,
-    /// Agent name (or --agent).
-    #[arg(
-        value_name = "AGENT",
-        required_unless_present = "agent",
-        conflicts_with = "agent"
-    )]
-    agent_name: Option<String>,
+    agent: String,
     /// What to allow: PORT/tcp, PORT/udp or PORT/both (ranges like 8000-8010/tcp), `server`,
     /// `full`, or a network behind the agent such as 192.168.178.0/24. Several are allowed.
     #[arg(value_name = "TARGET")]
     targets: Vec<String>,
-    #[arg(long, hide = true)]
-    agent: Option<String>,
-    /// TCP, UDP and ping to the agent host itself (same as the target `server`).
-    #[arg(long)]
-    server: bool,
-    /// Every IP protocol to the agent host itself, not its LAN (same as the target `full`).
-    #[arg(long)]
-    full: bool,
-    /// One port or range on the agent host, as PORT/tcp, PORT/udp or PORT/both. Repeatable.
-    #[arg(long = "port", value_name = "PORT/PROTO")]
-    ports: Vec<String>,
-    /// A network behind the agent, such as 192.168.178.0/24. Repeatable.
-    #[arg(long = "subnet", value_name = "CIDR")]
-    subnets: Vec<Ipv4Net>,
     /// Masquerade the device's address on the agent, for LANs without a route to the VPN pool.
     #[arg(long)]
     snat: bool,
 }
 impl VpnAccessArgs {
     fn agent(&self) -> String {
-        self.agent_name
-            .clone()
-            .or_else(|| self.agent.clone())
-            .unwrap_or_default()
+        self.agent.clone()
     }
     fn accesses(&self) -> Result<Vec<VpnAccess>> {
-        let (mut server, mut full) = (self.server, self.full);
-        let mut ports = self.ports.clone();
-        let mut subnets = self.subnets.clone();
+        let (mut server, mut full) = (false, false);
+        let (mut ports, mut subnets) = (Vec::new(), Vec::new());
         for target in &self.targets {
             match target.as_str() {
                 "server" => server = true,
                 "full" => full = true,
-                t if t.contains('/') && t.split('/').nth(1).is_some_and(|p| !p.chars().all(|c| c.is_ascii_digit())) => {
+                t if t
+                    .split('/')
+                    .nth(1)
+                    .is_some_and(|p| !p.chars().all(|c| c.is_ascii_digit())) =>
+                {
                     ports.push(t.to_string())
                 }
-                t => subnets.push(t.parse().with_context(|| {
+                t => subnets.push(t.parse::<Ipv4Net>().with_context(|| {
                     format!("{t:?} is not PORT/tcp|udp|both, server, full or a network like 192.168.178.0/24")
                 })?),
             }
@@ -240,19 +220,10 @@ enum AddWhat {
     /// with an optional /v4 (default), /v6 or /all for the server address, for example
     /// `rift add forward node1 53/both 8080:80/tcp/all`. The long options are the alternative.
     Forward {
-        #[arg(
-            value_name = "AGENT SPEC",
-            conflicts_with_all = ["agent", "listen", "target", "protocol"]
-        )]
-        short: Vec<String>,
-        #[arg(long, required_unless_present = "short")]
-        agent: Option<String>,
-        #[arg(long, required_unless_present = "short")]
-        listen: Option<PortRange>,
-        #[arg(long, required_unless_present = "short")]
-        target: Option<PortRange>,
-        #[arg(long)]
-        protocol: Option<Protocol>,
+        agent: String,
+        /// LISTEN[:TARGET]/tcp|udp|both, optionally ending in /v4, /v6 or /all.
+        #[arg(value_name = "SPEC", required = true)]
+        specs: Vec<String>,
         /// A specific server address instead of /v4, /v6 or /all. Rarely needed.
         #[arg(long)]
         listen_ip: Option<IpAddr>,
@@ -466,33 +437,14 @@ async fn run() -> Result<()> {
                 ttl_seconds: duration(&ttl)?,
             },
             AddWhat::Forward {
-                short,
                 agent,
-                listen,
-                target,
-                protocol,
+                specs,
                 listen_ip,
                 target_family,
                 mode,
                 ingress,
             } => {
-                let (agent, plans) = if let Some((name, specs)) = short.split_first() {
-                    anyhow::ensure!(
-                            !specs.is_empty(),
-                            "name at least one port with its protocol, for example: rift add forward {name} 8080:80/tcp"
-                        );
-                    (name.clone(), parse_forward_specs(specs)?)
-                } else {
-                    (
-                        agent.context("--agent is required")?,
-                        vec![ForwardPlan {
-                            listen: listen.context("--listen is required")?,
-                            target: target.context("--target is required")?,
-                            protocol: protocol.unwrap_or(Protocol::Tcp),
-                            on: None,
-                        }],
-                    )
-                };
+                let plans = parse_forward_specs(&specs)?;
                 let options = ForwardOptions {
                     listen_ip,
                     on: None,
@@ -720,25 +672,20 @@ mod tests {
             vec!["rift", "enable", "device", "iphone"],
             vec!["rift", "disable", "device", "iphone"],
             vec!["rift", "remove", "device", "iphone"],
+            vec!["rift", "vpn", "allow", "iphone", "home", "server"],
             vec![
-                "rift", "vpn", "allow", "iphone", "--agent", "home", "--server",
-            ],
-            vec![
-                "rift", "vpn", "allow", "iphone", "--agent", "home", "--port", "22/tcp", "--port",
-                "53/both",
+                "rift", "vpn", "allow", "iphone", "home", "22/tcp", "53/both",
             ],
             vec![
                 "rift",
                 "vpn",
                 "allow",
                 "iphone",
-                "--agent",
                 "home",
-                "--subnet",
                 "192.168.178.0/24",
                 "--snat",
             ],
-            vec!["rift", "vpn", "deny", "iphone", "--agent", "home"],
+            vec!["rift", "vpn", "deny", "iphone", "home"],
             vec!["rift", "vpn", "config", "export", "iphone"],
             vec!["rift", "vpn", "config", "qr", "iphone"],
             vec!["rift", "panel", "status"],
@@ -755,10 +702,9 @@ mod tests {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }
         // --snat only makes sense together with a network.
-        let snat = Cli::try_parse_from([
-            "rift", "vpn", "allow", "iphone", "--agent", "home", "--server", "--snat",
-        ])
-        .unwrap();
+        let snat =
+            Cli::try_parse_from(["rift", "vpn", "allow", "iphone", "home", "server", "--snat"])
+                .unwrap();
         let Command::Vpn {
             command: Vpn::Allow(args),
         } = snat.command
@@ -822,14 +768,15 @@ mod tests {
             .unwrap()
             .1
             .is_err());
-        // The agent is required, positionally or with --agent, but not both.
+        // The agent is required and the old long options are gone.
         assert!(parse(&["rift", "vpn", "allow", "iphone"]).is_none());
-        assert!(parse(&["rift", "vpn", "allow", "iphone", "core", "--agent", "x"]).is_none());
+        assert!(parse(&["rift", "vpn", "allow", "iphone", "core", "--server"]).is_none());
+        assert!(parse(&["rift", "vpn", "allow", "iphone", "--agent", "core", "server"]).is_none());
     }
     #[test]
-    fn vpn_selectors_become_accesses() {
+    fn vpn_targets_become_accesses() {
         let args = |extra: &[&str]| {
-            let mut argv = vec!["rift", "vpn", "allow", "iphone", "--agent", "home"];
+            let mut argv = vec!["rift", "vpn", "allow", "iphone", "home"];
             argv.extend(extra);
             match Cli::try_parse_from(argv).unwrap().command {
                 Command::Vpn {
@@ -839,11 +786,11 @@ mod tests {
             }
         };
         assert!(args(&[]).unwrap().is_empty());
-        assert_eq!(args(&["--port", "53/both"]).unwrap().len(), 2);
-        assert!(args(&["--port", "22:80/tcp"]).is_err());
-        assert!(args(&["--port", "22"]).is_err());
+        assert_eq!(args(&["53/both"]).unwrap().len(), 2);
+        assert!(args(&["22:80/tcp"]).is_err());
+        assert!(args(&["22"]).is_err());
         assert_eq!(
-            args(&["--subnet", "192.168.178.0/24", "--snat"]).unwrap(),
+            args(&["192.168.178.0/24", "--snat"]).unwrap(),
             vec![VpnAccess::Subnet {
                 net: "192.168.178.0/24".parse().unwrap(),
                 snat: true
@@ -852,20 +799,28 @@ mod tests {
     }
     #[test]
     fn documented_cli_parses() {
-        Cli::try_parse_from([
-            "rift",
-            "add",
-            "forward",
-            "--agent",
-            "nas",
-            "--listen",
-            "2222",
-            "--target",
-            "22",
-            "--protocol",
-            "tcp",
-        ])
-        .unwrap();
+        for args in [
+            vec!["rift", "add", "forward", "nas", "2222:22/tcp"],
+            vec![
+                "rift",
+                "add",
+                "forward",
+                "nas",
+                "53/both",
+                "8080:80/tcp/all",
+            ],
+            vec![
+                "rift",
+                "add",
+                "forward",
+                "nas",
+                "8080/tcp",
+                "--listen-ip",
+                "203.0.113.10",
+            ],
+        ] {
+            Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        }
     }
     #[test]
     fn translation_is_explicit() {
@@ -873,12 +828,8 @@ mod tests {
             "rift",
             "add",
             "forward",
-            "--agent",
             "core",
-            "--listen",
-            "443",
-            "--target",
-            "443",
+            "443/tcp",
             "--mode",
             "translate",
             "--target-family",
@@ -928,21 +879,21 @@ mod tests {
         }
     }
     #[test]
-    fn short_form_and_long_options_do_not_mix() {
+    fn forwards_need_an_agent_and_a_spec_and_the_long_form_is_gone() {
         Cli::try_parse_from(["rift", "add", "forward", "node1", "53/both"]).unwrap();
-        assert!(
-            Cli::try_parse_from(["rift", "add", "forward", "node1", "53", "--listen", "80"])
-                .is_err()
-        );
         assert!(Cli::try_parse_from(["rift", "add", "forward"]).is_err());
-        assert!(Cli::try_parse_from(["rift", "add", "forward", "--agent", "a"]).is_err());
+        assert!(Cli::try_parse_from(["rift", "add", "forward", "node1"]).is_err());
+        for long in ["--agent", "--listen", "--target", "--protocol"] {
+            assert!(
+                Cli::try_parse_from(["rift", "add", "forward", "node1", "80/tcp", long, "x"])
+                    .is_err(),
+                "{long}"
+            );
+        }
     }
     #[test]
     fn rejects_invalid_range() {
-        assert!(Cli::try_parse_from([
-            "rift", "add", "forward", "--agent", "core", "--listen", "0", "--target", "22"
-        ])
-        .is_err());
+        assert!(parse_forward_specs(&["0:22/tcp".into()]).is_err());
     }
     #[test]
     fn local_ingress_is_explicit() {
@@ -950,12 +901,8 @@ mod tests {
             "rift",
             "add",
             "forward",
-            "--agent",
             "core",
-            "--listen",
-            "20000",
-            "--target",
-            "8081",
+            "20000:8081/tcp",
             "--ingress",
             "local",
         ])

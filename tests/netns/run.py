@@ -355,9 +355,8 @@ def add_forwards(server_cfg, agent_names):
         cases = [(PUBLIC_V4, first, "tcp", 19080), (PUBLIC_V4, first + 1, "udp", 19081),
                  (PUBLIC_V6, first + 2, "tcp", 19080), (PUBLIC_V6, first + 3, "udp", 19081)]
         for listen_ip, listen_port, proto, target_port in cases:
-            cli(VPS, server_cfg, "add", "forward", "--agent", name,
-                "--listen-ip", listen_ip, "--listen", str(listen_port),
-                "--target", str(target_port), "--protocol", proto,
+            cli(VPS, server_cfg, "add", "forward", name,
+                f"{listen_port}:{target_port}/{proto}", "--listen-ip", listen_ip,
                 env={"RIFT_PUBLIC_ENDPOINT": SERVER_HOST,
                      "RIFT_PUBLIC_IPS": f"{PUBLIC_V4},{PUBLIC_V4_NEW},{PUBLIC_V6}"})
             ports[(name, listen_ip, proto)] = listen_port
@@ -401,9 +400,8 @@ got=s.recv(256).decode(); print(got); assert got==src,(got,src)
 
 def translation_ban_test(server_cfg):
     result = json.loads(cli(
-        VPS, server_cfg, "add", "forward", "--agent", "agent1",
-        "--listen-ip", PUBLIC_V4, "--listen", "18100", "--target", "19080",
-        "--protocol", "tcp", "--mode", "translate", "--target-family", "v6",
+        VPS, server_cfg, "add", "forward", "agent1", "18100:19080/tcp",
+        "--listen-ip", PUBLIC_V4, "--mode", "translate", "--target-family", "v6",
         env={"RIFT_PUBLIC_ENDPOINT": SERVER_HOST,
              "RIFT_PUBLIC_IPS": f"{PUBLIC_V4},{PUBLIC_V4_NEW},{PUBLIC_V6}"}).stdout)
     forward_id = result["id"]
@@ -438,9 +436,8 @@ except OSError as e:
 
 def agent_local_ban_test(server_cfg):
     forward = json.loads(cli(
-        VPS, server_cfg, "add", "forward", "--agent", "agent3",
-        "--listen-ip", PUBLIC_V4, "--listen", "18096", "--target", "19080",
-        "--protocol", "tcp", "--mode", "translate", "--target-family", "v6",
+        VPS, server_cfg, "add", "forward", "agent3", "18096:19080/tcp",
+        "--listen-ip", PUBLIC_V4, "--mode", "translate", "--target-family", "v6",
         env={"RIFT_PUBLIC_ENDPOINT": SERVER_HOST,
              "RIFT_PUBLIC_IPS": f"{PUBLIC_V4},{PUBLIC_V4_NEW},{PUBLIC_V6}"}).stdout)
     wait_policy(server_cfg, 3)
@@ -468,9 +465,8 @@ got=s.recv(128).decode(); print(got); assert got.startswith("fd88:5249:4654::1")
 
 def fail2ban_coexistence_test(server_cfg, ports):
     forward = json.loads(cli(
-        VPS, server_cfg, "add", "forward", "--agent", "agent3",
-        "--listen-ip", PUBLIC_V4, "--listen", "18092", "--target", "19082",
-        "--protocol", "tcp",
+        VPS, server_cfg, "add", "forward", "agent3", "18092:19082/tcp",
+        "--listen-ip", PUBLIC_V4,
         env={"RIFT_PUBLIC_ENDPOINT": SERVER_HOST,
              "RIFT_PUBLIC_IPS": f"{PUBLIC_V4},{PUBLIC_V4_NEW},{PUBLIC_V6}"}).stdout)
     forward_id = forward["id"]

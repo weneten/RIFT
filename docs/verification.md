@@ -34,9 +34,9 @@ These require disposable Linux runners with the documented kernel features. Dock
 
 The `rift vpn` feature has unit coverage only: rule rendering and ordering, state validation, rollback filtering, CLI parsing, client configuration and address allocation. No Linux runtime test has been executed for it. Before relying on it, exercise on a disposable runner with real WireGuard and nftables:
 
-1. A registered device completes a handshake with the server and reaches the granted agent address (`--server`).
+1. A registered device completes a handshake with the server and reaches the granted agent address (`server`).
 2. A key that is not registered gets no handshake; a registered device cannot reach another agent, a non-granted port, or a subnet without a grant.
-3. A device with only `--server` cannot reach any LAN host; with `--subnet` it can, with and without `--snat` (and with a static route on the LAN router for the non-NAT case).
+3. A device with only `server` cannot reach any LAN host; with a network grant it can, with and without `--snat` (and with a static route on the LAN router for the non-NAT case).
 4. Two devices cannot reach each other; a device cannot reach the server's tunnel address or control port.
 5. `rift remove device`, `rift disable device` and `rift vpn deny` cut established and new flows immediately.
 6. Server and agent restarts restore the same access; a failed apply leaves public forwards working.
@@ -59,7 +59,7 @@ Unit tests cover the configuration parsing; the listener lifecycle has not run i
 
 ## Agent allowlists: unit-tested only
 
-`RIFT_AGENT_ALLOW_PORTS` and `RIFT_AGENT_ALLOW_SUBNETS` are covered by unit tests of parsing and of the policy filter; no container or kernel test has run. Check on a disposable agent that a refused forward stays pending, that a `--subnet` grant is refused until the network is listed, and that both appear in `rift status`.
+`RIFT_AGENT_ALLOW_PORTS` and `RIFT_AGENT_ALLOW_SUBNETS` are covered by unit tests of parsing and of the policy filter; no container or kernel test has run. Check on a disposable agent that a refused forward stays pending, that a network grant is refused until the network is listed, and that both appear in `rift status`.
 
 ## Release gates
 

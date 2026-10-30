@@ -176,9 +176,8 @@ def main():
             forwards = [(VPS4, 18080, "tcp"), (VPS4, 18081, "udp"),
                         (VPS6, 18082, "tcp"), (VPS6, 18083, "udp")]
             for ip, port, proto in forwards:
-                exec_cli("add", "forward", "--agent", "core", "--listen-ip", ip,
-                         "--listen", str(port), "--target", "19080" if proto == "tcp" else "19081",
-                         "--protocol", proto)
+                target = "19080" if proto == "tcp" else "19081"
+                exec_cli("add", "forward", "core", f"{port}:{target}/{proto}", "--listen-ip", ip)
             def applied():
                 state = json.loads(exec_cli("status").stdout)
                 snap = state["snapshot"]

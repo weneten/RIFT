@@ -323,6 +323,15 @@ class FileProviderTests(unittest.TestCase):
             with self.assertRaises(rift_site.SiteError):
                 rift_site.parse_add_args(bad)
 
+    def test_a_refused_forward_reports_the_reason(self):
+        forwards = [
+            {"id": 1, "state": "enabled"},
+            {"id": 6, "state": "refused", "refused": "the agent allows only ports 8081; add 8080/tcp"},
+        ]
+        self.assertIsNone(rift_site.refusal(forwards, 1))
+        self.assertIn("add 8080/tcp", rift_site.refusal(forwards, 6))
+        self.assertIsNone(rift_site.refusal(forwards, 9))
+
     def test_messages_name_the_command_not_the_file(self):
         self.assertIn("usage: rift add site", rift_site.usage())
         self.assertNotIn("rift-site", rift_site.usage())
