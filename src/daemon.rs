@@ -128,7 +128,14 @@ pub async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
         );
     }
     if let Some(password) = &server.panel_password {
-        let listeners = crate::webpanel::bind(&config).await?;
+        // The tunnel and forwards must not depend on the panel: without its port, run without it.
+        let listeners = match crate::webpanel::bind(&config).await {
+            Ok(listeners) => listeners,
+            Err(error) => {
+                tracing::error!("web panel not started: {error:#}; RIFT runs without it. Free the port or set RIFT_WEBPANEL_PORT, then recreate the container");
+                Vec::new()
+            }
+        };
         let panel = Arc::new(crate::webpanel::Panel::new(
             PanelBackend(server.clone()),
             config.clone(),
