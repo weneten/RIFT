@@ -299,6 +299,27 @@ class FileProviderTests(unittest.TestCase):
         self.assertEqual(rows[2][3], "[2001:db8::1]:1337-1339")
         self.assertEqual(rows[2][8:], ("disabled", ""))
 
+    def test_add_arguments_and_the_proxy_option(self):
+        self.assertEqual(
+            rift_site.parse_add_args(["core", "a.example", "8081", "--proxy", "traefik"]),
+            (["core", "a.example", "8081"], "traefik"),
+        )
+        self.assertEqual(
+            rift_site.parse_add_args(["--proxy=caddy", "core", "a.example", "8081"]),
+            (["core", "a.example", "8081"], "caddy"),
+        )
+        self.assertEqual(rift_site.parse_add_args(["core", "a.example", "8081"])[1], None)
+        with self.assertRaises(rift_site.SiteError) as typo:
+            rift_site.parse_add_args(["core", "a.example", "8081", "--proxy-traefik"])
+        self.assertIn("use --proxy traefik (with a space)", str(typo.exception))
+        for bad in (["core", "a.example", "8081", "--proxy"], ["core", "a.example"], ["a", "b", "1", "--x"]):
+            with self.assertRaises(rift_site.SiteError):
+                rift_site.parse_add_args(bad)
+
+    def test_messages_name_the_command_not_the_file(self):
+        self.assertIn("usage: rift site add", rift_site.usage())
+        self.assertNotIn("rift-site", rift_site.usage())
+
     def test_a_site_forward_removed_by_hand_is_not_trusted(self):
         site = {"forward_id": 2, "listen": 20001, "target": 3001}
 

@@ -186,7 +186,7 @@ def resolve_public_ip(toml_text, env_value):
     # The server uses RIFT_PUBLIC_IPS from .env when it is set, and the TOML list otherwise.
     from_env = addresses_from_env(env_value)
     if len(from_env) > 1:
-        raise SiteError("RIFT_PUBLIC_IPS must contain one address for rift-site")
+        raise SiteError("RIFT_PUBLIC_IPS must contain one address for rift site")
     address = from_env[0] if from_env else public_ip_from_toml(toml_text)
     if not address:
         raise SiteError(
@@ -734,7 +734,7 @@ def ensure_traefik_provider(state):
         return None
     if not layout["config_files"] or not layout["working_dir"]:
         raise SiteError(
-            "Traefik was not started with Docker Compose, so rift-site cannot change its "
+            "Traefik was not started with Docker Compose, so rift site cannot change its "
             "configuration. Add --providers.file.directory=/dynamic and "
             "--providers.file.watch=true with a /dynamic volume yourself."
         )
@@ -757,8 +757,8 @@ def ensure_traefik_provider(state):
         migrated, changed = add_file_provider(original, layout["service"], str(dynamic))
     else:
         raise SiteError(
-            "Traefik uses a file provider that rift-site does not recognise. "
-            "Point it at a watched /dynamic directory before rift-site can add a name."
+            "Traefik uses a file provider that rift site does not recognise. "
+            "Point it at a watched /dynamic directory before rift site can add a name."
         )
     if not changed:
         raise SiteError(f"could not rewrite the Traefik file provider in {compose_path}")
@@ -782,7 +782,7 @@ def backup_notice(compose_path, backup, created):
         )
     return (
         f"Changed {compose_path} and recreated Traefik. An earlier backup from before "
-        f"rift-site's first change is still at {backup}."
+        f"rift site's first change is still at {backup}."
     )
 
 
@@ -904,7 +904,7 @@ def command_add(agent, host, port, proxy):
 def command_rm(host):
     state = load_state()
     if state is None or host not in state["sites"]:
-        raise SiteError(f"{host} is not a rift-site")
+        raise SiteError(f"{host} is not a site managed by rift site")
     site = state["sites"][host]
     note = remove_site_config(state, site, host)
     remove_forward(state, site.get("forward_id"))
@@ -1026,12 +1026,36 @@ def command_proxy(name):
 
 def usage():
     return (
-        "usage: rift-site add AGENT HOST PORT [--proxy traefik|caddy|nginx|npm]\n"
-        "       rift-site remove HOST\n"
-        "       rift-site list\n"
-        "       rift-site forwards\n"
-        "       rift-site proxy [traefik|caddy|nginx|npm]"
+        "usage: rift site add AGENT HOST PORT [--proxy traefik|caddy|nginx|npm]\n"
+        "       rift site remove HOST\n"
+        "       rift site list\n"
+        "       rift site forwards\n"
+        "       rift site proxy [traefik|caddy|nginx|npm]"
     )
+
+
+def parse_add_args(args):
+    """Split `add` arguments into (AGENT, HOST, PORT) and the optional --proxy value."""
+    proxy = None
+    positional = []
+    items = iter(args)
+    for arg in items:
+        if arg == "--proxy":
+            proxy = next(items, None)
+            if proxy is None:
+                raise SiteError("--proxy needs a value: traefik, caddy, nginx or npm")
+        elif arg.startswith("--proxy="):
+            proxy = arg.split("=", 1)[1]
+        elif arg.startswith("--proxy"):
+            hint = arg[len("--proxy") :].lstrip("-")
+            raise SiteError(f"unknown option {arg}; use --proxy {hint} (with a space)")
+        elif arg.startswith("--"):
+            raise SiteError(f"unknown option {arg}\n{usage()}")
+        else:
+            positional.append(arg)
+    if len(positional) != 3:
+        raise SiteError(usage())
+    return positional, proxy
 
 
 def main(argv):
@@ -1039,14 +1063,7 @@ def main(argv):
         raise SiteError(usage())
     command = argv[1]
     if command == "add":
-        proxy = None
-        args = argv[2:]
-        if "--proxy" in args:
-            index = args.index("--proxy")
-            proxy = args[index + 1]
-            args = args[:index] + args[index + 2 :]
-        if len(args) != 3:
-            raise SiteError(usage())
+        args, proxy = parse_add_args(argv[2:])
         command_add(args[0], args[1], args[2], proxy)
         return
     if command in ("remove", "rm") and len(argv) == 3:
@@ -1068,5 +1085,5 @@ if __name__ == "__main__":
     try:
         main(sys.argv)
     except (SiteError, json.JSONDecodeError, KeyError, ValueError) as error:
-        print(f"rift-site: {error}", file=sys.stderr)
+        print(f"rift site: {error}", file=sys.stderr)
         sys.exit(1)
