@@ -81,6 +81,9 @@ input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); ou
 }
 .login-card { width: min(360px, 100%); display: grid; gap: 10px; }
 .login-card .muted { margin: -6px 0 6px; }
+#code-row { display: grid; gap: 10px; }
+#code-row[hidden] { display: none; }
+.two-factor { margin: 12px 0 0; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .error { color: var(--bad); min-height: 1.2em; margin: 0; }
 .hint { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
 

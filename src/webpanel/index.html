@@ -15,6 +15,10 @@
     <p class="muted">Server panel</p>
     <label for="password">Password</label>
     <input id="password" type="password" autocomplete="current-password" required autofocus>
+    <div id="code-row" hidden>
+      <label for="code">Code</label>
+      <input id="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,7}" maxlength="7" placeholder="6-digit code from your authenticator app">
+    </div>
     <button type="submit" class="primary">Log in</button>
     <p id="login-error" class="error" role="alert"></p>
     <p class="hint">Forgot it? On the server: <code>rift panel password</code></p>
@@ -83,6 +87,7 @@
     <section class="card">
       <h2>Panel</h2>
       <ul id="panel-urls" class="plain"></ul>
+      <p id="two-factor" class="two-factor"></p>
     </section>
 
     <details id="logs-box" class="card">

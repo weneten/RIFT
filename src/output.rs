@@ -414,6 +414,19 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
         AdminRequest::VpnDeny { peer, agent, .. } => format!("Access of {peer} to {agent} withdrawn."),
         AdminRequest::PanelStatus => panel_status(data),
         AdminRequest::PanelPassword => field(data, "password"),
+        AdminRequest::PanelTwoFactorStatus => {
+            let mode = field(data, "mode");
+            let state = if data["enabled"].as_bool() == Some(true) { "on" } else { "off" };
+            let note = match (state, mode.as_str()) {
+                ("off", "required") => " Logins are refused until it is set up: rift panel 2fa setup",
+                ("off", _) => " Set it up with rift panel 2fa setup, or in the panel.",
+                _ => "",
+            };
+            format!("Two-factor panel login is {state} (mode: {mode}).{note}")
+        }
+        AdminRequest::PanelTwoFactorSetup => field(data, "uri"),
+        AdminRequest::PanelTwoFactorConfirm { .. } => "Two-factor panel login is now on.".into(),
+        AdminRequest::PanelTwoFactorReset => "Two-factor panel login is off. The secret is deleted and all panel sessions have ended.".into(),
         AdminRequest::PanelAllow { name, allowed: true } => {
             let url = data["urls"].as_array().and_then(|u| u.get(1)).map(|u| field(u, "url")).unwrap_or_default();
             format!("{name} may now open the web panel at {url}.\nIf the device was set up before, re-import its configuration: rift vpn config qr {name}")

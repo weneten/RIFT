@@ -8,6 +8,7 @@ pub mod net;
 pub mod protocol;
 pub mod state;
 pub mod tls_material;
+pub mod totp;
 pub mod translation;
 pub mod vpn;
 pub mod webpanel;

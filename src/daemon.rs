@@ -32,6 +32,7 @@ struct Server {
     server_public_key: String,
     /// Set when the web panel is on.
     panel_password: Option<String>,
+    two_factor: Arc<crate::totp::TwoFactor>,
     /// The running enrollment listener, if any. Shared with the kernel for the host firewall.
     enrollment: Mutex<Option<tokio::task::JoinHandle<()>>>,
     enrollment_open: Arc<std::sync::atomic::AtomicBool>,
@@ -86,6 +87,7 @@ pub async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
         translation: Mutex::new(TranslationManager::new()),
         server_public_key,
         panel_password,
+        two_factor: Arc::new(crate::totp::TwoFactor::new(crate::totp::path(&config))),
         enrollment: Mutex::new(None),
         enrollment_open,
     });
@@ -130,6 +132,7 @@ pub async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
             PanelBackend(server.clone()),
             config.clone(),
             password,
+            server.two_factor.clone(),
         ));
         for listener in listeners {
             let address = listener.local_addr()?;
@@ -375,6 +378,7 @@ async fn reload_config(s: &Server) -> Result<u64> {
         || next.webpanel_access != current.webpanel_access
         || next.webpanel_port != current.webpanel_port
         || next.webpanel_control != current.webpanel_control
+        || next.webpanel_2fa != current.webpanel_2fa
         || next.webpanel_allow != current.webpanel_allow
         || next.route_table != current.route_table
         || next.rule_priority != current.rule_priority
@@ -959,6 +963,24 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
         AdminRequest::PanelPassword => {
             let password = s.panel_password.clone().ok_or_else(|| anyhow!("the web panel is off; set RIFT_WEBPANEL=true in the server .env and recreate the container"))?;
             serde_json::json!({"password":password})
+        }
+        AdminRequest::PanelTwoFactorStatus => {
+            let cfg = s.config.read().await.clone();
+            serde_json::json!({"panel":cfg.webpanel,"enabled":s.two_factor.enabled(),"mode":cfg.webpanel_2fa})
+        }
+        AdminRequest::PanelTwoFactorSetup => {
+            let cfg = s.config.read().await.clone();
+            anyhow::ensure!(cfg.webpanel, "the web panel is off; set RIFT_WEBPANEL=true in the server .env and recreate the container");
+            let setup = s.two_factor.setup(crate::totp::host(&cfg))?;
+            serde_json::json!({"secret":setup.secret,"uri":setup.uri})
+        }
+        AdminRequest::PanelTwoFactorConfirm { code } => {
+            s.two_factor.confirm(&code, now())?;
+            serde_json::json!({"enabled":true})
+        }
+        AdminRequest::PanelTwoFactorReset => {
+            s.two_factor.reset()?;
+            serde_json::json!({"enabled":false})
         }
         vpn_request => vpn_admin(s, &snap, vpn_request).await?,
     };

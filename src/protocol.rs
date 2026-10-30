@@ -135,6 +135,15 @@ pub enum AdminRequest {
     /// Whether the web panel is on, where it listens and which devices may open it.
     PanelStatus,
     PanelPassword,
+    /// Whether two-factor panel login is on, and its mode.
+    PanelTwoFactorStatus,
+    /// Creates a pending secret to scan; `PanelTwoFactorConfirm` turns the login factor on.
+    PanelTwoFactorSetup,
+    PanelTwoFactorConfirm {
+        code: String,
+    },
+    /// Deletes the secret and ends all panel sessions.
+    PanelTwoFactorReset,
     /// Let a VPN device open the web panel, or withdraw that again.
     PanelAllow {
         name: String,
