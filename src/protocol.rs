@@ -33,6 +33,8 @@ pub enum ControlRequest {
         agent_id: String,
         applied_generation: u64,
         error: Option<String>,
+        /// The agent's own limits, so the server can leave out what it would refuse.
+        limits: AgentLimits,
     },
     Ban {
         version: u16,

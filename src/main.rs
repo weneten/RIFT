@@ -608,6 +608,9 @@ async fn show(
     request: &AdminRequest,
     response: &rift::protocol::AdminResponse,
 ) -> Result<()> {
+    if let Some(warning) = response.data["warning"].as_str().filter(|_| !json) {
+        eprintln!("Warning: {warning}");
+    }
     if json {
         println!("{}", serde_json::to_string(&response.data)?);
     } else if invitation {

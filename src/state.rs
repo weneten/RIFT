@@ -270,6 +270,7 @@ impl StateStore {
             last_error: None,
             created_at: t,
             pending_deadline: Some(stage_deadline),
+            limits: None,
         };
         s.agents.push(record.clone());
         tx.execute("UPDATE invites SET reserved_agent=?1,reserved_attempt=?2,reserved_key=?3,stage_deadline=?4 WHERE token_hash=?5", params![id,attempt,key,stage_deadline,token_hash])?;
@@ -355,6 +356,7 @@ impl StateStore {
         id: &str,
         applied: u64,
         error: Option<String>,
+        limits: AgentLimits,
     ) -> Result<StateSnapshot> {
         let mut c = self.lock()?;
         let tx = c.transaction()?;
@@ -370,10 +372,13 @@ impl StateStore {
                 .iter_mut()
                 .find(|a| a.id == id)
                 .ok_or_else(|| anyhow!("unknown agent"))?;
-            let changed = a.applied_generation != applied || a.last_error != error;
+            let changed = a.applied_generation != applied
+                || a.last_error != error
+                || a.limits.as_ref() != Some(&limits);
             if changed {
                 a.applied_generation = applied;
                 a.last_error = error;
+                a.limits = Some(limits);
             }
             changed
         };
@@ -660,6 +665,7 @@ mod tests {
             last_error: None,
             created_at: 0,
             pending_deadline: None,
+            limits: None,
         };
         let subnet = |net: &str| VpnAccess::Subnet {
             net: net.parse().unwrap(),
@@ -1121,6 +1127,7 @@ mod tests {
                     last_error: None,
                     created_at: now(),
                     pending_deadline: None,
+                    limits: None,
                 });
                 Ok(())
             })
@@ -1140,6 +1147,8 @@ mod tests {
         assert!(store.health().unwrap()[0]["last_observed_disconnect"]
             .as_i64()
             .is_some());
-        assert!(store.update_agent_sync("a", 2, None).is_err());
+        assert!(store
+            .update_agent_sync("a", 2, None, AgentLimits::default())
+            .is_err());
     }
 }

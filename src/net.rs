@@ -2692,6 +2692,7 @@ mod tests {
             last_error: None,
             created_at: 0,
             pending_deadline: None,
+            limits: None,
         }
     }
     fn forward(mode: ForwardMode) -> Forward {

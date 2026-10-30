@@ -1,4 +1,4 @@
-use crate::model::{PortRange, Protocol};
+use crate::model::{AgentLimits, PortAllow};
 use anyhow::{bail, ensure, Context, Result};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
@@ -114,43 +114,6 @@ impl std::fmt::Display for PanelAccess {
     }
 }
 
-/// One entry of the agent's port allowlist. `protocol` None means TCP and UDP.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PortAllow {
-    pub ports: PortRange,
-    pub protocol: Option<Protocol>,
-}
-impl PortAllow {
-    /// Whether `ports` over `protocol` lies entirely inside this entry.
-    pub fn covers(&self, protocol: Protocol, ports: PortRange) -> bool {
-        self.protocol.is_none_or(|p| p == protocol)
-            && self.ports.start <= ports.start
-            && ports.end <= self.ports.end
-    }
-}
-impl std::str::FromStr for PortAllow {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self> {
-        let s = s.trim();
-        let (ports, protocol) = match s.split_once('/') {
-            None => (s, None),
-            Some((p, "tcp")) => (p, Some(Protocol::Tcp)),
-            Some((p, "udp")) => (p, Some(Protocol::Udp)),
-            Some((p, "both")) => (p, None),
-            Some(_) => bail!("{s:?}: protocol must be /tcp, /udp or /both"),
-        };
-        ensure!(
-            !ports.is_empty() && ports.chars().all(|c| c.is_ascii_digit() || c == '-'),
-            "{s:?} is not a port or port range"
-        );
-        Ok(Self {
-            ports: ports
-                .parse()
-                .with_context(|| format!("invalid ports in {s:?}"))?,
-            protocol,
-        })
-    }
-}
 /// Comma-separated `PORT`, `PORT-PORT`, optionally with `/tcp`, `/udp` or `/both`.
 /// Empty means no restriction.
 pub fn parse_port_allow(text: &str) -> Result<Option<Vec<PortAllow>>> {
@@ -512,6 +475,13 @@ impl Config {
         );
         Ok(())
     }
+    /// What this agent's owner allows the server to open here.
+    pub fn agent_limits(&self) -> AgentLimits {
+        AgentLimits {
+            ports: self.agent_allow_ports.clone(),
+            subnets: self.agent_allow_subnets.clone(),
+        }
+    }
     pub fn socket_path(&self) -> PathBuf {
         self.state_dir.join("admin.sock")
     }
@@ -550,6 +520,7 @@ pub fn validate_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{PortRange, Protocol};
     #[test]
     fn defaults_valid() {
         Config::default().validate().unwrap();

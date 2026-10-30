@@ -969,7 +969,7 @@ def forward_rows(forwards, agents, sites):
                 str(f.get("target_family", "")),
                 str(f.get("ingress", "")),
                 str(f.get("mode", "")),
-                "enabled" if f.get("enabled") else "disabled",
+                str(f.get("state") or ("enabled" if f.get("enabled") else "disabled")),
                 by_forward.get(f.get("id"), ""),
             )
         )

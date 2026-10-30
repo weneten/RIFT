@@ -96,12 +96,11 @@ fn forwards(data: &Value, names: &HashMap<String, String>) -> String {
                 field(f, "target_family"),
                 field(f, "ingress"),
                 field(f, "mode"),
-                if f["enabled"].as_bool() == Some(true) {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-                .into(),
+                match f["state"].as_str() {
+                    Some(state) => state.into(),
+                    None if f["enabled"].as_bool() == Some(true) => "enabled".into(),
+                    None => "disabled".into(),
+                },
             ]
         })
         .collect();
@@ -193,6 +192,13 @@ fn status(data: &Value) -> String {
             lines.push(format!(
                 "Pending forward IDs: {}",
                 pending.iter().map(text).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        for refused in data["refused_forwards"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "Forward {} refused by its agent: {}",
+                field(refused, "id"),
+                field(refused, "reason")
             ));
         }
         let rows = data["agent_health"]
@@ -316,7 +322,18 @@ fn vpn_peers(data: &Value) -> String {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .map(|g| format!("{}: {}", field(g, "agent"), vpn_access(&g["access"])))
+                .map(|g| {
+                    let refused = if g["refused"].is_string() {
+                        " (refused by agent)"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "{}: {}{refused}",
+                        field(g, "agent"),
+                        vpn_access(&g["access"])
+                    )
+                })
                 .collect::<Vec<_>>();
             if p["panel"].as_bool() == Some(true) {
                 grants.insert(0, "web panel".into());

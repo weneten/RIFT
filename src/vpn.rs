@@ -294,6 +294,7 @@ mod tests {
             last_error: None,
             created_at: 0,
             pending_deadline: None,
+            limits: None,
         }
     }
     fn peer(name: &str, last: u8, enabled: bool) -> VpnPeer {

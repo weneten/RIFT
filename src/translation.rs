@@ -300,6 +300,7 @@ mod tests {
                 last_error: None,
                 created_at: now(),
                 pending_deadline: None,
+                limits: None,
             }],
             forwards: vec![Forward {
                 id: 1,

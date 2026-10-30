@@ -284,7 +284,7 @@ async fn reconcile(s: &Server) -> Result<()> {
     }
     let config = s.config.read().await.clone();
     let k = s.kernel.lock().await;
-    let snapshot = s.state.snapshot()?;
+    let snapshot = without_refused(s.state.snapshot()?);
     let result = async {
         k.apply_server(&snapshot, &config.private_key_path())
             .await?;
@@ -478,6 +478,7 @@ async fn handle_control(mut stream: TcpStream, source: IpAddr, s: Arc<Server>) -
             agent_id,
             applied_generation,
             error,
+            limits,
         } => {
             anyhow::ensure!(
                 version == VERSION && agent_id == agent.id,
@@ -486,11 +487,12 @@ async fn handle_control(mut stream: TcpStream, source: IpAddr, s: Arc<Server>) -
             if agent.status != AgentStatus::Active {
                 bail!("agent has not completed activation")
             }
+            let changed_limits = agent.limits.as_ref() != Some(&limits);
             let previous = agent.applied_generation;
             let _ = s
                 .state
-                .update_agent_sync(&agent.id, applied_generation, error)?;
-            if previous != applied_generation {
+                .update_agent_sync(&agent.id, applied_generation, error, limits)?;
+            if previous != applied_generation || changed_limits {
                 reconcile(&s).await?;
             }
             let pool = s.config.read().await.vpn_pool;
@@ -584,7 +586,49 @@ async fn handle_control(mut stream: TcpStream, source: IpAddr, s: Arc<Server>) -
     protocol::send(&mut stream, &response).await?;
     Ok(())
 }
+/// Why the agent behind `forward` refuses it, by the limits it last reported.
+fn forward_refusal(snap: &StateSnapshot, forward: &Forward) -> Option<String> {
+    let agent = snap.agents.iter().find(|a| a.id == forward.agent_id)?;
+    agent.limits.as_ref()?.refuse_forward(forward)
+}
+fn grant_refusal(snap: &StateSnapshot, grant: &VpnGrant) -> Option<String> {
+    let agent = snap.agents.iter().find(|a| a.id == grant.agent_id)?;
+    agent.limits.as_ref()?.refuse_access(&grant.access)
+}
+/// The snapshot without what agents refuse. Publishing a forward the agent drops would open
+/// a public port nothing answers on; the agent enforces its limits anyway.
+fn without_refused(snap: StateSnapshot) -> StateSnapshot {
+    let mut out = snap.clone();
+    out.forwards.retain(|f| forward_refusal(&snap, f).is_none());
+    out.vpn_grants.retain(|g| grant_refusal(&snap, g).is_none());
+    out.bans
+        .retain(|b| out.forwards.iter().any(|f| f.id == b.forward_id));
+    out
+}
+/// enabled, disabled, pending (not applied by the agent yet) or refused (outside its limits).
+fn forward_state(snap: &StateSnapshot, forward: &Forward) -> (&'static str, Option<String>) {
+    if !forward.enabled {
+        return ("disabled", None);
+    }
+    if let Some(why) = forward_refusal(snap, forward) {
+        return ("refused", Some(why));
+    }
+    let applied = snap.agents.iter().any(|a| {
+        a.id == forward.agent_id
+            && a.status == AgentStatus::Active
+            && a.applied_generation >= forward.generation
+    });
+    (if applied { "enabled" } else { "pending" }, None)
+}
+fn forward_json(snap: &StateSnapshot, forward: &Forward) -> Result<serde_json::Value> {
+    let (state, refusal) = forward_state(snap, forward);
+    let mut value = serde_json::to_value(forward)?;
+    value["state"] = state.into();
+    value["refused"] = refusal.into();
+    Ok(value)
+}
 fn policy_for(snapshot: &StateSnapshot, id: &str, vpn_pool: ipnet::Ipv4Net) -> AgentPolicy {
+    let snapshot = &without_refused(snapshot.clone());
     AgentPolicy {
         generation: snapshot.generation,
         forwards: snapshot
@@ -717,15 +761,16 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
             let pending_forwards: Vec<_> = snap
                 .forwards
                 .iter()
-                .filter(|f| {
-                    f.enabled
-                        && !snap.agents.iter().any(|a| {
-                            a.id == f.agent_id
-                                && a.status == AgentStatus::Active
-                                && a.applied_generation >= f.generation
-                        })
-                })
+                .filter(|f| forward_state(&snap, f).0 == "pending")
                 .map(|f| f.id)
+                .collect();
+            let refused_forwards: Vec<_> = snap
+                .forwards
+                .iter()
+                .filter_map(|f| match forward_state(&snap, f) {
+                    ("refused", why) => Some(serde_json::json!({"id":f.id,"reason":why})),
+                    _ => None,
+                })
                 .collect();
             let fully_applied =
                 error.is_none() && applied == Some(snap.generation) && pending_forwards.is_empty();
@@ -737,7 +782,7 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
                 .map(|(name, expires_at)| serde_json::json!({"name":name,"expires_at":expires_at}))
                 .collect();
             let enrollment = serde_json::json!({"mode":cfg.enrollment,"open":s.enrollment_open.load(Ordering::SeqCst),"bind":cfg.enrollment_bind});
-            serde_json::json!({"snapshot":snap,"enrollment":enrollment,"invites":invites,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"fully_applied":fully_applied,"connection_history":s.state.health()?})
+            serde_json::json!({"snapshot":snap,"enrollment":enrollment,"invites":invites,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"refused_forwards":refused_forwards,"fully_applied":fully_applied,"connection_history":s.state.health()?})
         }
         AdminRequest::AgentsList => serde_json::to_value(snap.agents)?,
         AdminRequest::AgentsShow { name } => {
@@ -836,7 +881,12 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
             s.state.request_rotation(&id, &rotation)?;
             serde_json::json!({"agent":id,"rotation_id":rotation,"status":"requested; agent will rotate on next WireGuard control sync"})
         }
-        AdminRequest::ForwardsList => serde_json::to_value(snap.forwards)?,
+        AdminRequest::ForwardsList => serde_json::Value::Array(
+            snap.forwards
+                .iter()
+                .map(|f| forward_json(&snap, f))
+                .collect::<Result<_>>()?,
+        ),
         AdminRequest::ForwardAdd(mut f) => {
             f.validate()?;
             let cfg = s.config.read().await.clone();
@@ -871,7 +921,15 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
                 Ok(())
             })?;
             reconcile(s).await?;
-            serde_json::to_value(f)?
+            let mut value = forward_json(&s.state.snapshot()?, &f)?;
+            if let Some(why) = value["refused"].as_str().map(String::from) {
+                value["warning"] = format!(
+                    "forward {} was added, but agent {} will refuse it: {why}",
+                    f.id, target.name
+                )
+                .into();
+            }
+            value
         }
         AdminRequest::ForwardRemove { id } => {
             s.state.mutate("forward-remove", |x| {
@@ -1055,7 +1113,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                 let handshake = stats.iter().find(|x| x.public_key == p.public_key).map(|x| x.last_handshake);
                 let grants: Vec<_> = snap.vpn_grants.iter().filter(|g| g.peer == p.name).map(|g| {
                     let agent = snap.agents.iter().find(|a| a.id == g.agent_id).map(|a| a.name.clone());
-                    serde_json::json!({"agent":agent,"access":g.access})
+                    serde_json::json!({"agent":agent,"access":g.access,"refused":grant_refusal(snap, g)})
                 }).collect();
                 serde_json::json!({"name":p.name,"ipv4":p.ipv4,"enabled":p.enabled,"panel":p.panel,"public_key":p.public_key,"last_handshake":handshake,"grants":grants})
             }).collect();
@@ -1118,7 +1176,17 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                 Ok(())
             })?;
             reconcile(s).await?;
-            serde_json::json!({"peer":peer,"agent":agent,"access":access})
+            let refused = grant_refusal(
+                &s.state.snapshot()?,
+                &VpnGrant {
+                    peer: peer.clone(),
+                    agent_id: agent_id.clone(),
+                    access: access.clone(),
+                },
+            );
+            let warning = refused
+                .map(|why| format!("the grant was added, but agent {agent} will refuse it: {why}"));
+            serde_json::json!({"peer":peer,"agent":agent,"access":access,"warning":warning})
         }
         AdminRequest::VpnDeny {
             peer,
@@ -1539,7 +1607,7 @@ fn note_refusals(refusals: &[String]) {
 fn load_agent_policy(config: &Config) -> Result<AgentPolicy> {
     let cached: AgentPolicy =
         serde_json::from_slice(&std::fs::read(config.state_dir.join("agent-policy.json"))?)?;
-    Ok(agent_policy::restrict(&cached, config).0)
+    Ok(agent_policy::restrict(&cached, &config.agent_limits()).0)
 }
 async fn agent_sync(
     config: &Config,
@@ -1559,12 +1627,13 @@ async fn agent_sync(
             agent_id: identity.id.clone(),
             applied_generation: identity.applied_generation,
             error: AGENT_REFUSALS.lock().ok().and_then(|r| r.clone()),
+            limits: config.agent_limits(),
         },
     )
     .await?;
     match protocol::receive::<ControlResponse, _>(&mut stream).await? {
         ControlResponse::Policy(policy) => {
-            let (policy, refusals) = agent_policy::restrict(&policy, config);
+            let (policy, refusals) = agent_policy::restrict(&policy, &config.agent_limits());
             note_refusals(&refusals);
             let k = Kernel::new(config.clone());
             k.apply_agent(w, &policy, key_path).await?;
@@ -1759,6 +1828,89 @@ mod tests {
             agent_id: "home".into(),
             access,
         }
+    }
+
+    #[test]
+    fn forwards_and_grants_outside_the_agent_limits_are_refused_and_left_out() {
+        let forward = |id: u64, port: &str| Forward {
+            id,
+            agent_id: "home".into(),
+            listen_ip: "203.0.113.10".parse().unwrap(),
+            listen_ports: port.parse().unwrap(),
+            target_ports: port.parse().unwrap(),
+            protocol: Protocol::Tcp,
+            mode: ForwardMode::Transparent,
+            ingress: Ingress::Public,
+            target_family: Family::V4,
+            enabled: true,
+            generation: 2,
+        };
+        let mut agent = AgentRecord {
+            id: "home".into(),
+            name: "core".into(),
+            public_key: "k".into(),
+            tunnel_ipv4: "10.13.0.2".parse().unwrap(),
+            tunnel_ipv6: "fd88:5249:4654::2".parse().unwrap(),
+            status: AgentStatus::Active,
+            attempt_id: "a".into(),
+            generation: 2,
+            applied_generation: 2,
+            last_error: None,
+            created_at: 0,
+            pending_deadline: None,
+            limits: None,
+        };
+        let snap = |agent: &AgentRecord| StateSnapshot {
+            generation: 2,
+            agents: vec![agent.clone()],
+            forwards: vec![forward(1, "8081"), forward(2, "3001")],
+            vpn_peers: vec![peer("phone", true)],
+            vpn_grants: vec![
+                grant("phone", VpnAccess::Server),
+                grant(
+                    "phone",
+                    VpnAccess::Port {
+                        protocol: Protocol::Tcp,
+                        ports: "3001".parse().unwrap(),
+                    },
+                ),
+            ],
+            ..Default::default()
+        };
+        // Before the first sync nothing is known, so nothing is refused.
+        let unknown = snap(&agent);
+        assert_eq!(forward_state(&unknown, &unknown.forwards[0]).0, "enabled");
+        assert_eq!(without_refused(unknown.clone()).forwards.len(), 2);
+
+        agent.limits = Some(AgentLimits {
+            ports: crate::config::parse_port_allow("3001,1337,8090").unwrap(),
+            subnets: vec![],
+        });
+        let limited = snap(&agent);
+        let (state, why) = forward_state(&limited, &limited.forwards[0]);
+        assert_eq!(state, "refused");
+        assert!(why.unwrap().contains("add 8081/tcp"));
+        assert_eq!(forward_state(&limited, &limited.forwards[1]).0, "enabled");
+        let applied = without_refused(limited.clone());
+        assert_eq!(
+            applied.forwards.iter().map(|f| f.id).collect::<Vec<_>>(),
+            [2]
+        );
+        assert_eq!(
+            applied.vpn_grants.len(),
+            1,
+            "the whole-host grant is left out"
+        );
+        let policy = policy_for(&limited, "home", "10.14.0.0/24".parse().unwrap());
+        assert_eq!(policy.forwards.len(), 1);
+        assert_eq!(
+            policy.generation, 2,
+            "the agent can acknowledge everything it got"
+        );
+
+        let mut stale = limited.clone();
+        stale.forwards[1].generation = 3;
+        assert_eq!(forward_state(&stale, &stale.forwards[1]).0, "pending");
     }
 
     #[test]

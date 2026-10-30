@@ -104,6 +104,123 @@ impl std::str::FromStr for PortRange {
         Ok(result)
     }
 }
+/// One entry of an agent's `RIFT_AGENT_ALLOW_PORTS`. `protocol` None means TCP and UDP.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortAllow {
+    pub ports: PortRange,
+    pub protocol: Option<Protocol>,
+}
+impl PortAllow {
+    /// Whether `ports` over `protocol` lies entirely inside this entry.
+    pub fn covers(&self, protocol: Protocol, ports: PortRange) -> bool {
+        self.protocol.is_none_or(|p| p == protocol)
+            && self.ports.start <= ports.start
+            && ports.end <= self.ports.end
+    }
+}
+impl std::str::FromStr for PortAllow {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        let s = s.trim();
+        let (ports, protocol) = match s.split_once('/') {
+            None => (s, None),
+            Some((p, "tcp")) => (p, Some(Protocol::Tcp)),
+            Some((p, "udp")) => (p, Some(Protocol::Udp)),
+            Some((p, "both")) => (p, None),
+            Some(_) => anyhow::bail!("{s:?}: protocol must be /tcp, /udp or /both"),
+        };
+        anyhow::ensure!(
+            !ports.is_empty() && ports.chars().all(|c| c.is_ascii_digit() || c == '-'),
+            "{s:?} is not a port or port range"
+        );
+        Ok(Self {
+            ports: ports
+                .parse()
+                .with_context(|| format!("invalid ports in {s:?}"))?,
+            protocol,
+        })
+    }
+}
+impl std::fmt::Display for PortAllow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.protocol {
+            Some(protocol) => write!(f, "{}/{protocol}", self.ports),
+            None => write!(f, "{}", self.ports),
+        }
+    }
+}
+
+/// What an agent's owner allows the server to open there (`RIFT_AGENT_ALLOW_PORTS`,
+/// `RIFT_AGENT_ALLOW_SUBNETS`). The agent enforces it and reports it with every sync, so the
+/// server can warn about and leave out what the agent would refuse anyway.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentLimits {
+    /// `None` means any port.
+    pub ports: Option<Vec<PortAllow>>,
+    /// Networks behind the agent that subnet grants may reach; empty means none.
+    pub subnets: Vec<Ipv4Net>,
+}
+impl AgentLimits {
+    fn ports_allowed(&self, protocol: Protocol, ports: PortRange) -> bool {
+        self.ports
+            .as_ref()
+            .is_none_or(|list| list.iter().any(|entry| entry.covers(protocol, ports)))
+    }
+    fn port_list(&self) -> String {
+        self.ports
+            .iter()
+            .flatten()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+    /// Why the agent refuses this forward, if it does.
+    pub fn refuse_forward(&self, forward: &Forward) -> Option<String> {
+        (!self.ports_allowed(forward.protocol, forward.target_ports)).then(|| {
+            format!(
+                "the agent allows only ports {} (RIFT_AGENT_ALLOW_PORTS); add {}/{}",
+                self.port_list(),
+                forward.target_ports,
+                forward.protocol
+            )
+        })
+    }
+    /// Why the agent refuses this VPN grant, if it does.
+    pub fn refuse_access(&self, access: &VpnAccess) -> Option<String> {
+        match access {
+            VpnAccess::Server | VpnAccess::Full => self.ports.is_some().then(|| {
+                format!(
+                    "it reaches every port, but the agent allows only ports {} (RIFT_AGENT_ALLOW_PORTS); grant single ports instead",
+                    self.port_list()
+                )
+            }),
+            VpnAccess::Port { protocol, ports } => {
+                (!self.ports_allowed(*protocol, *ports)).then(|| {
+                    format!(
+                        "the agent allows only ports {} (RIFT_AGENT_ALLOW_PORTS); add {ports}/{protocol}",
+                        self.port_list()
+                    )
+                })
+            }
+            VpnAccess::Subnet { net, .. } => {
+                (!self.subnets.iter().any(|allowed| allowed.contains(net))).then(|| {
+                    if self.subnets.is_empty() {
+                        format!("the agent allows no LAN access; add {net} to RIFT_AGENT_ALLOW_SUBNETS")
+                    } else {
+                        format!(
+                            "the agent allows only {} (RIFT_AGENT_ALLOW_SUBNETS); add {net}",
+                            self.subnets
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                    }
+                })
+            }
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
@@ -125,6 +242,8 @@ pub struct AgentRecord {
     pub last_error: Option<String>,
     pub created_at: i64,
     pub pending_deadline: Option<i64>,
+    /// The agent's own limits as of its last sync; `None` before the first one.
+    pub limits: Option<AgentLimits>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Forward {

@@ -701,7 +701,11 @@ impl Action {
                         }
                     }
                 }
-                Value::Array(created)
+                let warnings: Vec<Value> = created
+                    .iter()
+                    .filter_map(|f| f.get("warning").cloned())
+                    .collect();
+                json!({"forwards": created, "warnings": warnings})
             }
             Self::ForwardEnable { id, enabled } => {
                 panel
@@ -772,16 +776,20 @@ impl Action {
                     !accesses.is_empty(),
                     "choose what to allow: host, all protocols, ports or a subnet"
                 );
+                let mut warnings = Vec::new();
                 for access in accesses {
-                    panel
+                    let added = panel
                         .admin(AdminRequest::VpnAllow {
                             peer: peer.clone(),
                             agent: agent.clone(),
                             access,
                         })
                         .await?;
+                    if let Some(warning) = added.get("warning").filter(|w| w.is_string()) {
+                        warnings.push(warning.clone());
+                    }
                 }
-                json!({"peer": peer, "agent": agent})
+                json!({"peer": peer, "agent": agent, "warnings": warnings})
             }
             Self::VpnDeny {
                 peer,
@@ -858,6 +866,7 @@ fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> Value {
         })
         .collect();
     let pending = status["pending_forwards"].as_array().unwrap_or(&empty);
+    let refused = status["refused_forwards"].as_array().unwrap_or(&empty);
     let forwards: Vec<Value> = snapshot["forwards"]
         .as_array()
         .unwrap_or(&empty)
@@ -875,6 +884,7 @@ fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> Value {
                 "ingress": f["ingress"],
                 "enabled": f["enabled"],
                 "pending": pending.contains(&f["id"]),
+                "refused": refused.iter().find(|r| r["id"] == f["id"]).map(|r| r["reason"].clone()),
             })
         })
         .collect();

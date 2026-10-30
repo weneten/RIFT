@@ -230,9 +230,10 @@ function forwardDialog() {
   ], "Add", async () => {
     const body = { action: "forward_add", agent: agent.value, specs: specs.value, on: on.value, ingress: ingress.value };
     if (mode.value) body.mode = mode.value;
-    await act(body);
+    const result = await act(body);
     closeModal();
     await load();
+    if ((result.warnings || []).length) showBanner(result.warnings.join(" "));
   }));
 }
 
@@ -328,7 +329,7 @@ function grantsDialog(name) {
       button("Withdraw", async () => { await act({ action: "panel_allow", name, allowed: false }); await refresh(); }, "danger")));
   }
   for (const g of peer.grants || []) {
-    list.append(el("li", {}, el("span", {}, `${g.agent || "?"}: ${access(g.access)}`),
+    list.append(el("li", {}, el("span", { title: g.refused || "" }, `${g.agent || "?"}: ${access(g.access)}${g.refused ? " (refused by the agent)" : ""}`),
       button("Withdraw", async () => {
         try {
           await act({ action: "vpn_deny", peer: name, agent: g.agent, access: g.access });
@@ -364,8 +365,9 @@ function grantsDialog(name) {
       if (kind.value === "full") body.full = true;
       if (kind.value === "ports") body.ports = value.value;
       if (kind.value === "subnet") { body.subnets = value.value; body.snat = snat.checked; }
-      await act(body);
+      const result = await act(body);
       await refresh();
+      if ((result.warnings || []).length) showBanner(result.warnings.join(" "));
     }));
   }
   content.push(el("p", { class: "hint" }, "After a change, re-import the device's configuration so it routes the new addresses."),
@@ -461,7 +463,9 @@ function render() {
   }), 6, invites.length ? "No agent has enrolled yet." : "No agents yet.");
 
   fill($("forwards"), forwards.map((f) => {
-    const statePill = !f.enabled ? pill("disabled", "off") : f.pending ? pill("pending", "warn") : pill("active", "ok");
+    const statePill = !f.enabled ? pill("disabled", "off")
+      : f.refused ? Object.assign(pill("refused", "bad"), { title: f.refused })
+      : f.pending ? pill("pending", "warn") : pill("active", "ok");
     const mode = [f.mode, f.ingress === "local" ? "local" : null, f.target_family].filter(Boolean).join(" · ");
     return el("tr", {},
       el("td", {}, f.id),
@@ -480,6 +484,8 @@ function render() {
           `Remove forward ${f.id} (${endpoint(f.listen_ip, range(f.listen_ports))})? This cannot be undone.`, "danger"))));
   }), 8, "No forwards configured.");
 
+  $("refused").replaceChildren(...forwards.filter((f) => f.refused && f.enabled).map((f) =>
+    el("li", {}, el("strong", {}, `Forward ${f.id}`), ` refused by ${f.agent}: ${f.refused}`)));
   const bans = data.bans || [];
   $("bans-card").hidden = !bans.length;
   fill($("bans"), bans.map((b) => el("tr", {},
@@ -487,7 +493,7 @@ function render() {
     el("td", {}, `in ${left(b.expires_at, now)}`))), 4, "");
 
   fill($("vpn"), peers.map((p) => {
-    const grants = (p.grants || []).map((g) => `${g.agent || "?"}: ${access(g.access)}`);
+    const grants = (p.grants || []).map((g) => `${g.agent || "?"}: ${access(g.access)}${g.refused ? " (refused)" : ""}`);
     if (p.panel) grants.unshift("panel");
     return el("tr", {},
       el("td", {}, p.name),

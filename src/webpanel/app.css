@@ -238,3 +238,5 @@ hr.sep { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
 .dialog h4 { margin: 0 0 8px; font-size: 13px; color: var(--muted); font-weight: 600; }
 .offscreen { position: fixed; left: -9999px; top: 0; }
 .dialog .pre + .form, .dialog .qr + .pre, .dialog > .form:last-child { margin-top: 12px; }
+ul.refused { margin-top: 10px; }
+ul.refused li { color: var(--bad); font-size: 13px; }
