@@ -91,15 +91,22 @@ enum Agents {
 #[derive(Subcommand)]
 enum Forwards {
     List,
+    /// Add forwards. Short form: AGENT SPEC..., where SPEC is LISTEN[:TARGET][/tcp|/udp|/both],
+    /// for example `rift forwards add node1 53/both 8080:80`. The long options are the alternative.
     Add {
+        #[arg(
+            value_name = "AGENT SPEC",
+            conflicts_with_all = ["agent", "listen", "target", "protocol"]
+        )]
+        short: Vec<String>,
+        #[arg(long, required_unless_present = "short")]
+        agent: Option<String>,
+        #[arg(long, required_unless_present = "short")]
+        listen: Option<PortRange>,
+        #[arg(long, required_unless_present = "short")]
+        target: Option<PortRange>,
         #[arg(long)]
-        agent: String,
-        #[arg(long)]
-        listen: PortRange,
-        #[arg(long)]
-        target: PortRange,
-        #[arg(long, default_value = "tcp")]
-        protocol: Protocol,
+        protocol: Option<Protocol>,
         #[arg(long)]
         listen_ip: Option<IpAddr>,
         #[arg(long,value_parser=["v4","v6"])]
@@ -160,6 +167,8 @@ async fn run() -> Result<()> {
             command: Agents::Add { .. }
         }
     );
+    // Further forwards of one short-form `forwards add`, sent after the first one.
+    let mut more: Vec<AdminRequest> = Vec::new();
     let request = match cli.command {
         Command::Server => return rift::daemon::run_server(config, cli.config).await,
         Command::Agent => return rift::daemon::run_agent(config).await,
@@ -211,6 +220,7 @@ async fn run() -> Result<()> {
                 Forwards::Disable { id } => AdminRequest::ForwardEnable { id, enabled: false },
                 Forwards::Enable { id } => AdminRequest::ForwardEnable { id, enabled: true },
                 Forwards::Add {
+                    short,
                     agent,
                     listen,
                     target,
@@ -220,35 +230,58 @@ async fn run() -> Result<()> {
                     mode,
                     ingress,
                 } => {
+                    let (agent, plans) = if let Some((name, specs)) = short.split_first() {
+                        anyhow::ensure!(
+                            !specs.is_empty(),
+                            "name at least one port, for example: rift forwards add {name} 8080:80"
+                        );
+                        (name.clone(), parse_forward_specs(specs)?)
+                    } else {
+                        (
+                            agent.context("--agent is required")?,
+                            vec![(
+                                listen.context("--listen is required")?,
+                                target.context("--target is required")?,
+                                protocol.unwrap_or(Protocol::Tcp),
+                            )],
+                        )
+                    };
                     let ip = listen_ip.or_else(|| if config.public_ips.len() == 1 { config.public_ips.first().copied() } else { None }).context("use --listen-ip when the VPS has zero or multiple configured public IPs")?;
                     let family = match target_family.as_deref() {
                         Some("v4") => Family::V4,
                         Some("v6") => Family::V6,
                         _ => Family::of(ip),
                     };
-                    let forward = Forward {
-                        id: 0,
-                        agent_id: agent,
-                        listen_ip: ip,
-                        listen_ports: listen,
-                        target_ports: target,
-                        protocol,
-                        mode: if mode == "translate" {
-                            ForwardMode::Translate
-                        } else {
-                            ForwardMode::Transparent
-                        },
-                        ingress: if ingress == "local" {
-                            Ingress::Local
-                        } else {
-                            Ingress::Public
-                        },
-                        target_family: family,
-                        enabled: true,
-                        generation: 0,
-                    };
-                    forward.validate()?;
-                    AdminRequest::ForwardAdd(forward)
+                    let mut requests = Vec::new();
+                    for (listen, target, protocol) in plans {
+                        let forward = Forward {
+                            id: 0,
+                            agent_id: agent.clone(),
+                            listen_ip: ip,
+                            listen_ports: listen,
+                            target_ports: target,
+                            protocol,
+                            mode: if mode == "translate" {
+                                ForwardMode::Translate
+                            } else {
+                                ForwardMode::Transparent
+                            },
+                            ingress: if ingress == "local" {
+                                Ingress::Local
+                            } else {
+                                Ingress::Public
+                            },
+                            target_family: family,
+                            enabled: true,
+                            generation: 0,
+                        };
+                        forward.validate()?;
+                        requests.push(AdminRequest::ForwardAdd(forward));
+                    }
+                    let mut requests = requests.into_iter();
+                    let first = requests.next().context("nothing to add")?;
+                    more.extend(requests);
+                    first
                 }
             }
         }
@@ -274,7 +307,29 @@ async fn run() -> Result<()> {
             response.error.unwrap_or_else(|| "operation failed".into())
         );
     }
-    if cli.json {
+    show(&config, cli.json, invitation, &request, &response).await?;
+    for request in more {
+        let response = rift::daemon::admin_call(&config, request.clone())
+            .await
+            .context("earlier forwards of this command were already added")?;
+        if !response.ok {
+            bail!(
+                "{} (earlier forwards of this command were already added)",
+                response.error.unwrap_or_else(|| "operation failed".into())
+            );
+        }
+        show(&config, cli.json, false, &request, &response).await?;
+    }
+    Ok(())
+}
+async fn show(
+    config: &Config,
+    json: bool,
+    invitation: bool,
+    request: &AdminRequest,
+    response: &rift::protocol::AdminResponse,
+) -> Result<()> {
+    if json {
         println!("{}", serde_json::to_string(&response.data)?);
     } else if invitation {
         println!(
@@ -289,7 +344,7 @@ async fn run() -> Result<()> {
             request,
             AdminRequest::ForwardsList | AdminRequest::ForwardAdd(_)
         ) {
-            rift::daemon::admin_call(&config, AdminRequest::AgentsList)
+            rift::daemon::admin_call(config, AdminRequest::AgentsList)
                 .await
                 .ok()
                 .filter(|response| response.ok)
@@ -299,10 +354,34 @@ async fn run() -> Result<()> {
         };
         println!(
             "{}",
-            output::render(&request, &response.data, agents.as_ref())
+            output::render(request, &response.data, agents.as_ref())
         );
     }
     Ok(())
+}
+/// Parses `LISTEN[:TARGET][/tcp|/udp|/both]` specs; `both` adds a TCP and a UDP forward.
+fn parse_forward_specs(specs: &[String]) -> Result<Vec<(PortRange, PortRange, Protocol)>> {
+    let mut plans = Vec::new();
+    for spec in specs {
+        let (ports, proto) = spec.split_once('/').unwrap_or((spec, "tcp"));
+        let (listen, target) = ports.split_once(':').unwrap_or((ports, ports));
+        let listen: PortRange = listen
+            .parse()
+            .with_context(|| format!("invalid listen port in {spec:?}"))?;
+        let target: PortRange = target
+            .parse()
+            .with_context(|| format!("invalid target port in {spec:?}"))?;
+        let protocols = match proto {
+            "tcp" => vec![Protocol::Tcp],
+            "udp" => vec![Protocol::Udp],
+            "both" => vec![Protocol::Tcp, Protocol::Udp],
+            _ => bail!("protocol in {spec:?} must be tcp, udp or both"),
+        };
+        for protocol in protocols {
+            plans.push((listen, target, protocol));
+        }
+    }
+    Ok(plans)
 }
 fn duration(s: &str) -> Result<u64> {
     let seconds = humantime::parse_duration(s)?.as_secs();
@@ -348,6 +427,40 @@ mod tests {
             "v4",
         ])
         .unwrap();
+    }
+    #[test]
+    fn short_form_parses_ports_targets_and_protocols() {
+        let specs: Vec<String> = ["53/both", "8080:80", "5000-5002/udp", "443:8443/tcp"]
+            .map(String::from)
+            .to_vec();
+        let plans = parse_forward_specs(&specs).unwrap();
+        let shown: Vec<_> = plans
+            .iter()
+            .map(|(l, t, p)| (l.start, l.end, t.start, t.end, *p == Protocol::Udp))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                (53, 53, 53, 53, false),
+                (53, 53, 53, 53, true),
+                (8080, 8080, 80, 80, false),
+                (5000, 5002, 5000, 5002, true),
+                (443, 443, 8443, 8443, false),
+            ]
+        );
+        for bad in ["0", "99999", "80/icmp", "80:abc", "x"] {
+            assert!(parse_forward_specs(&[bad.to_string()]).is_err(), "{bad}");
+        }
+    }
+    #[test]
+    fn short_form_and_long_options_do_not_mix() {
+        Cli::try_parse_from(["rift", "forwards", "add", "node1", "53/both"]).unwrap();
+        assert!(
+            Cli::try_parse_from(["rift", "forwards", "add", "node1", "53", "--listen", "80"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["rift", "forwards", "add"]).is_err());
+        assert!(Cli::try_parse_from(["rift", "forwards", "add", "--agent", "a"]).is_err());
     }
     #[test]
     fn rejects_invalid_range() {

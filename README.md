@@ -161,6 +161,8 @@ Protocols that negotiate additional ports or embed addresses, such as FTP in som
 
 Run administrative commands on the **server**. The following examples use `node1` and assume one address in `RIFT_PUBLIC_IPS`. Replace ports with those used by your services. With multiple configured addresses, add `--listen-ip` with the desired address to every `forwards add` command.
 
+`forwards add` also has a short form: `rift forwards add AGENT SPEC...`, where each `SPEC` is `LISTEN[:TARGET][/tcp|/udp|/both]`. The target defaults to the listen port and the protocol to `tcp`; `both` creates a TCP and a UDP forward. Ranges such as `5000-5002` work. For example, `rift forwards add node1 53/both 8080:80` replaces the two long `--agent … --protocol …` commands for port 53 plus a forward from 8080 to 80. Options such as `--listen-ip`, `--ingress` and `--mode` still apply to every forward of the command. The short form cannot be mixed with `--agent`, `--listen`, `--target` or `--protocol`. If a later forward of one command fails, the earlier ones stay created.
+
 ### TCP example
 
 Publish an SSH service listening on the agent's port 22 as server port 2222:
