@@ -57,6 +57,10 @@ The web panel has unit coverage (configuration parsing, source checks, read/writ
 
 Unit tests cover the configuration parsing; the listener lifecycle has not run in a container. Check that 8443 is closed at start without invitations, opens with `rift agents add` and with an invitation from the panel, stays open until the agent is active, and closes after activation, `cancel-invite`, agent removal and expiry (within about 10 s). With UFW, RIFT's `rift:enrollment` rule should appear and disappear with it. `RIFT_ENROLLMENT=always` keeps it open; `off` refuses invitations.
 
+## Agent allowlists: unit-tested only
+
+`RIFT_AGENT_ALLOW_PORTS` and `RIFT_AGENT_ALLOW_SUBNETS` are covered by unit tests of parsing and of the policy filter; no container or kernel test has run. Check on a disposable agent that a refused forward stays pending, that a `--subnet` grant is refused until the network is listed, and that both appear in `rift status`.
+
 ## Release gates
 
 Run the configured Linux and Docker jobs, review failures and archive their results. Before production acceptance, additionally exercise full host reboots, startup-interruption fault injection, existing management SSH and the intended host-firewall/Docker-backend combination. Collect iperf3 measurements against ordinary WireGuard on representative hardware. No throughput, downtime or production-safety benchmark is claimed in this repository.

@@ -1,3 +1,4 @@
+use crate::model::{PortRange, Protocol};
 use anyhow::{bail, ensure, Context, Result};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
@@ -93,6 +94,81 @@ impl std::fmt::Display for PanelAccess {
     }
 }
 
+/// One entry of the agent's port allowlist. `protocol` None means TCP and UDP.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortAllow {
+    pub ports: PortRange,
+    pub protocol: Option<Protocol>,
+}
+impl PortAllow {
+    /// Whether `ports` over `protocol` lies entirely inside this entry.
+    pub fn covers(&self, protocol: Protocol, ports: PortRange) -> bool {
+        self.protocol.is_none_or(|p| p == protocol)
+            && self.ports.start <= ports.start
+            && ports.end <= self.ports.end
+    }
+}
+impl std::str::FromStr for PortAllow {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        let s = s.trim();
+        let (ports, protocol) = match s.split_once('/') {
+            None => (s, None),
+            Some((p, "tcp")) => (p, Some(Protocol::Tcp)),
+            Some((p, "udp")) => (p, Some(Protocol::Udp)),
+            Some((p, "both")) => (p, None),
+            Some(_) => bail!("{s:?}: protocol must be /tcp, /udp or /both"),
+        };
+        ensure!(
+            !ports.is_empty() && ports.chars().all(|c| c.is_ascii_digit() || c == '-'),
+            "{s:?} is not a port or port range"
+        );
+        Ok(Self {
+            ports: ports
+                .parse()
+                .with_context(|| format!("invalid ports in {s:?}"))?,
+            protocol,
+        })
+    }
+}
+/// Comma-separated `PORT`, `PORT-PORT`, optionally with `/tcp`, `/udp` or `/both`.
+/// Empty means no restriction.
+pub fn parse_port_allow(text: &str) -> Result<Option<Vec<PortAllow>>> {
+    let list = text
+        .split(',')
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .map(str::parse)
+        .collect::<Result<Vec<PortAllow>>>()?;
+    Ok((!list.is_empty()).then_some(list))
+}
+/// Comma-separated private IPv4 networks without host bits.
+pub fn parse_subnet_allow(text: &str) -> Result<Vec<Ipv4Net>> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .map(|x| {
+            let net: Ipv4Net = x
+                .parse()
+                .with_context(|| format!("{x:?} is not an IPv4 network"))?;
+            check_allowed_subnet(&net)?;
+            Ok(net)
+        })
+        .collect()
+}
+fn check_allowed_subnet(net: &Ipv4Net) -> Result<()> {
+    ensure!(
+        net.addr() == net.network(),
+        "subnet {net} has host bits set; write it as {}",
+        net.trunc()
+    );
+    ensure!(
+        net.prefix_len() >= 8 && net.addr().is_private(),
+        "allowed subnet {net} must be a private network of at least /8"
+    );
+    Ok(())
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -136,6 +212,12 @@ pub struct Config {
     #[serde(skip)]
     pub webpanel_password: Option<String>,
     pub agent_name: Option<String>,
+    /// Agent only. When set, the agent refuses forwards and VPN port grants outside these
+    /// ports, and VPN grants of the whole host, whatever the server asks for.
+    pub agent_allow_ports: Option<Vec<PortAllow>>,
+    /// Agent only. Networks behind the agent that VPN subnet grants may reach. Empty means
+    /// the agent refuses every subnet grant.
+    pub agent_allow_subnets: Vec<Ipv4Net>,
     pub server_address: Option<String>,
     #[serde(skip)]
     pub enrollment_token: Option<String>,
@@ -176,6 +258,8 @@ impl Default for Config {
             webpanel_allow: vec![],
             webpanel_password: None,
             agent_name: None,
+            agent_allow_ports: None,
+            agent_allow_subnets: vec![],
             server_address: None,
             enrollment_token: None,
             tls_cert: None,
@@ -241,6 +325,18 @@ impl Config {
         env_parse!("RIFT_WEBPANEL_CONTROL", webpanel_control);
         if let Ok(v) = std::env::var("RIFT_WEBPANEL_ALLOW") {
             config.webpanel_allow = parse_allow_list(&v).context("invalid RIFT_WEBPANEL_ALLOW")?;
+        }
+        if let Ok(v) = std::env::var("RIFT_AGENT_ALLOW_PORTS") {
+            if !v.trim().is_empty() {
+                config.agent_allow_ports =
+                    parse_port_allow(&v).context("invalid RIFT_AGENT_ALLOW_PORTS")?;
+            }
+        }
+        if let Ok(v) = std::env::var("RIFT_AGENT_ALLOW_SUBNETS") {
+            if !v.trim().is_empty() {
+                config.agent_allow_subnets =
+                    parse_subnet_allow(&v).context("invalid RIFT_AGENT_ALLOW_SUBNETS")?;
+            }
         }
         if let Ok(v) = std::env::var("RIFT_HOST_FIREWALL") {
             if !v.is_empty() {
@@ -352,6 +448,18 @@ impl Config {
         }
         if let Some(name) = &self.agent_name {
             validate_name(name)?;
+        }
+        if let Some(list) = &self.agent_allow_ports {
+            ensure!(
+                !list.is_empty(),
+                "agent_allow_ports must not be an empty list"
+            );
+            for entry in list {
+                entry.ports.validate()?;
+            }
+        }
+        for net in &self.agent_allow_subnets {
+            check_allowed_subnet(net)?;
         }
         if self.webpanel {
             ensure!(
@@ -522,6 +630,48 @@ mod tests {
         assert_eq!(shown, ["10.14.0.5/32", "192.168.1.0/24", "2001:db8::1/128"]);
         assert!(parse_allow_list("example.net").is_err());
         assert!(parse_allow_list("").unwrap().is_empty());
+    }
+    #[test]
+    fn agent_port_allowlist_parses_strictly() {
+        assert_eq!(parse_port_allow("").unwrap(), None);
+        assert_eq!(parse_port_allow(" , ").unwrap(), None);
+        let list = parse_port_allow("22/tcp, 80,443/both,27015-27020/udp")
+            .unwrap()
+            .unwrap();
+        let pr = |a, b| PortRange { start: a, end: b };
+        let entry = |ports, protocol| PortAllow { ports, protocol };
+        assert_eq!(
+            list,
+            [
+                entry(pr(22, 22), Some(Protocol::Tcp)),
+                entry(pr(80, 80), None),
+                entry(pr(443, 443), None),
+                entry(pr(27015, 27020), Some(Protocol::Udp)),
+            ]
+        );
+        for bad in [
+            "0", "70000", "90-80", "22/TCP", "22/icmp", "tcp", "22/", "a-b", "22:80", "-5", "22 80",
+        ] {
+            assert!(parse_port_allow(bad).is_err(), "{bad} must be rejected");
+        }
+    }
+    #[test]
+    fn agent_subnet_allowlist_parses_strictly() {
+        assert!(Config::default().agent_allow_subnets.is_empty());
+        assert!(Config::default().agent_allow_ports.is_none());
+        assert!(parse_subnet_allow("").unwrap().is_empty());
+        let nets = parse_subnet_allow("192.168.178.0/24, 10.0.0.0/8").unwrap();
+        assert_eq!(nets.len(), 2);
+        for bad in [
+            "192.168.178.5/24",
+            "8.8.8.0/24",
+            "192.168.0.1",
+            "fd00::/64",
+            "10.0.0.0/7",
+            "lan",
+        ] {
+            assert!(parse_subnet_allow(bad).is_err(), "{bad} must be rejected");
+        }
     }
     #[test]
     fn rejects_non_ula() {

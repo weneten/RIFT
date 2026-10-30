@@ -1,5 +1,6 @@
 #![cfg_attr(not(unix), allow(dead_code))]
 use crate::{
+    agent_policy,
     config::{validate_name, Config, EnrollmentMode},
     enrollment,
     model::*,
@@ -1230,7 +1231,7 @@ async fn run_agent_inner(
     // Rebuild the local kernel after every process or host restart before opening control.
     let policy_path = config.state_dir.join("agent-policy.json");
     let cached_policy = if policy_path.exists() {
-        serde_json::from_slice::<AgentPolicy>(&std::fs::read(&policy_path)?)?
+        load_agent_policy(&config)?
     } else {
         identity.applied_generation = 0;
         AgentPolicy::default()
@@ -1256,7 +1257,7 @@ async fn run_agent_inner(
         // Repair routes and refresh an unreachable DNS endpoint BEFORE trying control.
         // Control cannot repair its own transport when its connection is already down.
         let current_policy = if policy_path.exists() {
-            serde_json::from_slice::<AgentPolicy>(&std::fs::read(&policy_path)?)?
+            load_agent_policy(&config)?
         } else {
             AgentPolicy::default()
         };
@@ -1481,6 +1482,36 @@ async fn connect_control(w: &Welcome) -> Result<TcpStream> {
     }
     Err(last.unwrap_or_else(|| anyhow!("no WireGuard control address")))
 }
+/// Refusal text for the next sync, so the server shows it as the agent's last error.
+static AGENT_REFUSALS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// Remembers the refusals for the next sync and logs them only when they change.
+fn note_refusals(refusals: &[String]) {
+    let text = (!refusals.is_empty()).then(|| {
+        format!(
+            "agent refused {} server request(s): {}",
+            refusals.len(),
+            refusals.join("; ")
+        )
+    });
+    if let Ok(mut current) = AGENT_REFUSALS.lock() {
+        if *current != text {
+            for r in refusals {
+                tracing::warn!("{r}");
+            }
+            if text.is_none() {
+                tracing::info!("the server no longer asks for anything the agent refuses");
+            }
+            *current = text;
+        }
+    }
+}
+/// The cached policy, narrowed again by the current allowlists so a tightened `.env`
+/// takes effect on restart without waiting for the server.
+fn load_agent_policy(config: &Config) -> Result<AgentPolicy> {
+    let cached: AgentPolicy =
+        serde_json::from_slice(&std::fs::read(config.state_dir.join("agent-policy.json"))?)?;
+    Ok(agent_policy::restrict(&cached, config).0)
+}
 async fn agent_sync(
     config: &Config,
     identity: &mut AgentIdentity,
@@ -1498,12 +1529,14 @@ async fn agent_sync(
             version: VERSION,
             agent_id: identity.id.clone(),
             applied_generation: identity.applied_generation,
-            error: None,
+            error: AGENT_REFUSALS.lock().ok().and_then(|r| r.clone()),
         },
     )
     .await?;
     match protocol::receive::<ControlResponse, _>(&mut stream).await? {
         ControlResponse::Policy(policy) => {
+            let (policy, refusals) = agent_policy::restrict(&policy, config);
+            note_refusals(&refusals);
             let k = Kernel::new(config.clone());
             k.apply_agent(w, &policy, key_path).await?;
             atomic_json(&config.state_dir.join("agent-policy.json"), &policy)?;
@@ -1567,7 +1600,7 @@ async fn drive_rotation(
     let old_private = std::fs::read(&old)?;
     let policy_path = config.state_dir.join("agent-policy.json");
     let policy = if policy_path.exists() {
-        serde_json::from_slice::<AgentPolicy>(&std::fs::read(&policy_path)?)?
+        load_agent_policy(config)?
     } else {
         AgentPolicy::default()
     };

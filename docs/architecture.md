@@ -34,7 +34,7 @@ A subnet grant also adds that network to the agent peer's AllowedIPs and a route
 
 Revocation, disabling and denial remove the WireGuard peer, AllowedIPs, route and nft rules on the server in one reconcile; rollback after a failed apply never restores a revoked or disabled device or a withdrawn grant. Agents learn grants through the normal policy sync and fall back to deny for flows they do not know. An agent that is offline keeps its last rules, but the server no longer forwards.
 
-Trust boundary: the agent identifies a device by its VPN source address, delivered by the server. A compromised server can forge any granted address, so agent-side rules protect against configuration mistakes and a stolen device key, not a hostile server. Stronger protection needs end-to-end authentication between device and agent. A device key alone gives access to exactly what that device is granted; there is no per-device second factor.
+Trust boundary: the agent identifies a device by its VPN source address, delivered by the server. A compromised server can forge any granted address, so agent-side rules protect against configuration mistakes and a stolen device key, not a hostile server. The agent does cap what a hostile server can ask for: it drops forwards and VPN grants outside its local `RIFT_AGENT_ALLOW_PORTS` and `RIFT_AGENT_ALLOW_SUBNETS` (subnet grants are refused unless listed) before applying or caching a policy, and reports the refusals as its last error. Stronger protection needs end-to-end authentication between device and agent. A device key alone gives access to exactly what that device is granted; there is no per-device second factor.
 
 ## Web panel
 

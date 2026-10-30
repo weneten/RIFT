@@ -59,6 +59,8 @@ services:
       RIFT_SERVER: ${RIFT_SERVER:-}
       RIFT_AGENT_NAME: ${RIFT_AGENT_NAME:-}
       RIFT_ENROLLMENT_TOKEN: ${RIFT_ENROLLMENT_TOKEN:-}
+      RIFT_AGENT_ALLOW_PORTS: ${RIFT_AGENT_ALLOW_PORTS:-}
+      RIFT_AGENT_ALLOW_SUBNETS: ${RIFT_AGENT_ALLOW_SUBNETS:-}
     command: ["--config", "/etc/rift/config.toml", "agent"]
 
 volumes:

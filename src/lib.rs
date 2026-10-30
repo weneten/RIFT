@@ -1,3 +1,4 @@
+pub mod agent_policy;
 pub mod audit;
 pub mod config;
 pub mod daemon;

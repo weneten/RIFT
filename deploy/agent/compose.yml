@@ -25,6 +25,8 @@ services:
       RIFT_SERVER: ${RIFT_SERVER:?Set RIFT_SERVER=hostname:8443 in the root .env}
       RIFT_AGENT_NAME: ${RIFT_AGENT_NAME:?Set RIFT_AGENT_NAME in the root .env}
       RIFT_ENROLLMENT_TOKEN: ${RIFT_ENROLLMENT_TOKEN:-}
+      RIFT_AGENT_ALLOW_PORTS: ${RIFT_AGENT_ALLOW_PORTS:-}
+      RIFT_AGENT_ALLOW_SUBNETS: ${RIFT_AGENT_ALLOW_SUBNETS:-}
     command: ["--config", "/etc/rift/config.toml", "agent"]
 
 volumes:

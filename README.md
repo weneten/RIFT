@@ -17,6 +17,7 @@ The agent initiates the connection to the server. RIFT manages the tunnel, expli
 - [Requirements](#requirements)
 - [Install the server](#install-the-server)
 - [Connect an agent](#connect-an-agent)
+- [Harden the agent](#harden-the-agent)
 - [Supported protocols](#supported-protocols)
 - [Publish services](#publish-services)
 - [Publish websites with HTTPS](#publish-websites-with-https)
@@ -143,6 +144,17 @@ rift status
 ```
 
 Once active, remove the token line from the agent's `.env`; preserve its state volume for reconnection. If the invitation expires or is lost, cancel it and create another on the server. Repeat this process with a different name for every additional agent.
+
+## Harden the agent
+
+The server tells each agent which ports to forward and which VPN grants to enforce. The agent applies that blindly unless you cap it. Two optional settings in the agent's `.env` do that locally, so even a compromised server cannot open more of your home server or LAN than you allowed:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RIFT_AGENT_ALLOW_PORTS` | empty (no limit) | Comma-separated `PORT` or `PORT-PORT`, each optionally with `/tcp`, `/udp` or `/both` (default both), for example `22/tcp,80,443,27015-27020/udp`. The agent refuses forwards and VPN port grants that are not entirely inside this list. It also refuses `--server` and `--full` grants, because they reach every port. |
+| `RIFT_AGENT_ALLOW_SUBNETS` | empty (no LAN access) | Comma-separated private IPv4 networks behind the agent, for example `192.168.178.0/24`. A VPN `--subnet` grant works only when its network lies inside one of these. |
+
+The secure default for subnets is deliberate: until you list a network, no device can reach your LAN through this agent, whatever the server grants. A refused forward stays pending on the server. Refusals are logged once per change and show up as the agent's last error in `rift status` and `rift agents list`. Restart the agent after changing `.env`.
 
 ## Supported protocols
 
@@ -407,14 +419,14 @@ Manage devices with `rift vpn peer list`, `peer disable NAME` / `peer enable NAM
 
 Client configurations are split-tunnel: `AllowedIPs` lists only the granted addresses, never `0.0.0.0/0`. Exported files and QR codes contain the device's private key, which stays in a mode-0600 file under the state volume and is never logged.
 
-**Reaching the LAN.** `--subnet` forwards through the agent host and is the only grant that touches the LAN. Choose one:
+**Reaching the LAN.** `--subnet` forwards through the agent host and is the only grant that touches the LAN. The agent refuses it unless its owner lists the network in `RIFT_AGENT_ALLOW_SUBNETS` (see [Harden the agent](#harden-the-agent)). Then choose one:
 
 - Add a static route on the home router for the VPN pool (default `10.14.0.0/24`) via the agent host's LAN address, so LAN hosts can answer. Source addresses stay visible.
 - Or add `--snat`: the agent masquerades the device behind its own LAN address and no router change is needed. NAT applies only to the granted device and network.
 
 The agent host itself answers on its LAN address too, as long as that address lies in a granted subnet. A granted network must not exist on the server, overlap a RIFT pool, or be granted behind two different agents; RIFT refuses those. Change the VPN pool with `RIFT_VPN_POOL` (restart required) if `10.14.0.0/24` collides with something.
 
-**Trust boundary.** The server authenticates devices by WireGuard key, and the agent enforces its own input and forwarding rules by the device's VPN source address. A compromised server can forge an allowed source address, so the agent-side rules limit mistakes and stolen device keys, not a hostile server. Protecting against that needs end-to-end authentication between device and agent, which RIFT does not provide. Only IPv4 is supported for VPN devices, and the first version has no full-tunnel mode.
+**Trust boundary.** The server authenticates devices by WireGuard key, and the agent enforces its own input and forwarding rules by the device's VPN source address. A compromised server can forge an allowed source address, so the agent-side rules limit mistakes and stolen device keys, not a hostile server. What a hostile server can reach is capped by the agent's own `RIFT_AGENT_ALLOW_PORTS` and `RIFT_AGENT_ALLOW_SUBNETS`: it can never open a port outside the first or the LAN outside the second. Protecting against that needs end-to-end authentication between device and agent, which RIFT does not provide. Only IPv4 is supported for VPN devices, and the first version has no full-tunnel mode.
 
 ## Web panel
 
@@ -490,6 +502,8 @@ The panel port (default 8090, `RIFT_WEBPANEL_PORT`) must differ from the control
 | `RIFT_WEBPANEL_ALLOW` | empty | Server. Extra allowed source addresses or networks, comma-separated. |
 | `RIFT_WEBPANEL_PASSWORD` | generated | Server. Panel password, at least 12 characters; `rift panel password` shows the effective one. |
 | `RIFT_SERVER`, `RIFT_AGENT_NAME`, `RIFT_ENROLLMENT_TOKEN` | Agent | Invitation values; remove token after enrollment. |
+| `RIFT_AGENT_ALLOW_PORTS` | empty | Agent. Ports the agent may open for forwards and VPN grants, e.g. `22/tcp,80,27015-27020/udp`; empty means no limit. See [Harden the agent](#harden-the-agent). |
+| `RIFT_AGENT_ALLOW_SUBNETS` | empty | Agent. Networks behind the agent that VPN `--subnet` grants may reach; empty means no LAN access. |
 | `interface`, `wg_port`, `control_port` | `rift0`, `51820`, `8444` | WireGuard interface and ports. |
 | `ipv4_pool`, `ipv6_pool` | `10.13.0.0/24`, `fd88:5249:4654::/64` | Tunnel address pools; avoid overlaps. |
 | `route_table`, `rule_priority`, `mark`, `mark_mask` | See example TOML | Reserved routing and packet-mark resources. |
