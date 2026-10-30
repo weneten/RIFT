@@ -226,7 +226,7 @@ function forwardDialog() {
     el("p", { class: "hint" }, "LISTEN[:TARGET]/tcp, /udp or /both, several separated by spaces. The target defaults to the listen port. A port may end in /v4, /v6 or /all to override the server address below."),
     el("div", { class: "row inline" }, row("Server address", on), row("Mode", mode)),
     row("Ingress", ingress),
-    el("p", { class: "hint" }, "Automatic: IPv4 clients reach the agent transparently; IPv6 clients are translated to the agent's IPv4 address, so the service sees the server instead of the client. Open the public ports in your cloud firewall as well."),
+    el("p", { class: "hint" }, "Automatic is transparent: the service sees the client's address and must listen on the same IP version on the agent (0.0.0.0, or :: for IPv6). Translate bridges IPv6 clients to an IPv4-only service, but the service then sees the server instead of the client. Open the public ports in your cloud firewall as well."),
   ], "Add", async () => {
     const body = { action: "forward_add", agent: agent.value, specs: specs.value, on: on.value, ingress: ingress.value };
     if (mode.value) body.mode = mode.value;

@@ -218,7 +218,7 @@ enum Forwards {
         listen_ip: Option<IpAddr>,
         #[arg(long,value_parser=["v4","v6"])]
         target_family: Option<String>,
-        /// Default: transparent for IPv4 listeners, translate (to the agent's IPv4) for IPv6.
+        /// Default transparent; translate bridges IPv4 and IPv6.
         #[arg(long,value_parser=["transparent","translate"])]
         mode: Option<String>,
         #[arg(long, default_value = "public", value_parser = ["public", "local"])]

@@ -167,7 +167,9 @@ Run administrative commands on the **server**. The following examples use `node1
 
 `forwards add` also has a short form: `rift forwards add AGENT SPEC...`, where each `SPEC` is `LISTEN[:TARGET]/tcp`, `/udp` or `/both`, optionally followed by `/v4`, `/v6` or `/all` for the server address. The protocol is always required; `both` creates a TCP and a UDP forward. The target defaults to the listen port. Ranges such as `5000-5002/udp` work. For example, `rift forwards add node1 53/both 8080:80/tcp/all` creates TCP and UDP 53 on IPv4 plus 8080 → 80 on IPv4 and IPv6. Options such as `--ingress` and `--mode` still apply to every forward of the command.
 
-How IPv6 clients reach the agent: by default an IPv6 listener translates to the agent's IPv4 tunnel address, because most services listen on IPv4 only. That works with every service, but it runs in userspace and the service sees the server's tunnel address instead of the client's (the server logs the original address). Add `--mode transparent` to keep the client address in the kernel path; the service must then accept IPv6 on the agent's tunnel address (for example listen on `::`, which Docker-published ports do). The short form cannot be mixed with `--agent`, `--listen`, `--target` or `--protocol`. If a later forward of one command fails, the earlier ones stay created.
+Every forward is transparent unless you add `--mode translate`: the service sees the client's real address. For an IPv6 listener the service must therefore accept IPv6 on the agent's tunnel address (listen on `::`; Docker-published ports usually do). If it only listens on IPv4, add `--mode translate`; that runs in userspace and the service sees the server's tunnel address instead of the client's. The server logs the original address, but tools on the agent that block by source address, such as Fail2ban or CrowdSec, can then no longer tell clients apart and would block the server for everyone. Use translation only where that does not matter.
+
+The short form cannot be mixed with `--agent`, `--listen`, `--target` or `--protocol`. If a later forward of one command fails, the earlier ones stay created.
 
 ### TCP example
 
@@ -213,7 +215,7 @@ rift forwards add \
   --agent node1 --listen 30000-30002 --target 40000-40002 --protocol udp
 ```
 
-`--listen-ip ADDRESS` picks one specific configured address instead of `/v4`, `/v6` or `/all`; it is only needed with several addresses of the same family. The default ingress is `public`; the mode is transparent for IPv4 listeners and translate for IPv6 listeners (see above). Check the created ID and apply status:
+`--listen-ip ADDRESS` picks one specific configured address instead of `/v4`, `/v6` or `/all`; it is only needed with several addresses of the same family. The default ingress is `public`; the mode is transparent unless `--mode translate` is given (see above). Check the created ID and apply status:
 
 ```sh
 rift forwards list
@@ -224,7 +226,7 @@ A grant may remain pending while the agent applies it. Test from a separate clie
 
 ### IPv4-to-IPv6 and IPv6-to-IPv4
 
-Translation bridges different listener and target families. It is the default for IPv6 listeners (to the agent's IPv4); in the other direction it must be requested explicitly. For example, an IPv4 listener forwarding to the agent's IPv6 tunnel address:
+Translation bridges different listener and target families. It must be requested explicitly. For example, an IPv4 listener forwarding to the agent's IPv6 tunnel address:
 
 ```sh
 rift forwards add \

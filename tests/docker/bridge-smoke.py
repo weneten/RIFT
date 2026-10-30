@@ -178,7 +178,7 @@ def main():
             for ip, port, proto in forwards:
                 exec_cli("forwards", "add", "--agent", "core", "--listen-ip", ip,
                          "--listen", str(port), "--target", "19080" if proto == "tcp" else "19081",
-                         "--protocol", proto, "--mode", "transparent")
+                         "--protocol", proto)
             def applied():
                 state = json.loads(exec_cli("status").stdout)
                 snap = state["snapshot"]

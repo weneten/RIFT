@@ -357,11 +357,9 @@ pub struct ForwardOptions {
 
 /// The forwards one `forwards add` creates, validated, with IDs still to be assigned.
 ///
-/// Without an explicit mode an IPv4 listener forwards transparently to the agent's IPv4
-/// address. A public IPv6 listener translates to the agent's IPv4 address, because most
-/// services listen on IPv4; the service then sees the VPS tunnel address instead of the
-/// client's. `--mode transparent` keeps the client address but needs the service to accept
-/// IPv6 on the agent's tunnel address.
+/// Without an explicit mode every forward is transparent: it reaches the agent's tunnel
+/// address of the listener's family and the service sees the client's address. `translate`
+/// bridges families, for example an IPv6 listener to a service that only listens on IPv4.
 pub fn build_forwards(
     agent: &str,
     plans: &[ForwardPlan],
@@ -396,9 +394,6 @@ pub fn build_forwards(
                 (Some(ForwardMode::Translate), None) => (ForwardMode::Translate, other),
                 (None, Some(family)) if family == own => (ForwardMode::Transparent, own),
                 (None, Some(family)) => (ForwardMode::Translate, family),
-                (None, None) if own == Family::V6 && options.ingress == Ingress::Public => {
-                    (ForwardMode::Translate, Family::V4)
-                }
                 (None, None) => (ForwardMode::Transparent, own),
             };
             let forward = Forward {
@@ -457,20 +452,20 @@ mod tests {
         assert_eq!(v6[0].listen_ip, ips()[1]);
         assert_eq!(
             (v6[0].mode, v6[0].target_family),
-            (ForwardMode::Translate, Family::V4)
+            (ForwardMode::Transparent, Family::V6)
         );
 
         let all = build("53/both/all", &ips(), Default::default()).unwrap();
         assert_eq!(all.len(), 4, "TCP and UDP on each address");
-        // An explicit transparent mode keeps the IPv6 client address.
-        let keep = ForwardOptions {
-            mode: Some(ForwardMode::Transparent),
+        // Translation to an IPv4-only service is explicit.
+        let translate = ForwardOptions {
+            mode: Some(ForwardMode::Translate),
             ..Default::default()
         };
-        let v6 = build("80/tcp/v6", &ips(), keep).unwrap();
+        let v6 = build("80/tcp/v6", &ips(), translate).unwrap();
         assert_eq!(
             (v6[0].mode, v6[0].target_family),
-            (ForwardMode::Transparent, Family::V6)
+            (ForwardMode::Translate, Family::V4)
         );
     }
 

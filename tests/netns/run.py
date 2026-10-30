@@ -357,7 +357,7 @@ def add_forwards(server_cfg, agent_names):
         for listen_ip, listen_port, proto, target_port in cases:
             cli(VPS, server_cfg, "forwards", "add", "--agent", name,
                 "--listen-ip", listen_ip, "--listen", str(listen_port),
-                "--target", str(target_port), "--protocol", proto, "--mode", "transparent",
+                "--target", str(target_port), "--protocol", proto,
                 env={"RIFT_PUBLIC_ENDPOINT": SERVER_HOST,
                      "RIFT_PUBLIC_IPS": f"{PUBLIC_V4},{PUBLIC_V4_NEW},{PUBLIC_V6}"})
             ports[(name, listen_ip, proto)] = listen_port
