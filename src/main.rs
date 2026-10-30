@@ -91,8 +91,8 @@ enum Agents {
 #[derive(Subcommand)]
 enum Forwards {
     List,
-    /// Add forwards. Short form: AGENT SPEC..., where SPEC is LISTEN[:TARGET][/tcp|/udp|/both],
-    /// for example `rift forwards add node1 53/both 8080:80`. The long options are the alternative.
+    /// Add forwards. Short form: AGENT SPEC..., where SPEC is LISTEN[:TARGET]/tcp|udp|both,
+    /// for example `rift forwards add node1 53/both 8080:80/tcp`. The long options are the alternative.
     Add {
         #[arg(
             value_name = "AGENT SPEC",
@@ -233,7 +233,7 @@ async fn run() -> Result<()> {
                     let (agent, plans) = if let Some((name, specs)) = short.split_first() {
                         anyhow::ensure!(
                             !specs.is_empty(),
-                            "name at least one port, for example: rift forwards add {name} 8080:80"
+                            "name at least one port with its protocol, for example: rift forwards add {name} 8080:80/tcp"
                         );
                         (name.clone(), parse_forward_specs(specs)?)
                     } else {
@@ -359,11 +359,14 @@ async fn show(
     }
     Ok(())
 }
-/// Parses `LISTEN[:TARGET][/tcp|/udp|/both]` specs; `both` adds a TCP and a UDP forward.
+/// Parses `LISTEN[:TARGET]/tcp|udp|both` specs; `both` adds a TCP and a UDP forward.
+/// The protocol is mandatory so a forward never silently becomes TCP.
 fn parse_forward_specs(specs: &[String]) -> Result<Vec<(PortRange, PortRange, Protocol)>> {
     let mut plans = Vec::new();
     for spec in specs {
-        let (ports, proto) = spec.split_once('/').unwrap_or((spec, "tcp"));
+        let (ports, proto) = spec.split_once('/').with_context(|| {
+            format!("{spec:?} needs a protocol: {spec}/tcp, {spec}/udp or {spec}/both")
+        })?;
         let (listen, target) = ports.split_once(':').unwrap_or((ports, ports));
         let listen: PortRange = listen
             .parse()
@@ -430,7 +433,7 @@ mod tests {
     }
     #[test]
     fn short_form_parses_ports_targets_and_protocols() {
-        let specs: Vec<String> = ["53/both", "8080:80", "5000-5002/udp", "443:8443/tcp"]
+        let specs: Vec<String> = ["53/both", "8080:80/tcp", "5000-5002/udp", "443:8443/tcp"]
             .map(String::from)
             .to_vec();
         let plans = parse_forward_specs(&specs).unwrap();
@@ -448,7 +451,16 @@ mod tests {
                 (443, 443, 8443, 8443, false),
             ]
         );
-        for bad in ["0", "99999", "80/icmp", "80:abc", "x"] {
+        for bad in [
+            "0/tcp",
+            "99999/tcp",
+            "80/icmp",
+            "80:abc/tcp",
+            "x/tcp",
+            "80",
+            "8080:80",
+            "53/",
+        ] {
             assert!(parse_forward_specs(&[bad.to_string()]).is_err(), "{bad}");
         }
     }
