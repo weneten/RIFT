@@ -321,6 +321,7 @@ mod tests {
                 generation: 1,
             }],
             bans: vec![],
+            ..Default::default()
         }
     }
     #[tokio::test]

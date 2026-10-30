@@ -190,6 +190,20 @@ fn safe_rollback(mut previous: StateSnapshot, desired: &StateSnapshot) -> StateS
                     && serde_json::to_value(old).ok() == serde_json::to_value(new).ok()
             })
     });
+    // Neither a revoked or disabled device nor a withdrawn grant comes back.
+    previous.vpn_peers.retain(|old| {
+        desired.vpn_peers.iter().any(|new| {
+            new.enabled
+                && new
+                    == &VpnPeer {
+                        enabled: true,
+                        ..old.clone()
+                    }
+        })
+    });
+    previous.vpn_grants.retain(|old| {
+        desired.vpn_grants.contains(old) && previous.vpn_peers.iter().any(|p| p.name == old.peer)
+    });
     previous.bans = desired
         .bans
         .iter()
@@ -227,6 +241,7 @@ async fn reload_config(s: &Server) -> Result<u64> {
         || next.ipv6_pool != current.ipv6_pool
         || next.server_ipv4 != current.server_ipv4
         || next.server_ipv6 != current.server_ipv6
+        || next.vpn_pool != current.vpn_pool
         || next.route_table != current.route_table
         || next.rule_priority != current.rule_priority
         || next.mark != current.mark
@@ -327,14 +342,15 @@ async fn handle_control(mut stream: TcpStream, source: IpAddr, s: Arc<Server>) -
             if previous != applied_generation {
                 reconcile(&s).await?;
             }
+            let pool = s.config.read().await.vpn_pool;
             if let Some((rotation_id, _, committed)) = s.state.rotation(&agent.id)? {
                 if !committed {
                     ControlResponse::RotateRequested { rotation_id }
                 } else {
-                    ControlResponse::Policy(policy_for(&s.state.snapshot()?, &agent.id))
+                    ControlResponse::Policy(policy_for(&s.state.snapshot()?, &agent.id, pool))
                 }
             } else {
-                ControlResponse::Policy(policy_for(&s.state.snapshot()?, &agent.id))
+                ControlResponse::Policy(policy_for(&s.state.snapshot()?, &agent.id, pool))
             }
         }
         ControlRequest::Ban {
@@ -417,7 +433,7 @@ async fn handle_control(mut stream: TcpStream, source: IpAddr, s: Arc<Server>) -
     protocol::send(&mut stream, &response).await?;
     Ok(())
 }
-fn policy_for(snapshot: &StateSnapshot, id: &str) -> AgentPolicy {
+fn policy_for(snapshot: &StateSnapshot, id: &str, vpn_pool: ipnet::Ipv4Net) -> AgentPolicy {
     AgentPolicy {
         generation: snapshot.generation,
         forwards: snapshot
@@ -426,6 +442,8 @@ fn policy_for(snapshot: &StateSnapshot, id: &str) -> AgentPolicy {
             .filter(|f| f.agent_id == id && f.enabled)
             .cloned()
             .collect(),
+        vpn_pool: Some(vpn_pool),
+        vpn: crate::vpn::agent_rules(snapshot, id),
     }
 }
 
@@ -769,6 +787,176 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
         AdminRequest::Logs { lines } => {
             serde_json::json!({"lines":crate::audit::recent(lines.min(1000)),"persistent":false,"source":"process-local ring; Docker/journald retains container or service logs"})
         }
+        vpn_request => vpn_admin(s, &snap, vpn_request).await?,
+    };
+    Ok(data)
+}
+
+fn vpn_key_path(config: &Config, public_key: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let digest = format!("{:x}", Sha256::digest(public_key.as_bytes()));
+    config
+        .state_dir
+        .join("vpn")
+        .join(format!("{}.key", &digest[..16]))
+}
+
+async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<serde_json::Value> {
+    let cfg = s.config.read().await.clone();
+    let find_peer = |name: &str| {
+        snap.vpn_peers
+            .iter()
+            .find(|p| p.name == name)
+            .ok_or_else(|| anyhow!("VPN peer not found"))
+    };
+    let data = match r {
+        AdminRequest::VpnPeerAdd { name } => {
+            validate_name(&name)?;
+            cfg.check_vpn_pool()?;
+            anyhow::ensure!(
+                !snap.vpn_peers.iter().any(|p| p.name == name),
+                "VPN peer {name} already exists"
+            );
+            let (private, public) = net::generate_keypair().await?;
+            let key_path = vpn_key_path(&cfg, &public);
+            if let Some(dir) = key_path.parent() {
+                secure_dir(dir)?;
+            }
+            atomic_write(&key_path, private.as_bytes(), 0o600)?;
+            let added = s.state.mutate("vpn-peer-add", |x| {
+                let ipv4 = crate::vpn::allocate(cfg.vpn_pool, &x.vpn_peers)?;
+                x.vpn_peers.push(VpnPeer {
+                    name: name.clone(),
+                    public_key: public.clone(),
+                    ipv4,
+                    enabled: true,
+                    created_at: now(),
+                });
+                Ok(())
+            });
+            let added = match added {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&key_path);
+                    return Err(error);
+                }
+            };
+            reconcile(s).await?;
+            let peer = added.vpn_peers.iter().find(|p| p.name == name);
+            serde_json::json!({"name":name,"ipv4":peer.map(|p| p.ipv4),"public_key":public,"next":"grant access with `rift vpn allow`, then `rift vpn config export`"})
+        }
+        AdminRequest::VpnPeerList => {
+            let stats = s.kernel.lock().await.stats().await.unwrap_or_default();
+            let rows: Vec<_> = snap.vpn_peers.iter().map(|p| {
+                let handshake = stats.iter().find(|x| x.public_key == p.public_key).map(|x| x.last_handshake);
+                let grants: Vec<_> = snap.vpn_grants.iter().filter(|g| g.peer == p.name).map(|g| {
+                    let agent = snap.agents.iter().find(|a| a.id == g.agent_id).map(|a| a.name.clone());
+                    serde_json::json!({"agent":agent,"access":g.access})
+                }).collect();
+                serde_json::json!({"name":p.name,"ipv4":p.ipv4,"enabled":p.enabled,"public_key":p.public_key,"last_handshake":handshake,"grants":grants})
+            }).collect();
+            serde_json::Value::Array(rows)
+        }
+        AdminRequest::VpnPeerEnable { name, enabled } => {
+            find_peer(&name)?;
+            s.state.mutate("vpn-peer-enable", |x| {
+                x.vpn_peers
+                    .iter_mut()
+                    .filter(|p| p.name == name)
+                    .for_each(|p| p.enabled = enabled);
+                Ok(())
+            })?;
+            reconcile(s).await?;
+            serde_json::json!({"name":name,"enabled":enabled})
+        }
+        AdminRequest::VpnPeerRevoke { name } => {
+            let key_path = vpn_key_path(&cfg, &find_peer(&name)?.public_key);
+            s.state.mutate("vpn-peer-revoke", |x| {
+                x.vpn_peers.retain(|p| p.name != name);
+                x.vpn_grants.retain(|g| g.peer != name);
+                Ok(())
+            })?;
+            let _ = std::fs::remove_file(key_path);
+            reconcile(s).await?;
+            serde_json::json!({"revoked":name})
+        }
+        AdminRequest::VpnAllow {
+            peer,
+            agent,
+            access,
+        } => {
+            find_peer(&peer)?;
+            crate::vpn::validate_access(&access)?;
+            let target = find_agent(snap, &agent)?;
+            anyhow::ensure!(target.status == AgentStatus::Active, "agent must be active");
+            let agent_id = target.id.clone();
+            if let VpnAccess::Subnet { net, .. } = &access {
+                anyhow::ensure!(
+                    !(net.contains(&cfg.vpn_pool.network())
+                        || cfg.vpn_pool.contains(&net.network())
+                        || net.contains(&cfg.ipv4_pool.network())
+                        || cfg.ipv4_pool.contains(&net.network())),
+                    "subnet {net} overlaps a RIFT address pool"
+                );
+                s.kernel.lock().await.check_vpn_subnet(*net).await?;
+            }
+            s.state.mutate("vpn-allow", |x| {
+                x.vpn_grants.retain(|g| {
+                    !(g.peer == peer
+                        && g.agent_id == agent_id
+                        && crate::vpn::same_target(&g.access, &access))
+                });
+                x.vpn_grants.push(VpnGrant {
+                    peer: peer.clone(),
+                    agent_id: agent_id.clone(),
+                    access: access.clone(),
+                });
+                Ok(())
+            })?;
+            reconcile(s).await?;
+            serde_json::json!({"peer":peer,"agent":agent,"access":access})
+        }
+        AdminRequest::VpnDeny {
+            peer,
+            agent,
+            access,
+        } => {
+            find_peer(&peer)?;
+            let agent_id = find_agent(snap, &agent)?.id.clone();
+            s.state.mutate("vpn-deny", |x| {
+                let before = x.vpn_grants.len();
+                x.vpn_grants.retain(|g| {
+                    !(g.peer == peer
+                        && g.agent_id == agent_id
+                        && access
+                            .as_ref()
+                            .is_none_or(|a| crate::vpn::same_target(&g.access, a)))
+                });
+                anyhow::ensure!(before != x.vpn_grants.len(), "no matching grant");
+                Ok(())
+            })?;
+            reconcile(s).await?;
+            serde_json::json!({"peer":peer,"agent":agent,"denied":true})
+        }
+        AdminRequest::VpnConfig { name } => {
+            let peer = find_peer(&name)?;
+            anyhow::ensure!(
+                !cfg.public_endpoint.is_empty(),
+                "public_endpoint is not configured"
+            );
+            let private = std::fs::read_to_string(vpn_key_path(&cfg, &peer.public_key))
+                .context("read the peer's private key")?;
+            let config = crate::vpn::client_config(
+                snap,
+                peer,
+                private.trim(),
+                &s.server_public_key,
+                &host_port(&cfg.public_endpoint, cfg.wg_port),
+                cfg.mtu,
+            )?;
+            serde_json::json!({"name":name,"config":config})
+        }
+        _ => unreachable!("not a VPN request"),
     };
     Ok(data)
 }
@@ -1296,4 +1484,72 @@ fn atomic_write(path: &Path, data: &[u8], _mode: u32) -> Result<()> {
 }
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     atomic_write(path, &serde_json::to_vec(value)?, 0o600)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(name: &str, enabled: bool) -> VpnPeer {
+        VpnPeer {
+            name: name.into(),
+            public_key: format!("key-{name}"),
+            ipv4: "10.14.0.2".parse().unwrap(),
+            enabled,
+            created_at: 0,
+        }
+    }
+    fn grant(name: &str, access: VpnAccess) -> VpnGrant {
+        VpnGrant {
+            peer: name.into(),
+            agent_id: "home".into(),
+            access,
+        }
+    }
+
+    #[test]
+    fn rollback_never_restores_revoked_peers_or_withdrawn_grants() {
+        let previous = StateSnapshot {
+            vpn_peers: vec![
+                peer("kept", true),
+                peer("revoked", true),
+                peer("disabled", true),
+            ],
+            vpn_grants: vec![
+                grant("kept", VpnAccess::Server),
+                grant("kept", VpnAccess::Full),
+                grant("revoked", VpnAccess::Server),
+                grant("disabled", VpnAccess::Server),
+            ],
+            ..Default::default()
+        };
+        let desired = StateSnapshot {
+            vpn_peers: vec![
+                peer("kept", true),
+                peer("disabled", false),
+                peer("new", true),
+            ],
+            vpn_grants: vec![
+                grant("kept", VpnAccess::Server),
+                grant("disabled", VpnAccess::Server),
+                grant("new", VpnAccess::Server),
+            ],
+            ..Default::default()
+        };
+        let rolled = safe_rollback(previous, &desired);
+        let names: Vec<_> = rolled.vpn_peers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["kept"]);
+        assert_eq!(rolled.vpn_grants, [grant("kept", VpnAccess::Server)]);
+    }
+
+    #[test]
+    fn private_key_files_are_named_by_public_key_not_by_device_name() {
+        let config = Config::default();
+        let path = vpn_key_path(&config, "PUBLIC+KEY/=");
+        assert!(path.starts_with(config.state_dir.join("vpn")));
+        let file = path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            file.ends_with(".key") && file.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
+        );
+    }
 }

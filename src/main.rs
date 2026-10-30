@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use ipnet::Ipv4Net;
 use rift::{config::Config, model::*, protocol::AdminRequest};
 use std::{net::IpAddr, path::PathBuf};
 
@@ -40,6 +41,11 @@ enum Command {
         #[command(subcommand)]
         command: Bans,
     },
+    /// Give phones and laptops private access to chosen agents through the VPS.
+    Vpn {
+        #[command(subcommand)]
+        command: Vpn,
+    },
     /// Validate the local TOML configuration and environment overrides.
     Config {
         #[command(subcommand)]
@@ -52,6 +58,97 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         lines: usize,
     },
+}
+#[derive(Subcommand)]
+enum Vpn {
+    /// Register, list, disable or revoke devices.
+    Peer {
+        #[command(subcommand)]
+        command: VpnPeers,
+    },
+    /// Let a device reach an agent. Without an allow, a device reaches nothing.
+    Allow(VpnAccessArgs),
+    /// Withdraw access again. Without --server/--full/--port/--subnet, withdraws all of it on that agent.
+    Deny(VpnAccessArgs),
+    /// Export the WireGuard configuration of a device.
+    Config {
+        #[command(subcommand)]
+        command: VpnConfig,
+    },
+}
+#[derive(Subcommand)]
+enum VpnPeers {
+    Add {
+        name: String,
+    },
+    List,
+    Enable {
+        name: String,
+    },
+    /// Keep the device and its grants but cut it off until it is enabled again.
+    Disable {
+        name: String,
+    },
+    /// Delete the device, its key and its grants. This cannot be undone.
+    Revoke {
+        name: String,
+    },
+}
+#[derive(Subcommand)]
+enum VpnConfig {
+    /// Print the configuration, which contains the device's private key.
+    Export { name: String },
+    /// Print the configuration as a QR code for the WireGuard app.
+    Qr { name: String },
+}
+#[derive(Args)]
+struct VpnAccessArgs {
+    /// Device name.
+    peer: String,
+    #[arg(long)]
+    agent: String,
+    /// TCP, UDP and ping to the agent host itself.
+    #[arg(long)]
+    server: bool,
+    /// Every IP protocol to the agent host itself. Not its LAN.
+    #[arg(long)]
+    full: bool,
+    /// One port or range on the agent host, as PORT/tcp, PORT/udp or PORT/both. Repeatable.
+    #[arg(long = "port", value_name = "PORT/PROTO")]
+    ports: Vec<String>,
+    /// A network behind the agent, such as 192.168.178.0/24. Repeatable.
+    #[arg(long = "subnet", value_name = "CIDR")]
+    subnets: Vec<Ipv4Net>,
+    /// Masquerade the device's address on the agent, for LANs without a route to the VPN pool.
+    #[arg(long, requires = "subnets")]
+    snat: bool,
+}
+impl VpnAccessArgs {
+    fn accesses(&self) -> Result<Vec<VpnAccess>> {
+        let mut out = Vec::new();
+        if self.server {
+            out.push(VpnAccess::Server);
+        }
+        if self.full {
+            out.push(VpnAccess::Full);
+        }
+        for spec in &self.ports {
+            anyhow::ensure!(
+                !spec.contains(':'),
+                "{spec:?} must be PORT/tcp, PORT/udp or PORT/both"
+            );
+            for (ports, _, protocol) in parse_forward_specs(std::slice::from_ref(spec))? {
+                out.push(VpnAccess::Port { protocol, ports });
+            }
+        }
+        for net in &self.subnets {
+            out.push(VpnAccess::Subnet {
+                net: *net,
+                snat: self.snat,
+            });
+        }
+        Ok(out)
+    }
 }
 #[derive(Subcommand)]
 enum ConfigCommand {
@@ -194,6 +291,62 @@ async fn run() -> Result<()> {
             }
             return Ok(());
         }
+        Command::Vpn {
+            command: Vpn::Config { command },
+        } => {
+            let (name, qr) = match command {
+                VpnConfig::Export { name } => (name, false),
+                VpnConfig::Qr { name } => (name, true),
+            };
+            return vpn_config(&config, cli.json, name, qr).await;
+        }
+        Command::Vpn { command } => match command {
+            Vpn::Peer { command } => match command {
+                VpnPeers::Add { name } => AdminRequest::VpnPeerAdd { name },
+                VpnPeers::List => AdminRequest::VpnPeerList,
+                VpnPeers::Enable { name } => AdminRequest::VpnPeerEnable {
+                    name,
+                    enabled: true,
+                },
+                VpnPeers::Disable { name } => AdminRequest::VpnPeerEnable {
+                    name,
+                    enabled: false,
+                },
+                VpnPeers::Revoke { name } => AdminRequest::VpnPeerRevoke { name },
+            },
+            Vpn::Allow(args) => {
+                let mut requests =
+                    args.accesses()?
+                        .into_iter()
+                        .map(|access| AdminRequest::VpnAllow {
+                            peer: args.peer.clone(),
+                            agent: args.agent.clone(),
+                            access,
+                        });
+                let first = requests.next().context(
+                    "choose what to allow: --server, --full, --port PORT/PROTO or --subnet CIDR",
+                )?;
+                more.extend(requests);
+                first
+            }
+            Vpn::Deny(args) => {
+                let accesses = args.accesses()?;
+                let selected: Vec<Option<VpnAccess>> = if accesses.is_empty() {
+                    vec![None]
+                } else {
+                    accesses.into_iter().map(Some).collect()
+                };
+                let mut requests = selected.into_iter().map(|access| AdminRequest::VpnDeny {
+                    peer: args.peer.clone(),
+                    agent: args.agent.clone(),
+                    access,
+                });
+                let first = requests.next().context("nothing to deny")?;
+                more.extend(requests);
+                first
+            }
+            Vpn::Config { .. } => unreachable!("handled above"),
+        },
         Command::Status => AdminRequest::Status,
         Command::Reload => AdminRequest::Reload,
         Command::Logs { lines } => AdminRequest::Logs {
@@ -322,6 +475,26 @@ async fn run() -> Result<()> {
     }
     Ok(())
 }
+async fn vpn_config(config: &Config, json: bool, name: String, qr: bool) -> Result<()> {
+    let response = rift::daemon::admin_call(config, AdminRequest::VpnConfig { name }).await?;
+    if !response.ok {
+        bail!(
+            "{}",
+            response.error.unwrap_or_else(|| "operation failed".into())
+        );
+    }
+    let text = response.data["config"].as_str().unwrap_or_default();
+    if json {
+        println!("{}", serde_json::to_string(&response.data)?);
+    } else if qr {
+        println!("{}", rift::vpn::qr(text)?);
+        eprintln!("Scan this in the WireGuard app. The code contains the device's private key.");
+    } else {
+        print!("{text}");
+        eprintln!("This file contains the device's private key; store and delete it with care.");
+    }
+    Ok(())
+}
 async fn show(
     config: &Config,
     json: bool,
@@ -395,6 +568,66 @@ fn duration(s: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn vpn_cli_parses() {
+        for args in [
+            vec!["rift", "vpn", "peer", "add", "iphone"],
+            vec!["rift", "vpn", "peer", "list"],
+            vec!["rift", "vpn", "peer", "revoke", "iphone"],
+            vec![
+                "rift", "vpn", "allow", "iphone", "--agent", "home", "--server",
+            ],
+            vec![
+                "rift", "vpn", "allow", "iphone", "--agent", "home", "--port", "22/tcp", "--port",
+                "53/both",
+            ],
+            vec![
+                "rift",
+                "vpn",
+                "allow",
+                "iphone",
+                "--agent",
+                "home",
+                "--subnet",
+                "192.168.178.0/24",
+                "--snat",
+            ],
+            vec!["rift", "vpn", "deny", "iphone", "--agent", "home"],
+            vec!["rift", "vpn", "config", "export", "iphone"],
+            vec!["rift", "vpn", "config", "qr", "iphone"],
+        ] {
+            Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        }
+        // --snat only makes sense together with a subnet.
+        assert!(Cli::try_parse_from([
+            "rift", "vpn", "allow", "iphone", "--agent", "home", "--server", "--snat"
+        ])
+        .is_err());
+    }
+    #[test]
+    fn vpn_selectors_become_accesses() {
+        let args = |extra: &[&str]| {
+            let mut argv = vec!["rift", "vpn", "allow", "iphone", "--agent", "home"];
+            argv.extend(extra);
+            match Cli::try_parse_from(argv).unwrap().command {
+                Command::Vpn {
+                    command: Vpn::Allow(args),
+                } => args.accesses(),
+                _ => unreachable!(),
+            }
+        };
+        assert!(args(&[]).unwrap().is_empty());
+        assert_eq!(args(&["--port", "53/both"]).unwrap().len(), 2);
+        assert!(args(&["--port", "22:80/tcp"]).is_err());
+        assert!(args(&["--port", "22"]).is_err());
+        assert_eq!(
+            args(&["--subnet", "192.168.178.0/24", "--snat"]).unwrap(),
+            vec![VpnAccess::Subnet {
+                net: "192.168.178.0/24".parse().unwrap(),
+                snat: true
+            }]
+        );
+    }
     #[test]
     fn documented_cli_parses() {
         Cli::try_parse_from([

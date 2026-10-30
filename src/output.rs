@@ -245,6 +245,71 @@ fn status(data: &Value) -> String {
     }
 }
 
+fn vpn_access(value: &Value) -> String {
+    match value {
+        Value::String(kind) => kind.clone(),
+        _ if value["port"].is_object() => format!(
+            "port {}/{}",
+            range(&value["port"]["ports"]),
+            field(&value["port"], "protocol")
+        ),
+        _ if value["subnet"].is_object() => format!(
+            "subnet {}{}",
+            field(&value["subnet"], "net"),
+            if value["subnet"]["snat"].as_bool() == Some(true) {
+                " (snat)"
+            } else {
+                ""
+            }
+        ),
+        _ => text(value),
+    }
+}
+
+fn vpn_peers(data: &Value) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let rows = data
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| {
+            let seen = match p["last_handshake"].as_i64() {
+                Some(t) if t > 0 => format!("{}s ago", (now - t).max(0)),
+                _ => "never".into(),
+            };
+            let grants = p["grants"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|g| format!("{}: {}", field(g, "agent"), vpn_access(&g["access"])))
+                .collect::<Vec<_>>();
+            vec![
+                field(p, "name"),
+                field(p, "ipv4"),
+                if p["enabled"].as_bool() == Some(true) {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+                .into(),
+                seen,
+                if grants.is_empty() {
+                    "none".into()
+                } else {
+                    grants.join("; ")
+                },
+            ]
+        })
+        .collect();
+    table(
+        &["NAME", "ADDRESS", "STATE", "HANDSHAKE", "ACCESS"],
+        rows,
+        "No VPN devices registered.",
+    )
+}
+
 pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>) -> String {
     let names = names(agents_data);
     match request {
@@ -265,6 +330,12 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
             let rows = data.as_array().into_iter().flatten().map(|b| vec![field(b, "id"), field(b, "forward_id"), field(b, "ip"), field(b, "expires_at")]).collect();
             table(&["ID", "FORWARD", "ADDRESS", "EXPIRES (UNIX)"], rows, "No active bans.")
         },
+        AdminRequest::VpnPeerAdd { name } => format!("VPN device {name} registered with address {}.\nNext: rift vpn allow {name} --agent AGENT --server, then rift vpn config qr {name}", field(data, "ipv4")),
+        AdminRequest::VpnPeerList => vpn_peers(data),
+        AdminRequest::VpnPeerEnable { name, enabled } => format!("VPN device {name} {}.", if *enabled { "enabled" } else { "disabled; it can no longer connect" }),
+        AdminRequest::VpnPeerRevoke { name } => format!("VPN device {name} revoked. Its key and grants are gone."),
+        AdminRequest::VpnAllow { peer, agent, access } => format!("{peer} may now reach {agent}: {}.", vpn_access(&serde_json::to_value(access).unwrap_or_default())),
+        AdminRequest::VpnDeny { peer, agent, .. } => format!("Access of {peer} to {agent} withdrawn."),
         AdminRequest::Reload => format!("Configuration reconciled (generation {}).", field(data, "generation")),
         AdminRequest::Status => status(data),
         AdminRequest::Logs { .. } => {

@@ -30,6 +30,19 @@ The local test process needed permission to use loopback sockets outside the Win
 
 These require disposable Linux runners with the documented kernel features. Docker Desktop's engine was not available on this workstation. GitHub Actions has executed the Rust checks, Linux release builds, and full namespace suite successfully. Docker and application runtime verification remains pending. No service was deployed to a VPS from this session.
 
+## Private VPN access: not yet verified on a kernel
+
+The `rift vpn` feature has unit coverage only: rule rendering and ordering, state validation, rollback filtering, CLI parsing, client configuration and address allocation. No Linux runtime test has been executed for it. Before relying on it, exercise on a disposable runner with real WireGuard and nftables:
+
+1. A registered device completes a handshake with the server and reaches the granted agent address (`--server`).
+2. A key that is not registered gets no handshake; a registered device cannot reach another agent, a non-granted port, or a subnet without a grant.
+3. A device with only `--server` cannot reach any LAN host; with `--subnet` it can, with and without `--snat` (and with a static route on the LAN router for the non-NAT case).
+4. Two devices cannot reach each other; a device cannot reach the server's tunnel address or control port.
+5. `peer revoke`, `peer disable` and `deny` cut established and new flows immediately.
+6. Server and agent restarts restore the same access; a failed apply leaves public forwards working.
+7. Existing public forwards behave as before, with the home router still closed to inbound connections.
+8. UFW with `host_firewall = "auto"`: device traffic works and unrelated drops remain.
+
 ## Release gates
 
 Run the configured Linux and Docker jobs, review failures and archive their results. Before production acceptance, additionally exercise full host reboots, startup-interruption fault injection, existing management SSH and the intended host-firewall/Docker-backend combination. Collect iperf3 measurements against ordinary WireGuard on representative hardware. No throughput, downtime or production-safety benchmark is claimed in this repository.

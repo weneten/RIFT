@@ -33,6 +33,8 @@ pub struct Config {
     pub ipv6_pool: Ipv6Net,
     pub server_ipv4: Ipv4Addr,
     pub server_ipv6: Ipv6Addr,
+    /// Addresses for private VPN peers (phones, laptops). Must not overlap `ipv4_pool`.
+    pub vpn_pool: Ipv4Net,
     pub route_table: u32,
     pub rule_priority: u32,
     pub mark: u32,
@@ -67,6 +69,7 @@ impl Default for Config {
             ipv6_pool: "fd88:5249:4654::/64".parse().unwrap(),
             server_ipv4: "10.13.0.1".parse().unwrap(),
             server_ipv6: "fd88:5249:4654::1".parse().unwrap(),
+            vpn_pool: "10.14.0.0/24".parse().unwrap(),
             route_table: 51888,
             rule_priority: 11000,
             mark: 0x52490000,
@@ -139,6 +142,7 @@ impl Config {
         env_parse!("RIFT_IPV6_POOL", ipv6_pool);
         env_parse!("RIFT_SERVER_IPV4", server_ipv4);
         env_parse!("RIFT_SERVER_IPV6", server_ipv6);
+        env_parse!("RIFT_VPN_POOL", vpn_pool);
         if let Ok(v) = std::env::var("RIFT_HOST_FIREWALL") {
             if !v.is_empty() {
                 config.host_firewall = match v.to_ascii_lowercase().as_str() {
@@ -182,6 +186,12 @@ impl Config {
         ensure!(
             self.ipv4_pool.network().is_private(),
             "IPv4 pool must be private"
+        );
+        ensure!(
+            self.vpn_pool.prefix_len() >= 8
+                && self.vpn_pool.prefix_len() <= 29
+                && self.vpn_pool.network().is_private(),
+            "VPN pool must be a private /8../29 network"
         );
         ensure!(
             (u128::from(self.ipv6_pool.network()) >> 121) == 0x7e
@@ -243,6 +253,18 @@ impl Config {
         if let Some(name) = &self.agent_name {
             validate_name(name)?;
         }
+        Ok(())
+    }
+    /// Checked only once VPN peers exist, so a deployment that never uses the VPN is not
+    /// affected by the default pool overlapping a pool it chose itself.
+    pub fn check_vpn_pool(&self) -> Result<()> {
+        ensure!(
+            !self.vpn_pool.contains(&self.ipv4_pool.network())
+                && !self.ipv4_pool.contains(&self.vpn_pool.network())
+                && self.public_ips.iter().all(|ip| !matches!(ip, IpAddr::V4(v) if self.vpn_pool.contains(v))),
+            "VPN pool {} overlaps the IPv4 tunnel pool or a public IP; set RIFT_VPN_POOL (restart required)",
+            self.vpn_pool
+        );
         Ok(())
     }
     pub fn socket_path(&self) -> PathBuf {
@@ -307,6 +329,21 @@ mod tests {
         assert_eq!(config.host_firewall, HostFirewall::Auto);
         let config: Config = toml::from_str("host_firewall = \"off\"\n").unwrap();
         assert_eq!(config.host_firewall, HostFirewall::Off);
+    }
+    #[test]
+    fn vpn_pool_is_private_and_checked_against_the_tunnel_pool_on_use() {
+        let overlapping = Config {
+            vpn_pool: "10.13.0.128/25".parse().unwrap(),
+            ..Default::default()
+        };
+        overlapping.validate().unwrap();
+        assert!(overlapping.check_vpn_pool().is_err());
+        Config::default().check_vpn_pool().unwrap();
+        let public = Config {
+            vpn_pool: "203.0.113.0/24".parse().unwrap(),
+            ..Default::default()
+        };
+        assert!(public.validate().is_err());
     }
     #[test]
     fn rejects_non_ula() {

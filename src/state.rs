@@ -488,6 +488,7 @@ impl StateStore {
         s.agents.retain(|a| a.id != id);
         s.forwards.retain(|f| f.agent_id != id);
         s.bans.retain(|b| b.agent_id != id);
+        s.vpn_grants.retain(|g| g.agent_id != id);
         tx.execute("DELETE FROM invites WHERE reserved_agent=?1", [id])?;
         tx.execute("DELETE FROM rotations WHERE agent_id=?1", [id])?;
         let out = Self::commit_snapshot(&tx, s, "agent-remove")?;
@@ -560,6 +561,39 @@ fn validate_snapshot(s: &StateSnapshot) -> Result<()> {
             }
         }
     }
+    let (mut peer_names, mut peer_ips) = (HashSet::new(), HashSet::new());
+    for p in &s.vpn_peers {
+        crate::config::validate_name(&p.name)?;
+        anyhow::ensure!(peer_names.insert(&p.name), "duplicate VPN peer name");
+        anyhow::ensure!(peer_ips.insert(p.ipv4), "duplicate VPN peer address");
+        anyhow::ensure!(
+            keys.insert(&p.public_key),
+            "VPN peer reuses a WireGuard public key"
+        );
+    }
+    for (i, g) in s.vpn_grants.iter().enumerate() {
+        anyhow::ensure!(
+            peer_names.contains(&g.peer),
+            "VPN grant references unknown peer"
+        );
+        anyhow::ensure!(
+            ids.contains(&g.agent_id),
+            "VPN grant references unknown agent"
+        );
+        crate::vpn::validate_access(&g.access)?;
+        anyhow::ensure!(!s.vpn_grants[..i].contains(g), "duplicate VPN grant");
+        // One network behind two agents would make the VPS route ambiguous.
+        if let VpnAccess::Subnet { net, .. } = &g.access {
+            for other in &s.vpn_grants[..i] {
+                if let VpnAccess::Subnet { net: o, .. } = &other.access {
+                    anyhow::ensure!(
+                        other.agent_id == g.agent_id || !(net.contains(o) || o.contains(net)),
+                        "subnet {net} overlaps {o}, which is granted behind a different agent"
+                    );
+                }
+            }
+        }
+    }
     let mut ban_ids = HashSet::new();
     for b in &s.bans {
         anyhow::ensure!(ban_ids.insert(b.id), "duplicate ban ID");
@@ -602,6 +636,71 @@ pub fn lowest_free_id(used: impl IntoIterator<Item = u64>) -> u64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    #[test]
+    fn vpn_state_is_validated() {
+        let agent = |id: &str, n: u8| AgentRecord {
+            id: id.into(),
+            name: id.into(),
+            public_key: format!("k-{id}"),
+            tunnel_ipv4: Ipv4Addr::new(10, 13, 0, n),
+            tunnel_ipv6: Ipv6Addr::new(0xfd88, 0x5249, 0x4654, 0, 0, 0, 0, n.into()),
+            status: AgentStatus::Active,
+            attempt_id: id.into(),
+            generation: 1,
+            applied_generation: 1,
+            last_error: None,
+            created_at: 0,
+            pending_deadline: None,
+        };
+        let subnet = |net: &str| VpnAccess::Subnet {
+            net: net.parse().unwrap(),
+            snat: false,
+        };
+        let peer = VpnPeer {
+            name: "iphone".into(),
+            public_key: "k-iphone".into(),
+            ipv4: Ipv4Addr::new(10, 14, 0, 2),
+            enabled: true,
+            created_at: 0,
+        };
+        let grant = |agent: &str, access| VpnGrant {
+            peer: "iphone".into(),
+            agent_id: agent.into(),
+            access,
+        };
+        let base = StateSnapshot {
+            agents: vec![agent("a", 2), agent("b", 3)],
+            vpn_peers: vec![peer.clone()],
+            vpn_grants: vec![grant("a", subnet("192.168.178.0/24"))],
+            ..Default::default()
+        };
+        validate_snapshot(&base).unwrap();
+        let mut s = base.clone();
+        s.vpn_grants.push(grant("a", subnet("192.168.178.0/25")));
+        validate_snapshot(&s).unwrap();
+        s.vpn_grants.push(grant("b", subnet("192.168.178.128/25")));
+        assert!(validate_snapshot(&s).is_err(), "same LAN behind two agents");
+        let mut s = base.clone();
+        s.vpn_grants.push(grant("zzz", VpnAccess::Server));
+        assert!(validate_snapshot(&s).is_err(), "unknown agent");
+        let mut s = base.clone();
+        s.vpn_grants.push(grant("a", subnet("192.168.178.0/24")));
+        assert!(validate_snapshot(&s).is_err(), "duplicate grant");
+        let mut s = base.clone();
+        s.vpn_peers.push(VpnPeer {
+            name: "other".into(),
+            ..peer.clone()
+        });
+        assert!(validate_snapshot(&s).is_err(), "duplicate address and key");
+        let mut s = base.clone();
+        s.vpn_peers[0].public_key = "k-a".into();
+        assert!(validate_snapshot(&s).is_err(), "key shared with an agent");
+        // Older snapshots have no VPN fields at all.
+        let old: StateSnapshot =
+            serde_json::from_str(r#"{"generation":4,"agents":[],"forwards":[],"bans":[]}"#)
+                .unwrap();
+        assert!(old.vpn_peers.is_empty() && old.vpn_grants.is_empty());
+    }
     #[test]
     fn forward_ids_fill_gaps_before_growing() {
         assert_eq!(lowest_free_id([]), 1);

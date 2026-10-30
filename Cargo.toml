@@ -12,6 +12,7 @@ clap = { version = "4", features = ["derive"] }
 humantime = "2"
 ipnet = { version = "2", features = ["serde"] }
 libc = "0.2"
+qrcode = { version = "0.14.1", default-features = false }
 rand = "0.8"
 rcgen = "0.13"
 rusqlite = { version = "0.32", features = ["bundled"] }

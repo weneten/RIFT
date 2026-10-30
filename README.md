@@ -21,6 +21,7 @@ The agent initiates the connection to the server. RIFT manages the tunnel, expli
 - [Publish services](#publish-services)
 - [Publish websites with HTTPS](#publish-websites-with-https)
 - [Manage agents and forwards](#manage-agents-and-forwards)
+- [Private VPN access](#private-vpn-access)
 - [Configuration](#configuration)
 - [Operations and troubleshooting](#operations-and-troubleshooting)
 - [Build and development](#build-and-development)
@@ -360,6 +361,44 @@ ID  AGENT  PROTO  LISTEN                  TARGET  FAMILY  INGRESS  MODE         
 
 Normal commands print concise status and confirmations. Use `rift --json status`, `rift --json forwards list`, or `rift --json doctor` for complete machine-readable data. The `--json` format is also used by the site helper and integration tools.
 
+## Private VPN access
+
+Besides publishing ports, RIFT can give your own phones and laptops private access to an agent through the server. Each device is an extra WireGuard peer on the server's `rift0`; its traffic is forwarded into the existing agent tunnel. The home router needs no inbound port forwarding, and public forwards are unchanged.
+
+```text
+phone ── WireGuard ──> RIFT server ── existing tunnel ──> RIFT agent ──> home server
+                       (VPN peer 10.14.0.x)                             └─> optional LAN
+```
+
+Everything is denied until you allow it. A device reaches only what a grant names, and devices cannot reach each other or the server itself. Run on the **server**:
+
+```sh
+rift vpn peer add iphone                       # key pair + address from the VPN pool
+rift vpn allow iphone --agent home --server    # the home server itself
+rift vpn config qr iphone                      # scan in the WireGuard app
+rift vpn config export iphone > iphone.conf    # or export a file (contains the private key)
+```
+
+| Grant | Reaches |
+| --- | --- |
+| `--server` | TCP, UDP and ping to the agent host's tunnel address. |
+| `--port 22/tcp` | Only that port or range (`8000-8010/tcp`, `53/both`) on the agent host. Repeatable. |
+| `--full` | Every IP protocol to the agent host. Still not its LAN. |
+| `--subnet 192.168.178.0/24` | An explicitly named private network behind the agent. Repeatable. |
+
+Manage devices with `rift vpn peer list`, `peer disable NAME` / `peer enable NAME` (reversible) and `peer revoke NAME` (deletes the device, its key and its grants). `rift vpn deny NAME --agent AGENT [selectors]` withdraws grants; without selectors it withdraws everything on that agent. Revocation and denial close the path on the server in the same reconcile pass; the agent follows on its next sync.
+
+Client configurations are split-tunnel: `AllowedIPs` lists only the granted addresses, never `0.0.0.0/0`. Exported files and QR codes contain the device's private key, which stays in a mode-0600 file under the state volume and is never logged.
+
+**Reaching the LAN.** `--subnet` forwards through the agent host and is the only grant that touches the LAN. Choose one:
+
+- Add a static route on the home router for the VPN pool (default `10.14.0.0/24`) via the agent host's LAN address, so LAN hosts can answer. Source addresses stay visible.
+- Or add `--snat`: the agent masquerades the device behind its own LAN address and no router change is needed. NAT applies only to the granted device and network.
+
+The agent host itself answers on its LAN address too, as long as that address lies in a granted subnet. A granted network must not exist on the server, overlap a RIFT pool, or be granted behind two different agents; RIFT refuses those. Change the VPN pool with `RIFT_VPN_POOL` (restart required) if `10.14.0.0/24` collides with something.
+
+**Trust boundary.** The server authenticates devices by WireGuard key, and the agent enforces its own input and forwarding rules by the device's VPN source address. A compromised server can forge an allowed source address, so the agent-side rules limit mistakes and stolen device keys, not a hostile server. Protecting against that needs end-to-end authentication between device and agent, which RIFT does not provide. Only IPv4 is supported for VPN devices, and the first version has no full-tunnel mode.
+
 ## Configuration
 
 `config.toml` contains static settings; `.env` supplies the Compose profile and the documented environment overrides. Compose reads the project `.env` automatically. Agents, invitations and forwards are stored in the persistent state volume rather than in TOML.
@@ -374,6 +413,7 @@ Normal commands print concise status and confirmations. Use `rift --json status`
 | `RIFT_WG_PORT` | `51820` | Server. WireGuard UDP port; use another one if 51820 is taken on the host. Restart required. |
 | `RIFT_IPV4_POOL`, `RIFT_SERVER_IPV4` | `10.13.0.0/24`, `10.13.0.1` | Server. Override the IPv4 tunnel pool if it overlaps a host network (the default avoids Podman's 10.88.0.0/16, Docker's 172.16/12 and common WireGuard 10.8.0.0/24). The server address must be inside the pool; restart required. |
 | `RIFT_IPV6_POOL`, `RIFT_SERVER_IPV6` | `fd88:5249:4654::/64`, `fd88:5249:4654::1` | Server. Same for IPv6 (ULA pool). |
+| `RIFT_VPN_POOL` | `10.14.0.0/24` | Server. Addresses for [private VPN devices](#private-vpn-access); must not overlap the IPv4 tunnel pool or a granted LAN; restart required. |
 | `RIFT_SERVER`, `RIFT_AGENT_NAME`, `RIFT_ENROLLMENT_TOKEN` | Agent | Invitation values; remove token after enrollment. |
 | `interface`, `wg_port`, `control_port` | `rift0`, `51820`, `8444` | WireGuard interface and ports. |
 | `ipv4_pool`, `ipv6_pool` | `10.13.0.0/24`, `fd88:5249:4654::/64` | Tunnel address pools; avoid overlaps. |

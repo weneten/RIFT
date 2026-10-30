@@ -2,7 +2,7 @@
 //! override a drop in another filter base chain, so this module installs one owned jump
 //! into the UFW user chains. Grant checks remain in the RIFT table.
 
-use crate::model::{Family, Forward};
+use crate::model::{AgentVpnRule, Family, Forward};
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
@@ -57,6 +57,8 @@ pub struct ServerSpec<'a> {
     pub enrollment: Option<SocketAddr>,
     pub uplinks: &'a [String],
     pub local_ingress: bool,
+    /// VPN peers reach agents through `rift0` and leave by `rift0` again.
+    pub vpn: bool,
 }
 
 pub struct AgentSpec<'a> {
@@ -64,6 +66,7 @@ pub struct AgentSpec<'a> {
     pub tunnel_v4: Ipv4Addr,
     pub tunnel_v6: Ipv6Addr,
     pub forwards: &'a [&'a Forward],
+    pub vpn: &'a [AgentVpnRule],
 }
 
 pub struct DoctorReport {
@@ -181,6 +184,12 @@ pub fn plan_server(obs: &Observation, spec: &ServerSpec<'_>) -> Result<Plan> {
                 spec.interface
             ));
         }
+        if spec.vpn {
+            rules.push(format!(
+                "iifname \"{0}\" oifname \"{0}\" accept comment \"rift:vpn\"",
+                spec.interface
+            ));
+        }
         push_chain(&mut plan, obs, chain, CHAIN_FWD, &rules);
     }
     plan.summary = format!(
@@ -211,6 +220,15 @@ pub fn plan_agent(obs: &Observation, spec: &AgentSpec<'_>) -> Result<Plan> {
                 "iifname \"{}\" {family} daddr {address} {} dport {} accept comment \"rift:grant\"",
                 spec.interface, forward.protocol, forward.target_ports
             ));
+        }
+        if chain.family == "ip" || chain.family == "inet" {
+            for rule in spec.vpn {
+                rules.push(format!(
+                    "iifname \"{}\" {}accept comment \"rift:vpn\"",
+                    spec.interface,
+                    crate::vpn::flow_match(rule.source, spec.tunnel_v4, &rule.access)
+                ));
+            }
         }
         push_chain(&mut plan, obs, chain, CHAIN_IN, &rules);
     }
@@ -516,6 +534,7 @@ mod tests {
             enrollment: Some("0.0.0.0:8443".parse().unwrap()),
             uplinks,
             local_ingress: false,
+            vpn: false,
         }
     }
 
@@ -592,6 +611,7 @@ mod tests {
                 tunnel_v4: Ipv4Addr::new(10, 88, 0, 2),
                 tunnel_v6: "fd88:5249:4654::2".parse().unwrap(),
                 forwards: &[&forward],
+                vpn: &[],
             },
         )
         .unwrap();
@@ -605,6 +625,37 @@ mod tests {
         assert!(plan
             .fill
             .contains("oifname \"rift0\" accept comment \"rift:egress\""));
+    }
+
+    #[test]
+    fn vpn_rules_open_ufw_only_when_a_grant_exists() {
+        let obs = observe(&ruleset()).unwrap();
+        let uplinks = vec!["eth0".to_string()];
+        let mut spec = server_spec(&uplinks);
+        let plain = plan_server(&obs, &spec).unwrap();
+        assert!(!plain.fill.contains("rift:vpn"));
+        spec.vpn = true;
+        let plan = plan_server(&obs, &spec).unwrap();
+        assert!(plan
+            .fill
+            .contains("iifname \"rift0\" oifname \"rift0\" accept comment \"rift:vpn\""));
+
+        let rule = AgentVpnRule {
+            source: Ipv4Addr::new(10, 14, 0, 2),
+            access: crate::model::VpnAccess::Server,
+        };
+        let plan = plan_agent(
+            &obs,
+            &AgentSpec {
+                interface: "rift0",
+                tunnel_v4: Ipv4Addr::new(10, 88, 0, 2),
+                tunnel_v6: "fd88:5249:4654::2".parse().unwrap(),
+                forwards: &[],
+                vpn: &[rule],
+            },
+        )
+        .unwrap();
+        assert!(plan.fill.contains("iifname \"rift0\" ip saddr 10.14.0.2 ip daddr 10.88.0.2 meta l4proto { tcp, udp, icmp } accept comment \"rift:vpn\""));
     }
 
     #[test]

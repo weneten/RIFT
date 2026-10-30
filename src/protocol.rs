@@ -107,6 +107,31 @@ pub enum AdminRequest {
     Logs {
         lines: usize,
     },
+    VpnPeerAdd {
+        name: String,
+    },
+    VpnPeerList,
+    VpnPeerEnable {
+        name: String,
+        enabled: bool,
+    },
+    VpnPeerRevoke {
+        name: String,
+    },
+    VpnAllow {
+        peer: String,
+        agent: String,
+        access: VpnAccess,
+    },
+    /// Without `access`, removes every grant of the peer on that agent.
+    VpnDeny {
+        peer: String,
+        agent: String,
+        access: Option<VpnAccess>,
+    },
+    VpnConfig {
+        name: String,
+    },
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AdminResponse {

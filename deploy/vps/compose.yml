@@ -36,6 +36,7 @@ services:
       RIFT_IPV6_POOL: ${RIFT_IPV6_POOL:-}
       RIFT_SERVER_IPV4: ${RIFT_SERVER_IPV4:-}
       RIFT_SERVER_IPV6: ${RIFT_SERVER_IPV6:-}
+      RIFT_VPN_POOL: ${RIFT_VPN_POOL:-}
     command: ["--config", "/etc/rift/config.toml", "server"]
 
 volumes:

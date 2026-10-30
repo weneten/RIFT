@@ -1,3 +1,4 @@
+use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -187,17 +188,68 @@ pub struct Ban {
     pub ip: IpAddr,
     pub expires_at: i64,
 }
+/// A roaming device (phone, laptop) that reaches the home side through the VPS.
+/// The private key lives in a mode-0600 file, never in the snapshot.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VpnPeer {
+    pub name: String,
+    pub public_key: String,
+    pub ipv4: Ipv4Addr,
+    pub enabled: bool,
+    pub created_at: i64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VpnAccess {
+    /// TCP, UDP and ping to the agent's own tunnel address.
+    Server,
+    /// Every IP protocol to the agent's own tunnel address, still not its LAN.
+    Full,
+    /// One protocol and port range on the agent's own tunnel address.
+    Port {
+        protocol: Protocol,
+        ports: PortRange,
+    },
+    /// An explicitly named network behind the agent. `snat` masquerades the peer's address
+    /// on the agent, for LANs whose router has no route back to the VPN pool.
+    Subnet {
+        net: Ipv4Net,
+        #[serde(default)]
+        snat: bool,
+    },
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VpnGrant {
+    pub peer: String,
+    pub agent_id: String,
+    pub access: VpnAccess,
+}
+/// What an agent needs to know about one granted peer.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentVpnRule {
+    pub source: Ipv4Addr,
+    pub access: VpnAccess,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct StateSnapshot {
     pub generation: u64,
     pub agents: Vec<AgentRecord>,
     pub forwards: Vec<Forward>,
     pub bans: Vec<Ban>,
+    #[serde(default)]
+    pub vpn_peers: Vec<VpnPeer>,
+    #[serde(default)]
+    pub vpn_grants: Vec<VpnGrant>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct AgentPolicy {
     pub generation: u64,
     pub forwards: Vec<Forward>,
+    /// Missing on policies from older servers, which means no VPN access.
+    #[serde(default)]
+    pub vpn_pool: Option<Ipv4Net>,
+    #[serde(default)]
+    pub vpn: Vec<AgentVpnRule>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Welcome {

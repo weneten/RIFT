@@ -2,11 +2,12 @@ use crate::{
     config::Config,
     model::{
         AgentPolicy, AgentStatus, Family, Forward, ForwardMode, Ingress, PeerStats, PortRange,
-        Protocol, StateSnapshot, Welcome,
+        Protocol, StateSnapshot, VpnAccess, Welcome,
     },
+    vpn,
 };
 use anyhow::{bail, ensure, Context, Result};
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -124,6 +125,27 @@ impl Kernel {
                 "duplicate agent IPv6 tunnel address"
             );
         }
+        let vpn_grants = vpn::effective(snapshot);
+        let vpn_peers: Vec<_> = snapshot.vpn_peers.iter().filter(|p| p.enabled).collect();
+        for peer in &vpn_peers {
+            ensure!(
+                self.config.vpn_pool.contains(&peer.ipv4),
+                "VPN peer {} address {} is outside the VPN pool",
+                peer.name,
+                peer.ipv4
+            );
+            ensure!(
+                peer_keys.insert(peer.public_key.clone()),
+                "VPN peer {} reuses a WireGuard public key",
+                peer.name
+            );
+        }
+        if !vpn_peers.is_empty() {
+            self.config.check_vpn_pool()?;
+            self.check_networks_free(&[self.config.vpn_pool.into()])
+                .await
+                .context("VPN pool")?;
+        }
         let private_key = read_private_key(private_key_path).await?;
         let public_key = wg_public_key(&private_key).await?;
         self.ensure_interface(&public_key, private_key_path).await?;
@@ -143,7 +165,11 @@ impl Kernel {
 
         let existing = self.wg_dump().await?;
         for agent in peers.values() {
-            let allowed = format!("{}/32,{}/128", agent.tunnel_ipv4, agent.tunnel_ipv6);
+            let mut allowed = format!("{}/32,{}/128", agent.tunnel_ipv4, agent.tunnel_ipv6);
+            // Networks behind the agent: its replies to VPN peers may carry LAN source addresses.
+            for net in vpn::agent_subnets(&vpn_grants, &agent.id) {
+                allowed.push_str(&format!(",{net}"));
+            }
             let keepalive = self.config.keepalive.to_string();
             run_ok(
                 "wg",
@@ -163,6 +189,41 @@ impl Kernel {
             self.add_peer_routes(agent.tunnel_ipv4.into(), agent.tunnel_ipv6.into())
                 .await?;
         }
+        // A VPN peer may only source its own address; reachability is the nftables grants' job.
+        for peer in &vpn_peers {
+            let allowed = format!("{}/32", peer.ipv4);
+            run_ok(
+                "wg",
+                [
+                    "set",
+                    self.interface(),
+                    "peer",
+                    &peer.public_key,
+                    "allowed-ips",
+                    &allowed,
+                ],
+            )
+            .await
+            .with_context(|| format!("configure WireGuard VPN peer {}", peer.name))?;
+        }
+        let mut vpn_routes: BTreeSet<Ipv4Net> = vpn_peers
+            .iter()
+            .map(|p| Ipv4Net::new(p.ipv4, 32).expect("a /32 is a valid prefix"))
+            .collect();
+        vpn_routes.extend(vpn_grants.iter().filter_map(|e| match e.access {
+            VpnAccess::Subnet { net, .. } => Some(*net),
+            _ => None,
+        }));
+        let mut kept_routes = vpn_routes.clone();
+        kept_routes.extend(
+            peers
+                .values()
+                .filter_map(|a| Ipv4Net::new(a.tunnel_ipv4, 32).ok()),
+        );
+        for net in &vpn_routes {
+            self.replace_owned_route(*net).await?;
+        }
+        self.delete_stale_v4_routes(&kept_routes).await?;
         for peer in existing {
             if !peer_keys.contains(&peer.public_key) {
                 run_ok(
@@ -206,9 +267,11 @@ impl Kernel {
             &forwards,
             &peers,
             &uplinks,
+            &vpn::server_rules(self.interface(), self.config.vpn_pool, snapshot),
         )?;
         self.replace_nft_table(&rules).await?;
-        self.sync_server_host_firewall(local_ingress).await?;
+        self.sync_server_host_firewall(local_ingress, !vpn_grants.is_empty())
+            .await?;
         Ok(())
     }
 
@@ -250,6 +313,10 @@ impl Kernel {
         self.remember_tunnel_addrs([welcome.tunnel_ipv4.into(), welcome.tunnel_ipv6.into()]);
         self.ensure_routing_ownership().await?;
         self.install_agent_routes(welcome).await?;
+        // Only the VPN path may fail softly: it must not hold back forward grants.
+        if let Err(error) = self.sync_agent_vpn_route(policy).await {
+            tracing::warn!("VPN return route not installed: {error:#}");
+        }
 
         let peers = self.wg_dump().await?;
         let peer = peers
@@ -298,9 +365,11 @@ impl Kernel {
             self.config.mark_mask,
             welcome,
             &forwards,
+            &vpn::agent_nft_rules(self.interface(), welcome.tunnel_ipv4, &policy.vpn),
         )?;
         self.replace_nft_table(&rules).await?;
-        self.sync_agent_host_firewall(welcome, &forwards).await?;
+        self.sync_agent_host_firewall(welcome, &forwards, &policy.vpn)
+            .await?;
         Ok(())
     }
 
@@ -464,7 +533,7 @@ impl Kernel {
         Ok(())
     }
 
-    async fn sync_server_host_firewall(&self, local_ingress: bool) -> Result<()> {
+    async fn sync_server_host_firewall(&self, local_ingress: bool, vpn: bool) -> Result<()> {
         if self.config.host_firewall == crate::config::HostFirewall::Off {
             return self.remove_host_firewall().await;
         }
@@ -493,6 +562,7 @@ impl Kernel {
                     .then_some(self.config.enrollment_bind),
                 uplinks: &uplinks,
                 local_ingress,
+                vpn,
             },
         )?;
         self.apply_host_plan(&plan).await
@@ -502,6 +572,7 @@ impl Kernel {
         &self,
         welcome: &Welcome,
         forwards: &[&Forward],
+        vpn: &[crate::model::AgentVpnRule],
     ) -> Result<()> {
         if self.config.host_firewall == crate::config::HostFirewall::Off {
             return self.remove_host_firewall().await;
@@ -517,6 +588,7 @@ impl Kernel {
                 tunnel_v4: welcome.tunnel_ipv4,
                 tunnel_v6: welcome.tunnel_ipv6,
                 forwards,
+                vpn,
             },
         )?;
         self.apply_host_plan(&plan).await
@@ -605,6 +677,20 @@ impl Kernel {
     }
 
     async fn check_tunnel_overlap(&self, addresses: &[IpAddr]) -> Result<()> {
+        let nets: Vec<IpNet> = addresses.iter().map(|ip| IpNet::from(*ip)).collect();
+        self.check_networks_free(&nets).await
+    }
+
+    /// A granted network must not collide with anything the VPS already has.
+    pub async fn check_vpn_subnet(&self, net: Ipv4Net) -> Result<()> {
+        self.check_networks_free(&[net.into()]).await
+    }
+
+    async fn check_networks_free(&self, nets: &[IpNet]) -> Result<()> {
+        let overlaps = |network: &IpNet| {
+            nets.iter()
+                .any(|net| network.contains(net) || net.contains(network))
+        };
         let links: Value =
             serde_json::from_str(&run_output("ip", ["-j", "address", "show"]).await?)?;
         for link in links.as_array().context("invalid ip address JSON")? {
@@ -617,7 +703,7 @@ impl Kernel {
                         (entry["local"].as_str(), entry["prefixlen"].as_u64())
                     {
                         let network = IpNet::new(local.parse()?, prefix as u8)?;
-                        ensure!(!addresses.iter().any(|ip|network.contains(ip)),"WireGuard addresses overlap existing host interface {}; choose different tunnel pools on the VPS",link["ifname"]);
+                        ensure!(!overlaps(&network),"WireGuard or VPN networks overlap existing host interface {}; choose different tunnel pools on the VPS",link["ifname"]);
                     }
                 }
             }
@@ -639,7 +725,7 @@ impl Kernel {
                         .map(|ip| IpNet::new(ip, if ip.is_ipv4() { 32 } else { 128 }).unwrap())
                 });
                 if let Ok(network) = network {
-                    ensure!(!addresses.iter().any(|ip|network.contains(ip)),"WireGuard addresses overlap existing route {destination}; choose different VPS tunnel pools");
+                    ensure!(!overlaps(&network),"WireGuard or VPN networks overlap existing route {destination}; choose different VPS tunnel pools");
                 }
             }
         }
@@ -1007,6 +1093,134 @@ impl Kernel {
         ensure_rule("-4", &mark_pref, &["fwmark", &fwmark], &table).await?;
         ensure_rule("-6", &mark_pref, &["fwmark", &fwmark], &table).await?;
         Ok(())
+    }
+
+    /// Installs `net` via the tunnel unless a route that is not RIFT's already owns it.
+    async fn replace_owned_route(&self, net: Ipv4Net) -> Result<()> {
+        let destination = net.to_string();
+        let existing = run_output(
+            "ip",
+            [
+                "-N",
+                "-4",
+                "route",
+                "show",
+                "exact",
+                &destination,
+                "table",
+                "main",
+            ],
+        )
+        .await?;
+        ensure!(
+            existing
+                .lines()
+                .all(|l| l.contains(self.interface()) && l.contains(ROUTE_PROTOCOL)),
+            "route {destination} already exists outside the RIFT route protocol; refusing to replace it"
+        );
+        run_ok(
+            "ip",
+            [
+                "-4",
+                "route",
+                "replace",
+                &destination,
+                "dev",
+                self.interface(),
+                "proto",
+                ROUTE_PROTOCOL,
+                "table",
+                "main",
+            ],
+        )
+        .await
+    }
+
+    /// Removes RIFT-owned IPv4 routes on the tunnel that are no longer wanted, such as the
+    /// address of a revoked VPN peer or a network nobody may reach any more.
+    async fn delete_stale_v4_routes(&self, keep: &BTreeSet<Ipv4Net>) -> Result<()> {
+        let listing = run_output(
+            "ip",
+            [
+                "-N",
+                "-4",
+                "-j",
+                "route",
+                "show",
+                "dev",
+                self.interface(),
+                "proto",
+                ROUTE_PROTOCOL,
+                "table",
+                "main",
+            ],
+        )
+        .await?;
+        if listing.trim().is_empty() {
+            return Ok(());
+        }
+        let routes: Value = serde_json::from_str(&listing).context("parse ip route JSON")?;
+        for route in routes.as_array().into_iter().flatten() {
+            let Some(destination) = route["dst"].as_str() else {
+                continue;
+            };
+            let Ok(net) = destination
+                .parse::<Ipv4Net>()
+                .or_else(|_| destination.parse().map(|ip| Ipv4Net::new(ip, 32).unwrap()))
+            else {
+                continue;
+            };
+            if !keep.contains(&net) {
+                run_ok_allow_missing(
+                    "ip",
+                    [
+                        "-4",
+                        "route",
+                        "del",
+                        &net.to_string(),
+                        "dev",
+                        self.interface(),
+                        "proto",
+                        ROUTE_PROTOCOL,
+                        "table",
+                        "main",
+                    ],
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The agent only needs a route back to the VPN pool when it forwards for a subnet grant.
+    /// Replies from its own tunnel address already use the RIFT table.
+    async fn sync_agent_vpn_route(&self, policy: &AgentPolicy) -> Result<()> {
+        let Some(pool) = policy.vpn_pool else {
+            return Ok(());
+        };
+        if policy
+            .vpn
+            .iter()
+            .any(|rule| matches!(rule.access, VpnAccess::Subnet { .. }))
+        {
+            return self.replace_owned_route(pool).await;
+        }
+        run_ok_allow_missing(
+            "ip",
+            [
+                "-4",
+                "route",
+                "del",
+                &pool.to_string(),
+                "dev",
+                self.interface(),
+                "proto",
+                ROUTE_PROTOCOL,
+                "table",
+                "main",
+            ],
+        )
+        .await
     }
 
     async fn add_peer_routes(&self, v4: IpAddr, v6: IpAddr) -> Result<()> {
@@ -1422,11 +1636,14 @@ fn render_server_rules(
     forwards: &[&Forward],
     agents: &BTreeMap<String, &crate::model::AgentRecord>,
     uplinks: &[String],
+    vpn: &vpn::Rules,
 ) -> Result<String> {
     let mut out = "add chain inet rift prerouting_mark { type filter hook prerouting priority mangle; policy accept; }\n\
          add chain inet rift prerouting_nat { type nat hook prerouting priority dstnat; policy accept; }\n\
          add chain inet rift forward { type filter hook forward priority filter; policy accept; }\n\
          add chain inet rift input { type filter hook input priority filter; policy accept; }\n".to_string();
+    // VPN peers must never reach the control port, whatever their source address claims.
+    out.push_str(&vpn.input);
     out.push_str(&format!(
         "add rule inet rift input iifname \"{interface}\" ip daddr {server_v4} tcp dport {control_port} accept\n\
          add rule inet rift input iifname \"{interface}\" ip6 daddr {server_v6} tcp dport {control_port} accept\n\
@@ -1466,6 +1683,7 @@ fn render_server_rules(
             ));
         }
     }
+    out.push_str(&vpn.forward);
     out.push_str(&format!(
         "add rule inet rift forward oifname \"{interface}\" drop\n\
          add rule inet rift forward iifname \"{interface}\" drop\n"
@@ -1479,6 +1697,7 @@ fn render_agent_rules(
     mask: u32,
     welcome: &Welcome,
     forwards: &[&Forward],
+    vpn: &vpn::Rules,
 ) -> Result<String> {
     let mut out = "add chain inet rift prerouting_mark { type filter hook prerouting priority mangle; policy accept; }\n\
          add chain inet rift output_route { type route hook output priority mangle; policy accept; }\n\
@@ -1526,6 +1745,9 @@ fn render_agent_rules(
             ));
         }
     }
+    out.push_str(&vpn.input);
+    out.push_str(&vpn.forward);
+    out.push_str(&vpn.nat);
     out.push_str(&format!(
         "add rule inet rift prerouting_mark ct direction reply ct mark & {mask:#x} == {mark:#x} meta mark set (meta mark & {:#x}) | {mark:#x}\n\
          add rule inet rift output_route ct direction reply ct mark & {mask:#x} == {mark:#x} meta mark set (meta mark & {:#x}) | {mark:#x}\n\
@@ -2491,6 +2713,7 @@ mod tests {
             &[&f, &udp],
             &agents,
             &[],
+            &vpn::Rules::default(),
         )
         .unwrap();
         assert!(rendered.contains("tcp dport 80 dnat ip to 10.88.0.2:8080"));
@@ -2508,6 +2731,116 @@ mod tests {
         assert!(!rendered.contains("snat"));
         assert!(!rendered.contains("masquerade"));
         assert!(!rendered.contains("iifname != \"eth0\""));
+    }
+    #[test]
+    fn vpn_rules_sit_before_the_final_drops_and_leave_dnat_alone() {
+        use crate::model::{VpnGrant, VpnPeer};
+        let a = agent();
+        let agents = BTreeMap::from([(a.id.clone(), &a)]);
+        let f = forward(ForwardMode::Transparent);
+        let snap = StateSnapshot {
+            agents: vec![a.clone()],
+            vpn_peers: vec![VpnPeer {
+                name: "iphone".into(),
+                public_key: "k".into(),
+                ipv4: Ipv4Addr::new(10, 14, 0, 2),
+                enabled: true,
+                created_at: 0,
+            }],
+            vpn_grants: vec![VpnGrant {
+                peer: "iphone".into(),
+                agent_id: a.id.clone(),
+                access: VpnAccess::Server,
+            }],
+            ..Default::default()
+        };
+        let render = |vpn: &vpn::Rules| {
+            render_server_rules(
+                "rift0",
+                0x52490000,
+                0xffff0000,
+                8444,
+                Ipv4Addr::new(10, 88, 0, 1),
+                "fd88:5249:4654::1".parse().unwrap(),
+                &[&f],
+                &agents,
+                &[],
+                vpn,
+            )
+            .unwrap()
+        };
+        let without = render(&vpn::Rules::default());
+        let rules = vpn::server_rules("rift0", "10.14.0.0/24".parse().unwrap(), &snap);
+        let with = render(&rules);
+        let position =
+            |text: &str, needle: &str| text.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let grant = position(
+            &with,
+            "ip saddr 10.14.0.2 ip daddr 10.88.0.2 meta l4proto { tcp, udp, icmp } accept",
+        );
+        assert!(grant < position(&with, "forward oifname \"rift0\" drop"));
+        assert!(
+            position(&with, "input iifname \"rift0\" ip saddr 10.14.0.0/24 drop")
+                < position(&with, "tcp dport 8444 accept")
+        );
+        // Every existing line survives untouched, so the public path is the same as before.
+        for line in without.lines() {
+            assert!(with.lines().any(|l| l == line), "lost: {line}");
+        }
+        assert!(!with.contains("snat") && !with.contains("masquerade"));
+    }
+    #[test]
+    fn agent_vpn_rules_precede_the_tunnel_drops_and_nat_is_opt_in() {
+        use crate::model::AgentVpnRule;
+        let w = Welcome {
+            agent_id: "a1".into(),
+            name: "agent".into(),
+            attempt_id: "x".into(),
+            server_public_key: "pk".into(),
+            server_endpoint: "vps.example:51820".into(),
+            server_ipv4: Ipv4Addr::new(10, 88, 0, 1),
+            server_ipv6: "fd88:5249:4654::1".parse().unwrap(),
+            tunnel_ipv4: Ipv4Addr::new(10, 88, 0, 2),
+            tunnel_ipv6: "fd88:5249:4654::2".parse().unwrap(),
+            keepalive: 25,
+            control_port: 8444,
+            mtu: 1380,
+        };
+        let source = Ipv4Addr::new(10, 14, 0, 2);
+        let net = |snat| AgentVpnRule {
+            source,
+            access: VpnAccess::Subnet {
+                net: "192.168.178.0/24".parse().unwrap(),
+                snat,
+            },
+        };
+        let render = |rules: &[AgentVpnRule]| {
+            render_agent_rules(
+                "rift0",
+                0x52490000,
+                0xffff0000,
+                &w,
+                &[],
+                &vpn::agent_nft_rules("rift0", w.tunnel_ipv4, rules),
+            )
+            .unwrap()
+        };
+        let plain = render(&[
+            AgentVpnRule {
+                source,
+                access: VpnAccess::Server,
+            },
+            net(false),
+        ]);
+        let accept = plain
+            .find("input iifname \"rift0\" ip saddr 10.14.0.2 ip daddr 10.88.0.2")
+            .unwrap();
+        assert!(accept < plain.find("input iifname \"rift0\" drop").unwrap());
+        let lan = plain.find("forward iifname \"rift0\" oifname != \"rift0\" ip saddr 10.14.0.2 ip daddr 192.168.178.0/24 accept").unwrap();
+        assert!(lan < plain.find("forward oifname \"rift0\" drop").unwrap());
+        assert!(!plain.contains("masquerade") && !plain.contains("postrouting"));
+        assert!(render(&[net(true)]).contains("postrouting_nat iifname \"rift0\" oifname != \"rift0\" ip saddr 10.14.0.2 ip daddr 192.168.178.0/24 masquerade"));
+        assert!(!render(&[]).contains("10.14.0.2"));
     }
     #[test]
     fn local_ingress_excludes_the_public_uplink_on_dnat_and_the_original_forward() {
@@ -2531,6 +2864,7 @@ mod tests {
             &[&f],
             &agents,
             &uplinks,
+            &vpn::Rules::default(),
         )
         .unwrap();
         let excluded = "iifname != \"rift0\" iifname != \"eth0\"";
@@ -2553,6 +2887,7 @@ mod tests {
             &[&f],
             &agents,
             &[],
+            &vpn::Rules::default(),
         )
         .is_err());
     }
@@ -2675,8 +3010,15 @@ mod tests {
         let f = forward(ForwardMode::Translate);
         let mut udp = f.clone();
         udp.protocol = Protocol::Udp;
-        let rendered =
-            render_agent_rules("rift0", 0x52490000, 0xffff0000, &w, &[&f, &udp]).unwrap();
+        let rendered = render_agent_rules(
+            "rift0",
+            0x52490000,
+            0xffff0000,
+            &w,
+            &[&f, &udp],
+            &vpn::Rules::default(),
+        )
+        .unwrap();
         assert!(rendered.contains("ip saddr 10.88.0.1"));
         assert!(rendered.contains("ct direction original"));
         assert!(rendered.contains("ct mark & 0xffff0000 == 0x52490000"));
