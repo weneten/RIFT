@@ -174,13 +174,12 @@ pub fn doctor(data: &Value) -> String {
 fn status(data: &Value) -> String {
     if let Some(snapshot) = data.get("snapshot") {
         let mut lines = vec![format!(
-            "Server: configuration {} (generation {})",
+            "Server: configuration {}",
             if data["fully_applied"].as_bool() == Some(true) {
                 "applied"
             } else {
                 "pending or failed"
-            },
-            field(snapshot, "generation")
+            }
         )];
         if !data["apply_error"].is_null() {
             lines.push(format!("Apply error: {}", text(&data["apply_error"])));
@@ -454,7 +453,7 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
             format!("{name} may now open the web panel at {url}.\nIf the device was set up before, re-import its configuration: rift vpn config qr {name}")
         }
         AdminRequest::PanelAllow { name, allowed: false } => format!("{name} can no longer open the web panel."),
-        AdminRequest::Reload => format!("Configuration reconciled (generation {}).", field(data, "generation")),
+        AdminRequest::Reload => "Configuration reconciled.".into(),
         AdminRequest::Status => status(data),
         AdminRequest::Logs { .. } => {
             let lines = data["lines"].as_array().into_iter().flatten().map(text).collect::<Vec<_>>();
