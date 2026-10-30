@@ -26,6 +26,9 @@ static APPLY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 pub struct Kernel {
     config: Config,
     endpoint_refresh: Mutex<Option<(Instant, SocketAddr)>>,
+    /// Tunnel addresses that enrollment handed out. Rules for exactly these stay recognisable
+    /// as RIFT's after the tunnel pool changed, so leftovers from before can be reclaimed.
+    known_tunnel_addrs: std::sync::Mutex<Vec<IpAddr>>,
 }
 
 impl Kernel {
@@ -33,7 +36,22 @@ impl Kernel {
         Self {
             config,
             endpoint_refresh: Mutex::new(None),
+            known_tunnel_addrs: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    fn remember_tunnel_addrs(&self, addrs: impl IntoIterator<Item = IpAddr>) {
+        *self
+            .known_tunnel_addrs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = addrs.into_iter().collect();
+    }
+
+    fn known_tunnel_addrs(&self) -> Vec<IpAddr> {
+        self.known_tunnel_addrs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub async fn apply_server(
@@ -116,6 +134,11 @@ impl Kernel {
         )
         .await?;
         self.set_rp_filter().await?;
+        self.remember_tunnel_addrs(
+            peers
+                .values()
+                .flat_map(|a| [IpAddr::V4(a.tunnel_ipv4), IpAddr::V6(a.tunnel_ipv6)]),
+        );
         self.ensure_routing_ownership().await?;
 
         let existing = self.wg_dump().await?;
@@ -224,6 +247,7 @@ impl Kernel {
         )
         .await?;
         self.set_rp_filter().await?;
+        self.remember_tunnel_addrs([welcome.tunnel_ipv4.into(), welcome.tunnel_ipv6.into()]);
         self.ensure_routing_ownership().await?;
         self.install_agent_routes(welcome).await?;
 
@@ -838,6 +862,7 @@ impl Kernel {
         let v6 = read_route_table("-6", self.config.route_table).await?;
         let rules_v4 = run_output("ip", ["-4", "rule", "show"]).await?;
         let rules_v6 = run_output("ip", ["-6", "rule", "show"]).await?;
+        let known = self.known_tunnel_addrs();
         match routing_claim(
             &[&v4, &v6],
             &[&rules_v4, &rules_v6],
@@ -849,6 +874,7 @@ impl Kernel {
                 mask: self.config.mark_mask,
                 v4_pool: self.config.ipv4_pool,
                 v6_pool: self.config.ipv6_pool,
+                known: &known,
             },
         ) {
             RoutingClaim::Foreign => bail!(
@@ -1129,6 +1155,7 @@ impl Kernel {
     async fn delete_all_agent_rules(&self) -> Result<()> {
         let pref = self.config.rule_priority.to_string();
         let mark_pref = (self.config.rule_priority + 1).to_string();
+        let known = self.known_tunnel_addrs();
         for family in ["-4", "-6"] {
             // Remove only rules whose selectors and table exactly match this RIFT configuration.
             let rules = run_output("ip", [family, "rule", "show"]).await?;
@@ -1146,7 +1173,7 @@ impl Kernel {
                             from,
                             self.config.ipv4_pool,
                             self.config.ipv6_pool,
-                        );
+                        ) || selector_is_known(from, &known);
                         if managed {
                             run_ok_allow_missing(
                                 "ip",
@@ -1769,6 +1796,8 @@ struct RoutingReservation<'a> {
     mask: u32,
     v4_pool: ipnet::Ipv4Net,
     v6_pool: ipnet::Ipv6Net,
+    /// Addresses enrolled earlier, recognised even when they lie outside the current pools.
+    known: &'a [IpAddr],
 }
 
 fn routing_claim(
@@ -1822,7 +1851,8 @@ fn rule_is_rift(line: &str, existing: u32, reserved: &RoutingReservation<'_>) ->
             .and_then(|rest| rest.split_whitespace().next())
             .is_some_and(|from| {
                 from != "all"
-                    && selector_is_managed_tunnel(from, reserved.v4_pool, reserved.v6_pool)
+                    && (selector_is_managed_tunnel(from, reserved.v4_pool, reserved.v6_pool)
+                        || selector_is_known(from, reserved.known))
             });
     }
     existing == reserved.priority.saturating_add(1)
@@ -1834,6 +1864,15 @@ fn lookup_is(line: &str, table: u32) -> bool {
         .skip_while(|token| *token != "lookup")
         .nth(1)
         .is_some_and(|value| value == table.to_string())
+}
+
+/// A single-host selector that is exactly one of the addresses enrollment handed out.
+fn selector_is_known(from: &str, known: &[IpAddr]) -> bool {
+    if let Ok(net) = from.parse::<IpNet>() {
+        let host_len = if net.addr().is_ipv4() { 32 } else { 128 };
+        return net.prefix_len() == host_len && known.contains(&net.addr());
+    }
+    from.parse::<IpAddr>().is_ok_and(|ip| known.contains(&ip))
 }
 
 fn selector_is_managed_tunnel(
@@ -2527,6 +2566,7 @@ mod tests {
             mask: 0xffff0000,
             v4_pool: "10.88.0.0/24".parse().unwrap(),
             v6_pool: "fd88:5249:4654::/64".parse().unwrap(),
+            known: &[],
         };
         let routes = [
             "unreachable default metric 42760",
@@ -2561,6 +2601,43 @@ mod tests {
             routing_claim(&routes, &["11002:\tfrom 10.88.0.2 lookup 51888"], &reserved),
             RoutingClaim::Foreign
         ));
+    }
+    #[test]
+    fn leftovers_from_before_a_pool_change_are_reclaimed_only_for_known_addresses() {
+        let routes = ["unreachable default metric 42760"];
+        let rules = [
+            "11000:\tfrom 10.88.0.2 lookup 51888",
+            "11001:\tfrom all fwmark 0x52490000/0xffff0000 lookup 51888",
+        ];
+        let new_pool = |known: &'static [IpAddr]| RoutingReservation {
+            interface: "rift0",
+            table: 51888,
+            priority: 11000,
+            mark: 0x52490000,
+            mask: 0xffff0000,
+            v4_pool: "10.13.0.0/24".parse().unwrap(),
+            v6_pool: "fd88:5249:4654::/64".parse().unwrap(),
+            known,
+        };
+        // The pool moved to 10.13, so 10.88.0.2 is unknown and the table looks foreign.
+        assert!(matches!(
+            routing_claim(&routes, &rules, &new_pool(&[])),
+            RoutingClaim::Foreign
+        ));
+        // The agent still holds exactly that enrolled address, so the leftovers are its own.
+        let own: &'static [IpAddr] = Box::leak(Box::new(["10.88.0.2".parse().unwrap()]));
+        assert!(matches!(
+            routing_claim(&routes, &rules, &new_pool(own)),
+            RoutingClaim::Orphan
+        ));
+        // A different address in the same old range is still refused.
+        let other = ["11000:\tfrom 10.88.0.9 lookup 51888"];
+        assert!(matches!(
+            routing_claim(&routes, &other, &new_pool(own)),
+            RoutingClaim::Foreign
+        ));
+        assert!(selector_is_known("10.88.0.2/32", own));
+        assert!(!selector_is_known("10.88.0.0/24", own));
     }
     #[test]
     fn rift_alias_identifies_an_orphaned_interface() {
