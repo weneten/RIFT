@@ -48,7 +48,7 @@ On both machines:
 On the server:
 
 - A DNS name or IP address reachable by the agent for enrollment and WireGuard. The public address used in forwards must actually be assigned to a server network interface; a DNS name is not valid for `RIFT_PUBLIC_IPS`. A network that only supplies an externally NATed address without assigning it to the server interface (typical for Oracle Cloud, AWS and Google Cloud) needs `RIFT_ALLOW_PRIVATE_LISTENERS=true` and the private interface address in `RIFT_PUBLIC_IPS`; see the configuration table below. That setup follows from the code and unit tests but has not been verified on a real NAT cloud.
-- Allow incoming UDP **51820** for WireGuard and TCP **8443** for enrollment, plus each public TCP or UDP service port you choose. Adjust upstream firewall/security-group rules as well as the host firewall. TCP **8444** is tunnel control and must not be exposed publicly.
+- Allow incoming UDP **51820** for WireGuard and TCP **8443** for enrollment, plus each public TCP or UDP service port you choose. Adjust upstream firewall/security-group rules as well as the host firewall. By default the server only listens on 8443 while an invitation is open (see [Connect an agent](#connect-an-agent)). TCP **8444** is tunnel control and must not be exposed publicly.
 - For a website, a DNS record for its domain and an existing supported reverse proxy listening on TCP 443. Certificate issuance may also require TCP 80.
 
 The agent needs outbound connectivity to the server's enrollment and WireGuard ports. The application must listen on the agent tunnel address, for example `0.0.0.0` for IPv4, or be published through Docker on the agent host. Binding only to `127.0.0.1` is insufficient for a direct tunnel destination.
@@ -116,6 +116,8 @@ rift agents add node1 --ttl 15m
 ```
 
 The output contains `RIFT_SERVER`, `RIFT_AGENT_NAME` and `RIFT_ENROLLMENT_TOKEN`. Treat the token as a secret and transfer all three lines securely to the agent.
+
+The enrollment port opens with the invitation. With the default `RIFT_ENROLLMENT_ENABLED=auto` the server listens on TCP 8443 (and RIFT's UFW rule for it exists) only while at least one invitation is open. It closes again as soon as the last agent is active or the last invitation has expired or been cancelled; expiry is noticed within one reconcile interval (10 s). RIFT can only close the port on the server itself: a rule in your cloud firewall or security group stays open, but nothing listens behind it. Set `RIFT_ENROLLMENT_ENABLED=true` (or `always`) to keep the port open permanently, or `false` to turn enrollment off. `rift status` shows the port's state and the open invitations.
 
 On the **agent**, from its own checkout:
 
@@ -402,7 +404,7 @@ The agent host itself answers on its LAN address too, as long as that address li
 
 ## Web panel
 
-The server can serve a small web panel: agents with their connection state, forwards, VPN devices and the apply status. It can enable and disable agents, forwards and VPN devices and remove forwards; everything else stays with the CLI. The panel is **off** by default. Enable it in the server `.env` and recreate the container:
+The server can serve a web panel with what the CLI does: agents and invitations, forwards and bans, VPN devices with their grants and WireGuard configuration (as QR code or file), panel access, reconcile, the recent log and diagnostics. Only printing the panel password stays in the CLI. The panel is **off** by default. Enable it in the server `.env` and recreate the container:
 
 ```dotenv
 RIFT_WEBPANEL=true
@@ -426,6 +428,13 @@ Without `RIFT_WEBPANEL_PASSWORD` RIFT generates a 24-character password once and
 
 `RIFT_WEBPANEL_ALLOW` takes comma-separated addresses or networks, for example `10.14.0.5,198.51.100.0/24`. In private mode only addresses that arrive through the tunnel can use it (agents or VPN devices); an address on the Internet needs public mode.
 
+**Who can change things.** Every logged-in session can read. Changes, and anything that shows a secret (invitation tokens, a device's private key), need a trusted connection as well:
+
+- a connection from loopback without proxy headers: on the server itself or through an SSH tunnel, or
+- a VPN device with panel access (`rift panel connect`, `rift panel allow`).
+
+Everything else is read-only: public addresses, `RIFT_WEBPANEL_ALLOW` entries and any request carrying `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto` or `X-Real-IP`. That last rule exists because a reverse proxy on the same host also connects from loopback. A proxy that strips or never sends these headers would make its clients look local, so do not put such a proxy in front of the panel. `RIFT_WEBPANEL_CONTROL=off` makes the panel read-only for everyone; there is deliberately no setting that allows changes over the public path. A trusted device plus the password is administrator access to your network: it can publish ports, invite agents and create VPN devices. If such a device is lost, revoke it with `rift vpn peer revoke NAME` and change the password.
+
 **Private mode from your own computer.** Either use an SSH tunnel and open `http://127.0.0.1:8090`:
 
 ```sh
@@ -441,7 +450,7 @@ rift panel connect laptop --export > laptop.conf   # the same as a file (contain
 
 Import the configuration into the WireGuard app, connect, and open `http://10.13.0.1:8090` (the server's `RIFT_SERVER_IPV4`). The device reaches only that port on the server; its configuration routes only the server's tunnel address, plus whatever `rift vpn allow` grants it on agents. `rift panel allow NAME` grants an existing VPN device; re-import its configuration afterwards so it routes the server address. `rift panel deny NAME` withdraws panel access and keeps the device's other grants. Disabling or revoking the device in `rift vpn peer` also ends its panel access.
 
-**Public mode** opens the port in UFW when RIFT manages it (`host_firewall = "auto"`); open it in any upstream firewall or cloud security group yourself. The panel speaks plain HTTP. In public mode the password and session cookie cross the network unencrypted, so prefer private mode, restrict `RIFT_WEBPANEL_ALLOW`, or put a TLS reverse proxy in front (the cookie is marked `Secure` when the proxy sends `X-Forwarded-Proto: https`). Everyone who has the password can change forwards and agents.
+**Public mode** opens the port in UFW when RIFT manages it (`host_firewall = "auto"`); open it in any upstream firewall or cloud security group yourself. The panel speaks plain HTTP. In public mode the password and session cookie cross the network unencrypted, so prefer private mode, restrict `RIFT_WEBPANEL_ALLOW`, or put a TLS reverse proxy in front (the cookie is marked `Secure` when the proxy sends `X-Forwarded-Proto: https`). Public sessions are read-only, so a password read off the network alone allows no changes; it still shows your agents, ports and devices.
 
 The panel port (default 8090, `RIFT_WEBPANEL_PORT`) must differ from the control and enrollment ports. Panel settings need a restart; `rift reload` refuses to change them.
 
@@ -454,7 +463,7 @@ The panel port (default 8090, `RIFT_WEBPANEL_PORT`) must differ from the control
 | `RIFT_PUBLIC_ENDPOINT` | Server | Reachable DNS name or IP, without port; enrollment certificate identity. |
 | `RIFT_PUBLIC_IPS` | Server | Comma-separated addresses assigned to server interfaces for listeners. |
 | `RIFT_ENROLLMENT_BIND` | `0.0.0.0:8443` | Enrollment listener. |
-| `RIFT_ENROLLMENT_ENABLED` | `true` | Enables enrollment. |
+| `RIFT_ENROLLMENT_ENABLED` | `auto` | `auto`: listen on the enrollment port only while an invitation is open; `true`/`always`: always; `false`: off. In `config.toml`, the old template line `enrollment_enabled = true` means `auto`; only `"always"` keeps the port open there. |
 | `RIFT_ALLOW_PRIVATE_LISTENERS` | `false` | Server. Set `true` behind a cloud NAT (e.g. Oracle Cloud), where the public address is not assigned to the interface: put the private interface address in `RIFT_PUBLIC_IPS`, keep the public DNS name in `RIFT_PUBLIC_ENDPOINT`, and open the ports in the cloud's firewall. Allows private and ULA listener addresses; loopback, link-local, multicast and unspecified stay forbidden, as does an address inside a tunnel pool. |
 | `RIFT_WG_PORT` | `51820` | Server. WireGuard UDP port; use another one if 51820 is taken on the host. Restart required. |
 | `RIFT_IPV4_POOL`, `RIFT_SERVER_IPV4` | `10.13.0.0/24`, `10.13.0.1` | Server. Override the IPv4 tunnel pool if it overlaps a host network (the default avoids Podman's 10.88.0.0/16, Docker's 172.16/12 and common WireGuard 10.8.0.0/24). The server address must be inside the pool; restart required. |
@@ -463,6 +472,7 @@ The panel port (default 8090, `RIFT_WEBPANEL_PORT`) must differ from the control
 | `RIFT_WEBPANEL` | `false` | Server. Serves the [web panel](#web-panel). Restart required. |
 | `RIFT_WEBPANEL_ACCESS` | `private` | Server. `private`: loopback and tunnel address only; `public`: every address. |
 | `RIFT_WEBPANEL_PORT` | `8090` | Server. TCP port of the panel. |
+| `RIFT_WEBPANEL_CONTROL` | `private` | Server. `private`: changes from loopback without proxy headers and from panel VPN devices; `off`: read-only everywhere. |
 | `RIFT_WEBPANEL_ALLOW` | empty | Server. Extra allowed source addresses or networks, comma-separated. |
 | `RIFT_WEBPANEL_PASSWORD` | generated | Server. Panel password, at least 12 characters; `rift panel password` shows the effective one. |
 | `RIFT_SERVER`, `RIFT_AGENT_NAME`, `RIFT_ENROLLMENT_TOKEN` | Agent | Invitation values; remove token after enrollment. |
@@ -498,7 +508,7 @@ rift logs --lines 100
 
 Run the container-specific log command on the machine hosting that role.
 
-- **Agent is not active:** check the invitation name, token and expiry; server readiness; DNS; TCP 8443 and UDP 51820 reachability; and both container logs. Enrollment checks the certificate name and CA.
+- **Agent is not active:** check the invitation name, token and expiry; server readiness; DNS; TCP 8443 and UDP 51820 reachability (with `auto`, 8443 only listens while the invitation is open; see `rift status`); and both container logs. Enrollment checks the certificate name and CA.
 - **Forward exists but traffic fails:** inspect `status` for pending or failed application; verify the correct agent, IP, port and protocol; check upstream and host firewall rules; and verify the service listens on the appropriate tunnel address or published host port. Test from a separate client.
 - **Website fails:** check DNS, TCP 80/443, which proxy owns 443, certificate issuance, proxy configuration and logs, and the local-ingress packet path. Ensure the agent application serves HTTP on the configured port.
 - **Conflicting routes or firewall:** review existing interfaces, pools, routing table, priorities and marks. RIFT refuses conflicting ownership; do not flush unrelated rules to make it start.

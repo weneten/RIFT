@@ -73,6 +73,36 @@ pub fn agent_rules(snap: &StateSnapshot, agent_id: &str) -> Vec<AgentVpnRule> {
         .collect()
 }
 
+/// The accesses the `vpn allow`/`deny` selectors name, in CLI flag terms.
+pub fn accesses(
+    server: bool,
+    full: bool,
+    ports: &[String],
+    subnets: &[Ipv4Net],
+    snat: bool,
+) -> Result<Vec<VpnAccess>> {
+    let mut out = Vec::new();
+    if server {
+        out.push(VpnAccess::Server);
+    }
+    if full {
+        out.push(VpnAccess::Full);
+    }
+    for spec in ports {
+        ensure!(
+            !spec.contains(':'),
+            "{spec:?} must be PORT/tcp, PORT/udp or PORT/both"
+        );
+        for (ports, _, protocol) in parse_forward_specs(std::slice::from_ref(spec))? {
+            out.push(VpnAccess::Port { protocol, ports });
+        }
+    }
+    for net in subnets {
+        out.push(VpnAccess::Subnet { net: *net, snat });
+    }
+    Ok(out)
+}
+
 pub fn validate_access(access: &VpnAccess) -> Result<()> {
     match access {
         VpnAccess::Port { ports, .. } => ports.validate(),
@@ -219,6 +249,16 @@ pub fn allocate(pool: Ipv4Net, peers: &[VpnPeer]) -> Result<Ipv4Addr> {
     pool.hosts()
         .find(|ip| !peers.iter().any(|p| p.ipv4 == *ip))
         .ok_or_else(|| anyhow::anyhow!("VPN address pool is exhausted"))
+}
+
+/// The same QR code as an SVG image, for the web panel.
+pub fn qr_svg(text: &str) -> Result<String> {
+    use qrcode::{render::svg, QrCode};
+    Ok(QrCode::new(text.as_bytes())?
+        .render::<svg::Color>()
+        .min_dimensions(264, 264)
+        .quiet_zone(true)
+        .build())
 }
 
 pub fn qr(text: &str) -> Result<String> {

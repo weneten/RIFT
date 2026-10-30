@@ -1,6 +1,6 @@
 #![cfg_attr(not(unix), allow(dead_code))]
 use crate::{
-    config::{validate_name, Config},
+    config::{validate_name, Config, EnrollmentMode},
     enrollment,
     model::*,
     net::{self, Kernel},
@@ -14,7 +14,7 @@ use serde::Serialize;
 use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{atomic::Ordering, Arc},
     time::Duration,
 };
 use tokio::{
@@ -32,6 +32,9 @@ struct Server {
     server_public_key: String,
     /// Set when the web panel is on.
     panel_password: Option<String>,
+    /// The running enrollment listener, if any. Shared with the kernel for the host firewall.
+    enrollment: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    enrollment_open: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The web panel acts through the same admin requests as the CLI.
@@ -62,7 +65,7 @@ pub async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
     let mut config = config;
     config.validate()?;
     secure_dir(&config.state_dir)?;
-    if config.enrollment_enabled {
+    if config.enrollment_enabled != EnrollmentMode::Off {
         crate::tls_material::prepare(&mut config)?;
         let _ = enrollment::server_tls(&config)?;
     }
@@ -73,14 +76,18 @@ pub async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
     } else {
         None
     };
+    let kernel = Kernel::new(config.clone());
+    let enrollment_open = kernel.enrollment_open.clone();
     let server = Arc::new(Server {
         config: tokio::sync::RwLock::new(config.clone()),
         config_path: config_path.clone(),
         state,
-        kernel: Arc::new(Mutex::new(Kernel::new(config.clone()))),
+        kernel: Arc::new(Mutex::new(kernel)),
         translation: Mutex::new(TranslationManager::new()),
         server_public_key,
         panel_password,
+        enrollment: Mutex::new(None),
+        enrollment_open,
     });
     reconcile(&server).await?;
     let admin = bind_admin(config.socket_path()).await?;
@@ -110,19 +117,12 @@ pub async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
     tasks.push(tokio::spawn(
         async move { accept_control(control6, s).await },
     ));
-    if config.enrollment_enabled {
-        let listener = TcpListener::bind(config.enrollment_bind)
-            .await
-            .with_context(|| format!("bind enrollment endpoint {}", config.enrollment_bind))?;
-        let state = server.state.clone();
-        let cfg = config.clone();
-        let public = server.server_public_key.clone();
-        let kernel = server.kernel.clone();
-        tasks.push(tokio::spawn(async move {
-            if let Err(e) = enrollment::serve(listener, state, cfg, public, kernel).await {
-                tracing::error!("enrollment endpoint stopped: {e:#}");
-            }
-        }));
+    if config.enrollment_enabled == EnrollmentMode::Always {
+        anyhow::ensure!(
+            server.enrollment_open.load(Ordering::SeqCst),
+            "enrollment endpoint {} could not be opened",
+            config.enrollment_bind
+        );
     }
     if let Some(password) = &server.panel_password {
         let listeners = crate::webpanel::bind(&config).await?;
@@ -162,6 +162,9 @@ pub async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
     // Wait for an in-flight reconciliation before stopping request handlers.
     // Keep this lock until cleanup finishes so no handler can apply new state.
     let kernel = server.kernel.lock().await;
+    if let Some(task) = server.enrollment.lock().await.take() {
+        task.abort();
+    }
     for task in &tasks {
         task.abort();
     }
@@ -191,7 +194,54 @@ async fn ensure_server_keypair(config: &Config) -> Result<(String, PathBuf)> {
     Ok((std::fs::read_to_string(public)?.trim().into(), private))
 }
 
+/// Opens or closes the enrollment listener. `always` keeps it open, `auto` only while an
+/// invitation is open (until activation, expiry or cancellation), `off` never.
+async fn sync_enrollment(s: &Server) -> Result<()> {
+    let config = s.config.read().await.clone();
+    let wanted = match config.enrollment_enabled {
+        EnrollmentMode::Always => true,
+        EnrollmentMode::Off => false,
+        EnrollmentMode::Auto => !s.state.open_invites()?.is_empty(),
+    };
+    let mut running = s.enrollment.lock().await;
+    let is_running = running.as_ref().is_some_and(|task| !task.is_finished());
+    if wanted && !is_running {
+        let listener = TcpListener::bind(config.enrollment_bind)
+            .await
+            .with_context(|| format!("bind enrollment endpoint {}", config.enrollment_bind))?;
+        let state = s.state.clone();
+        let public = s.server_public_key.clone();
+        let kernel = s.kernel.clone();
+        let cfg = config.clone();
+        *running = Some(tokio::spawn(async move {
+            if let Err(e) = enrollment::serve(listener, state, cfg, public, kernel).await {
+                tracing::error!("enrollment endpoint stopped: {e:#}");
+            }
+        }));
+        s.enrollment_open.store(true, Ordering::SeqCst);
+        tracing::info!(
+            "enrollment endpoint {} open ({})",
+            config.enrollment_bind,
+            config.enrollment_enabled
+        );
+    } else if !wanted {
+        if let Some(task) = running.take() {
+            task.abort();
+            tracing::info!(
+                "enrollment endpoint {} closed; no invitation is open",
+                config.enrollment_bind
+            );
+        }
+        s.enrollment_open.store(false, Ordering::SeqCst);
+    }
+    Ok(())
+}
+
 async fn reconcile(s: &Server) -> Result<()> {
+    // A failed bind must not stop forwards from being applied; status reports the port state.
+    if let Err(error) = sync_enrollment(s).await {
+        tracing::error!("enrollment endpoint: {error:#}");
+    }
     let config = s.config.read().await.clone();
     let k = s.kernel.lock().await;
     let snapshot = s.state.snapshot()?;
@@ -295,6 +345,7 @@ async fn reload_config(s: &Server) -> Result<u64> {
         || next.webpanel != current.webpanel
         || next.webpanel_access != current.webpanel_access
         || next.webpanel_port != current.webpanel_port
+        || next.webpanel_control != current.webpanel_control
         || next.webpanel_allow != current.webpanel_allow
         || next.route_table != current.route_table
         || next.rule_priority != current.rule_priority
@@ -304,11 +355,16 @@ async fn reload_config(s: &Server) -> Result<u64> {
         || next.tls_key != current.tls_key
         || next.tls_ca != current.tls_ca;
     anyhow::ensure!(!immutable_changed,"configuration change requires a service restart (interface, endpoint, pools, ports, routing, web panel, or TLS identity)");
+    let kernel = |config| {
+        let mut kernel = Kernel::new(config);
+        kernel.enrollment_open = s.enrollment_open.clone();
+        kernel
+    };
     *s.config.write().await = next.clone();
-    *s.kernel.lock().await = Kernel::new(next);
+    *s.kernel.lock().await = kernel(next);
     if let Err(error) = reconcile(s).await {
         *s.config.write().await = current.clone();
-        *s.kernel.lock().await = Kernel::new(current);
+        *s.kernel.lock().await = kernel(current);
         let _ = reconcile(s).await;
         return Err(error.context("reload rejected; previous runtime configuration restored"));
     }
@@ -632,7 +688,15 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
                 .collect();
             let fully_applied =
                 error.is_none() && applied == Some(snap.generation) && pending_forwards.is_empty();
-            serde_json::json!({"snapshot":snap,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"fully_applied":fully_applied,"connection_history":s.state.health()?})
+            let cfg = s.config.read().await.clone();
+            let invites: Vec<_> = s
+                .state
+                .open_invites()?
+                .into_iter()
+                .map(|(name, expires_at)| serde_json::json!({"name":name,"expires_at":expires_at}))
+                .collect();
+            let enrollment = serde_json::json!({"mode":cfg.enrollment_enabled,"open":s.enrollment_open.load(Ordering::SeqCst),"bind":cfg.enrollment_bind});
+            serde_json::json!({"snapshot":snap,"enrollment":enrollment,"invites":invites,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"fully_applied":fully_applied,"connection_history":s.state.health()?})
         }
         AdminRequest::AgentsList => serde_json::to_value(snap.agents)?,
         AdminRequest::AgentsShow { name } => {
@@ -646,8 +710,16 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
         AdminRequest::Invite { name, ttl_seconds } => {
             let cfg = s.config.read().await.clone();
             validate_name(&name)?;
+            anyhow::ensure!(
+                cfg.enrollment_enabled != EnrollmentMode::Off,
+                "enrollment is off; set RIFT_ENROLLMENT_ENABLED=auto in the server .env and recreate the container"
+            );
             let token = enrollment::create_invite(&cfg, &s.state, &name, ttl_seconds)?;
-            serde_json::json!({"name":name,"token":token,"expires_at":now()+ttl_seconds as i64,"server":host_port(&cfg.public_endpoint,cfg.enrollment_bind.port())})
+            sync_enrollment(s)
+                .await
+                .context("invitation created, but the enrollment port could not be opened")?;
+            reconcile(s).await?;
+            serde_json::json!({"name":name,"token":token,"expires_at":now()+ttl_seconds as i64,"server":host_port(&cfg.public_endpoint,cfg.enrollment_bind.port()),"enrollment":cfg.enrollment_enabled})
         }
         AdminRequest::CancelInvite { name } => {
             s.state.cancel_invite(&name)?;

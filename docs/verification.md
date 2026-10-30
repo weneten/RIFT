@@ -45,12 +45,17 @@ The `rift vpn` feature has unit coverage only: rule rendering and ordering, stat
 
 ## Web panel: not yet verified on a kernel
 
-The web panel has unit coverage (configuration parsing, source checks, nft and UFW rule rendering, client AllowedIPs, HTTP parsing limits, login, session, CSRF header, action allow-list, password file mode) and was driven in headless Chromium against a fake backend (login, wrong password, enable/disable, remove, reload, logout, light/dark, 390 px width, no CSP violations). It has not run inside a real server container. Before relying on it, check on a disposable server:
+The web panel has unit coverage (configuration parsing, source checks, read/write separation, proxy headers, nft and UFW rule rendering, client AllowedIPs, HTTP parsing limits, login, session, CSRF header, action list, short-form forwards, password file mode) and was driven in headless Chromium against a fake backend (login, invitation, forwards, devices with QR code, grants, cancel, log, diagnostics, read-only view behind a proxy header, light/dark, 390 px width, no CSP violations). It has not run inside a real server container. Before relying on it, check on a disposable server:
 
 1. `RIFT_WEBPANEL=true` with `private`: the panel answers on `127.0.0.1` and through `ssh -L`, but not on the public address.
 2. `rift panel connect` yields a working WireGuard configuration; the device opens `http://10.13.0.1:8090` but still cannot reach the control port, other devices or ungranted agents; `rift panel deny`, `vpn peer disable` and `revoke` cut it off.
 3. An agent or a device without the panel flag cannot connect to the panel port.
 4. `public` with and without `RIFT_WEBPANEL_ALLOW`, with UFW active and with `host_firewall = "off"`.
+5. Changes from a public address, an allow-listed address and loopback behind a reverse proxy are refused; from loopback and a panel device they work, including an invitation, a forward, a device with QR code and a grant.
+
+## Enrollment port in `auto` mode: not yet verified on a kernel
+
+Unit tests cover the configuration parsing; the listener lifecycle has not run in a container. Check that 8443 is closed at start without invitations, opens with `rift agents add` and with an invitation from the panel, stays open until the agent is active, and closes after activation, `cancel-invite`, agent removal and expiry (within about 10 s). With UFW, RIFT's `rift:enrollment` rule should appear and disappear with it. `RIFT_ENROLLMENT_ENABLED=true` keeps it open; `false` refuses invitations.
 
 ## Release gates
 

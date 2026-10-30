@@ -8,13 +8,17 @@
 //!
 //! The HTTP server is deliberately small: one request per connection, bounded headers and
 //! bodies, no keep-alive. Panel actions go through the same admin requests as the CLI.
+//!
+//! Every logged-in session may read. Changes, and anything that reveals a secret (an
+//! invitation token, a device's private key), additionally need a trusted connection: loopback
+//! without proxy headers or a panel VPN device, and `RIFT_WEBPANEL_CONTROL=private`.
 
 use crate::{
-    config::{Config, PanelAccess},
+    config::{Config, PanelAccess, PanelControl},
     model::*,
     protocol::AdminRequest,
 };
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use ipnet::{IpNet, Ipv4Net};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -278,9 +282,10 @@ impl<B: Backend> Panel<B> {
             ("GET", "/" | "/index.html") => Response::asset("text/html", INDEX),
             ("GET", "/app.js") => Response::asset("text/javascript", APP_JS),
             ("GET", "/app.css") => Response::asset("text/css", APP_CSS),
-            ("GET", "/api/session") => {
-                Response::json(200, &json!({"authenticated": self.session(&request)}))
-            }
+            ("GET", "/api/session") => Response::json(
+                200,
+                &json!({"authenticated": self.session(&request), "can_write": self.trusted(&request, source)}),
+            ),
             ("POST", path) if request.header(CSRF_HEADER) != Some("1") => {
                 tracing::warn!("web panel refused {path} from {source}: missing {CSRF_HEADER}");
                 Response::error(403, "missing request header")
@@ -297,14 +302,31 @@ impl<B: Backend> Panel<B> {
             (_, "/api/overview" | "/api/action") if !self.session(&request) => {
                 Response::error(401, "log in first")
             }
-            ("GET", "/api/overview") => match self.overview().await {
+            ("GET", "/api/overview") => match self.overview(self.trusted(&request, source)).await {
                 Ok(data) => Response::json(200, &data),
                 Err(e) => Response::error(500, &e.to_string()),
             },
-            ("POST", "/api/action") => match self.action(&request, source).await {
-                Ok(data) => Response::json(200, &data),
-                Err(e) => Response::error(400, &e.to_string()),
-            },
+            ("POST", "/api/action") => {
+                let action: Action = match serde_json::from_slice(&request.body) {
+                    Ok(action) => action,
+                    Err(e) => {
+                        return Response::error(400, &format!("unknown or malformed action: {e}"))
+                    }
+                };
+                if action.writes() && !self.trusted(&request, source) {
+                    tracing::warn!(
+                        "web panel refused a change from {source}: read-only connection"
+                    );
+                    return Response::error(403, READ_ONLY);
+                }
+                if action.writes() {
+                    tracing::info!("web panel action from {source}: {action:?}");
+                }
+                match action.run(self).await {
+                    Ok(data) => Response::json(200, &data),
+                    Err(e) => Response::error(400, &format!("{e:#}")),
+                }
+            }
             (
                 _,
                 "/" | "/index.html" | "/app.js" | "/app.css" | "/api/session" | "/api/login"
@@ -312,6 +334,16 @@ impl<B: Backend> Panel<B> {
             ) => Response::error(405, "method not allowed"),
             _ => Response::error(404, "not found"),
         }
+    }
+
+    /// Changes need an encrypted, local path: loopback without proxy headers (the VPS itself
+    /// or an SSH tunnel) or a VPN device granted the panel. A reverse proxy on the same host
+    /// also connects from loopback, so any proxy header makes the request read-only.
+    fn trusted(&self, request: &Request, source: IpAddr) -> bool {
+        let source = source.to_canonical();
+        self.config.webpanel_control == PanelControl::Private
+            && !PROXY_HEADERS.iter().any(|h| request.header(h).is_some())
+            && (source.is_loopback() || self.backend.panel_peers().contains(&source))
     }
 
     fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, i64>> {
@@ -374,45 +406,350 @@ impl<B: Backend> Panel<B> {
         response
     }
 
-    async fn overview(&self) -> Result<Value> {
+    async fn overview(&self, can_write: bool) -> Result<Value> {
         let status = self.backend.admin(AdminRequest::Status).await?;
         let peers = self.backend.admin(AdminRequest::VpnPeerList).await?;
         let panel = self.backend.admin(AdminRequest::PanelStatus).await?;
-        Ok(compose_overview(&status, &peers, &panel))
+        let mut overview = compose_overview(&status, &peers, &panel);
+        overview["can_write"] = can_write.into();
+        overview["public_ips"] = json!(self.config.public_ips);
+        Ok(overview)
     }
 
-    async fn action(&self, request: &Request, source: IpAddr) -> Result<Value> {
-        let action: Action = serde_json::from_slice(&request.body)
-            .map_err(|e| anyhow!("unknown or malformed action: {e}"))?;
-        tracing::info!("web panel action from {source}: {action:?}");
-        self.backend.admin(action.request()).await
+    async fn admin(&self, request: AdminRequest) -> Result<Value> {
+        self.backend.admin(request).await
     }
 }
 
-/// The only changes the panel can make. Everything else stays with the CLI.
+const READ_ONLY: &str =
+    "read-only connection: changes need the VPS itself, an SSH tunnel or a panel VPN device";
+const PROXY_HEADERS: [&str; 5] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+];
+
+fn default_lines() -> usize {
+    200
+}
+fn transparent() -> ForwardMode {
+    ForwardMode::Transparent
+}
+fn seconds(text: &str) -> Result<u64> {
+    let seconds = humantime::parse_duration(text.trim())
+        .with_context(|| format!("invalid duration {text:?}; use e.g. 15m or 1h"))?
+        .as_secs();
+    ensure!(seconds > 0, "duration must be positive");
+    Ok(seconds)
+}
+fn words(text: &str) -> Vec<String> {
+    text.split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|w| !w.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// What the panel can do: the CLI's commands except printing the panel password. Reads are
+/// open to every logged-in session; everything else needs a trusted connection.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
-    ForwardEnable { id: u64, enabled: bool },
-    ForwardRemove { id: u64 },
-    AgentEnable { name: String, enabled: bool },
-    VpnPeerEnable { name: String, enabled: bool },
+    Logs {
+        #[serde(default = "default_lines")]
+        lines: usize,
+    },
+    Diagnostics,
+    Reload,
+    AgentInvite {
+        name: String,
+        ttl: String,
+    },
+    AgentCancelInvite {
+        name: String,
+    },
+    AgentRemove {
+        name: String,
+    },
+    AgentEnable {
+        name: String,
+        enabled: bool,
+    },
+    AgentRename {
+        name: String,
+        new_name: String,
+    },
+    AgentRotate {
+        name: String,
+    },
+    /// `specs` uses the CLI's short form: `LISTEN[:TARGET]/tcp|udp|both`, several allowed.
+    ForwardAdd {
+        agent: String,
+        specs: String,
+        #[serde(default)]
+        listen_ip: Option<IpAddr>,
+        #[serde(default)]
+        target_family: Option<Family>,
+        #[serde(default = "transparent")]
+        mode: ForwardMode,
+        #[serde(default)]
+        ingress: Ingress,
+    },
+    ForwardEnable {
+        id: u64,
+        enabled: bool,
+    },
+    ForwardRemove {
+        id: u64,
+    },
+    BanAdd {
+        agent: String,
+        forward_id: u64,
+        ip: IpAddr,
+        ttl: String,
+    },
+    VpnPeerAdd {
+        name: String,
+        #[serde(default)]
+        panel: bool,
+    },
+    VpnPeerEnable {
+        name: String,
+        enabled: bool,
+    },
+    VpnPeerRevoke {
+        name: String,
+    },
+    /// The selectors of `rift vpn allow`; `ports` and `subnets` may hold several entries.
+    VpnAllow {
+        peer: String,
+        agent: String,
+        #[serde(default)]
+        server: bool,
+        #[serde(default)]
+        full: bool,
+        #[serde(default)]
+        ports: String,
+        #[serde(default)]
+        subnets: String,
+        #[serde(default)]
+        snat: bool,
+    },
+    /// Without `access`, withdraws everything the device has on that agent.
+    VpnDeny {
+        peer: String,
+        agent: String,
+        #[serde(default)]
+        access: Option<VpnAccess>,
+    },
+    /// Contains the device's private key, so it counts as a change.
+    VpnConfig {
+        name: String,
+    },
+    PanelAllow {
+        name: String,
+        allowed: bool,
+    },
 }
 impl Action {
-    fn request(self) -> AdminRequest {
-        match self {
-            Self::ForwardEnable { id, enabled } => AdminRequest::ForwardEnable { id, enabled },
-            Self::ForwardRemove { id } => AdminRequest::ForwardRemove { id },
+    fn writes(&self) -> bool {
+        !matches!(self, Self::Logs { .. } | Self::Diagnostics)
+    }
+
+    async fn run<B: Backend>(self, panel: &Panel<B>) -> Result<Value> {
+        Ok(match self {
+            Self::Logs { lines } => {
+                panel
+                    .admin(AdminRequest::Logs {
+                        lines: lines.min(1000),
+                    })
+                    .await?
+            }
+            Self::Diagnostics => {
+                let status = panel.admin(AdminRequest::Status).await?;
+                json!({"doctor": status["doctor"], "peers": status["peers"], "connection_history": status["connection_history"]})
+            }
+            Self::Reload => panel.admin(AdminRequest::Reload).await?,
+            Self::AgentInvite { name, ttl } => {
+                let mut data = panel
+                    .admin(AdminRequest::Invite {
+                        name,
+                        ttl_seconds: seconds(&ttl)?,
+                    })
+                    .await?;
+                data["lines"] = format!(
+                    "RIFT_SERVER={}\nRIFT_AGENT_NAME={}\nRIFT_ENROLLMENT_TOKEN={}\n",
+                    data["server"].as_str().unwrap_or_default(),
+                    data["name"].as_str().unwrap_or_default(),
+                    data["token"].as_str().unwrap_or_default()
+                )
+                .into();
+                data
+            }
+            Self::AgentCancelInvite { name } => {
+                panel.admin(AdminRequest::CancelInvite { name }).await?
+            }
+            Self::AgentRemove { name } => panel.admin(AdminRequest::AgentRemove { name }).await?,
             Self::AgentEnable {
                 name,
                 enabled: true,
-            } => AdminRequest::AgentEnable { name },
+            } => panel.admin(AdminRequest::AgentEnable { name }).await?,
             Self::AgentEnable {
                 name,
                 enabled: false,
-            } => AdminRequest::AgentDisable { name },
-            Self::VpnPeerEnable { name, enabled } => AdminRequest::VpnPeerEnable { name, enabled },
-        }
+            } => panel.admin(AdminRequest::AgentDisable { name }).await?,
+            Self::AgentRename { name, new_name } => {
+                panel
+                    .admin(AdminRequest::AgentRename { name, new_name })
+                    .await?
+            }
+            Self::AgentRotate { name } => panel.admin(AdminRequest::AgentRotate { name }).await?,
+            Self::ForwardAdd {
+                agent,
+                specs,
+                listen_ip,
+                target_family,
+                mode,
+                ingress,
+            } => {
+                let specs = words(&specs);
+                ensure!(
+                    !specs.is_empty(),
+                    "name at least one port with its protocol, for example 8080:80/tcp"
+                );
+                let plans = parse_forward_specs(&specs)?;
+                let ips = &panel.config.public_ips;
+                let ip = listen_ip
+                    .or_else(|| (ips.len() == 1).then(|| ips[0]))
+                    .context("choose a listen IP; the server has zero or several public IPs")?;
+                let forwards = build_forwards(
+                    &agent,
+                    &plans,
+                    ip,
+                    target_family.unwrap_or(Family::of(ip)),
+                    mode,
+                    ingress,
+                )?;
+                let mut created = Vec::new();
+                for forward in forwards {
+                    match panel.admin(AdminRequest::ForwardAdd(forward)).await {
+                        Ok(data) => created.push(data),
+                        Err(e) if created.is_empty() => return Err(e),
+                        Err(e) => {
+                            let ids: Vec<String> =
+                                created.iter().map(|f| f["id"].to_string()).collect();
+                            bail!("{e} (forwards {} were already created)", ids.join(", "))
+                        }
+                    }
+                }
+                Value::Array(created)
+            }
+            Self::ForwardEnable { id, enabled } => {
+                panel
+                    .admin(AdminRequest::ForwardEnable { id, enabled })
+                    .await?
+            }
+            Self::ForwardRemove { id } => panel.admin(AdminRequest::ForwardRemove { id }).await?,
+            Self::BanAdd {
+                agent,
+                forward_id,
+                ip,
+                ttl,
+            } => {
+                panel
+                    .admin(AdminRequest::Ban {
+                        agent,
+                        forward_id,
+                        ip,
+                        ttl_seconds: seconds(&ttl)?,
+                    })
+                    .await?
+            }
+            Self::VpnPeerAdd { name, panel: grant } => {
+                let data = panel
+                    .admin(AdminRequest::VpnPeerAdd { name: name.clone() })
+                    .await?;
+                if grant {
+                    panel
+                        .admin(AdminRequest::PanelAllow {
+                            name,
+                            allowed: true,
+                        })
+                        .await
+                        .context("device created, but panel access was not granted")?;
+                }
+                data
+            }
+            Self::VpnPeerEnable { name, enabled } => {
+                panel
+                    .admin(AdminRequest::VpnPeerEnable { name, enabled })
+                    .await?
+            }
+            Self::VpnPeerRevoke { name } => {
+                panel.admin(AdminRequest::VpnPeerRevoke { name }).await?
+            }
+            Self::VpnAllow {
+                peer,
+                agent,
+                server,
+                full,
+                ports,
+                subnets,
+                snat,
+            } => {
+                let subnets = words(&subnets)
+                    .iter()
+                    .map(|s| {
+                        s.parse()
+                            .with_context(|| format!("{s:?} is not an IPv4 network"))
+                    })
+                    .collect::<Result<Vec<ipnet::Ipv4Net>>>()?;
+                ensure!(
+                    !snat || !subnets.is_empty(),
+                    "SNAT applies only to a subnet"
+                );
+                let accesses = crate::vpn::accesses(server, full, &words(&ports), &subnets, snat)?;
+                ensure!(
+                    !accesses.is_empty(),
+                    "choose what to allow: host, all protocols, ports or a subnet"
+                );
+                for access in accesses {
+                    panel
+                        .admin(AdminRequest::VpnAllow {
+                            peer: peer.clone(),
+                            agent: agent.clone(),
+                            access,
+                        })
+                        .await?;
+                }
+                json!({"peer": peer, "agent": agent})
+            }
+            Self::VpnDeny {
+                peer,
+                agent,
+                access,
+            } => {
+                panel
+                    .admin(AdminRequest::VpnDeny {
+                        peer,
+                        agent,
+                        access,
+                    })
+                    .await?
+            }
+            Self::VpnConfig { name } => {
+                let mut data = panel.admin(AdminRequest::VpnConfig { name }).await?;
+                let text = data["config"].as_str().unwrap_or_default().to_string();
+                data["qr_svg"] = crate::vpn::qr_svg(&text)?.into();
+                data
+            }
+            Self::PanelAllow { name, allowed } => {
+                panel
+                    .admin(AdminRequest::PanelAllow { name, allowed })
+                    .await?
+            }
+        })
     }
 }
 
@@ -467,10 +804,19 @@ fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> Value {
             })
         })
         .collect();
+    let bans: Vec<Value> = snapshot["bans"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .map(|b| json!({"id": b["id"], "agent": name_of(&b["agent_id"]), "forward_id": b["forward_id"], "ip": b["ip"], "expires_at": b["expires_at"]}))
+        .collect();
     json!({
         "generation": snapshot["generation"],
         "fully_applied": status["fully_applied"],
         "apply_error": status["apply_error"],
+        "enrollment": status["enrollment"],
+        "invites": status["invites"],
+        "bans": bans,
         "agents": agents,
         "forwards": forwards,
         "vpn_peers": peers,
@@ -664,6 +1010,13 @@ mod tests {
                 }),
                 AdminRequest::VpnPeerList => json!([]),
                 AdminRequest::PanelStatus => json!({"enabled": true}),
+                AdminRequest::Invite { name, .. } => {
+                    json!({"name": name, "token": "TOKEN", "server": "rift.example.net:8443"})
+                }
+                AdminRequest::VpnConfig { .. } => {
+                    json!({"config": "[Interface]\nPrivateKey = K\n"})
+                }
+                AdminRequest::ForwardAdd(f) => json!({"id": f.listen_ports.start}),
                 _ => json!({"ok": true}),
             })
         }
@@ -882,7 +1235,7 @@ mod tests {
             "127.0.0.1",
             &post(
                 "/api/action",
-                r#"{"action":"vpn_config","name":"x"}"#,
+                r#"{"action":"panel_password"}"#,
                 &format!("Cookie: {cookie}\r\nX-Rift-Panel: 1\r\n"),
             ),
         )
@@ -907,6 +1260,167 @@ mod tests {
         )
         .await;
         assert!(after.starts_with("HTTP/1.1 401"), "{after}");
+    }
+
+    async fn logged_in(panel: &Panel<Arc<Fake>>) -> String {
+        let login = r#"{"password":"correct horse battery"}"#;
+        let ok = exchange(
+            panel,
+            "127.0.0.1",
+            &post("/api/login", login, "X-Rift-Panel: 1\r\n"),
+        )
+        .await;
+        session_cookie(&ok)
+    }
+
+    async fn act(
+        panel: &Panel<Arc<Fake>>,
+        source: &str,
+        cookie: &str,
+        body: &str,
+        extra: &str,
+    ) -> String {
+        exchange(
+            panel,
+            source,
+            &post(
+                "/api/action",
+                body,
+                &format!("Cookie: {cookie}\r\nX-Rift-Panel: 1\r\n{extra}"),
+            ),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn changes_need_loopback_without_a_proxy_or_a_panel_device() {
+        let (panel, fake) = panel(config(PanelAccess::Public, ""));
+        let cookie = logged_in(&panel).await;
+        let change = r#"{"action":"forward_remove","id":3}"#;
+        let read = r#"{"action":"logs","lines":10}"#;
+        // A public address may read but not change.
+        let refused = act(&panel, "203.0.113.7", &cookie, change, "").await;
+        assert!(
+            refused.starts_with("HTTP/1.1 403") && refused.contains("read-only"),
+            "{refused}"
+        );
+        assert!(act(&panel, "203.0.113.7", &cookie, read, "")
+            .await
+            .starts_with("HTTP/1.1 200"));
+        // Loopback behind a reverse proxy is public too.
+        let proxied = act(
+            &panel,
+            "127.0.0.1",
+            &cookie,
+            change,
+            "X-Forwarded-For: 203.0.113.7\r\n",
+        )
+        .await;
+        assert!(proxied.starts_with("HTTP/1.1 403"), "{proxied}");
+        // The VPS itself and a panel device may change.
+        assert!(act(&panel, "127.0.0.1", &cookie, change, "")
+            .await
+            .starts_with("HTTP/1.1 200"));
+        assert!(act(&panel, "10.14.0.2", &cookie, change, "")
+            .await
+            .starts_with("HTTP/1.1 200"));
+        let removals = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.contains("ForwardRemove"))
+            .count();
+        assert_eq!(removals, 2);
+        // The session endpoint tells the page which one it is.
+        let session = exchange(&panel, "203.0.113.7", "GET /api/session HTTP/1.1\r\n\r\n").await;
+        assert!(session.contains("\"can_write\":false"), "{session}");
+        let session = exchange(&panel, "10.14.0.2", "GET /api/session HTTP/1.1\r\n\r\n").await;
+        assert!(session.contains("\"can_write\":true"), "{session}");
+        // Private keys count as a change.
+        let config = r#"{"action":"vpn_config","name":"laptop"}"#;
+        assert!(act(&panel, "203.0.113.7", &cookie, config, "")
+            .await
+            .starts_with("HTTP/1.1 403"));
+        let shown = act(&panel, "127.0.0.1", &cookie, config, "").await;
+        assert!(
+            shown.contains("<svg") && shown.contains("PrivateKey"),
+            "{shown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_off_makes_every_connection_read_only() {
+        let mut cfg = config(PanelAccess::Private, "");
+        cfg.webpanel_control = PanelControl::Off;
+        let (panel, _) = panel(cfg);
+        let cookie = logged_in(&panel).await;
+        let change = r#"{"action":"reload"}"#;
+        assert!(act(&panel, "127.0.0.1", &cookie, change, "")
+            .await
+            .starts_with("HTTP/1.1 403"));
+    }
+
+    #[tokio::test]
+    async fn forwards_use_the_short_form_and_invites_return_the_env_lines() {
+        let mut cfg = config(PanelAccess::Private, "");
+        cfg.public_ips = vec!["203.0.113.10".parse().unwrap()];
+        let (panel, fake) = panel(cfg);
+        let cookie = logged_in(&panel).await;
+        let added = act(
+            &panel,
+            "127.0.0.1",
+            &cookie,
+            r#"{"action":"forward_add","agent":"home","specs":"53/both, 8080:80/tcp"}"#,
+            "",
+        )
+        .await;
+        assert!(added.starts_with("HTTP/1.1 200"), "{added}");
+        let calls = fake.calls.lock().unwrap().clone();
+        let adds: Vec<_> = calls.iter().filter(|c| c.contains("ForwardAdd")).collect();
+        assert_eq!(adds.len(), 3, "{adds:?}");
+        assert!(adds
+            .iter()
+            .all(|c| c.contains("203.0.113.10") && c.contains("transparent")));
+        let bad = act(
+            &panel,
+            "127.0.0.1",
+            &cookie,
+            r#"{"action":"forward_add","agent":"home","specs":"80"}"#,
+            "",
+        )
+        .await;
+        assert!(
+            bad.starts_with("HTTP/1.1 400") && bad.contains("needs a protocol"),
+            "{bad}"
+        );
+        let invite = act(
+            &panel,
+            "127.0.0.1",
+            &cookie,
+            r#"{"action":"agent_invite","name":"node2","ttl":"15m"}"#,
+            "",
+        )
+        .await;
+        assert!(invite.contains("RIFT_ENROLLMENT_TOKEN=TOKEN"), "{invite}");
+        assert!(calls.iter().all(|c| !c.contains("PanelPassword")));
+        let grant = act(
+            &panel,
+            "127.0.0.1",
+            &cookie,
+            r#"{"action":"vpn_allow","peer":"phone","agent":"home","ports":"22/tcp 53/both","subnets":"192.168.178.0/24"}"#,
+            "",
+        )
+        .await;
+        assert!(grant.starts_with("HTTP/1.1 200"), "{grant}");
+        let allows = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.contains("VpnAllow"))
+            .count();
+        assert_eq!(allows, 4);
     }
 
     #[tokio::test]

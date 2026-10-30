@@ -1,3 +1,4 @@
+use anyhow::{bail, Context};
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -286,6 +287,65 @@ pub struct PeerStats {
     pub last_handshake: i64,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+}
+/// Parses `LISTEN[:TARGET]/tcp|udp|both` specs; `both` adds a TCP and a UDP forward.
+/// The protocol is mandatory so a forward never silently becomes TCP.
+pub fn parse_forward_specs(
+    specs: &[String],
+) -> anyhow::Result<Vec<(PortRange, PortRange, Protocol)>> {
+    let mut plans = Vec::new();
+    for spec in specs {
+        let (ports, proto) = spec.split_once('/').with_context(|| {
+            format!("{spec:?} needs a protocol: {spec}/tcp, {spec}/udp or {spec}/both")
+        })?;
+        let (listen, target) = ports.split_once(':').unwrap_or((ports, ports));
+        let listen: PortRange = listen
+            .parse()
+            .with_context(|| format!("invalid listen port in {spec:?}"))?;
+        let target: PortRange = target
+            .parse()
+            .with_context(|| format!("invalid target port in {spec:?}"))?;
+        let protocols = match proto {
+            "tcp" => vec![Protocol::Tcp],
+            "udp" => vec![Protocol::Udp],
+            "both" => vec![Protocol::Tcp, Protocol::Udp],
+            _ => bail!("protocol in {spec:?} must be tcp, udp or both"),
+        };
+        for protocol in protocols {
+            plans.push((listen, target, protocol));
+        }
+    }
+    Ok(plans)
+}
+/// The forwards one `forwards add` creates, validated, with IDs still to be assigned.
+pub fn build_forwards(
+    agent: &str,
+    plans: &[(PortRange, PortRange, Protocol)],
+    listen_ip: IpAddr,
+    target_family: Family,
+    mode: ForwardMode,
+    ingress: Ingress,
+) -> anyhow::Result<Vec<Forward>> {
+    plans
+        .iter()
+        .map(|&(listen, target, protocol)| {
+            let forward = Forward {
+                id: 0,
+                agent_id: agent.into(),
+                listen_ip,
+                listen_ports: listen,
+                target_ports: target,
+                protocol,
+                mode,
+                ingress,
+                target_family,
+                enabled: true,
+                generation: 0,
+            };
+            forward.validate()?;
+            Ok(forward)
+        })
+        .collect()
 }
 pub fn now() -> i64 {
     std::time::SystemTime::now()

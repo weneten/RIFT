@@ -222,6 +222,34 @@ fn status(data: &Value) -> String {
             rows,
             "No agents configured.",
         ));
+        if let Some(enrollment) = data.get("enrollment") {
+            let port = field(enrollment, "bind");
+            let open = enrollment["open"].as_bool() == Some(true);
+            lines.push(match (field(enrollment, "mode").as_str(), open) {
+                ("off", _) => "Enrollment: off.".into(),
+                ("always", true) => format!("Enrollment: {port} always open."),
+                ("auto", true) => format!("Enrollment: {port} open while an invitation is open."),
+                ("auto", false) => {
+                    "Enrollment: closed; opens with the next 'rift agents add'.".into()
+                }
+                (_, false) => {
+                    format!("Enrollment: {port} should be open but is not; see the logs.")
+                }
+                (mode, true) => format!("Enrollment: {port} open ({mode})."),
+            });
+        }
+        let invites: Vec<String> = data["invites"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|i| {
+                let left = i["expires_at"].as_i64().unwrap_or(0) - rift::model::now();
+                format!("{} ({}m left)", field(i, "name"), (left.max(0) + 59) / 60)
+            })
+            .collect();
+        if !invites.is_empty() {
+            lines.push(format!("Open invitations: {}", invites.join(", ")));
+        }
         lines.push(format!(
             "Forwards: {} total. Use 'rift forwards list' for details.",
             snapshot["forwards"].as_array().map_or(0, Vec::len)

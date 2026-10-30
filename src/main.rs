@@ -130,29 +130,13 @@ struct VpnAccessArgs {
 }
 impl VpnAccessArgs {
     fn accesses(&self) -> Result<Vec<VpnAccess>> {
-        let mut out = Vec::new();
-        if self.server {
-            out.push(VpnAccess::Server);
-        }
-        if self.full {
-            out.push(VpnAccess::Full);
-        }
-        for spec in &self.ports {
-            anyhow::ensure!(
-                !spec.contains(':'),
-                "{spec:?} must be PORT/tcp, PORT/udp or PORT/both"
-            );
-            for (ports, _, protocol) in parse_forward_specs(std::slice::from_ref(spec))? {
-                out.push(VpnAccess::Port { protocol, ports });
-            }
-        }
-        for net in &self.subnets {
-            out.push(VpnAccess::Subnet {
-                net: *net,
-                snat: self.snat,
-            });
-        }
-        Ok(out)
+        rift::vpn::accesses(
+            self.server,
+            self.full,
+            &self.ports,
+            &self.subnets,
+            self.snat,
+        )
     }
 }
 #[derive(Subcommand)]
@@ -445,33 +429,23 @@ async fn run() -> Result<()> {
                         Some("v6") => Family::V6,
                         _ => Family::of(ip),
                     };
-                    let mut requests = Vec::new();
-                    for (listen, target, protocol) in plans {
-                        let forward = Forward {
-                            id: 0,
-                            agent_id: agent.clone(),
-                            listen_ip: ip,
-                            listen_ports: listen,
-                            target_ports: target,
-                            protocol,
-                            mode: if mode == "translate" {
-                                ForwardMode::Translate
-                            } else {
-                                ForwardMode::Transparent
-                            },
-                            ingress: if ingress == "local" {
-                                Ingress::Local
-                            } else {
-                                Ingress::Public
-                            },
-                            target_family: family,
-                            enabled: true,
-                            generation: 0,
-                        };
-                        forward.validate()?;
-                        requests.push(AdminRequest::ForwardAdd(forward));
-                    }
-                    let mut requests = requests.into_iter();
+                    let forwards = build_forwards(
+                        &agent,
+                        &plans,
+                        ip,
+                        family,
+                        if mode == "translate" {
+                            ForwardMode::Translate
+                        } else {
+                            ForwardMode::Transparent
+                        },
+                        if ingress == "local" {
+                            Ingress::Local
+                        } else {
+                            Ingress::Public
+                        },
+                    )?;
+                    let mut requests = forwards.into_iter().map(AdminRequest::ForwardAdd);
                     let first = requests.next().context("nothing to add")?;
                     more.extend(requests);
                     first
@@ -593,6 +567,9 @@ async fn show(
             response.data["token"].as_str().unwrap_or_default()
         );
         eprintln!("Copy these values into the agent's private .env file. This invitation is single-use and expires.");
+        if response.data["enrollment"].as_str() == Some("auto") {
+            eprintln!("The enrollment port is open until the agent is active or the invitation expires or is cancelled.");
+        }
     } else {
         let agents = if matches!(
             request,
@@ -612,33 +589,6 @@ async fn show(
         );
     }
     Ok(())
-}
-/// Parses `LISTEN[:TARGET]/tcp|udp|both` specs; `both` adds a TCP and a UDP forward.
-/// The protocol is mandatory so a forward never silently becomes TCP.
-fn parse_forward_specs(specs: &[String]) -> Result<Vec<(PortRange, PortRange, Protocol)>> {
-    let mut plans = Vec::new();
-    for spec in specs {
-        let (ports, proto) = spec.split_once('/').with_context(|| {
-            format!("{spec:?} needs a protocol: {spec}/tcp, {spec}/udp or {spec}/both")
-        })?;
-        let (listen, target) = ports.split_once(':').unwrap_or((ports, ports));
-        let listen: PortRange = listen
-            .parse()
-            .with_context(|| format!("invalid listen port in {spec:?}"))?;
-        let target: PortRange = target
-            .parse()
-            .with_context(|| format!("invalid target port in {spec:?}"))?;
-        let protocols = match proto {
-            "tcp" => vec![Protocol::Tcp],
-            "udp" => vec![Protocol::Udp],
-            "both" => vec![Protocol::Tcp, Protocol::Udp],
-            _ => bail!("protocol in {spec:?} must be tcp, udp or both"),
-        };
-        for protocol in protocols {
-            plans.push((listen, target, protocol));
-        }
-    }
-    Ok(plans)
 }
 fn duration(s: &str) -> Result<u64> {
     let seconds = humantime::parse_duration(s)?.as_secs();

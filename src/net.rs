@@ -30,6 +30,9 @@ pub struct Kernel {
     /// Tunnel addresses that enrollment handed out. Rules for exactly these stay recognisable
     /// as RIFT's after the tunnel pool changed, so leftovers from before can be reclaimed.
     known_tunnel_addrs: std::sync::Mutex<Vec<IpAddr>>,
+    /// Whether the enrollment listener runs right now. In `auto` mode the server opens it
+    /// only while an invitation is open; the host firewall follows this flag.
+    pub enrollment_open: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Kernel {
@@ -38,6 +41,7 @@ impl Kernel {
             config,
             endpoint_refresh: Mutex::new(None),
             known_tunnel_addrs: std::sync::Mutex::new(Vec::new()),
+            enrollment_open: Default::default(),
         }
     }
 
@@ -562,8 +566,8 @@ impl Kernel {
                 control_port: self.config.control_port,
                 wg_port: self.config.wg_port,
                 enrollment: self
-                    .config
-                    .enrollment_enabled
+                    .enrollment_open
+                    .load(std::sync::atomic::Ordering::SeqCst)
                     .then_some(self.config.enrollment_bind),
                 uplinks: &uplinks,
                 local_ingress,

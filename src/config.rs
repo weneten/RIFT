@@ -14,6 +14,89 @@ pub enum HostFirewall {
     Off,
 }
 
+/// When the enrollment port listens. `auto` opens it only while an invitation is open and
+/// closes it again on activation, expiry or cancellation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum EnrollmentMode {
+    #[default]
+    Auto,
+    Always,
+    Off,
+}
+impl EnrollmentMode {
+    /// The environment is where an operator deliberately decides, so `true` there means
+    /// always open. In TOML a bare `true` is the old template line and means `auto`.
+    fn from_env(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "always" | "true" | "on" => Ok(Self::Always),
+            "off" | "false" => Ok(Self::Off),
+            _ => bail!("enrollment must be auto, always (true) or off (false)"),
+        }
+    }
+}
+impl std::fmt::Display for EnrollmentMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Off => "off",
+        })
+    }
+}
+impl Serialize for EnrollmentMode {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+impl<'de> Deserialize<'de> for EnrollmentMode {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bool(bool),
+            Text(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Bool(true) => Ok(Self::Auto),
+            Raw::Bool(false) => Ok(Self::Off),
+            Raw::Text(text) => match text.trim().to_ascii_lowercase().as_str() {
+                "auto" | "true" => Ok(Self::Auto),
+                "always" | "on" => Ok(Self::Always),
+                "off" | "false" => Ok(Self::Off),
+                _ => Err(serde::de::Error::custom(
+                    "enrollment_enabled must be auto, always or off",
+                )),
+            },
+        }
+    }
+}
+
+/// Whether panel sessions may change anything. `private` allows changes only from loopback
+/// without proxy headers and from VPN devices granted the panel; `off` makes it read-only.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PanelControl {
+    #[default]
+    Private,
+    Off,
+}
+impl std::str::FromStr for PanelControl {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "private" => Ok(Self::Private),
+            "off" | "false" | "none" => Ok(Self::Off),
+            _ => bail!("web panel control must be private or off"),
+        }
+    }
+}
+
 /// Who can open the web panel. `private` listens on the VPS's loopback and its tunnel
 /// address only; `public` listens on every address.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -55,7 +138,7 @@ pub struct Config {
     pub allow_private_listeners: bool,
     pub wg_port: u16,
     pub enrollment_bind: SocketAddr,
-    pub enrollment_enabled: bool,
+    pub enrollment_enabled: EnrollmentMode,
     pub control_port: u16,
     pub ipv4_pool: Ipv4Net,
     pub ipv6_pool: Ipv6Net,
@@ -77,6 +160,7 @@ pub struct Config {
     pub webpanel: bool,
     pub webpanel_access: PanelAccess,
     pub webpanel_port: u16,
+    pub webpanel_control: PanelControl,
     /// Extra source addresses that may open the panel besides loopback and the VPN devices
     /// granted with `rift panel allow`. In public mode a non-empty list restricts the panel to it.
     pub webpanel_allow: Vec<IpNet>,
@@ -101,7 +185,7 @@ impl Default for Config {
             allow_private_listeners: false,
             wg_port: 51820,
             enrollment_bind: "0.0.0.0:8443".parse().unwrap(),
-            enrollment_enabled: true,
+            enrollment_enabled: EnrollmentMode::Auto,
             control_port: 8444,
             ipv4_pool: "10.13.0.0/24".parse().unwrap(),
             ipv6_pool: "fd88:5249:4654::/64".parse().unwrap(),
@@ -120,6 +204,7 @@ impl Default for Config {
             webpanel: false,
             webpanel_access: PanelAccess::Private,
             webpanel_port: 8090,
+            webpanel_control: PanelControl::Private,
             webpanel_allow: vec![],
             webpanel_password: None,
             agent_name: None,
@@ -163,8 +248,9 @@ impl Config {
             }
         }
         if let Ok(v) = std::env::var("RIFT_ENROLLMENT_ENABLED") {
-            if !v.is_empty() {
-                config.enrollment_enabled = v.parse()?;
+            if !v.trim().is_empty() {
+                config.enrollment_enabled =
+                    EnrollmentMode::from_env(&v).context("invalid RIFT_ENROLLMENT_ENABLED")?;
             }
         }
         macro_rules! env_parse {
@@ -189,6 +275,7 @@ impl Config {
         env_parse!("RIFT_WEBPANEL", webpanel);
         env_parse!("RIFT_WEBPANEL_ACCESS", webpanel_access);
         env_parse!("RIFT_WEBPANEL_PORT", webpanel_port);
+        env_parse!("RIFT_WEBPANEL_CONTROL", webpanel_control);
         if let Ok(v) = std::env::var("RIFT_WEBPANEL_ALLOW") {
             config.webpanel_allow = parse_allow_list(&v).context("invalid RIFT_WEBPANEL_ALLOW")?;
         }
@@ -445,6 +532,32 @@ mod tests {
             ..Default::default()
         };
         assert!(short.validate().is_err());
+    }
+    #[test]
+    fn enrollment_defaults_to_auto_and_only_the_environment_means_always() {
+        assert_eq!(Config::default().enrollment_enabled, EnrollmentMode::Auto);
+        let parse = |text: &str| toml::from_str::<Config>(text).unwrap().enrollment_enabled;
+        assert_eq!(parse("enrollment_enabled = true"), EnrollmentMode::Auto);
+        assert_eq!(parse("enrollment_enabled = false"), EnrollmentMode::Off);
+        assert_eq!(
+            parse("enrollment_enabled = \"always\""),
+            EnrollmentMode::Always
+        );
+        assert!(toml::from_str::<Config>("enrollment_enabled = \"sometimes\"").is_err());
+        assert_eq!(
+            EnrollmentMode::from_env("true").unwrap(),
+            EnrollmentMode::Always
+        );
+        assert_eq!(
+            EnrollmentMode::from_env("auto").unwrap(),
+            EnrollmentMode::Auto
+        );
+        assert_eq!(
+            EnrollmentMode::from_env("false").unwrap(),
+            EnrollmentMode::Off
+        );
+        assert_eq!("off".parse::<PanelControl>().unwrap(), PanelControl::Off);
+        assert!("all".parse::<PanelControl>().is_err());
     }
     #[test]
     fn allow_list_accepts_hosts_and_networks() {

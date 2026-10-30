@@ -501,6 +501,15 @@ impl StateStore {
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
+    /// Invitations that can still be used or are being used: the enrollment port must listen.
+    pub fn open_invites(&self) -> Result<Vec<(String, i64)>> {
+        let c = self.lock()?;
+        let mut st = c.prepare(
+            "SELECT name,expires_at FROM invites WHERE consumed=0 AND expires_at>=?1 ORDER BY expires_at",
+        )?;
+        let rows = st.query_map([now()], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
     pub fn invite_hash(token: &str) -> Vec<u8> {
         Sha256::digest(token.as_bytes()).to_vec()
     }
@@ -807,6 +816,43 @@ mod tests {
                 .status,
             AgentStatus::Active
         );
+    }
+    #[test]
+    fn an_invitation_keeps_enrollment_open_until_activation_or_expiry() {
+        let d = tempdir().unwrap();
+        let st = StateStore::open(&d.path().join("state.db")).unwrap();
+        assert!(st.open_invites().unwrap().is_empty());
+        let h = StateStore::invite_hash("token");
+        st.invite("agent", &h, now() + 600).unwrap();
+        st.invite("late", &StateStore::invite_hash("old"), now() - 1)
+            .unwrap();
+        let open: Vec<_> = st
+            .open_invites()
+            .unwrap()
+            .into_iter()
+            .map(|i| i.0)
+            .collect();
+        assert_eq!(open, ["agent"], "an expired invitation does not count");
+        let id = uuid::Uuid::new_v4().to_string();
+        let attempt = uuid::Uuid::new_v4().to_string();
+        st.reserve_enrollment(
+            &h,
+            "agent",
+            &id,
+            &attempt,
+            "k",
+            "10.6.0.0/24".parse().unwrap(),
+            "fd00:6::/64".parse().unwrap(),
+            "10.6.0.1".parse().unwrap(),
+            "fd00:6::1".parse().unwrap(),
+            120,
+        )
+        .unwrap();
+        // A reserved token may still be retried, so the port stays open until activation.
+        assert_eq!(st.open_invites().unwrap().len(), 1);
+        st.activate(&id, &attempt, "10.6.0.2".parse().unwrap())
+            .unwrap();
+        assert!(st.open_invites().unwrap().is_empty());
     }
     #[test]
     fn cancelling_invite_removes_its_pending_agent() {
