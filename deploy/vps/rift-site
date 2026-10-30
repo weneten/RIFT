@@ -919,8 +919,20 @@ def command_rm(host):
 
 
 def site_forward_alive(site, forwards):
+    """The recorded forward still exists and is still this site's (IDs get reused)."""
     forward_id = site.get("forward_id")
-    return forward_id is not None and any(f.get("id") == forward_id for f in forwards)
+    if forward_id is None:
+        return False
+    for forward in forwards:
+        if forward.get("id") != forward_id:
+            continue
+        try:
+            listen, target = int(site["listen"]), int(site["target"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        target_start = int((forward.get("target_ports") or {}).get("start", 0))
+        return listen in listen_ports_of(forward) and target_start == target
+    return False
 
 
 def print_table(rows):

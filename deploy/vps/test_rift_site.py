@@ -300,10 +300,22 @@ class FileProviderTests(unittest.TestCase):
         self.assertEqual(rows[2][8:], ("disabled", ""))
 
     def test_a_site_forward_removed_by_hand_is_not_trusted(self):
-        site = {"forward_id": 2}
-        self.assertTrue(rift_site.site_forward_alive(site, [{"id": 1}, {"id": 2}]))
-        self.assertFalse(rift_site.site_forward_alive(site, [{"id": 1}]))
-        self.assertFalse(rift_site.site_forward_alive({}, [{"id": 1}]))
+        site = {"forward_id": 2, "listen": 20001, "target": 3001}
+
+        def forward(forward_id, listen, target):
+            return {
+                "id": forward_id,
+                "listen_ports": {"start": listen, "end": listen},
+                "target_ports": {"start": target, "end": target},
+            }
+
+        mine = forward(2, 20001, 3001)
+        self.assertTrue(rift_site.site_forward_alive(site, [forward(1, 20000, 8081), mine]))
+        self.assertFalse(rift_site.site_forward_alive(site, [forward(1, 20000, 8081)]))
+        self.assertFalse(rift_site.site_forward_alive({}, [mine]))
+        # The ID was freed and handed to another forward: same ID, different ports.
+        self.assertFalse(rift_site.site_forward_alive(site, [forward(2, 20003, 8080)]))
+        self.assertFalse(rift_site.site_forward_alive(site, [forward(2, 20001, 9999)]))
 
     def test_detects_an_existing_file_provider(self):
         self.assertTrue(rift_site.has_file_provider({"args": ["--providers.file.filename=/x.yml"]}))

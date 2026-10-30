@@ -592,10 +592,23 @@ fn allocate_v6(pool: ipnet::Ipv6Net, server: Ipv6Addr, agents: &[AgentRecord]) -
     bail!("IPv6 tunnel pool exhausted or too large to scan")
 }
 
+/// The smallest positive ID not in use, so IDs freed by a removal are handed out again.
+pub fn lowest_free_id(used: impl IntoIterator<Item = u64>) -> u64 {
+    let used: HashSet<u64> = used.into_iter().collect();
+    (1..).find(|id| !used.contains(id)).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    #[test]
+    fn forward_ids_fill_gaps_before_growing() {
+        assert_eq!(lowest_free_id([]), 1);
+        assert_eq!(lowest_free_id([1, 2, 3]), 4);
+        assert_eq!(lowest_free_id([1, 2, 4, 5, 7]), 3);
+        assert_eq!(lowest_free_id([2, 3]), 1);
+    }
     #[test]
     fn invitation_reservation_is_idempotent_and_single_use() {
         let d = tempdir().unwrap();

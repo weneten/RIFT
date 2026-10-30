@@ -680,7 +680,7 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
                 }
             }
             s.state.mutate("forward-add", |x| {
-                f.id = x.forwards.iter().map(|f| f.id).max().unwrap_or(0) + 1;
+                f.id = crate::state::lowest_free_id(x.forwards.iter().map(|f| f.id));
                 f.generation = x.generation + 1;
                 x.forwards.push(f.clone());
                 Ok(())
