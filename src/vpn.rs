@@ -43,12 +43,6 @@ impl Pools {
             vpn6: config.vpn_pool6,
         }
     }
-    fn nft4(&self) -> String {
-        format!("{{ {}, {}, 169.254.0.0/16 }}", self.tunnel4, self.vpn4)
-    }
-    fn nft6(&self) -> String {
-        format!("{{ {}, {}, fe80::/10 }}", self.tunnel6, self.vpn6)
-    }
 }
 
 /// The address of the exit interface on every agent: the first host of each VPN pool. Devices
@@ -320,9 +314,10 @@ pub fn server_rules(interface: &str, pools: Pools, ipv6_exit: bool, snap: &State
         ));
     }
     // Internet exit through the VPS. These accepts come before the final drops of the
-    // renderer and leave out every RIFT pool, so a device still reaches no other device and
-    // no agent beyond its grants.
-    let (tunnel4, tunnel6) = (pools.nft4(), pools.nft6());
+    // renderer and leave out every private and local network: the RIFT pools (a device still
+    // reaches no other device and no agent beyond its grants), Docker bridges and provider
+    // networks on the VPS, and its metadata service. The exit reaches the internet only.
+    let (tunnel4, tunnel6) = (PRIVATE_V4, PRIVATE_V6);
     for peer in server_exit_peers(snap) {
         let (v4, v6) = (peer.ipv4, peer.ipv6);
         rules.forward.push_str(&format!(
@@ -341,8 +336,9 @@ pub fn server_rules(interface: &str, pools: Pools, ipv6_exit: bool, snap: &State
                 "add rule inet rift postrouting_nat ip6 saddr {v6} oifname != \"{interface}\" masquerade\n"
             ));
         } else {
+            // Reject rather than drop, so apps fall back to IPv4 at once.
             rules.forward.push_str(&format!(
-                "add rule inet rift forward iifname \"{interface}\" ip6 saddr {v6} drop\n"
+                "add rule inet rift forward iifname \"{interface}\" ip6 saddr {v6} reject with icmpv6 type admin-prohibited\n"
             ));
         }
     }
@@ -400,7 +396,13 @@ pub fn agent_exit_rules(exit: &AgentExit<'_>) -> Rules {
             ));
         }
     }
-    // Whatever is left, including the IPv6 of a host without global IPv6, is dropped.
+    if !exit.ipv6 && !exit.peers.is_empty() {
+        // No global IPv6 here: reject, so apps fall back to IPv4 at once instead of waiting.
+        rules.forward.push_str(&format!(
+            "add rule inet rift forward iifname \"{iface}\" meta nfproto ipv6 reject with icmpv6 type admin-prohibited\n"
+        ));
+    }
+    // Whatever is left is dropped.
     rules.forward.push_str(&format!(
         "add rule inet rift forward iifname \"{iface}\" drop\n\
          add rule inet rift forward iifname != \"{iface}\" oifname \"{iface}\" ct state established,related accept\n\
@@ -924,13 +926,23 @@ mod tests {
     }
 
     #[test]
-    fn server_exit_rules_masquerade_and_leave_out_every_rift_network() {
+    fn server_exit_rules_masquerade_and_reach_only_the_internet() {
         let mut snap = snapshot();
         snap.vpn_peers[0].exit = Exit::Server;
         let rules = server_rules("rift0", pools(), true, &snap);
         let forward = &rules.forward;
-        let tunnel4 = "{ 10.13.0.0/24, 10.14.0.0/24, 169.254.0.0/16 }";
-        let tunnel6 = "{ fd88:5249:4654::/64, fd88:5249:4655::/64, fe80::/10 }";
+        // Every private and local network is left out: RIFT pools, Docker bridges, provider
+        // networks and the metadata service.
+        let (tunnel4, tunnel6) = (PRIVATE_V4, PRIVATE_V6);
+        for net in [
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "169.254.0.0/16",
+        ] {
+            assert!(tunnel4.contains(net), "{net}");
+        }
+        assert!(tunnel6.contains("fc00::/7"));
         assert!(forward.contains(&format!(
             "forward iifname \"rift0\" oifname != \"rift0\" ip saddr 10.14.0.2 ip daddr != {tunnel4} accept"
         )), "{forward}");
@@ -968,7 +980,7 @@ mod tests {
         let rules = server_rules("rift0", pools(), false, &snap);
         assert!(rules
             .forward
-            .contains("forward iifname \"rift0\" ip6 saddr fd88:5249:4655::2 drop"));
+            .contains("forward iifname \"rift0\" ip6 saddr fd88:5249:4655::2 reject with icmpv6 type admin-prohibited"));
         assert!(!rules.forward.contains("ip6 daddr !="), "{}", rules.forward);
         assert!(!rules.nat.contains("ip6"), "{}", rules.nat);
         assert!(rules.nat.contains("ip saddr 10.14.0.2"));

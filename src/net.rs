@@ -3292,9 +3292,12 @@ mod tests {
         let final_drop = at(&with, "forward oifname \"rift0\" drop");
         let exit_v4 = at(
             &with,
-            "forward iifname \"rift0\" oifname != \"rift0\" ip saddr 10.14.0.2 ip daddr != { 10.88.0.0/24, 10.14.0.0/24, 169.254.0.0/16 } accept",
+            "forward iifname \"rift0\" oifname != \"rift0\" ip saddr 10.14.0.2 ip daddr != { 0.0.0.0/8, 10.0.0.0/8,",
         );
-        let exit_v6 = at(&with, "ip6 saddr fd88:5249:4655::2 ip6 daddr != { fd88:5249:4654::/64, fd88:5249:4655::/64, fe80::/10 } accept");
+        let exit_v6 = at(
+            &with,
+            "ip6 saddr fd88:5249:4655::2 ip6 daddr != { ::/128, ::1/128, fc00::/7",
+        );
         let replies = at(
             &with,
             "forward iifname != \"rift0\" oifname \"rift0\" ip daddr 10.14.0.2 ct state established,related accept",
@@ -3317,7 +3320,7 @@ mod tests {
         assert!(
             at(
                 &without,
-                "forward iifname \"rift0\" ip6 saddr fd88:5249:4655::2 drop"
+                "forward iifname \"rift0\" ip6 saddr fd88:5249:4655::2 reject"
             ) < at(&without, "forward oifname \"rift0\" drop")
         );
         assert!(!without.contains("ip6 saddr fd88:5249:4655::2 masquerade"));

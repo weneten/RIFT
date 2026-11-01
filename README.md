@@ -454,7 +454,7 @@ rift vpn config qr iphone                # scan in the WireGuard app
 
 ### Exit through the VPS
 
-The device's configuration routes `0.0.0.0/0, ::/0` through the usual WireGuard endpoint and sets `DNS` (see below). The VPS forwards the device's traffic to its uplink and masquerades it; replies come back only for connections the device opened. Everything else stays as isolated as before: a device still cannot reach other devices or the VPS itself (except the panel it was granted), and reaches the agents' tunnel addresses only through its grants. Destinations inside the RIFT pools and `169.254.0.0/16` (cloud metadata) are never part of the exit. If UFW manages the host, RIFT adds forwarding rules commented `rift:exit` while a device uses this exit.
+The device's configuration routes `0.0.0.0/0, ::/0` through the usual WireGuard endpoint and sets `DNS` (see below). The VPS forwards the device's traffic to its uplink and masquerades it; replies come back only for connections the device opened. Everything else stays as isolated as before: a device still cannot reach other devices or the VPS itself (except the panel it was granted), and reaches the agents' tunnel addresses only through its grants. The exit reaches the internet only: private and local networks (the RIFT pools, Docker bridges and other containers on the VPS, the provider's private network, `169.254.0.0/16` cloud metadata, `fc00::/7`) are never part of it. If UFW manages the host, RIFT adds forwarding rules commented `rift:exit` while a device uses this exit.
 
 ### Exit through a home server
 
@@ -488,7 +488,7 @@ The first host address of each VPN pool (`10.14.0.1` and `fd88:5249:4655::1` by 
 Every device gets an IPv4 address from `RIFT_VPN_POOL` and an IPv6 address from `RIFT_VPN_POOL6` (a ULA network, default `fd88:5249:4655::/64`), and its configuration lists both. Grants (`server`, `full`, ports, networks) stay IPv4 only.
 
 - An exit carries IPv6 only if it has a global IPv6 address: for the VPS, an IPv6 address in `RIFT_PUBLIC_IPS`; for an agent, a global address on its host (reported automatically). The device's IPv6 is masqueraded there.
-- Otherwise the device's IPv6 traffic is **dropped, not leaked**: the configuration still routes `::/0` into the tunnel, where it goes nowhere, so nothing leaves around the VPN and apps fall back to IPv4. `rift doctor` and the answer to `rift vpn allow` tell you when this applies.
+- Otherwise the device's IPv6 traffic is **dropped, not leaked**: the configuration still routes `::/0` into the tunnel, where it is rejected at once, so nothing leaves around the VPN and apps fall back to IPv4 without waiting. `rift doctor` and the answer to `rift vpn allow` tell you when this applies.
 - `RIFT_VPN_DNS` (default `9.9.9.9,2620:fe::fe`, Quad9) is written as `DNS` into configurations that have an exit: always the IPv4 servers, the IPv6 ones only if that exit carries IPv6. Without an exit there is no `DNS` line. The list needs at least one IPv4 address. The servers are reached through the exit.
 - To check a setup, open [test-ipv6.com](https://test-ipv6.com) on the device. With an exit without IPv6 it should show IPv4 working through the exit's address and no IPv6, and no leak of your own address.
 
