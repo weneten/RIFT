@@ -576,6 +576,30 @@ mod tests {
     }
 
     #[test]
+    fn the_ca_expiry_does_not_matter_only_the_server_certificate_does() {
+        // rustls/webpki keep a trust anchor as name and key only, so agents enroll against a
+        // CA past its end date as long as the server certificate is valid; that one renews
+        // itself. The CA therefore never needs replacing.
+        let now = time::OffsetDateTime::now_utc();
+        let mut params = ca_params();
+        params.not_before = now - time::Duration::days(4000);
+        params.not_after = now - time::Duration::days(1);
+        let ca_key = KeyPair::generate().unwrap();
+        let expired_ca = issue_leaf(
+            TlsBundle {
+                version: BUNDLE_VERSION,
+                ca_key_pem: ca_key.serialize_pem(),
+                ca_cert_pem: params.self_signed(&ca_key).unwrap().pem(),
+                server_key_pem: String::new(),
+                server_cert_pem: String::new(),
+            },
+            "localhost",
+        )
+        .unwrap();
+        validate_bundle(&expired_ca, "localhost").unwrap();
+    }
+
+    #[test]
     fn a_new_endpoint_gets_a_new_certificate_from_the_same_ca() {
         let temp = tempdir().unwrap();
         let mut first = config(temp.path());
