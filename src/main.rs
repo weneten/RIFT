@@ -192,12 +192,16 @@ enum TwoFactorCommand {
 }
 #[derive(Subcommand)]
 enum ConfigCommand {
+    /// Check config.toml and the environment and report the first error.
     Validate,
 }
 #[derive(Subcommand)]
 enum ListWhat {
+    /// Agents with their state and tunnel addresses.
     Agents,
+    /// Forwards with their state (enabled, disabled, pending or refused).
     Forwards,
+    /// Active bans of translated forwards.
     Bans,
     /// VPN devices.
     Devices,
@@ -206,6 +210,7 @@ enum ListWhat {
 }
 #[derive(Subcommand)]
 enum ShowWhat {
+    /// Every stored detail of one agent.
     Agent { name: String },
 }
 #[derive(Subcommand)]
@@ -216,9 +221,9 @@ enum AddWhat {
         #[arg(long, default_value = "15m")]
         ttl: String,
     },
-    /// Add forwards. Short form: AGENT SPEC..., where SPEC is LISTEN[:TARGET]/tcp|udp|both
-    /// with an optional /v4 (default), /v6 or /all for the server address, for example
-    /// `rift add forward node1 53/both 8080:80/tcp/all`. The long options are the alternative.
+    /// Publish ports: AGENT SPEC..., where SPEC is LISTEN[:TARGET]/tcp|udp|both with an optional
+    /// /v4 (default), /v6 or /all for the server address, for example
+    /// `rift add forward node1 53/both 8080:80/tcp/all`.
     Forward {
         agent: String,
         /// LISTEN[:TARGET]/tcp|udp|both, optionally ending in /v4, /v6 or /all.
@@ -256,6 +261,7 @@ enum AddWhat {
 }
 #[derive(Subcommand)]
 enum RemoveWhat {
+    /// Delete an agent with its forwards and VPN grants.
     Agent {
         name: String,
     },
@@ -263,6 +269,7 @@ enum RemoveWhat {
     Invite {
         name: String,
     },
+    /// Delete a forward by its ID.
     Forward {
         id: u64,
     },
@@ -277,23 +284,27 @@ enum RemoveWhat {
 }
 #[derive(Subcommand)]
 enum ToggleWhat {
+    /// An agent with all its forwards and VPN grants.
     Agent {
         name: String,
     },
+    /// One forward by its ID.
     Forward {
         id: u64,
     },
-    /// Disabling keeps the device and its grants but cuts it off.
+    /// A VPN device; it keeps its key and grants.
     Device {
         name: String,
     },
 }
 #[derive(Subcommand)]
 enum RenameWhat {
+    /// Give an agent a new name.
     Agent { name: String, new_name: String },
 }
 #[derive(Subcommand)]
 enum RotateWhat {
+    /// Give an agent a new WireGuard key on its next sync.
     Agent { name: String },
 }
 

@@ -24,6 +24,7 @@ The agent initiates the connection to the server. RIFT manages the tunnel, expli
 - [Manage agents and forwards](#manage-agents-and-forwards)
 - [Private VPN access](#private-vpn-access)
 - [Web panel](#web-panel)
+- [Command reference](#command-reference)
 - [Configuration](#configuration)
 - [Operations and troubleshooting](#operations-and-troubleshooting)
 - [Build and development](#build-and-development)
@@ -491,6 +492,82 @@ Import the configuration into the WireGuard app, connect, and open `http://10.13
 **Public mode** opens the port in UFW when RIFT manages it (`host_firewall = "auto"`); open it in any upstream firewall or cloud security group yourself. The panel speaks plain HTTP. In public mode the password and session cookie cross the network unencrypted, so prefer private mode, restrict `RIFT_WEBPANEL_ALLOW`, or put a TLS reverse proxy in front (the cookie is marked `Secure` when the proxy sends `X-Forwarded-Proto: https`). Public sessions are read-only, so a password read off the network alone allows no changes; it still shows your agents, ports and devices.
 
 The panel port (default 8090, `RIFT_WEBPANEL_PORT`) must differ from the control and enrollment ports. Panel settings need a restart; `rift reload` refuses to change them.
+
+## Command reference
+
+All commands run on the **server** unless noted. `rift COMMAND --help` shows the details of each. `--json` before the command gives machine-readable output, for example `rift --json list forwards`.
+
+**Overview**
+
+| Command | What it does |
+| --- | --- |
+| `rift status` | Health of the server, agents, enrollment port, open invitations and refused forwards. |
+| `rift doctor` | Checks kernel tools, WireGuard, nftables and the host firewall. |
+| `rift logs [--lines N]` | Recent log entries of the running server (default 100). |
+| `rift reload` | Re-reads `config.toml` and applies the current state again. |
+| `rift config validate` | Checks `config.toml` and the `.env` values; reports the first error. |
+
+**Agents (home servers)**
+
+| Command | What it does |
+| --- | --- |
+| `rift add agent NAME [--ttl 15m]` | Creates a single-use invitation and prints the three `.env` lines for the agent. Opens the enrollment port until the agent is active. |
+| `rift list agents` | All agents with state and tunnel addresses. |
+| `rift show agent NAME` | Every stored detail of one agent. |
+| `rift remove invite NAME` | Cancels an open invitation. |
+| `rift remove agent NAME` | Deletes an agent with its forwards and VPN grants. |
+| `rift disable agent NAME` / `rift enable agent NAME` | Switches an agent and everything on it off and on again. |
+| `rift rename agent OLD NEW` | Renames an agent. |
+| `rift rotate agent NAME` | Gives the agent a new WireGuard key on its next sync. |
+
+**Forwards (published ports)**
+
+| Command | What it does |
+| --- | --- |
+| `rift add forward AGENT SPEC...` | Publishes ports. `SPEC` is `LISTEN[:TARGET]/tcp`, `/udp` or `/both`, optionally ending in `/v4` (default), `/v6` or `/all`. Example: `rift add forward core 2222:22/tcp 53/both 8080:80/tcp/all`. |
+| … `--mode translate` | Bridges IPv6 clients to an IPv4-only service (the service then sees the server, not the client). |
+| … `--ingress local` | Only for a reverse proxy on the server; not reachable from the Internet. |
+| … `--listen-ip ADDRESS` | A specific server address, only needed with several addresses of the same IP version. |
+| `rift list forwards` | All forwards with ID and state (`enabled`, `disabled`, `pending`, `refused`); on the server with a SITE column. |
+| `rift remove forward ID` | Deletes a forward. |
+| `rift disable forward ID` / `rift enable forward ID` | Switches a forward off and on again. |
+| `rift add ban AGENT FORWARD_ID IP [--ttl 1h]` | Blocks a client address on a translated forward for a while. |
+| `rift list bans` | Active bans. |
+
+**Websites (host commands, run with `sudo` on the server)**
+
+| Command | What it does |
+| --- | --- |
+| `rift add site AGENT DOMAIN PORT [traefik\|caddy\|nginx\|npm]` | Publishes `https://DOMAIN` through your reverse proxy to `PORT` on the agent. Without a proxy word the default is used. |
+| `rift list sites` | All sites with their forward state (`ok`, `missing`, `refused`). |
+| `rift remove site DOMAIN` | Removes the site, its proxy configuration and its forward. |
+| `rift proxy [traefik\|caddy\|nginx\|npm]` | Shows or sets the default proxy. |
+
+**VPN devices (phones, laptops)**
+
+| Command | What it does |
+| --- | --- |
+| `rift add device NAME` | Registers a device with a key and an address. It reaches nothing yet. |
+| `rift list devices` | All devices with state, last handshake and access. |
+| `rift vpn allow DEVICE AGENT TARGET... [--snat]` | Grants access. `TARGET` is `22/tcp` (port or range), `server` (the agent host), `full` (all protocols to the host) or a network such as `192.168.178.30/32`; `--snat` for networks whose router has no route back. |
+| `rift vpn deny DEVICE AGENT [TARGET...]` | Withdraws access; without a target everything on that agent. |
+| `rift vpn config qr DEVICE` / `rift vpn config export DEVICE` | WireGuard configuration as a QR code or file (contains the private key). |
+| `rift disable device NAME` / `rift enable device NAME` | Cuts a device off and lets it back in; key and grants stay. |
+| `rift remove device NAME` | Deletes the device, its key and its grants. |
+
+**Web panel**
+
+| Command | What it does |
+| --- | --- |
+| `rift panel status` | Whether the panel is on, its addresses and which devices may open it. |
+| `rift panel password` | Prints the login password. |
+| `rift panel connect NAME [--export]` | Creates a VPN device for the panel (or reuses one), grants it access and prints its configuration. |
+| `rift panel allow NAME` / `rift panel deny NAME` | Grants or withdraws panel access of an existing device. |
+| `rift panel 2fa status` | Whether two-factor login is on and required. |
+| `rift panel 2fa setup` then `rift panel 2fa confirm CODE` | Sets up two-factor login with an authenticator app. |
+| `rift panel 2fa reset` | Turns two-factor login off and ends all sessions, for a lost phone. |
+
+**Run by Docker Compose, not by hand:** `rift server` (the server) and `rift agent` (an agent).
 
 ## Configuration
 
