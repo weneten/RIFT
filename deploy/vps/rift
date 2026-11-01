@@ -15,6 +15,29 @@ case "${1-} ${2-}" in
         exec "$site" list
         ;;
 esac
+# Commands that read or write files in the current directory run on the host; the container
+# only produces and consumes streams. `--help` is answered by the container's own help text.
+json=
+if [ "${1-}" = --json ]; then
+    case "${2-}" in
+        export | import | backup | restore)
+            json=--json
+            shift
+            ;;
+    esac
+fi
+case "${1-}" in
+    export | import | backup | restore)
+        case " $* " in
+            *" --help "* | *" -h "*) ;;
+            *)
+                cmd=$1
+                shift
+                exec "$site" "$cmd" $json "$@"
+                ;;
+        esac
+        ;;
+esac
 if [ "${1-}" = proxy ]; then
     shift
     exec "$site" proxy "$@"
@@ -26,4 +49,4 @@ if [ "${1-}" = list ] && [ "${2-}" = forwards ] && [ "$#" -eq 2 ] && [ -x "$site
     "$site" forwards 2> /dev/null && exit 0
 fi
 
-exec docker exec rift-server rift --config /etc/rift/config.toml "$@"
+exec docker exec rift-server rift --config /etc/rift/config.toml $json "$@"

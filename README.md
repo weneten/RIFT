@@ -24,6 +24,7 @@ The agent initiates the connection to the server. RIFT manages the tunnel, expli
 - [Manage agents and forwards](#manage-agents-and-forwards)
 - [Private VPN access](#private-vpn-access)
 - [Web panel](#web-panel)
+- [Back up, move or rebuild](#back-up-move-or-rebuild)
 - [Command reference](#command-reference)
 - [Configuration](#configuration)
 - [Operations and troubleshooting](#operations-and-troubleshooting)
@@ -493,6 +494,97 @@ Import the configuration into the WireGuard app, connect, and open `http://10.13
 
 The panel port (default 8090, `RIFT_WEBPANEL_PORT`) must differ from the control and enrollment ports. Panel settings need a restart; `rift reload` refuses to change them.
 
+## Back up, move or rebuild
+
+RIFT has two ways to save a server. Pick by what you want to keep.
+
+| | `rift export` / `rift import` | `rift backup` / `rift restore` |
+| --- | --- | --- |
+| Holds | Agent names, forwards, VPN devices with their grants, sites. | The whole state: agents and their keys, forwards, VPN devices and their keys, enrollment CA, panel secrets, sites. |
+| Secrets | None. The file is safe to keep and share. | Every key. **Keep the file private.** |
+| Agents | Must be added and enrolled again (`rift add agent`). | Keep working: they reconnect to the restored server. |
+| Devices | Get new keys; import their configuration again. | Unchanged. |
+| Use it to | Rebuild from scratch, copy settings to another server, keep a readable record. | Move to another VPS or recover from a lost disk without touching agents or devices. |
+
+All four commands run on the server and read or write files in your current directory. `rift restore` needs `sudo`.
+
+### Export and import settings
+
+```sh
+rift export                       # writes rift-export-2026-11-01.json here
+rift export /root/settings.json   # or a name of your choice
+rift import rift-export-2026-11-01.json --dry-run   # what would happen; changes nothing
+rift import rift-export-2026-11-01.json
+```
+
+An import creates what is missing and leaves everything else alone. It never creates agents, because an agent needs its own enrollment. Entries of an agent that does not exist (or is not active yet) are skipped and the report tells you what to do. Forwards that are already there are reported as present; a forward whose ports are taken is reported as failed and the rest carries on. If a forward listens on an address the new server does not have, it goes to the first address of the same IP version from `RIFT_PUBLIC_IPS` (the report says so), or is skipped when there is none. Devices are created with new keys, with their enabled state, panel access and grants. Sites are created through your reverse proxy again, like `rift add site`. A file with an export format this version does not know is refused.
+
+Filters, applied after the renaming:
+
+```sh
+rift import settings.json --map core2=core             # the entries of agent core2 go to core
+rift import settings.json --skip-agent core2           # leave core2 out
+rift import settings.json --agent core --agent nas     # only these agents
+rift import settings.json --map core2=core --skip-agent nas --dry-run
+```
+
+`--map OLD=NEW` moves everything of agent OLD to agent NEW (the last mapping of an agent wins). `--agent NAME` and `--skip-agent NAME` use the names after mapping; both can be repeated. A device whose grants all belong to left-out agents is not created.
+
+The report groups what happened:
+
+```text
+Created (3)
+  forward core 2222:22/tcp on 203.0.113.10 (the server has no address 198.51.100.7; used 203.0.113.10)
+  device phone (new keys; re-import the device config: rift vpn config qr phone)
+  site app.example.org (agent core, port 8080, caddy) (DNS: app.example.org -> 203.0.113.10)
+
+Already present (1)
+  forward core 53/udp on 203.0.113.10
+
+Skipped (1)
+  3 entries for agent core2: no such agent; create it with `rift add agent core2` or use --map core2=NAME
+
+Failed (1)
+  forward core 80/tcp on 203.0.113.10: the public port range overlaps forward 4
+```
+
+`rift --json import FILE` prints the same report as JSON. The file is plain JSON with `"format": 1`; forwards, devices and sites refer to agents by name.
+
+### Back up and restore everything
+
+```sh
+sudo rift backup                          # writes rift-backup-2026-11-01.tar.gz here, mode 0600
+sudo rift restore rift-backup-2026-11-01.tar.gz
+```
+
+The backup is one `.tar.gz` with three parts: a small manifest, `server/` (everything in the container's `/var/lib/rift`) and `host/rift-site/` (the site records in `/var/lib/rift-site`). The database is copied with SQLite's online backup (`VACUUM INTO`), so a backup taken while RIFT runs is consistent; the archive is streamed out of the container, so nothing large is staged in its small `/tmp`. The proxy configuration files themselves are not part of it; the site records are, and a restore writes the proxy configuration again.
+
+`rift restore` asks for confirmation (`--yes` skips the question). It checks the archive first, then stops `rift-server`, replaces the content of its state volume with the backup, restores the site records, starts the container again and re-creates the proxy configuration of the restored sites. Everything on the server before the restore is gone.
+
+### Move to a new VPS with backup and restore
+
+Agents, devices and sites keep working; only the address changes.
+
+1. On the old server: `sudo rift backup`. Copy the file to the new server over a channel you trust (`scp`). It holds every key.
+2. On the new server, install RIFT as in [Install the server](#install-the-server), with the same `.env` values for `RIFT_PUBLIC_ENDPOINT` (the enrollment certificate is issued for that name) and for the pools and ports you changed (`RIFT_IPV4_POOL`, `RIFT_WG_PORT`, ...). Set `RIFT_PUBLIC_IPS` to the **new** addresses, run `docker compose up -d` and `sudo sh deploy/vps/install-cli`. For websites, have your reverse proxy running too.
+3. Stop the old server's container (`docker compose down`) so two servers never use the same keys.
+4. Run `sudo rift restore rift-backup-2026-11-01.tar.gz` on the new server.
+5. Point DNS at the new server: the name in `RIFT_PUBLIC_ENDPOINT` and the names of your sites. If your agents connect to a raw IP address instead of a name, edit `RIFT_SERVER` in each agent's `.env` to the new address and run `docker compose up -d` there; the agent then dials that address with the WireGuard port it already knows. Nothing else changes on the agent.
+6. Open the ports in the new cloud firewall or security group: UDP 51820 (or `RIFT_WG_PORT`), the TCP/UDP ports of your forwards, 80 and 443 for sites.
+7. Check `rift status` and `rift list forwards`.
+
+Forwards that listened on an address the new server does not have are moved at startup to the first address of the same IP version in `RIFT_PUBLIC_IPS`; `rift status` names each one it moved, and the log has a warning. If there is no address of that version (an IPv6 forward on a server without IPv6), or the ports are already taken there, the forward stays where it is and `rift status` and `rift doctor` list it as not applicable until you change `RIFT_PUBLIC_IPS` or remove it.
+
+### Rebuild with export and import
+
+For a fresh start that keeps your settings, not your keys:
+
+1. `rift export`, and copy the file away.
+2. Reinstall the server as in [Install the server](#install-the-server).
+3. For every agent: `rift add agent NAME` on the server, and the three `.env` lines on the agent. The agent needs a clean state volume (`docker compose down -v` there), because it was enrolled with the old server. Wait until `rift list agents` shows it as active.
+4. `rift import rift-export-2026-11-01.json --dry-run`, read the report, then run it again without `--dry-run`. Use `--map OLD=NEW` for agents that now have another name and `--skip-agent NAME` for ones you do not bring back.
+5. Import the configuration of every VPN device again (`rift vpn config qr NAME`): the devices have new keys.
+
 ## Command reference
 
 All commands run on the **server** unless noted. `rift COMMAND --help` shows the details of each. `--json` before the command gives machine-readable output, for example `rift --json list forwards`.
@@ -567,6 +659,18 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | `rift panel 2fa setup` then `rift panel 2fa confirm CODE` | Sets up two-factor login with an authenticator app. |
 | `rift panel 2fa reset` | Turns two-factor login off and ends all sessions, for a lost phone. |
 
+**Save and move (run on the server, files in the current directory; see [Back up, move or rebuild](#back-up-move-or-rebuild))**
+
+| Command | What it does |
+| --- | --- |
+| `rift export [FILE]` | Saves agents, forwards, VPN devices with grants and sites as JSON, without keys. Default file `rift-export-DATE.json`. |
+| `rift import FILE` | Creates what the file holds and the server lacks; never creates agents. Prints what was created, already present, skipped or failed. |
+| … `--dry-run` | Shows what would happen and changes nothing. |
+| … `--agent NAME` / `--skip-agent NAME` | Imports only, or leaves out, the entries of an agent. Repeatable. |
+| … `--map OLD=NEW` | Puts the entries of agent OLD on agent NEW. Repeatable. |
+| `rift backup [FILE]` | Saves the whole state, **including every key**, as a private `.tar.gz`. Default file `rift-backup-DATE.tar.gz`. |
+| `sudo rift restore FILE [--yes]` | Replaces all state on this server with a backup, restarts it and re-creates the proxy configuration of the sites. |
+
 **Run by Docker Compose, not by hand:** `rift server` (the server) and `rift agent` (an agent).
 
 ## Configuration
@@ -591,7 +695,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | `RIFT_WEBPANEL_ALLOW` | empty | Server. Extra allowed source addresses or networks, comma-separated. |
 | `RIFT_WEBPANEL_2FA` | `optional` | Server. `optional`: one-time code at login once someone turned it on; `required`: no login until `rift panel 2fa setup` and `confirm` ran. Restart required. |
 | `RIFT_WEBPANEL_PASSWORD` | generated | Server. Panel password, at least 12 characters; `rift panel password` shows the effective one. |
-| `RIFT_SERVER`, `RIFT_AGENT_NAME`, `RIFT_ENROLLMENT_TOKEN` | Agent | Invitation values; remove token after enrollment. |
+| `RIFT_SERVER`, `RIFT_AGENT_NAME`, `RIFT_ENROLLMENT_TOKEN` | Agent | Invitation values; remove token after enrollment. If the host of `RIFT_SERVER` later differs from the server address stored at enrollment, the agent dials the new host with the stored WireGuard port; after a server move, editing `RIFT_SERVER` is enough. |
 | `RIFT_AGENT_ALLOW_PORTS` | empty | Agent. Ports the agent may open for forwards and VPN grants, e.g. `22/tcp,80,27015-27020/udp`; empty means no limit. See [Harden the agent](#harden-the-agent). |
 | `RIFT_AGENT_ALLOW_SUBNETS` | empty | Agent. Networks behind the agent that VPN network grants may reach; empty means no LAN access. |
 | `interface`, `wg_port`, `control_port` | `rift0`, `51820`, `8444` | WireGuard interface and ports. |
@@ -644,7 +748,7 @@ docker compose ps
 
 On the server, run `sudo sh deploy/vps/install-cli` again after `git pull` to update the installed CLI and site helper. Check logs, agent status and representative services after the update. Review configuration changes before replacing your local `config.toml` or `.env`.
 
-The `rift-state` volume contains identities, keys, certificates and dynamic configuration. Protect and back up the state on **both** server and agent, and test restoration. A normal `docker compose down` asks RIFT to remove its owned networking configuration; a subsequent `docker compose up -d` recreates it from the retained volume. A crash, forced kill or cleanup error can leave network state behind; inspect the logs and use the ownership-aware recovery procedure in [docs/deploy.md](docs/deploy.md#rollout-and-rollback). `docker compose down -v` and volume pruning can delete the state; agents and invitations cannot be recovered merely by restarting. Host-wide sysctl settings installed by `deploy/prepare-host` remain in place.
+The `rift-state` volume contains identities, keys, certificates and dynamic configuration. Protect and back up the state on **both** server and agent, and test restoration. On the server, `rift backup` and `rift restore` do this for you; see [Back up, move or rebuild](#back-up-move-or-rebuild). The agent's state volume is backed up with your usual volume tools. A normal `docker compose down` asks RIFT to remove its owned networking configuration; a subsequent `docker compose up -d` recreates it from the retained volume. A crash, forced kill or cleanup error can leave network state behind; inspect the logs and use the ownership-aware recovery procedure in [docs/deploy.md](docs/deploy.md#rollout-and-rollback). `docker compose down -v` and volume pruning can delete the state; agents and invitations cannot be recovered merely by restarting. Host-wide sysctl settings installed by `deploy/prepare-host` remain in place.
 
 ### Uninstall
 

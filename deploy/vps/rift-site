@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-"""Publish one home-agent port as an HTTPS name on the VPS proxy that owns port 443."""
+"""Host-side helper of the `rift` command.
 
+Publishes home-agent ports as HTTPS names on the VPS proxy that owns port 443, and runs the
+commands that read or write files on the host: export, import, backup and restore.
+"""
+
+import argparse
+import contextlib
+import datetime
+import io
 import ipaddress
 import json
 import os
@@ -9,9 +17,11 @@ import shutil
 import socket
 import subprocess
 import sys
+import tarfile
+import time
 import urllib.error
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 PROXIES = ("traefik", "caddy", "nginx", "npm")
 HOST_RE = re.compile(
@@ -1135,13 +1145,609 @@ def command_proxy(name):
     save_state(state)
     print(name)
 
+# ---------------------------------------------------------------------------------------
+# Export, import, backup and restore. These run on the host because the files live there;
+# the container only produces and consumes streams (`rift export -`, `rift import -`,
+# `rift backup -`).
+
+EXPORT_FORMAT = 1
+BACKUP_FORMAT = 1
+BACKUP_MANIFEST = "rift-backup.json"
+BACKUP_SERVER = "server"
+BACKUP_HOST = "host/rift-site"
+STATE_VOLUME_PATH = "/var/lib/rift"
+
+
+def today():
+    return datetime.date.today().isoformat()
+
+
+def container_command(state, *args, interactive=False):
+    command = ["docker", "exec"]
+    if interactive:
+        command.append("-i")
+    return command + [state["container"], "rift", "--config", state["rift_config"], *args]
+
+
+def rift_with_input(state, text, *args):
+    """Run a container command that reads standard input and prints JSON."""
+    completed = subprocess.run(
+        container_command(state, "--json", *args, interactive=True),
+        input=text,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "command failed").strip()
+        raise SiteError(detail[6:] if detail.startswith("rift: ") else detail)
+    return json.loads(completed.stdout)
+
+
+def site_state():
+    """The helper's state, with stale records of an earlier installation dropped."""
+    state = load_state()
+    if state is None:
+        return default_state("")
+    sync_installation(state)
+    return state
+
+
+def site_forward_entry(site, entry):
+    """Whether an exported forward is the one `rift add site` made for this site."""
+    ports = entry.get("listen_ports") or {}
+    targets = entry.get("target_ports") or {}
+    return (
+        entry.get("agent") == site.get("agent")
+        and entry.get("ingress") == "local"
+        and entry.get("protocol") == "tcp"
+        and ports.get("start") == ports.get("end") == int(site.get("listen", 0))
+        and targets.get("start") == targets.get("end") == int(site.get("target", 0))
+    )
+
+
+def export_document(core, sites):
+    """The core export plus sites; the forwards that belong to sites are left to the sites."""
+    document = dict(core)
+    records = sorted(sites.items())
+    document["forwards"] = [
+        entry
+        for entry in core.get("forwards", [])
+        if not any(site_forward_entry(site, entry) for _, site in records)
+    ]
+    document["sites"] = [
+        {"agent": site["agent"], "host": host, "port": int(site["target"]), "proxy": site["proxy"]}
+        for host, site in records
+    ]
+    return document
+
+
+def export_summary(document):
+    grants = sum(len(d.get("grants", [])) for d in document["devices"])
+    return (
+        f"{len(document['agents'])} agent(s), {len(document['forwards'])} forward(s), "
+        f"{len(document['devices'])} device(s) with {grants} grant(s), "
+        f"{len(document['sites'])} site(s)"
+    )
+
+
+def write_file(path, data, mode=0o600):
+    """Write through a temporary file so an existing file survives a failed write."""
+    path = Path(path)
+    partial = path.with_name("." + path.name + ".partial")
+    fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    partial.replace(path)
+
+
+def command_export(args):
+    parser = ArgumentParser("rift export", "Save settings to a JSON file (no keys or tokens).")
+    parser.add_argument("file", nargs="?", help="where to write (default: rift-export-DATE.json)")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    options = parser.parse_args(args)
+    state = site_state()
+    document = export_document(rift(state, "export", "-"), state.get("sites") or {})
+    path = Path(options.file) if options.file else Path.cwd() / f"rift-export-{today()}.json"
+    write_file(path, (json.dumps(document, indent=2) + "\n").encode("utf-8"), 0o644)
+    if options.json:
+        print(json.dumps({"file": str(path), **document_counts(document)}))
+    else:
+        print(path)
+        print(f"Exported {export_summary(document)}. The file holds no keys or tokens.")
+
+
+def document_counts(document):
+    return {
+        "agents": len(document["agents"]),
+        "forwards": len(document["forwards"]),
+        "devices": len(document["devices"]),
+        "grants": sum(len(d.get("grants", [])) for d in document["devices"]),
+        "sites": len(document["sites"]),
+    }
+
+
+def check_export_format(document):
+    if not isinstance(document, dict) or "format" not in document:
+        raise SiteError("this is not a RIFT export file (no \"format\" field)")
+    if document["format"] != EXPORT_FORMAT:
+        raise SiteError(
+            f"this file has export format {document['format']}, but this rift reads format "
+            f"{EXPORT_FORMAT}; export again with the same rift version"
+        )
+
+
+def parse_map(value):
+    old, separator, new = value.partition("=")
+    if not separator or not old or not new or "=" in new:
+        raise argparse.ArgumentTypeError("use OLD=NEW, for example core2=core")
+    return old, new
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    def __init__(self, prog, description):
+        super().__init__(prog=prog, description=description)
+
+    def error(self, message):
+        raise SiteError(f"{message}\n{self.format_usage().strip()}")
+
+
+def import_target(options, old):
+    for source, target in reversed(options["map"]):
+        if source == old:
+            return target
+    return old
+
+
+def import_filtered(options, name):
+    if options["agents"] and name not in options["agents"]:
+        return "not selected with --agent"
+    if name in options["skip_agents"]:
+        return "left out with --skip-agent"
+    return None
+
+
+def agent_problem(name, old, agents):
+    """Why an entry for this (mapped) agent cannot be imported, or None."""
+    status = agents.get(name)
+    if status is None:
+        return f"no such agent; create it with `rift add agent {name}` or use --map {old}=NAME"
+    if status == "pending":
+        return (
+            "its invitation is still open; run the import again once "
+            f"`rift list agents` shows {name} as active"
+        )
+    if status == "disabled":
+        return f"the agent is disabled; enable it with `rift enable agent {name}`"
+    return None
+
+
+def plan_site_import(entries, options, agents, sites, alive_hosts):
+    """What importing the exported sites does: create, present, skipped or failed per site.
+
+    `agents` maps agent names to their status, `sites` are the helper's records and
+    `alive_hosts` the sites whose forward still exists.
+    """
+    plan = []
+    for entry in entries:
+        host, old = entry["host"], entry["agent"]
+        agent = import_target(options, old)
+        what = f"site {host} (agent {agent}, port {entry['port']}, {entry['proxy']})"
+        problem = import_filtered(options, agent) or agent_problem(agent, old, agents)
+        if problem:
+            plan.append({"status": "skipped", "what": what, "detail": problem})
+        elif entry["proxy"] not in PROXIES or not valid_host(host) or not 1 <= int(entry["port"]) <= 65535:
+            plan.append({"status": "failed", "what": what, "detail": "the entry is not a usable site"})
+        elif host in sites:
+            site = sites[host]
+            same = (
+                site.get("agent") == agent
+                and int(site["target"]) == int(entry["port"])
+                and site.get("proxy") == entry["proxy"]
+            )
+            if same and host in alive_hosts:
+                plan.append({"status": "present", "what": what, "detail": None})
+            else:
+                plan.append(
+                    {
+                        "status": "failed",
+                        "what": what,
+                        "detail": (
+                            f"{host} exists as a site of agent {site.get('agent')}, port "
+                            f"{site.get('target')}, {site.get('proxy')}; remove it first with "
+                            f"`rift remove site {host}` to import this one"
+                        ),
+                    }
+                )
+        else:
+            plan.append(
+                {
+                    "status": "create",
+                    "what": what,
+                    "detail": None,
+                    "agent": agent,
+                    "host": host,
+                    "port": int(entry["port"]),
+                    "proxy": entry["proxy"],
+                }
+            )
+    return plan
+
+
+REPORT_GROUPS = (
+    ("created", "Created", "Would create"),
+    ("present", "Already present", "Already present"),
+    ("skipped", "Skipped", "Skipped"),
+    ("failed", "Failed", "Failed"),
+)
+
+
+def render_import_report(items, dry_run):
+    lines = ["Dry run: nothing was changed."] if dry_run else []
+    for status, title, dry_title in REPORT_GROUPS:
+        group = [item for item in items if item["status"] == status]
+        if not group:
+            continue
+        if lines:
+            lines.append("")
+        lines.append(f"{dry_title if dry_run else title} ({len(group)})")
+        for item in group:
+            detail = item.get("detail")
+            if not detail:
+                lines.append(f"  {item['what']}")
+            elif status == "created":
+                lines.append(f"  {item['what']} ({detail})")
+            else:
+                lines.append(f"  {item['what']}: {detail}")
+    if not items:
+        lines.append("Nothing to import.")
+    return "\n".join(lines)
+
+
+def import_sites(state, plan, dry_run):
+    """Carry out the planned sites; returns the report items."""
+    items = []
+    for step in plan:
+        if step["status"] != "create":
+            items.append({k: step[k] for k in ("status", "what", "detail")})
+            continue
+        if dry_run:
+            items.append({"status": "created", "what": step["what"], "detail": None})
+            continue
+        captured = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(captured):
+                command_add(step["agent"], step["host"], step["port"], step["proxy"])
+        except SiteError as error:
+            items.append({"status": "failed", "what": step["what"], "detail": str(error)})
+            continue
+        hint = next((l for l in captured.getvalue().splitlines() if l.startswith("DNS:")), None)
+        items.append({"status": "created", "what": step["what"], "detail": hint})
+    return items
+
+
+def command_import(args):
+    parser = ArgumentParser(
+        "rift import",
+        "Create what an export file holds and this server lacks. Agents are never created.",
+    )
+    parser.add_argument("file", help="export file; - reads standard input")
+    parser.add_argument("--agent", action="append", default=[], metavar="NAME")
+    parser.add_argument("--skip-agent", action="append", default=[], metavar="NAME", dest="skip_agent")
+    parser.add_argument("--map", action="append", default=[], metavar="OLD=NEW", type=parse_map)
+    parser.add_argument("--dry-run", action="store_true", dest="dry_run")
+    parser.add_argument("--json", action="store_true")
+    given = parser.parse_args(args)
+    options = {
+        "agents": given.agent,
+        "skip_agents": given.skip_agent,
+        "map": given.map,
+        "dry_run": given.dry_run,
+    }
+    raw = sys.stdin.read() if given.file == "-" else Path(given.file).read_text(encoding="utf-8")
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError:
+        raise SiteError("this is not a RIFT export file (not JSON)") from None
+    check_export_format(document)
+    state = site_state()
+    argv = ["import", "-"]
+    for name in options["agents"]:
+        argv += ["--agent", name]
+    for name in options["skip_agents"]:
+        argv += ["--skip-agent", name]
+    for old, new in options["map"]:
+        argv += ["--map", f"{old}={new}"]
+    if options["dry_run"]:
+        argv.append("--dry-run")
+    report = rift_with_input(state, raw, *argv)
+    items = list(report["items"])
+    entries = document.get("sites") or []
+    if entries:
+        agents = {a["name"]: a["status"] for a in rift(state, "list", "agents") or []}
+        forwards = rift(state, "list", "forwards") or []
+        sites = state.get("sites") or {}
+        alive = {host for host, site in sites.items() if site_forward_alive(site, forwards)}
+        plan = plan_site_import(entries, options, agents, sites, alive)
+        items += import_sites(state, plan, options["dry_run"])
+    if given.json:
+        print(json.dumps({"dry_run": options["dry_run"], "items": items}))
+    else:
+        print(render_import_report(items, options["dry_run"]))
+
+
+def tar_member_name(name):
+    """A safe relative archive path, or an error."""
+    path = PurePosixPath(name)
+    if path.is_absolute() or ".." in path.parts:
+        raise SiteError(f"the archive contains an unsafe path: {name}")
+    return str(path)
+
+
+def copy_tar_members(source, destination, prefix):
+    """Copy every file and directory under `prefix` from one tar stream into another."""
+    for member in source:
+        name = tar_member_name(member.name)
+        if name == "." or not (name == prefix or name.startswith(prefix + "/")):
+            continue
+        if not (member.isfile() or member.isdir()):
+            raise SiteError(f"the archive contains something other than files: {member.name}")
+        destination.addfile(member, source.extractfile(member) if member.isfile() else None)
+
+
+def command_backup(args):
+    parser = ArgumentParser("rift backup", "Save everything, including every key, to a private archive.")
+    parser.add_argument("file", nargs="?", help="where to write (default: rift-backup-DATE.tar.gz)")
+    parser.add_argument("--json", action="store_true")
+    options = parser.parse_args(args)
+    state = site_state()
+    path = Path(options.file) if options.file else Path.cwd() / f"rift-backup-{today()}.tar.gz"
+    partial = path.with_name("." + path.name + ".partial")
+    manifest = json.dumps(
+        {
+            "format": BACKUP_FORMAT,
+            "created": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "contains": [BACKUP_SERVER, BACKUP_HOST],
+        },
+        indent=2,
+    ).encode("utf-8")
+    fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    producer = subprocess.Popen(
+        container_command(state, "backup", "-"), stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    try:
+        with os.fdopen(fd, "wb") as out, tarfile.open(fileobj=out, mode="w|gz") as archive:
+            info = tarfile.TarInfo(BACKUP_MANIFEST)
+            info.size, info.mode, info.mtime = len(manifest), 0o600, int(time.time())
+            archive.addfile(info, io.BytesIO(manifest))
+            with tarfile.open(fileobj=producer.stdout, mode="r|gz") as server:
+                copy_tar_members(server, archive, BACKUP_SERVER)
+            for file in sorted(STATE_PATH.parent.glob("*")) if STATE_PATH.parent.is_dir() else []:
+                if file.is_file() and not file.name.endswith(".tmp"):
+                    archive.add(str(file), arcname=f"{BACKUP_HOST}/{file.name}")
+        error = producer.stderr.read().decode("utf-8", "replace").strip()
+        if producer.wait() != 0:
+            raise SiteError(error[6:] if error.startswith("rift: ") else error or "backup failed")
+    except BaseException:
+        producer.kill()
+        partial.unlink(missing_ok=True)
+        raise
+    partial.replace(path)
+    if options.json:
+        print(json.dumps({"file": str(path)}))
+        return
+    print(path)
+    print(
+        "WARNING: this file contains every key of this server (WireGuard, enrollment CA, "
+        "VPN devices) and the panel password.\nKeep it private and store it somewhere safe, "
+        "not on this server only."
+    )
+
+
+def verify_backup(path):
+    """Read the whole archive once. Returns (manifest, server file count, host files)."""
+    try:
+        archive = tarfile.open(path, "r:gz")
+    except (tarfile.TarError, OSError) as error:
+        raise SiteError(f"{path} is not a RIFT backup: {error}") from None
+    host = {}
+    server_files = set()
+    manifest = None
+    try:
+        with archive:
+            for member in archive:
+                name = tar_member_name(member.name)
+                if not (member.isfile() or member.isdir()):
+                    raise SiteError(f"the backup contains something other than files: {member.name}")
+                if member.isfile():
+                    data = archive.extractfile(member).read()
+                if name == BACKUP_MANIFEST and member.isfile():
+                    manifest = json.loads(data)
+                elif member.isfile() and name.startswith(BACKUP_SERVER + "/"):
+                    server_files.add(name[len(BACKUP_SERVER) + 1 :])
+                elif member.isfile() and name.startswith(BACKUP_HOST + "/"):
+                    leaf = name[len(BACKUP_HOST) + 1 :]
+                    if "/" in leaf:
+                        raise SiteError(f"the backup contains an unexpected path: {name}")
+                    host[leaf] = data
+                elif name not in (BACKUP_SERVER, "host", BACKUP_HOST) and not name.startswith(
+                    (BACKUP_SERVER + "/", BACKUP_HOST + "/")
+                ):
+                    raise SiteError(f"the backup contains an unexpected path: {name}")
+    except (tarfile.TarError, EOFError, OSError, json.JSONDecodeError) as error:
+        raise SiteError(f"{path} is damaged: {error}") from None
+    if not isinstance(manifest, dict) or "format" not in manifest:
+        raise SiteError(f"{path} is not a RIFT backup (no {BACKUP_MANIFEST})")
+    if manifest["format"] != BACKUP_FORMAT:
+        raise SiteError(
+            f"this backup has format {manifest['format']}, but this rift reads format {BACKUP_FORMAT}"
+        )
+    for required in ("state.db", "wireguard.key"):
+        if required not in server_files:
+            raise SiteError(f"{path} is incomplete: server/{required} is missing")
+    return manifest, len(server_files), host
+
+
+def state_volume(inspected):
+    """The volume or directory behind /var/lib/rift in `docker inspect` output."""
+    document = inspected[0] if isinstance(inspected, list) else inspected
+    for mount in document.get("Mounts") or []:
+        if mount.get("Destination") == STATE_VOLUME_PATH:
+            if mount.get("Type") == "volume" and mount.get("Name"):
+                return mount["Name"]
+            if mount.get("Source"):
+                return mount["Source"]
+    raise SiteError(f"{STATE_VOLUME_PATH} is not a volume of the server container")
+
+
+def wait_for_server(state, seconds=90):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        probe = subprocess.run(
+            container_command(state, "--json", "list", "agents"),
+            capture_output=True,
+            check=False,
+        )
+        if probe.returncode == 0:
+            return True
+        time.sleep(2)
+    return False
+
+
+def resync_sites():
+    """Write the proxy configuration of every recorded site again.
+
+    The records come from a backup; the proxy files and Nginx Proxy Manager hosts do not,
+    and the public address of a new server differs.
+    """
+    state = load_state()
+    sites = (state or {}).get("sites") or {}
+    if not sites:
+        print("No sites to re-create.")
+        return 0
+    state["public_ip"] = read_server_public_ip(state["container"], state["rift_config"])
+    save_state(state)
+    failed = 0
+    for host, site in sorted(sites.items()):
+        try:
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                command_add(site["agent"], host, int(site["target"]), site["proxy"])
+            print(f"Site {host}: proxy configuration written.")
+        except SiteError as error:
+            failed += 1
+            print(f"Site {host}: not re-created: {error}", file=sys.stderr)
+            print(f"  Fix the cause, then run: rift add site {site['agent']} {host} {site['target']} {site['proxy']}", file=sys.stderr)
+    return failed
+
+
+def command_restore(args):
+    parser = ArgumentParser("rift restore", "Replace all state on this server with a backup.")
+    parser.add_argument("file")
+    parser.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    parser.add_argument("--json", action="store_true")
+    options = parser.parse_args(args)
+    if os.geteuid() != 0:
+        raise SiteError("restore replaces the server's state volume; run it with sudo")
+    path = Path(options.file)
+    if not path.is_file():
+        raise SiteError(f"{path} does not exist")
+    manifest, count, host = verify_backup(path)
+    state = load_state() or default_state("")
+    container = state["container"]
+    inspected = run(["docker", "inspect", container])
+    volume = state_volume(json.loads(inspected))
+    image = run(["docker", "inspect", "--format", "{{.Image}}", container]).strip()
+    if not options.yes:
+        if not sys.stdin.isatty():
+            raise SiteError("restore needs your confirmation: add --yes to run it without asking")
+        answer = input(
+            f"This replaces ALL RIFT state on this server (agents, forwards, keys, devices) with "
+            f"the backup made {manifest.get('created', 'at an unknown time')}.\n"
+            f"Everything that is here now is lost. Type yes to continue: "
+        )
+        if answer.strip().lower() != "yes":
+            raise SiteError("cancelled; nothing was changed")
+    print(f"Stopping {container}...")
+    run(["docker", "stop", "-t", "60", container])
+    print(f"Writing {count} file(s) to {volume}...")
+    loader = subprocess.Popen(
+        [
+            "docker", "run", "--rm", "-i", "--network", "none",
+            "-v", f"{volume}:/data",
+            "--entrypoint", "sh", image,
+            "-c", "find /data -mindepth 1 -delete && chmod 700 /data && tar -xpf - -C /data",
+        ],
+        stdin=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        with tarfile.open(path, "r:gz") as source, tarfile.open(fileobj=loader.stdin, mode="w|") as out:
+            for member in source:
+                name = tar_member_name(member.name)
+                if name == BACKUP_SERVER or not name.startswith(BACKUP_SERVER + "/"):
+                    continue
+                member.name = name[len(BACKUP_SERVER) + 1 :]
+                member.uid = member.gid = 0
+                member.uname = member.gname = "root"
+                out.addfile(member, source.extractfile(member) if member.isfile() else None)
+        loader.stdin.close()
+        failure = loader.stderr.read().decode("utf-8", "replace").strip()
+        if loader.wait() != 0:
+            raise SiteError(failure or "writing the state volume failed")
+    except BaseException as error:
+        loader.kill()
+        raise SiteError(
+            f"the state volume may be incomplete and {container} stays stopped: {error}. "
+            "Run the restore again with the same file."
+        ) from None
+    if host:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        for leaf, data in host.items():
+            write_file(STATE_PATH.parent / leaf, data)
+    print(f"Starting {container}...")
+    run(["docker", "start", container])
+    ready = wait_for_server(state)
+    failed = 0
+    if ready:
+        failed = resync_sites()
+    if options.json:
+        print(json.dumps({"restored": True, "server_ready": ready, "sites_failed": failed}))
+        return
+    print("Restored.")
+    if not ready:
+        print(f"{container} did not answer within 90 seconds; check: docker logs {container}")
+    print(restore_next_steps())
+
+
+def restore_next_steps():
+    return (
+        "Next steps:\n"
+        "  1. rift status           the server and its forwards should be listed.\n"
+        "  2. RIFT_PUBLIC_IPS       forwards on an address this server does not have moved to its\n"
+        "                           first address of the same IP version; rift status says which.\n"
+        "  3. DNS                   point RIFT_PUBLIC_ENDPOINT (and the names of your sites) at this\n"
+        "                           server. Agents that connect by a raw IP: set RIFT_SERVER in their\n"
+        "                           .env to this server and restart them.\n"
+        "  4. Firewall              open UDP 51820 (WireGuard) and each public port in the cloud\n"
+        "                           firewall of this server."
+    )
+
 
 def usage():
     return (
         "usage: rift add site AGENT HOST PORT [traefik|caddy|nginx|npm]\n"
         "       rift remove site HOST\n"
         "       rift list sites\n"
-        "       rift proxy [traefik|caddy|nginx|npm]"
+        "       rift proxy [traefik|caddy|nginx|npm]\n"
+        "       rift export [FILE]\n"
+        "       rift import FILE [--agent NAME]... [--skip-agent NAME]... [--map OLD=NEW]... [--dry-run]\n"
+        "       rift backup [FILE]\n"
+        "       rift restore FILE [--yes]"
     )
 
 
@@ -1156,7 +1762,8 @@ def parse_add_args(args):
 
 
 def main(argv):
-    """Commands as the host `rift` wrapper passes them: add, remove, list, forwards, proxy, purge."""
+    """Commands as the host `rift` wrapper passes them: add, remove, list, forwards, proxy, purge,
+    export, import, backup, restore and resync."""
     if len(argv) < 2:
         raise SiteError(usage())
     command = argv[1]
@@ -1179,6 +1786,20 @@ def main(argv):
     if command == "purge" and len(argv) == 2:
         command_purge()
         return
+    if command == "export":
+        command_export(argv[2:])
+        return
+    if command == "import":
+        command_import(argv[2:])
+        return
+    if command == "backup":
+        command_backup(argv[2:])
+        return
+    if command == "restore":
+        command_restore(argv[2:])
+        return
+    if command == "resync" and len(argv) == 2:
+        sys.exit(1 if resync_sites() else 0)
     raise SiteError(usage())
 
 

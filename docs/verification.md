@@ -57,6 +57,15 @@ The web panel has unit coverage (configuration parsing, source checks, read/writ
 
 Unit tests cover the configuration parsing; the listener lifecycle has not run in a container. Check that 8443 is closed at start without invitations, opens with `rift add agent` and with an invitation from the panel, stays open until the agent is active, and closes after activation, `rift remove invite`, agent removal and expiry (within about 10 s). With UFW, RIFT's `rift:enrollment` rule should appear and disappear with it. `RIFT_ENROLLMENT=always` keeps it open; `off` refuses invitations.
 
+## Export, import, backup and restore: unit-tested only
+
+Unit tests cover the pure planning of an import (agent mapping and filters, unknown and inactive agents, duplicate and overlapping forwards, listen-address replacement, devices with flags and grants, subnets behind two agents, format check), the repair of forwards on addresses the server lacks, the agent endpoint choice, the report layout, CLI parsing, and the host helper (site planning, archive layout and validation, volume lookup, restore sequence with mocked Docker). The state backup runs `tar` and SQLite for real in a test (WAL database with an open writer, socket excluded, mode 0600). Nothing has been run against a real Docker volume or a second VPS. Before relying on it, on disposable machines:
+
+1. `sudo rift backup` on a server with agents, forwards, a VPN device and a site; the archive lists `server/state.db`, the key files and `host/rift-site/sites.json`, and `rift backup` runs while the server serves traffic.
+2. On a second server with a different `RIFT_PUBLIC_IPS`: `docker compose up -d`, then `sudo rift restore`. Agents reconnect after DNS or `RIFT_SERVER` changes, VPN devices still connect with their old configuration, forwards moved to the new address work, and the site's proxy configuration exists again.
+3. `rift export` and `rift import` into a reinstalled server with re-enrolled agents, with and without `--map`, `--skip-agent` and `--dry-run`; a port in use is reported without stopping the rest.
+4. A restore interrupted halfway leaves `rift-server` stopped and a second `rift restore` succeeds.
+
 ## Agent allowlists: unit-tested only
 
 `RIFT_AGENT_ALLOW_PORTS` and `RIFT_AGENT_ALLOW_SUBNETS` are covered by unit tests of parsing and of the policy filter; no container or kernel test has run. Check on a disposable agent that a refused forward stays pending, that a network grant is refused until the network is listed, and that both appear in `rift status`.

@@ -1,6 +1,8 @@
 import importlib.machinery
 import importlib.util
+import io
 import json
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -477,6 +479,412 @@ class InstallationTests(unittest.TestCase):
                 sp.assert_not_called()
             self.assertFalse((dynamic / "a.example.yml").exists())
             self.assertFalse(state_dir.exists())
+
+
+def make_tar(path, members, mode="w:gz"):
+    """members: name -> bytes (a file), or None (a directory)."""
+    with tarfile.open(path, mode) as archive:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name)
+            if data is None:
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o700
+                archive.addfile(info)
+            else:
+                info.size = len(data)
+                info.mode = 0o600
+                archive.addfile(info, io.BytesIO(data))
+
+
+MANIFEST = json.dumps({"format": 1, "created": "2026-11-01T10:00:00+00:00"}).encode()
+SERVER_FILES = {
+    "server": None,
+    "server/state.db": b"db",
+    "server/wireguard.key": b"key",
+    "server/vpn": None,
+    "server/vpn/a.key": b"device",
+}
+
+
+class ExportTests(unittest.TestCase):
+    def forward(self, agent, listen, target, ingress="public"):
+        return {
+            "agent": agent,
+            "listen_ip": "203.0.113.10",
+            "listen_ports": {"start": listen, "end": listen},
+            "target_ports": {"start": target, "end": target},
+            "protocol": "tcp",
+            "mode": "transparent",
+            "ingress": ingress,
+            "target_family": "v4",
+            "enabled": True,
+        }
+
+    def test_sites_replace_the_forwards_they_made(self):
+        core = {
+            "format": 1,
+            "agents": ["core"],
+            "forwards": [
+                self.forward("core", 2222, 22),
+                self.forward("core", 20000, 8080, "local"),
+                self.forward("core", 20001, 9000, "local"),
+            ],
+            "devices": [
+                {
+                    "name": "phone",
+                    "enabled": True,
+                    "panel": False,
+                    "grants": [{"agent": "core", "access": "server"}],
+                }
+            ],
+        }
+        sites = {
+            "app.example.org": {
+                "agent": "core",
+                "target": 8080,
+                "listen": 20000,
+                "proxy": "caddy",
+                "forward_id": 2,
+            }
+        }
+        document = rift_site.export_document(core, sites)
+        self.assertEqual([f["listen_ports"]["start"] for f in document["forwards"]], [2222, 20001])
+        self.assertEqual(
+            document["sites"],
+            [{"agent": "core", "host": "app.example.org", "port": 8080, "proxy": "caddy"}],
+        )
+        self.assertEqual(document["format"], 1)
+        self.assertNotIn("forward_id", json.dumps(document))
+        self.assertIn("2 forward(s)", rift_site.export_summary(document))
+        self.assertIn("1 site(s)", rift_site.export_summary(document))
+        self.assertEqual(rift_site.document_counts(document)["grants"], 1)
+
+    def test_other_formats_are_refused(self):
+        rift_site.check_export_format({"format": 1})
+        with self.assertRaisesRegex(rift_site.SiteError, "format 2"):
+            rift_site.check_export_format({"format": 2})
+        with self.assertRaises(rift_site.SiteError):
+            rift_site.check_export_format({"agents": []})
+        with self.assertRaises(rift_site.SiteError):
+            rift_site.check_export_format([])
+
+    def test_export_writes_the_file_and_names_it_by_date(self):
+        core = {"format": 1, "agents": ["core"], "forwards": [], "devices": []}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(rift_site, "site_state", return_value={"sites": {}}), \
+                mock.patch.object(rift_site, "rift", return_value=core) as call, \
+                mock.patch.object(rift_site.Path, "cwd", return_value=Path(tmp)):
+            rift_site.command_export([])
+            call.assert_called_with({"sites": {}}, "export", "-")
+            written = Path(tmp) / f"rift-export-{rift_site.today()}.json"
+            self.assertEqual(json.loads(written.read_text())["sites"], [])
+            rift_site.command_export([str(Path(tmp) / "mine.json")])
+            self.assertTrue((Path(tmp) / "mine.json").exists())
+
+
+class ImportTests(unittest.TestCase):
+    def options(self, **extra):
+        base = {"agents": [], "skip_agents": [], "map": [], "dry_run": False}
+        base.update(extra)
+        return base
+
+    def entry(self, host, agent="core", port=8080, proxy="caddy"):
+        return {"agent": agent, "host": host, "port": port, "proxy": proxy}
+
+    def test_map_pairs_must_be_old_equals_new(self):
+        self.assertEqual(rift_site.parse_map("core2=core"), ("core2", "core"))
+        for bad in ("core2", "=core", "core2=", "a=b=c"):
+            with self.assertRaises(Exception, msg=bad):
+                rift_site.parse_map(bad)
+
+    def test_sites_follow_the_agent_filters_and_mapping(self):
+        agents = {"core": "active", "off": "disabled", "new": "pending"}
+        entries = [
+            self.entry("a.example.org", "core2"),
+            self.entry("b.example.org", "core"),
+            self.entry("c.example.org", "off"),
+            self.entry("d.example.org", "new"),
+            self.entry("e.example.org", "gone"),
+        ]
+        plan = rift_site.plan_site_import(
+            entries, self.options(map=[("core2", "core")]), agents, {}, set()
+        )
+        self.assertEqual(
+            [p["status"] for p in plan], ["create", "create", "skipped", "skipped", "skipped"]
+        )
+        self.assertEqual(plan[0]["agent"], "core")
+        self.assertIn("rift enable agent off", plan[2]["detail"])
+        self.assertIn("still open", plan[3]["detail"])
+        self.assertIn("rift add agent gone", plan[4]["detail"])
+        self.assertIn("--map gone=NAME", plan[4]["detail"])
+        only = rift_site.plan_site_import(
+            entries[:2], self.options(agents=["core"], map=[("core2", "off")]), agents, {}, set()
+        )
+        self.assertEqual([p["status"] for p in only], ["skipped", "create"])
+        self.assertIn("--agent", only[0]["detail"])
+        skip = rift_site.plan_site_import(
+            entries[:2], self.options(skip_agents=["core"]), agents, {}, set()
+        )
+        self.assertEqual([p["status"] for p in skip], ["skipped", "skipped"])
+        self.assertIn("--skip-agent", skip[1]["detail"])
+
+    def test_existing_sites_are_present_or_a_conflict_but_never_changed(self):
+        agents = {"core": "active"}
+        sites = {
+            "same.example.org": {"agent": "core", "target": 8080, "proxy": "caddy", "listen": 20000, "forward_id": 1},
+            "other.example.org": {"agent": "core", "target": 9999, "proxy": "caddy", "listen": 20001, "forward_id": 2},
+            "lost.example.org": {"agent": "core", "target": 8080, "proxy": "caddy", "listen": 20002, "forward_id": 3},
+        }
+        entries = [self.entry(h) for h in sites]
+        plan = rift_site.plan_site_import(
+            entries, self.options(), agents, sites, {"same.example.org", "other.example.org"}
+        )
+        self.assertEqual([p["status"] for p in plan], ["present", "failed", "failed"])
+        self.assertIn("rift remove site other.example.org", plan[1]["detail"])
+        bad = rift_site.plan_site_import(
+            [self.entry("x.example.org", proxy="apache"), self.entry("not a host")],
+            self.options(),
+            agents,
+            {},
+            set(),
+        )
+        self.assertEqual([p["status"] for p in bad], ["failed", "failed"])
+
+    def test_a_dry_run_creates_nothing_and_a_real_run_adds_each_site(self):
+        agents = {"core": "active"}
+        plan = rift_site.plan_site_import(
+            [self.entry("a.example.org"), self.entry("b.example.org")],
+            self.options(),
+            agents,
+            {},
+            set(),
+        )
+        with mock.patch.object(rift_site, "command_add") as add:
+            items = rift_site.import_sites({}, plan, True)
+            add.assert_not_called()
+        self.assertEqual([i["status"] for i in items], ["created", "created"])
+
+        def fake_add(agent, host, port, proxy):
+            if host == "b.example.org":
+                raise rift_site.SiteError("caddy is not listening on port 443")
+            print("https://" + host)
+            print("DNS: " + host + " -> 203.0.113.10")
+
+        with mock.patch.object(rift_site, "command_add", side_effect=fake_add):
+            items = rift_site.import_sites({}, plan, False)
+        self.assertEqual([i["status"] for i in items], ["created", "failed"])
+        self.assertEqual(items[0]["detail"], "DNS: a.example.org -> 203.0.113.10")
+        self.assertIn("port 443", items[1]["detail"])
+
+    def test_the_report_is_grouped_like_the_server_report(self):
+        items = [
+            {"status": "created", "what": "forward core 22/tcp on 1.2.3.4", "detail": None},
+            {"status": "created", "what": "device phone", "detail": "new keys"},
+            {"status": "present", "what": "device tv", "detail": None},
+            {"status": "skipped", "what": "3 entries for agent core2", "detail": "no such agent"},
+            {"status": "failed", "what": "site a.example.org", "detail": "no proxy"},
+        ]
+        text = rift_site.render_import_report(items, True)
+        for expected in (
+            "Dry run: nothing was changed.",
+            "Would create (2)\n  forward core 22/tcp on 1.2.3.4\n  device phone (new keys)",
+            "Already present (1)\n  device tv",
+            "Skipped (1)\n  3 entries for agent core2: no such agent",
+            "Failed (1)\n  site a.example.org: no proxy",
+        ):
+            self.assertIn(expected, text)
+        self.assertEqual(rift_site.render_import_report([], False), "Nothing to import.")
+        self.assertTrue(rift_site.render_import_report(items, False).startswith("Created (2)"))
+
+    def test_import_passes_the_file_and_filters_to_the_container(self):
+        document = {"format": 1, "agents": [], "forwards": [], "devices": [], "sites": []}
+        report = {"dry_run": True, "items": [{"status": "present", "what": "device tv", "detail": None}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            export = Path(tmp) / "e.json"
+            export.write_text(json.dumps(document))
+            with mock.patch.object(rift_site, "site_state", return_value={"sites": {}}), \
+                    mock.patch.object(rift_site, "rift_with_input", return_value=report) as call:
+                rift_site.command_import(
+                    [str(export), "--agent", "core", "--skip-agent", "x", "--map", "a=b", "--dry-run"]
+                )
+            args = call.call_args[0]
+            self.assertEqual(
+                args[2:],
+                ("import", "-", "--agent", "core", "--skip-agent", "x", "--map", "a=b", "--dry-run"),
+            )
+            self.assertEqual(json.loads(args[1])["format"], 1)
+            export.write_text(json.dumps({"format": 7}))
+            with self.assertRaisesRegex(rift_site.SiteError, "format 7"):
+                rift_site.command_import([str(export)])
+            with self.assertRaises(rift_site.SiteError):
+                rift_site.command_import([])
+
+
+class BackupTests(unittest.TestCase):
+    def test_paths_are_checked_and_the_volume_is_found(self):
+        self.assertEqual(rift_site.tar_member_name("server/a"), "server/a")
+        for bad in ("/etc/passwd", "server/../../etc"):
+            with self.assertRaises(rift_site.SiteError):
+                rift_site.tar_member_name(bad)
+        volume = [
+            {
+                "Mounts": [
+                    {"Type": "bind", "Source": "/etc/rift/config.toml", "Destination": "/etc/rift/config.toml"},
+                    {
+                        "Type": "volume",
+                        "Name": "rift-vps_rift-state",
+                        "Source": "/var/lib/docker/x",
+                        "Destination": "/var/lib/rift",
+                    },
+                ]
+            }
+        ]
+        self.assertEqual(rift_site.state_volume(volume), "rift-vps_rift-state")
+        bind = [{"Mounts": [{"Type": "bind", "Source": "/srv/rift", "Destination": "/var/lib/rift"}]}]
+        self.assertEqual(rift_site.state_volume(bind), "/srv/rift")
+        with self.assertRaises(rift_site.SiteError):
+            rift_site.state_volume([{"Mounts": []}])
+
+    def producer(self, tmp, returncode=0, stderr=b"keep it private"):
+        stream = Path(tmp) / "server.tar.gz"
+        make_tar(stream, {**SERVER_FILES, "./": None, "other/x": b"no"})
+        producer = mock.Mock()
+        producer.stdout = io.BytesIO(stream.read_bytes())
+        producer.stderr = io.BytesIO(stderr)
+        producer.wait.return_value = returncode
+        return producer
+
+    def test_backup_adds_the_host_part_to_the_container_stream(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            site_dir = Path(tmp) / "rift-site"
+            site_dir.mkdir()
+            (site_dir / "sites.json").write_text('{"sites": {}}')
+            out = Path(tmp) / "out" / "b.tar.gz"
+            out.parent.mkdir()
+            state = {"container": "rift-server", "rift_config": "/c"}
+            with mock.patch.object(rift_site, "site_state", return_value=state), \
+                    mock.patch.object(rift_site, "STATE_PATH", site_dir / "sites.json"), \
+                    mock.patch.object(
+                        rift_site.subprocess, "Popen", return_value=self.producer(tmp)
+                    ) as popen:
+                rift_site.command_backup([str(out)])
+            self.assertEqual(popen.call_args[0][0][-2:], ["backup", "-"])
+            self.assertEqual(out.stat().st_mode & 0o777, 0o600)
+            with tarfile.open(out) as archive:
+                names = archive.getnames()
+            self.assertEqual(names[0], "rift-backup.json")
+            self.assertIn("server/state.db", names)
+            self.assertIn("server/vpn/a.key", names)
+            self.assertIn("host/rift-site/sites.json", names)
+            self.assertNotIn("other/x", names)
+            manifest, files, host = rift_site.verify_backup(out)
+            self.assertEqual((manifest["format"], files), (1, 3))
+            self.assertEqual(host, {"sites.json": b'{"sites": {}}'})
+
+    def test_a_failing_producer_leaves_no_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "b.tar.gz"
+            failing = self.producer(tmp, 1, b"rift: there is no state to back up")
+            state = {"container": "c", "rift_config": "/c"}
+            with mock.patch.object(rift_site, "site_state", return_value=state), \
+                    mock.patch.object(rift_site, "STATE_PATH", Path(tmp) / "none" / "sites.json"), \
+                    mock.patch.object(rift_site.subprocess, "Popen", return_value=failing):
+                with self.assertRaisesRegex(rift_site.SiteError, "no state to back up"):
+                    rift_site.command_backup([str(out)])
+            self.assertEqual(list(Path(tmp).glob("*b.tar.gz*")), [])
+
+    def test_a_backup_is_checked_before_anything_is_touched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            good = Path(tmp) / "good.tar.gz"
+            make_tar(good, {"rift-backup.json": MANIFEST, **SERVER_FILES})
+            self.assertEqual(rift_site.verify_backup(good)[1], 3)
+            cases = {
+                "no manifest": SERVER_FILES,
+                "no database": {"rift-backup.json": MANIFEST, "server/wireguard.key": b"k"},
+                "unsafe path": {"rift-backup.json": MANIFEST, **SERVER_FILES, "server/../x": b"x"},
+                "stray path": {"rift-backup.json": MANIFEST, **SERVER_FILES, "etc/passwd": b"x"},
+                "other format": {"rift-backup.json": b'{"format": 9}', **SERVER_FILES},
+            }
+            path = Path(tmp) / "bad.tar.gz"
+            for label, members in cases.items():
+                make_tar(path, members)
+                with self.assertRaises(rift_site.SiteError, msg=label):
+                    rift_site.verify_backup(path)
+            path.write_bytes(b"not an archive")
+            with self.assertRaises(rift_site.SiteError):
+                rift_site.verify_backup(path)
+
+    def run_restore(self, tmp, args, answer=None, tty=False):
+        archive = Path(tmp) / "b.tar.gz"
+        make_tar(
+            archive,
+            {
+                "rift-backup.json": MANIFEST,
+                **SERVER_FILES,
+                "host/rift-site/sites.json": b'{"sites": {}}',
+            },
+        )
+        loader = mock.Mock()
+        loader.stdin = io.BytesIO()
+        loader.stdin.close = lambda: None
+        loader.stderr = io.BytesIO(b"")
+        loader.wait.return_value = 0
+        calls = []
+
+        def fake_run(command, cwd=None):
+            calls.append(command)
+            if command[:2] == ["docker", "inspect"] and "--format" in command:
+                return "sha256:image\n"
+            if command[:2] == ["docker", "inspect"]:
+                mounts = [{"Type": "volume", "Name": "vol", "Destination": "/var/lib/rift"}]
+                return json.dumps([{"Mounts": mounts}])
+            return ""
+
+        site_dir = Path(tmp) / "rift-site"
+        patches = [
+            mock.patch.object(rift_site.os, "geteuid", return_value=0),
+            mock.patch.object(rift_site, "run", side_effect=fake_run),
+            mock.patch.object(rift_site, "load_state", return_value=None),
+            mock.patch.object(rift_site, "STATE_PATH", site_dir / "sites.json"),
+            mock.patch.object(rift_site, "wait_for_server", return_value=True),
+            mock.patch.object(rift_site, "resync_sites", return_value=0),
+            mock.patch.object(rift_site.subprocess, "Popen", return_value=loader),
+            mock.patch.object(rift_site.sys.stdin, "isatty", return_value=tty),
+            mock.patch("builtins.input", return_value=answer),
+        ]
+        for patch in patches:
+            patch.start()
+        self.addCleanup(mock.patch.stopall)
+        rift_site.command_restore([str(archive), *args])
+        return calls, loader, site_dir
+
+    def test_restore_needs_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(rift_site.SiteError, "--yes"):
+                self.run_restore(tmp, [])
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(rift_site.SiteError, "cancelled"):
+                self.run_restore(tmp, [], answer="no", tty=True)
+
+    def test_restore_stops_writes_the_volume_and_starts_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls, loader, site_dir = self.run_restore(tmp, ["--yes"])
+            steps = [c[1] for c in calls if c[:2] in (["docker", "stop"], ["docker", "start"])]
+            self.assertEqual(steps, ["stop", "start"])
+            sent = loader.stdin.getvalue()
+            with tarfile.open(fileobj=io.BytesIO(sent), mode="r:") as sent_archive:
+                self.assertEqual(
+                    sorted(sent_archive.getnames()),
+                    ["state.db", "vpn", "vpn/a.key", "wireguard.key"],
+                )
+                self.assertEqual({m.uid for m in sent_archive}, {0})
+            self.assertEqual((site_dir / "sites.json").read_bytes(), b'{"sites": {}}')
+            self.assertEqual((site_dir / "sites.json").stat().st_mode & 0o777, 0o600)
+
+    def test_restore_refuses_without_root(self):
+        with mock.patch.object(rift_site.os, "geteuid", return_value=1000):
+            with self.assertRaisesRegex(rift_site.SiteError, "sudo"):
+                rift_site.command_restore(["x.tar.gz", "--yes"])
 
 
 if __name__ == "__main__":
