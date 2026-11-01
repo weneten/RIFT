@@ -850,6 +850,8 @@ class BackupTests(unittest.TestCase):
             mock.patch.object(rift_site, "resync_sites", return_value=0),
             mock.patch.object(rift_site.subprocess, "Popen", return_value=loader),
             mock.patch.object(rift_site.sys.stdin, "isatty", return_value=tty),
+            mock.patch.object(rift_site, "command_backup", side_effect=self.safety),
+            mock.patch.object(rift_site.Path, "cwd", return_value=Path(tmp)),
             mock.patch("builtins.input", return_value=answer),
         ]
         for patch in patches:
@@ -857,6 +859,27 @@ class BackupTests(unittest.TestCase):
         self.addCleanup(mock.patch.stopall)
         rift_site.command_restore([str(archive), *args])
         return calls, loader, site_dir
+
+    def safety(self, args):
+        self.safety_paths.append(args[0])
+        if getattr(self, "safety_fails", False):
+            raise rift_site.SiteError("server not running")
+
+    def setUp(self):
+        self.safety_paths = []
+
+    def test_restore_saves_the_current_state_first_and_stops_if_it_cannot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_restore(tmp, ["--yes"])
+            self.assertEqual(len(self.safety_paths), 1)
+            self.assertIn("rift-before-restore-", self.safety_paths[0])
+        self.safety_paths, self.safety_fails = [], True
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(rift_site.SiteError, "nothing was changed"):
+                self.run_restore(tmp, ["--yes"])
+        with tempfile.TemporaryDirectory() as tmp:
+            calls, _, _ = self.run_restore(tmp, ["--yes", "--no-safety-backup"])
+            self.assertIn(["docker", "stop", "-t", "60", "rift-server"], calls)
 
     def test_restore_needs_confirmation(self):
         with tempfile.TemporaryDirectory() as tmp:

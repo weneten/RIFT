@@ -1649,6 +1649,11 @@ def command_restore(args):
     parser = ArgumentParser("rift restore", "Replace all state on this server with a backup.")
     parser.add_argument("file")
     parser.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    parser.add_argument(
+        "--no-safety-backup",
+        action="store_true",
+        help="do not save the current state first (only when that is impossible)",
+    )
     parser.add_argument("--json", action="store_true")
     options = parser.parse_args(args)
     if os.geteuid() != 0:
@@ -1672,6 +1677,19 @@ def command_restore(args):
         )
         if answer.strip().lower() != "yes":
             raise SiteError("cancelled; nothing was changed")
+    if not options.no_safety_backup:
+        # The volume is emptied below; keep what is there now in case the backup is not the
+        # one you meant.
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
+        safety = Path.cwd() / f"rift-before-restore-{stamp}.tar.gz"
+        try:
+            command_backup([str(safety)])
+        except (SiteError, OSError, tarfile.TarError) as error:
+            raise SiteError(
+                f"could not save the current state first ({error}); nothing was changed. "
+                "Start the server, or add --no-safety-backup to restore without it."
+            ) from None
+        print(f"The previous state is saved in {safety}; restore it the same way if needed.")
     print(f"Stopping {container}...")
     run(["docker", "stop", "-t", "60", container])
     print(f"Writing {count} file(s) to {volume}...")

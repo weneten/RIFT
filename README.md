@@ -559,7 +559,7 @@ sudo rift restore rift-backup-2026-11-01.tar.gz
 
 The backup is one `.tar.gz` with three parts: a small manifest, `server/` (everything in the container's `/var/lib/rift`) and `host/rift-site/` (the site records in `/var/lib/rift-site`). The database is copied with SQLite's online backup (`VACUUM INTO`), so a backup taken while RIFT runs is consistent; the archive is streamed out of the container, so nothing large is staged in its small `/tmp`. The proxy configuration files themselves are not part of it; the site records are, and a restore writes the proxy configuration again.
 
-`rift restore` asks for confirmation (`--yes` skips the question). It checks the archive first, then stops `rift-server`, replaces the content of its state volume with the backup, restores the site records, starts the container again and re-creates the proxy configuration of the restored sites. Everything on the server before the restore is gone.
+`rift restore` asks for confirmation (`--yes` skips the question). It checks the archive first, then stops `rift-server`, replaces the content of its state volume with the backup, restores the site records, starts the container again and re-creates the proxy configuration of the restored sites. Before it changes anything it saves the current state as `rift-before-restore-DATE-TIME.tar.gz` in the current directory, so a wrong archive can be undone by restoring that file (`--no-safety-backup` skips this, for example when the server cannot start).
 
 ### Move to a new VPS with backup and restore
 
