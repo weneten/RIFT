@@ -225,9 +225,18 @@ async fn sync_enrollment(s: &Server) -> Result<()> {
         EnrollmentMode::Auto => !s.state.open_invites()?.is_empty(),
     };
     let mut running = s.enrollment.lock().await;
-    let is_running = running.as_ref().is_some_and(|task| !task.is_finished());
+    let mut is_running = running.as_ref().is_some_and(|task| !task.is_finished());
+    if wanted
+        && crate::tls_material::refresh(&config).context("renew the enrollment certificate")?
+        && is_running
+    {
+        // The listener holds the old certificate; restart it with the new one.
+        if let Some(task) = running.take() {
+            task.abort();
+        }
+        is_running = false;
+    }
     if wanted && !is_running {
-        crate::tls_material::refresh(&config).context("renew the enrollment certificate")?;
         let listener = TcpListener::bind(config.enrollment_bind)
             .await
             .with_context(|| format!("bind enrollment endpoint {}", config.enrollment_bind))?;

@@ -213,16 +213,16 @@ fn materialize(paths: &MaterialPaths, bundle: &TlsBundle) -> Result<()> {
     Ok(())
 }
 
-/// Renews the automatic certificate if needed while the server runs, before the enrollment
-/// port opens. External TLS material is left alone.
-pub fn refresh(config: &Config) -> Result<()> {
+/// Renews the automatic certificate if needed while the server runs; true when it did, so a
+/// running enrollment listener must reload it. External TLS material is left alone.
+pub fn refresh(config: &Config) -> Result<bool> {
     let paths = MaterialPaths::in_dir(&config.state_dir);
     if config.tls_cert.as_ref() != Some(&paths.server_cert) || !path_is_file(&paths.bundle)? {
-        return Ok(());
+        return Ok(false);
     }
     let bundle = read_bundle(&paths.bundle)?;
-    renew_if_needed(&paths, bundle, &config.public_endpoint)?;
-    Ok(())
+    let before = bundle.server_cert_pem.clone();
+    Ok(renew_if_needed(&paths, bundle, &config.public_endpoint)?.server_cert_pem != before)
 }
 
 /// Days of validity left at which the automatic server certificate is renewed.
