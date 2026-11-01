@@ -4,6 +4,7 @@ pub mod backup;
 pub mod config;
 pub mod daemon;
 pub mod enrollment;
+pub mod exit;
 pub(crate) mod host_firewall;
 pub mod model;
 pub mod net;

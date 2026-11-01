@@ -301,6 +301,8 @@ mod tests {
                 created_at: now(),
                 pending_deadline: None,
                 limits: None,
+                exit: None,
+                exit_port: None,
             }],
             forwards: vec![Forward {
                 id: 1,
@@ -320,6 +322,7 @@ mod tests {
                 target_family: Family::of(target.ip()),
                 enabled: true,
                 generation: 1,
+                purpose: Purpose::User,
             }],
             bans: vec![],
             ..Default::default()

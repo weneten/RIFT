@@ -148,10 +148,12 @@ impl Kernel {
         let vpn_peers: Vec<_> = snapshot.vpn_peers.iter().filter(|p| p.enabled).collect();
         for peer in &vpn_peers {
             ensure!(
-                self.config.vpn_pool.contains(&peer.ipv4),
-                "VPN peer {} address {} is outside the VPN pool",
+                self.config.vpn_pool.contains(&peer.ipv4)
+                    && self.config.vpn_pool6.contains(&peer.ipv6),
+                "VPN peer {} address {} / {} is outside the VPN pools",
                 peer.name,
-                peer.ipv4
+                peer.ipv4,
+                peer.ipv6
             );
             ensure!(
                 peer_keys.insert(peer.public_key.clone()),
@@ -161,7 +163,7 @@ impl Kernel {
         }
         if !vpn_peers.is_empty() {
             self.config.check_vpn_pool()?;
-            self.check_networks_free(&[self.config.vpn_pool.into()])
+            self.check_networks_free(&[self.config.vpn_pool.into(), self.config.vpn_pool6.into()])
                 .await
                 .context("VPN pool")?;
         }
@@ -208,9 +210,9 @@ impl Kernel {
             self.add_peer_routes(agent.tunnel_ipv4.into(), agent.tunnel_ipv6.into())
                 .await?;
         }
-        // A VPN peer may only source its own address; reachability is the nftables grants' job.
+        // A VPN peer may only source its own addresses; reachability is the nftables grants' job.
         for peer in &vpn_peers {
-            let allowed = format!("{}/32", peer.ipv4);
+            let allowed = format!("{}/32,{}/128", peer.ipv4, peer.ipv6);
             run_ok(
                 "wg",
                 [
@@ -225,24 +227,31 @@ impl Kernel {
             .await
             .with_context(|| format!("configure WireGuard VPN peer {}", peer.name))?;
         }
-        let mut vpn_routes: BTreeSet<Ipv4Net> = vpn_peers
+        let mut vpn_routes: BTreeSet<IpNet> = vpn_peers
             .iter()
-            .map(|p| Ipv4Net::new(p.ipv4, 32).expect("a /32 is a valid prefix"))
+            .flat_map(|p| {
+                [
+                    IpNet::from(IpAddr::V4(p.ipv4)),
+                    IpNet::from(IpAddr::V6(p.ipv6)),
+                ]
+            })
             .collect();
         vpn_routes.extend(vpn_grants.iter().filter_map(|e| match e.access {
-            VpnAccess::Subnet { net, .. } => Some(*net),
+            VpnAccess::Subnet { net, .. } => Some(IpNet::from(*net)),
             _ => None,
         }));
         let mut kept_routes = vpn_routes.clone();
-        kept_routes.extend(
-            peers
-                .values()
-                .filter_map(|a| Ipv4Net::new(a.tunnel_ipv4, 32).ok()),
-        );
+        kept_routes.extend(peers.values().flat_map(|a| {
+            [
+                IpNet::from(IpAddr::V4(a.tunnel_ipv4)),
+                IpNet::from(IpAddr::V6(a.tunnel_ipv6)),
+            ]
+        }));
         for net in &vpn_routes {
             self.replace_owned_route(*net).await?;
         }
-        self.delete_stale_v4_routes(&kept_routes).await?;
+        self.delete_stale_routes(self.interface(), &kept_routes)
+            .await?;
         for peer in existing {
             if !peer_keys.contains(&peer.public_key) {
                 run_ok(
@@ -276,7 +285,14 @@ impl Kernel {
         } else {
             Vec::new()
         };
-        let mut vpn_rules = vpn::server_rules(self.interface(), self.config.vpn_pool, snapshot);
+        let ipv6_exit = self.config.public_ips.iter().any(IpAddr::is_ipv6);
+        let exit_peers = vpn::server_exit_peers(snapshot);
+        let mut vpn_rules = vpn::server_rules(
+            self.interface(),
+            vpn::Pools::of(&self.config),
+            ipv6_exit,
+            snapshot,
+        );
         // Panel access sits ahead of the rule that keeps VPN peers off the VPS.
         vpn_rules
             .input
@@ -294,8 +310,12 @@ impl Kernel {
             &vpn_rules,
         )?;
         self.replace_nft_table(&rules).await?;
-        self.sync_server_host_firewall(local_ingress, !vpn_grants.is_empty())
-            .await?;
+        self.sync_server_host_firewall(
+            local_ingress,
+            !vpn_grants.is_empty(),
+            !exit_peers.is_empty(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -386,6 +406,21 @@ impl Kernel {
         .context("configure VPS WireGuard peer")?;
         self.maybe_refresh_endpoint(welcome, endpoint, peer).await?;
 
+        // Like the VPN route, the exit must not hold back forward grants. Until its rules are
+        // installed the renderer drops everything that comes in on the exit interface.
+        let exit_rules = match self.sync_agent_exit(welcome, policy).await {
+            Ok(rules) => rules,
+            Err(error) => {
+                tracing::warn!("internet exit not applied: {error:#}");
+                None
+            }
+        };
+        let exit_active = exit_rules.is_some();
+        let mut vpn_rules =
+            vpn::agent_nft_rules(self.interface(), welcome.tunnel_ipv4, &policy.vpn);
+        if let Some(rules) = exit_rules {
+            vpn_rules.merge(rules);
+        }
         self.ensure_nft_ownership().await?;
         let rules = render_agent_rules(
             self.interface(),
@@ -393,12 +428,106 @@ impl Kernel {
             self.config.mark_mask,
             welcome,
             &forwards,
-            &vpn::agent_nft_rules(self.interface(), welcome.tunnel_ipv4, &policy.vpn),
+            &vpn_rules,
         )?;
         self.replace_nft_table(&rules).await?;
-        self.sync_agent_host_firewall(welcome, &forwards, &policy.vpn)
+        self.sync_agent_host_firewall(welcome, &forwards, &policy.vpn, exit_active)
             .await?;
         Ok(())
+    }
+
+    /// Brings the agent's `rift-exit` interface in line with the policy and returns the
+    /// firewall rules for it. Without an exit in the policy, or when the owner did not allow
+    /// one, the interface is removed.
+    async fn sync_agent_exit(
+        &self,
+        welcome: &Welcome,
+        policy: &AgentPolicy,
+    ) -> Result<Option<vpn::Rules>> {
+        let Some(exit) = policy
+            .exit
+            .as_ref()
+            .filter(|_| self.config.agent_allow_exit)
+        else {
+            self.remove_exit_interface().await?;
+            return Ok(None);
+        };
+        let name = vpn::EXIT_INTERFACE;
+        let key_path = self.config.exit_key_path();
+        let private = read_private_key(&key_path)
+            .await
+            .context("read the exit interface key")?;
+        let public = wg_public_key(&private).await?;
+        let mtu = welcome.mtu.saturating_sub(vpn::EXIT_OVERHEAD);
+        self.ensure_interface_named(name, mtu, &public, &key_path)
+            .await?;
+        let wanted = exit.listen_port.to_string();
+        let current = run_output("wg", ["show", name, "listen-port"]).await?;
+        if current.trim() != wanted {
+            run_ok("wg", ["set", name, "listen-port", &wanted])
+                .await
+                .context("set the exit listen port")?;
+        }
+        for address in [
+            ["-4", &format!("{}/32", exit.gateway_v4)],
+            ["-6", &format!("{}/128", exit.gateway_v6)],
+        ] {
+            run_ok(
+                "ip",
+                [address[0], "address", "replace", address[1], "dev", name],
+            )
+            .await?;
+        }
+        let existing = parse_wg_dump(&run_output("wg", ["show", name, "dump"]).await?)?;
+        let mut keep = BTreeSet::new();
+        for peer in &exit.peers {
+            let allowed = format!("{}/32,{}/128", peer.ipv4, peer.ipv6);
+            run_ok(
+                "wg",
+                [
+                    "set",
+                    name,
+                    "peer",
+                    &peer.public_key,
+                    "allowed-ips",
+                    &allowed,
+                ],
+            )
+            .await
+            .context("configure an exit device")?;
+            for ip in [IpAddr::V4(peer.ipv4), IpAddr::V6(peer.ipv6)] {
+                let net = IpNet::from(ip);
+                self.replace_route_on(name, net).await?;
+                keep.insert(net);
+            }
+        }
+        for old in existing {
+            if !exit.peers.iter().any(|p| p.public_key == old.public_key) {
+                run_ok("wg", ["set", name, "peer", &old.public_key, "remove"]).await?;
+            }
+        }
+        self.delete_stale_routes(name, &keep).await?;
+        Ok(Some(vpn::agent_exit_rules(&vpn::AgentExit {
+            tunnel: self.interface(),
+            peers: &exit.peers,
+            ipv6: has_global_ipv6().await,
+            subnets: &self.config.agent_allow_subnets,
+        })))
+    }
+
+    /// Network interfaces that carry the default routes of this host.
+    async fn default_uplinks(&self) -> Vec<String> {
+        let mut found = Vec::new();
+        for family in ["-4", "-6"] {
+            if let Ok(text) = run_output("ip", [family, "-j", "route", "show", "default"]).await {
+                for dev in default_route_devices(&text, &[self.interface(), vpn::EXIT_INTERFACE]) {
+                    if !found.contains(&dev) {
+                        found.push(dev);
+                    }
+                }
+            }
+        }
+        found
     }
 
     pub async fn stats(&self) -> Result<Vec<PeerStats>> {
@@ -509,13 +638,7 @@ impl Kernel {
         ] {
             let on = sysctl(name).as_deref() == Some("1");
             checks.push(
-                if on {
-                    OK
-                } else if name == "ipv4_forward" {
-                    forward_needed
-                } else {
-                    WARN
-                },
+                if on { OK } else { forward_needed },
                 label.into(),
                 if on {
                     "on".into()
@@ -544,6 +667,30 @@ impl Kernel {
                 "off; run `sudo sh deploy/prepare-host`".into()
             },
         );
+        if !server {
+            let exit = self.config.agent_allow_exit;
+            checks.push(
+                OK,
+                "Internet exit".into(),
+                if exit {
+                    "offered (RIFT_AGENT_ALLOW_EXIT=true); VPN devices may leave through this host's connection, never towards its LAN unless RIFT_AGENT_ALLOW_SUBNETS lists it".into()
+                } else {
+                    "not offered (RIFT_AGENT_ALLOW_EXIT=false)".into()
+                },
+            );
+            if exit {
+                let v6 = has_global_ipv6().await;
+                checks.push(
+                    if v6 { OK } else { WARN },
+                    "Exit IPv6".into(),
+                    if v6 {
+                        "this host has a global IPv6 address; devices get IPv6 through the exit".into()
+                    } else {
+                        "no global IPv6 address on this host; IPv6 traffic of exit devices is dropped, not leaked".into()
+                    },
+                );
+            }
+        }
         let backend = host.status["backend"]
             .as_str()
             .unwrap_or("none")
@@ -665,11 +812,23 @@ impl Kernel {
             self.delete_agent_routes().await?;
             remove_owner_file(&self.owner_path("routes")).await?;
         }
+        self.remove_exit_interface().await?;
         if self.is_interface_owned().await {
             run_ok("ip", ["link", "delete", "dev", self.interface()])
                 .await
                 .context("delete owned WireGuard interface")?;
             remove_owner_file(&self.owner_path("interface")).await?;
+        }
+        Ok(())
+    }
+
+    /// Deletes the agent's exit interface when RIFT created it.
+    async fn remove_exit_interface(&self) -> Result<()> {
+        if self.is_named_interface_owned(vpn::EXIT_INTERFACE).await {
+            run_ok("ip", ["link", "delete", "dev", vpn::EXIT_INTERFACE])
+                .await
+                .context("delete owned exit interface")?;
+            remove_owner_file(&self.owner_path_of(vpn::EXIT_INTERFACE, "interface")).await?;
         }
         Ok(())
     }
@@ -709,7 +868,12 @@ impl Kernel {
         Ok(())
     }
 
-    async fn sync_server_host_firewall(&self, local_ingress: bool, vpn: bool) -> Result<()> {
+    async fn sync_server_host_firewall(
+        &self,
+        local_ingress: bool,
+        vpn: bool,
+        exit: bool,
+    ) -> Result<()> {
         if self.config.host_firewall == crate::config::HostFirewall::Off {
             return self.remove_host_firewall().await;
         }
@@ -739,6 +903,7 @@ impl Kernel {
                 uplinks: &uplinks,
                 local_ingress,
                 vpn,
+                exit,
                 panel: self
                     .config
                     .webpanel
@@ -756,6 +921,7 @@ impl Kernel {
         welcome: &Welcome,
         forwards: &[&Forward],
         vpn: &[crate::model::AgentVpnRule],
+        exit: bool,
     ) -> Result<()> {
         if self.config.host_firewall == crate::config::HostFirewall::Off {
             return self.remove_host_firewall().await;
@@ -764,6 +930,11 @@ impl Kernel {
         if obs.input.is_empty() && obs.forward.is_empty() {
             return Ok(());
         }
+        let uplinks = if exit {
+            self.default_uplinks().await
+        } else {
+            Vec::new()
+        };
         let plan = crate::host_firewall::plan_agent(
             &obs,
             &crate::host_firewall::AgentSpec {
@@ -772,6 +943,10 @@ impl Kernel {
                 tunnel_v6: welcome.tunnel_ipv6,
                 forwards,
                 vpn,
+                exit: exit.then_some(crate::host_firewall::ExitSpec {
+                    interface: vpn::EXIT_INTERFACE,
+                    uplinks: &uplinks,
+                }),
             },
         )?;
         self.apply_host_plan(&plan).await
@@ -939,12 +1114,28 @@ impl Kernel {
     }
 
     async fn ensure_interface(&self, expected_public: &str, private_key_path: &Path) -> Result<()> {
-        let marker_path = self.owner_path("interface");
-        let mut exists = interface_exists(self.interface()).await?;
+        self.ensure_interface_named(
+            self.interface(),
+            self.config.mtu,
+            expected_public,
+            private_key_path,
+        )
+        .await
+    }
+
+    async fn ensure_interface_named(
+        &self,
+        name: &str,
+        mtu: u16,
+        expected_public: &str,
+        private_key_path: &Path,
+    ) -> Result<()> {
+        let marker_path = self.owner_path_of(name, "interface");
+        let mut exists = interface_exists(name).await?;
         let mut owner = read_owner_file(&marker_path).await?;
         let mut live_public = None;
         if exists && owner.is_none() {
-            let alias = match interface_alias(self.interface()).await {
+            let alias = match interface_alias(name).await {
                 Ok(alias) => alias,
                 Err(error)
                     if error
@@ -957,11 +1148,11 @@ impl Kernel {
             };
             if rift_interface_alias(&alias) {
                 tracing::warn!(
-                    interface = self.interface(),
+                    interface = name,
                     alias,
                     "replacing orphaned RIFT WireGuard interface; its ownership marker is gone"
                 );
-                run_ok("ip", ["link", "delete", "dev", self.interface()])
+                run_ok("ip", ["link", "delete", "dev", name])
                     .await
                     .context("delete orphaned RIFT WireGuard interface")?;
                 exists = false;
@@ -973,7 +1164,7 @@ impl Kernel {
                 saved.starts_with(&format!("{OWNER_VERSION}\ninterface\n")),
                 "interface ownership marker is invalid"
             );
-            let live = run_output("wg", ["show", self.interface(), "public-key"])
+            let live = run_output("wg", ["show", name, "public-key"])
                 .await
                 .context("existing interface is not a WireGuard interface")?;
             let token = saved
@@ -981,7 +1172,7 @@ impl Kernel {
                 .nth(3)
                 .context("interface ownership marker has no alias token")?;
             ensure!(
-                interface_alias(self.interface()).await? == token,
+                interface_alias(name).await? == token,
                 "existing interface alias does not match its persistent RIFT ownership token"
             );
             live_public = Some(live.trim().to_string());
@@ -999,13 +1190,8 @@ impl Kernel {
                     "interface ownership marker is invalid"
                 );
             }
-            if let Err(e) = run_ok(
-                "ip",
-                ["link", "add", "dev", self.interface(), "type", "wireguard"],
-            )
-            .await
-            {
-                if !interface_exists(self.interface()).await.unwrap_or(true) {
+            if let Err(e) = run_ok("ip", ["link", "add", "dev", name, "type", "wireguard"]).await {
+                if !interface_exists(name).await.unwrap_or(true) {
                     remove_owner_file(&marker_path).await.ok();
                 }
                 return Err(e).context("create WireGuard interface");
@@ -1014,19 +1200,16 @@ impl Kernel {
                 .as_deref()
                 .and_then(|v| v.lines().nth(3))
                 .context("interface ownership marker has no alias token")?;
-            run_ok(
-                "ip",
-                ["link", "set", "dev", self.interface(), "alias", token],
-            )
-            .await
-            .context("tag RIFT-owned WireGuard interface")?;
+            run_ok("ip", ["link", "set", "dev", name, "alias", token])
+                .await
+                .context("tag RIFT-owned WireGuard interface")?;
         }
         if live_public.as_deref() != Some(expected_public) {
             run_ok(
                 "wg",
                 [
                     "set",
-                    self.interface(),
+                    name,
                     "private-key",
                     private_key_path.to_string_lossy().as_ref(),
                 ],
@@ -1034,7 +1217,7 @@ impl Kernel {
             .await
             .context("set WireGuard private key")?;
         }
-        let live_public = run_output("wg", ["show", self.interface(), "public-key"]).await?;
+        let live_public = run_output("wg", ["show", name, "public-key"]).await?;
         ensure!(
             live_public.trim() == expected_public,
             "WireGuard returned an unexpected interface public key"
@@ -1047,20 +1230,10 @@ impl Kernel {
         if owner.as_deref() != Some(expected_marker.as_str()) {
             write_owner_replace(&marker_path, &expected_marker).await?;
         }
-        run_ok(
-            "ip",
-            [
-                "link",
-                "set",
-                "dev",
-                self.interface(),
-                "mtu",
-                &self.config.mtu.to_string(),
-            ],
-        )
-        .await
-        .context("set WireGuard MTU")?;
-        run_ok("ip", ["link", "set", "dev", self.interface(), "up"])
+        run_ok("ip", ["link", "set", "dev", name, "mtu", &mtu.to_string()])
+            .await
+            .context("set WireGuard MTU")?;
+        run_ok("ip", ["link", "set", "dev", name, "up"])
             .await
             .context("bring WireGuard interface up")?;
         Ok(())
@@ -1279,13 +1452,18 @@ impl Kernel {
     }
 
     /// Installs `net` via the tunnel unless a route that is not RIFT's already owns it.
-    async fn replace_owned_route(&self, net: Ipv4Net) -> Result<()> {
+    async fn replace_owned_route(&self, net: impl Into<IpNet>) -> Result<()> {
+        self.replace_route_on(self.interface(), net.into()).await
+    }
+
+    async fn replace_route_on(&self, dev: &str, net: IpNet) -> Result<()> {
+        let family = if net.addr().is_ipv4() { "-4" } else { "-6" };
         let destination = net.to_string();
         let existing = run_output(
             "ip",
             [
                 "-N",
-                "-4",
+                family,
                 "route",
                 "show",
                 "exact",
@@ -1298,18 +1476,18 @@ impl Kernel {
         ensure!(
             existing
                 .lines()
-                .all(|l| l.contains(self.interface()) && l.contains(ROUTE_PROTOCOL)),
+                .all(|l| l.contains(dev) && l.contains(ROUTE_PROTOCOL)),
             "route {destination} already exists outside the RIFT route protocol; refusing to replace it"
         );
         run_ok(
             "ip",
             [
-                "-4",
+                family,
                 "route",
                 "replace",
                 &destination,
                 "dev",
-                self.interface(),
+                dev,
                 "proto",
                 ROUTE_PROTOCOL,
                 "table",
@@ -1319,57 +1497,59 @@ impl Kernel {
         .await
     }
 
-    /// Removes RIFT-owned IPv4 routes on the tunnel that are no longer wanted, such as the
-    /// address of a revoked VPN peer or a network nobody may reach any more.
-    async fn delete_stale_v4_routes(&self, keep: &BTreeSet<Ipv4Net>) -> Result<()> {
-        let listing = run_output(
-            "ip",
-            [
-                "-N",
-                "-4",
-                "-j",
-                "route",
-                "show",
-                "dev",
-                self.interface(),
-                "proto",
-                ROUTE_PROTOCOL,
-                "table",
-                "main",
-            ],
-        )
-        .await?;
-        if listing.trim().is_empty() {
-            return Ok(());
-        }
-        let routes: Value = serde_json::from_str(&listing).context("parse ip route JSON")?;
-        for route in routes.as_array().into_iter().flatten() {
-            let Some(destination) = route["dst"].as_str() else {
+    /// Removes RIFT-owned routes on `dev` that are no longer wanted, such as the address of a
+    /// revoked VPN peer or a network nobody may reach any more.
+    async fn delete_stale_routes(&self, dev: &str, keep: &BTreeSet<IpNet>) -> Result<()> {
+        for family in ["-4", "-6"] {
+            let listing = run_output(
+                "ip",
+                [
+                    "-N",
+                    family,
+                    "-j",
+                    "route",
+                    "show",
+                    "dev",
+                    dev,
+                    "proto",
+                    ROUTE_PROTOCOL,
+                    "table",
+                    "main",
+                ],
+            )
+            .await?;
+            if listing.trim().is_empty() {
                 continue;
-            };
-            let Ok(net) = destination
-                .parse::<Ipv4Net>()
-                .or_else(|_| destination.parse().map(|ip| Ipv4Net::new(ip, 32).unwrap()))
-            else {
-                continue;
-            };
-            if !keep.contains(&net) {
-                run_ok_allow_missing(
-                    "ip",
-                    [
-                        "-4",
-                        "route",
-                        "del",
-                        &net.to_string(),
-                        "dev",
-                        self.interface(),
-                        "proto",
-                        ROUTE_PROTOCOL,
-                        "table",
-                        "main",
-                    ],
-                )
-                .await?;
+            }
+            let routes: Value = serde_json::from_str(&listing).context("parse ip route JSON")?;
+            for route in routes.as_array().into_iter().flatten() {
+                let Some(destination) = route["dst"].as_str() else {
+                    continue;
+                };
+                let Ok(net) = destination
+                    .parse::<IpNet>()
+                    .or_else(|_| destination.parse::<IpAddr>().map(IpNet::from))
+                else {
+                    continue;
+                };
+                if !keep.contains(&net) {
+                    run_ok_allow_missing(
+                        "ip",
+                        [
+                            family,
+                            "route",
+                            "del",
+                            &net.to_string(),
+                            "dev",
+                            dev,
+                            "proto",
+                            ROUTE_PROTOCOL,
+                            "table",
+                            "main",
+                        ],
+                    )
+                    .await?;
+                }
             }
         }
         Ok(())
@@ -1521,7 +1701,10 @@ impl Kernel {
             .is_some_and(|s| s == format!("{OWNER_VERSION}\nnft\ninet rift\n"))
     }
     async fn is_interface_owned(&self) -> bool {
-        let Some(saved) = read_owner_file(&self.owner_path("interface"))
+        self.is_named_interface_owned(self.interface()).await
+    }
+    async fn is_named_interface_owned(&self, name: &str) -> bool {
+        let Some(saved) = read_owner_file(&self.owner_path_of(name, "interface"))
             .await
             .ok()
             .flatten()
@@ -1534,10 +1717,10 @@ impl Kernel {
         let Some(token) = saved.lines().nth(3) else {
             return false;
         };
-        let Ok(true) = interface_exists(self.interface()).await else {
+        let Ok(true) = interface_exists(name).await else {
             return false;
         };
-        interface_alias(self.interface())
+        interface_alias(name)
             .await
             .is_ok_and(|alias| alias == token)
     }
@@ -1654,9 +1837,12 @@ impl Kernel {
     }
 
     fn owner_path(&self, resource: &str) -> PathBuf {
+        self.owner_path_of(self.interface(), resource)
+    }
+    fn owner_path_of(&self, name: &str, resource: &str) -> PathBuf {
         self.config
             .state_dir
-            .join(format!("kernel-owner-{}-{resource}", self.interface()))
+            .join(format!("kernel-owner-{name}-{resource}"))
     }
     fn interface(&self) -> &str {
         &self.config.interface
@@ -1806,6 +1992,8 @@ fn ingress_clause(tunnel: &str, forward: &Forward, uplinks: &[String]) -> Result
     Ok(clause)
 }
 
+const NAT_CHAIN: &str = "add chain inet rift postrouting_nat { type nat hook postrouting priority srcnat; policy accept; }\n";
+
 // Keep meta l4proto before conntrack port comparisons in both renderers.
 // nftables 1.0.6 needs this context to infer the transport-port datatype.
 #[allow(clippy::too_many_arguments)] // Explicit kernel renderer inputs, shared by server and renderer tests.
@@ -1825,6 +2013,9 @@ fn render_server_rules(
          add chain inet rift prerouting_nat { type nat hook prerouting priority dstnat; policy accept; }\n\
          add chain inet rift forward { type filter hook forward priority filter; policy accept; }\n\
          add chain inet rift input { type filter hook input priority filter; policy accept; }\n".to_string();
+    if !vpn.nat.is_empty() {
+        out.push_str(NAT_CHAIN);
+    }
     // VPN peers must never reach the control port, whatever their source address claims.
     out.push_str(&vpn.input);
     out.push_str(&format!(
@@ -1867,6 +2058,7 @@ fn render_server_rules(
         }
     }
     out.push_str(&vpn.forward);
+    out.push_str(&vpn.nat);
     out.push_str(&format!(
         "add rule inet rift forward oifname \"{interface}\" drop\n\
          add rule inet rift forward iifname \"{interface}\" drop\n"
@@ -1887,6 +2079,9 @@ fn render_agent_rules(
          add chain inet rift input { type filter hook input priority filter; policy accept; }\n\
          add chain inet rift forward { type filter hook forward priority filter; policy accept; }\n\
          add chain inet rift output_guard { type filter hook output priority filter; policy accept; }\n".to_string();
+    if !vpn.nat.is_empty() {
+        out.push_str(NAT_CHAIN);
+    }
     for f in forwards {
         let dest = match f.target_family {
             Family::V4 => IpAddr::V4(welcome.tunnel_ipv4),
@@ -1939,11 +2134,15 @@ fn render_agent_rules(
          add rule inet rift input iifname \"{interface}\" drop\n\
          add rule inet rift forward oifname \"{interface}\" drop\n\
          add rule inet rift forward iifname \"{interface}\" drop\n\
+         add rule inet rift input iifname \"{exit_interface}\" drop\n\
+         add rule inet rift forward iifname \"{exit_interface}\" drop\n\
+         add rule inet rift forward oifname \"{exit_interface}\" drop\n\
          add rule inet rift output_guard ip saddr {agent_v4} oifname != \"{interface}\" drop\n\
          add rule inet rift output_guard ip6 saddr {agent_v6} oifname != \"{interface}\" drop\n\
          add rule inet rift output_guard ct mark & {mask:#x} == {mark:#x} oifname != \"{interface}\" drop\n",
         !mask,
         !mask,
+        exit_interface = vpn::EXIT_INTERFACE,
         agent_v4 = welcome.tunnel_ipv4,
         agent_v6 = welcome.tunnel_ipv6,
         server_v4 = welcome.server_ipv4,
@@ -1951,6 +2150,56 @@ fn render_agent_rules(
         control_port = welcome.control_port
     ));
     Ok(out)
+}
+
+/// The port the agent's exit interface listens on, if it exists.
+pub async fn exit_listen_port() -> Option<u16> {
+    run_output("wg", ["show", vpn::EXIT_INTERFACE, "listen-port"])
+        .await
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|port| *port != 0)
+}
+/// Whether this host has a global IPv6 address, so an exit can carry IPv6 for its devices.
+pub async fn has_global_ipv6() -> bool {
+    match run_output("ip", ["-6", "-j", "address", "show", "scope", "global"]).await {
+        Ok(text) => global_ipv6_in(&text),
+        Err(_) => false,
+    }
+}
+/// A global unicast address (2000::/3) in `ip -6 -j address` output; a ULA is not one.
+fn global_ipv6_in(json: &str) -> bool {
+    let Ok(links) = serde_json::from_str::<Value>(json) else {
+        return false;
+    };
+    links.as_array().into_iter().flatten().any(|link| {
+        link["addr_info"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|entry| {
+                entry["local"]
+                    .as_str()
+                    .and_then(|a| a.parse::<std::net::Ipv6Addr>().ok())
+                    .is_some_and(|ip| ip.octets()[0] & 0xe0 == 0x20)
+            })
+    })
+}
+/// Interfaces named by `ip -j route show default` output, without the excluded ones.
+fn default_route_devices(json: &str, exclude: &[&str]) -> Vec<String> {
+    let Ok(routes) = serde_json::from_str::<Value>(json) else {
+        return Vec::new();
+    };
+    routes
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|route| route["dev"].as_str())
+        .filter(|dev| crate::host_firewall::valid_ifname(dev) && !exclude.contains(dev))
+        .map(String::from)
+        .collect()
 }
 
 fn nft_addr(ip: IpAddr) -> (&'static str, String) {
@@ -2860,6 +3109,8 @@ mod tests {
             created_at: 0,
             pending_deadline: None,
             limits: None,
+            exit: None,
+            exit_port: None,
         }
     }
     fn forward(mode: ForwardMode) -> Forward {
@@ -2878,6 +3129,7 @@ mod tests {
             target_family: Family::V4,
             enabled: true,
             generation: 1,
+            purpose: crate::model::Purpose::User,
         }
     }
     #[test]
@@ -2931,6 +3183,8 @@ mod tests {
                 enabled: true,
                 created_at: 0,
                 panel: false,
+                exit: crate::model::Exit::None,
+                ipv6: std::net::Ipv6Addr::LOCALHOST,
             }],
             vpn_grants: vec![VpnGrant {
                 peer: "iphone".into(),
@@ -2955,7 +3209,7 @@ mod tests {
             .unwrap()
         };
         let without = render(&vpn::Rules::default());
-        let rules = vpn::server_rules("rift0", "10.14.0.0/24".parse().unwrap(), &snap);
+        let rules = vpn::server_rules("rift0", test_pools(), true, &snap);
         let with = render(&rules);
         let position =
             |text: &str, needle: &str| text.find(needle).unwrap_or_else(|| panic!("{needle}"));
@@ -2973,6 +3227,180 @@ mod tests {
             assert!(with.lines().any(|l| l == line), "lost: {line}");
         }
         assert!(!with.contains("snat") && !with.contains("masquerade"));
+    }
+    fn test_pools() -> vpn::Pools {
+        vpn::Pools {
+            tunnel4: "10.88.0.0/24".parse().unwrap(),
+            tunnel6: "fd88:5249:4654::/64".parse().unwrap(),
+            vpn4: "10.14.0.0/24".parse().unwrap(),
+            vpn6: "fd88:5249:4655::/64".parse().unwrap(),
+        }
+    }
+    fn welcome() -> Welcome {
+        Welcome {
+            agent_id: "a1".into(),
+            name: "agent".into(),
+            attempt_id: "x".into(),
+            server_public_key: "pk".into(),
+            server_endpoint: "vps.example:51820".into(),
+            server_ipv4: Ipv4Addr::new(10, 88, 0, 1),
+            server_ipv6: "fd88:5249:4654::1".parse().unwrap(),
+            tunnel_ipv4: Ipv4Addr::new(10, 88, 0, 2),
+            tunnel_ipv6: "fd88:5249:4654::2".parse().unwrap(),
+            keepalive: 25,
+            control_port: 8444,
+            mtu: 1380,
+        }
+    }
+    #[test]
+    fn server_exit_accepts_sit_before_the_final_drops_and_nat_has_its_chain() {
+        use crate::model::{Exit, VpnPeer};
+        let a = agent();
+        let agents = BTreeMap::from([(a.id.clone(), &a)]);
+        let f = forward(ForwardMode::Transparent);
+        let snap = StateSnapshot {
+            agents: vec![a.clone()],
+            vpn_peers: vec![VpnPeer {
+                name: "iphone".into(),
+                public_key: "k".into(),
+                ipv4: Ipv4Addr::new(10, 14, 0, 2),
+                enabled: true,
+                created_at: 0,
+                panel: false,
+                ipv6: "fd88:5249:4655::2".parse().unwrap(),
+                exit: Exit::Server,
+            }],
+            ..Default::default()
+        };
+        let render = |ipv6: bool| {
+            render_server_rules(
+                "rift0",
+                0x52490000,
+                0xffff0000,
+                8444,
+                Ipv4Addr::new(10, 88, 0, 1),
+                "fd88:5249:4654::1".parse().unwrap(),
+                &[&f],
+                &agents,
+                &[],
+                &vpn::server_rules("rift0", test_pools(), ipv6, &snap),
+            )
+            .unwrap()
+        };
+        let with = render(true);
+        let at = |text: &str, needle: &str| text.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let final_drop = at(&with, "forward oifname \"rift0\" drop");
+        let exit_v4 = at(
+            &with,
+            "forward iifname \"rift0\" oifname != \"rift0\" ip saddr 10.14.0.2 ip daddr != { 10.88.0.0/24, 10.14.0.0/24, 169.254.0.0/16 } accept",
+        );
+        let exit_v6 = at(&with, "ip6 saddr fd88:5249:4655::2 ip6 daddr != { fd88:5249:4654::/64, fd88:5249:4655::/64, fe80::/10 } accept");
+        let replies = at(
+            &with,
+            "forward iifname != \"rift0\" oifname \"rift0\" ip daddr 10.14.0.2 ct state established,related accept",
+        );
+        let last_drop = at(&with, "forward iifname \"rift0\" drop");
+        for position in [exit_v4, exit_v6, replies] {
+            assert!(position < final_drop && final_drop < last_drop);
+        }
+        // The chain exists before the rules that use it, and the DNAT of the forwards stays.
+        assert!(
+            at(&with, "add chain inet rift postrouting_nat")
+                < at(
+                    &with,
+                    "postrouting_nat ip saddr 10.14.0.2 oifname != \"rift0\" masquerade"
+                )
+        );
+        assert!(with.contains("prerouting_nat iifname != \"rift0\""));
+        // Without IPv6 on the VPS the device's IPv6 is dropped before the final drops, too.
+        let without = render(false);
+        assert!(
+            at(
+                &without,
+                "forward iifname \"rift0\" ip6 saddr fd88:5249:4655::2 drop"
+            ) < at(&without, "forward oifname \"rift0\" drop")
+        );
+        assert!(!without.contains("ip6 saddr fd88:5249:4655::2 masquerade"));
+        // A server without any exit device has no NAT chain at all.
+        let mut none = snap.clone();
+        none.vpn_peers[0].exit = Exit::None;
+        let plain = render_server_rules(
+            "rift0",
+            0x52490000,
+            0xffff0000,
+            8444,
+            Ipv4Addr::new(10, 88, 0, 1),
+            "fd88:5249:4654::1".parse().unwrap(),
+            &[],
+            &agents,
+            &[],
+            &vpn::server_rules("rift0", test_pools(), true, &none),
+        )
+        .unwrap();
+        assert!(!plain.contains("postrouting_nat"));
+    }
+    #[test]
+    fn agent_exit_rules_precede_the_exit_lockdown_which_is_always_there() {
+        let w = welcome();
+        let peers = vec![crate::model::ExitPeer {
+            public_key: "k".into(),
+            ipv4: Ipv4Addr::new(10, 14, 0, 2),
+            ipv6: "fd88:5249:4655::2".parse().unwrap(),
+        }];
+        let render = |rules: &vpn::Rules| {
+            render_agent_rules("rift0", 0x52490000, 0xffff0000, &w, &[], rules).unwrap()
+        };
+        // No exit: the interface is closed anyway, in case one is left over.
+        let closed = render(&vpn::Rules::default());
+        for rule in [
+            "input iifname \"rift-exit\" drop",
+            "forward iifname \"rift-exit\" drop",
+            "forward oifname \"rift-exit\" drop",
+        ] {
+            assert!(closed.contains(rule), "{rule}");
+        }
+        assert!(!closed.contains("masquerade") && !closed.contains("postrouting_nat"));
+        // With an exit its rules come first.
+        let rules = vpn::agent_exit_rules(&vpn::AgentExit {
+            tunnel: "rift0",
+            peers: &peers,
+            ipv6: true,
+            subnets: &[],
+        });
+        let open = render(&rules);
+        let at = |needle: &str| open.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(
+            at("add chain inet rift postrouting_nat") < at("postrouting_nat iifname \"rift-exit\"")
+        );
+        assert!(at("ip saddr 10.14.0.2 accept") < at("forward oifname \"rift0\" drop"));
+        assert!(open.matches("forward iifname \"rift-exit\" drop").count() >= 2);
+        // Control traffic of the tunnel is not touched.
+        assert!(open.contains("input iifname \"rift0\" drop"));
+    }
+    #[test]
+    fn global_ipv6_means_a_global_unicast_address_not_a_ula() {
+        let json = |address: &str| {
+            format!(
+                r#"[{{"ifname":"eth0","addr_info":[{{"family":"inet6","local":"{address}","scope":"global"}}]}}]"#
+            )
+        };
+        assert!(global_ipv6_in(&json("2a01:4f8::1")));
+        assert!(global_ipv6_in(&json("2001:db8::5")));
+        assert!(
+            !global_ipv6_in(&json("fd12:3456::1")),
+            "a ULA is not global"
+        );
+        assert!(!global_ipv6_in(&json("fe80::1")));
+        assert!(!global_ipv6_in("[]") && !global_ipv6_in("not json"));
+    }
+    #[test]
+    fn uplinks_are_the_default_route_interfaces_without_the_tunnels() {
+        let json = r#"[{"dst":"default","dev":"eth0"},{"dst":"default","dev":"rift0"},{"dst":"default","dev":"wlan0"},{"dst":"default","dev":"bad name"}]"#;
+        assert_eq!(
+            default_route_devices(json, &["rift0", "rift-exit"]),
+            ["eth0", "wlan0"]
+        );
+        assert!(default_route_devices("", &[]).is_empty());
     }
     #[test]
     fn agent_vpn_rules_precede_the_tunnel_drops_and_nat_is_opt_in() {

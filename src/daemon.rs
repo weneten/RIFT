@@ -2,7 +2,7 @@
 use crate::{
     agent_policy,
     config::{validate_name, Config, EnrollmentMode},
-    enrollment,
+    enrollment, exit,
     model::*,
     net::{self, Kernel},
     portable,
@@ -304,6 +304,9 @@ async fn reconcile(s: &Server) -> Result<()> {
     }
     let config = s.config.read().await.clone();
     fix_listen_addresses(s, &config.public_ips);
+    if let Err(error) = sync_exit_forwards(s, &config) {
+        tracing::error!("internet exit forwards: {error:#}");
+    }
     let k = s.kernel.lock().await;
     let snapshot =
         portable::without_inapplicable(without_refused(s.state.snapshot()?), &config.public_ips);
@@ -334,6 +337,22 @@ async fn reconcile(s: &Server) -> Result<()> {
             Err(error.context("desired configuration not applied; retained safe previously confirmed grants where possible"))
         }
     }
+}
+/// Keeps the exit ports and the managed forwards of internet exits in line with the devices.
+fn sync_exit_forwards(s: &Server, config: &Config) -> Result<()> {
+    let settings = exit::Settings {
+        public_ips: &config.public_ips,
+        ports: config.exit_port_min..=config.exit_port_max,
+        wg_port: config.wg_port,
+    };
+    let mut probe = s.state.snapshot()?;
+    if exit::sync(&mut probe, &settings) {
+        s.state.mutate("exit-sync", |x| {
+            exit::sync(x, &settings);
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 /// A server on a new address (a restored backup on another VPS) keeps its forwards: those on
 /// an address the server no longer has move to its first address of the same IP version. The
@@ -451,6 +470,9 @@ async fn reload_config(s: &Server) -> Result<u64> {
         || next.server_ipv4 != current.server_ipv4
         || next.server_ipv6 != current.server_ipv6
         || next.vpn_pool != current.vpn_pool
+        || next.vpn_pool6 != current.vpn_pool6
+        || next.exit_port_min != current.exit_port_min
+        || next.exit_port_max != current.exit_port_max
         || next.webpanel != current.webpanel
         || next.webpanel_access != current.webpanel_access
         || next.webpanel_port != current.webpanel_port
@@ -548,6 +570,7 @@ async fn handle_control(mut stream: TcpStream, source: IpAddr, s: Arc<Server>) -
             applied_generation,
             error,
             limits,
+            exit,
         } => {
             anyhow::ensure!(
                 version == VERSION && agent_id == agent.id,
@@ -556,23 +579,40 @@ async fn handle_control(mut stream: TcpStream, source: IpAddr, s: Arc<Server>) -
             if agent.status != AgentStatus::Active {
                 bail!("agent has not completed activation")
             }
-            let changed_limits = agent.limits.as_ref() != Some(&limits);
+            if let Some(report) = &exit {
+                anyhow::ensure!(
+                    report.public_key.len() <= 64
+                        && base64::engine::general_purpose::STANDARD
+                            .decode(&report.public_key)
+                            .is_ok_and(|key| key.len() == 32),
+                    "invalid WireGuard public key for the exit interface"
+                );
+            }
+            let changed_report = agent.limits.as_ref() != Some(&limits) || agent.exit != exit;
             let previous = agent.applied_generation;
-            let _ = s
-                .state
-                .update_agent_sync(&agent.id, applied_generation, error, limits)?;
-            if previous != applied_generation || changed_limits {
+            let _ =
+                s.state
+                    .update_agent_sync(&agent.id, applied_generation, error, limits, exit)?;
+            if previous != applied_generation || changed_report {
                 reconcile(&s).await?;
             }
-            let pool = s.config.read().await.vpn_pool;
+            let (pool, pool6) = {
+                let config = s.config.read().await;
+                (config.vpn_pool, config.vpn_pool6)
+            };
             if let Some((rotation_id, _, committed)) = s.state.rotation(&agent.id)? {
                 if !committed {
                     ControlResponse::RotateRequested { rotation_id }
                 } else {
-                    ControlResponse::Policy(policy_for(&s.state.snapshot()?, &agent.id, pool))
+                    ControlResponse::Policy(policy_for(
+                        &s.state.snapshot()?,
+                        &agent.id,
+                        pool,
+                        pool6,
+                    ))
                 }
             } else {
-                ControlResponse::Policy(policy_for(&s.state.snapshot()?, &agent.id, pool))
+                ControlResponse::Policy(policy_for(&s.state.snapshot()?, &agent.id, pool, pool6))
             }
         }
         ControlRequest::Ban {
@@ -670,6 +710,19 @@ fn without_refused(snap: StateSnapshot) -> StateSnapshot {
     let mut out = snap.clone();
     out.forwards.retain(|f| forward_refusal(&snap, f).is_none());
     out.vpn_grants.retain(|g| grant_refusal(&snap, g).is_none());
+    for peer in &mut out.vpn_peers {
+        if let Exit::Agent(id) = &peer.exit {
+            let refused = snap
+                .agents
+                .iter()
+                .find(|a| a.id == *id)
+                .and_then(|a| a.limits.as_ref())
+                .is_some_and(|limits| limits.refuse_exit().is_some());
+            if refused {
+                peer.exit = Exit::None;
+            }
+        }
+    }
     out.bans
         .retain(|b| out.forwards.iter().any(|f| f.id == b.forward_id));
     out
@@ -717,7 +770,12 @@ fn inapplicable(snap: &StateSnapshot, public_ips: &[IpAddr]) -> Vec<serde_json::
         })
         .collect()
 }
-fn policy_for(snapshot: &StateSnapshot, id: &str, vpn_pool: ipnet::Ipv4Net) -> AgentPolicy {
+fn policy_for(
+    snapshot: &StateSnapshot,
+    id: &str,
+    vpn_pool: ipnet::Ipv4Net,
+    vpn_pool6: ipnet::Ipv6Net,
+) -> AgentPolicy {
     let snapshot = &without_refused(snapshot.clone());
     AgentPolicy {
         generation: snapshot.generation,
@@ -729,6 +787,7 @@ fn policy_for(snapshot: &StateSnapshot, id: &str, vpn_pool: ipnet::Ipv4Net) -> A
             .collect(),
         vpn_pool: Some(vpn_pool),
         vpn: crate::vpn::agent_rules(snapshot, id),
+        exit: crate::vpn::agent_exit_policy(snapshot, id, vpn_pool, vpn_pool6),
     }
 }
 
@@ -908,6 +967,10 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
             let cfg = s.config.read().await.clone();
             validate_name(&name)?;
             anyhow::ensure!(
+                name != "internet",
+                "an agent cannot be called internet: `rift vpn allow DEVICE internet` would be ambiguous"
+            );
+            anyhow::ensure!(
                 cfg.enrollment != EnrollmentMode::Off,
                 "enrollment is off; set RIFT_ENROLLMENT=auto in the server .env and recreate the container"
             );
@@ -967,6 +1030,10 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
         }
         AdminRequest::AgentRename { name, new_name } => {
             validate_name(&new_name)?;
+            anyhow::ensure!(
+                new_name != "internet",
+                "an agent cannot be called internet: `rift vpn allow DEVICE internet` would be ambiguous"
+            );
             let id = find_agent(&snap, &name)?.id.clone();
             s.state.mutate("agent-rename", |x| {
                 if x.agents.iter().any(|a| a.id != id && a.name == new_name) {
@@ -1056,6 +1123,7 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
             value
         }
         AdminRequest::ForwardRemove { id } => {
+            exit::ensure_user_forward(&snap, id)?;
             s.state.mutate("forward-remove", |x| {
                 let n = x.forwards.len();
                 x.forwards.retain(|f| f.id != id);
@@ -1067,6 +1135,7 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
             serde_json::json!({"removed":id})
         }
         AdminRequest::ForwardEnable { id, enabled } => {
+            exit::ensure_user_forward(&snap, id)?;
             let grant = snap
                 .forwards
                 .iter()
@@ -1314,6 +1383,7 @@ async fn import_admin(
                         .map(|(_, public, _)| public.clone())
                         .ok_or_else(|| anyhow!("no key for device {name}"))?;
                     let ipv4 = crate::vpn::allocate(cfg.vpn_pool, &x.vpn_peers)?;
+                    let ipv6 = crate::vpn::allocate6(cfg.vpn_pool6, &x.vpn_peers)?;
                     x.vpn_peers.push(VpnPeer {
                         name: name.clone(),
                         public_key: public,
@@ -1321,6 +1391,8 @@ async fn import_admin(
                         enabled: true,
                         created_at: now(),
                         panel: false,
+                        ipv6,
+                        exit: Exit::None,
                     });
                 }
                 Op::Flags {
@@ -1411,6 +1483,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
             atomic_write(&key_path, private.as_bytes(), 0o600)?;
             let added = s.state.mutate("vpn-peer-add", |x| {
                 let ipv4 = crate::vpn::allocate(cfg.vpn_pool, &x.vpn_peers)?;
+                let ipv6 = crate::vpn::allocate6(cfg.vpn_pool6, &x.vpn_peers)?;
                 x.vpn_peers.push(VpnPeer {
                     name: name.clone(),
                     public_key: public.clone(),
@@ -1418,6 +1491,8 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                     enabled: true,
                     created_at: now(),
                     panel: false,
+                    ipv6,
+                    exit: Exit::None,
                 });
                 Ok(())
             });
@@ -1430,7 +1505,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
             };
             reconcile(s).await?;
             let peer = added.vpn_peers.iter().find(|p| p.name == name);
-            serde_json::json!({"name":name,"ipv4":peer.map(|p| p.ipv4),"public_key":public,"next":"grant access with `rift vpn allow`, then `rift vpn config export`"})
+            serde_json::json!({"name":name,"ipv4":peer.map(|p| p.ipv4),"ipv6":peer.map(|p| p.ipv6),"public_key":public,"next":"grant access with `rift vpn allow`, then `rift vpn config export`"})
         }
         AdminRequest::VpnPeerList => {
             let stats = s.kernel.lock().await.stats().await.unwrap_or_default();
@@ -1440,7 +1515,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                     let agent = snap.agents.iter().find(|a| a.id == g.agent_id).map(|a| a.name.clone());
                     serde_json::json!({"agent":agent,"access":g.access,"refused":grant_refusal(snap, g)})
                 }).collect();
-                serde_json::json!({"name":p.name,"ipv4":p.ipv4,"enabled":p.enabled,"panel":p.panel,"public_key":p.public_key,"last_handshake":handshake,"grants":grants})
+                serde_json::json!({"name":p.name,"ipv4":p.ipv4,"ipv6":p.ipv6,"enabled":p.enabled,"panel":p.panel,"public_key":p.public_key,"last_handshake":handshake,"grants":grants,"exit":exit_json(snap, p)})
             }).collect();
             serde_json::Value::Array(rows)
         }
@@ -1529,7 +1604,17 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                             .as_ref()
                             .is_none_or(|a| crate::vpn::same_target(&g.access, a)))
                 });
-                anyhow::ensure!(before != x.vpn_grants.len(), "no matching grant");
+                let mut removed = before != x.vpn_grants.len();
+                // Withdrawing everything on an agent also ends an exit through it.
+                if access.is_none() {
+                    for p in x.vpn_peers.iter_mut().filter(|p| p.name == peer) {
+                        if p.exit == Exit::Agent(agent_id.clone()) {
+                            p.exit = Exit::None;
+                            removed = true;
+                        }
+                    }
+                }
+                anyhow::ensure!(removed, "no matching grant");
                 Ok(())
             })?;
             reconcile(s).await?;
@@ -1547,12 +1632,95 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                 snap,
                 peer,
                 private.trim(),
-                &s.server_public_key,
-                &host_port(&cfg.public_endpoint, cfg.wg_port),
-                cfg.mtu,
-                cfg.webpanel.then_some(cfg.server_ipv4),
+                &crate::vpn::ClientParams {
+                    server_public_key: &s.server_public_key,
+                    host: &cfg.public_endpoint,
+                    wg_port: cfg.wg_port,
+                    mtu: cfg.mtu,
+                    panel: cfg.webpanel.then_some(cfg.server_ipv4),
+                    dns: &cfg.vpn_dns,
+                    server_ipv6: cfg.public_ips.iter().any(IpAddr::is_ipv6),
+                },
             )?;
             serde_json::json!({"name":name,"config":config})
+        }
+        AdminRequest::VpnExit { peer, exit } => {
+            find_peer(&peer)?;
+            let chosen = match &exit {
+                Exit::None => Exit::None,
+                Exit::Server => Exit::Server,
+                Exit::Agent(name) => {
+                    let target = find_agent(snap, name)?;
+                    anyhow::ensure!(target.status == AgentStatus::Active, "agent must be active");
+                    Exit::Agent(target.id.clone())
+                }
+            };
+            s.state.mutate("vpn-exit", |x| {
+                x.vpn_peers
+                    .iter_mut()
+                    .filter(|p| p.name == peer)
+                    .for_each(|p| p.exit = chosen.clone());
+                Ok(())
+            })?;
+            reconcile(s).await?;
+            let after = s.state.snapshot()?;
+            let device = after.vpn_peers.iter().find(|p| p.name == peer);
+            let problem = device.and_then(|p| crate::vpn::exit_problem(&after, p));
+            let agent_name = match &chosen {
+                Exit::Agent(id) => after
+                    .agents
+                    .iter()
+                    .find(|a| a.id == *id)
+                    .map(|a| a.name.clone()),
+                _ => None,
+            };
+            let warning = problem.as_ref().filter(|p| p.0 == "refused").map(|p| {
+                format!(
+                    "the choice was stored, but agent {} will refuse it: {}",
+                    agent_name.clone().unwrap_or_default(),
+                    p.1
+                )
+            });
+            let waiting = problem
+                .as_ref()
+                .filter(|p| p.0 == "waiting")
+                .map(|p| p.1.clone());
+            let ipv6 = match chosen {
+                Exit::Server => Some(cfg.public_ips.iter().any(IpAddr::is_ipv6)),
+                Exit::Agent(id) => after
+                    .agents
+                    .iter()
+                    .find(|a| a.id == id)
+                    .and_then(|a| a.exit.as_ref())
+                    .map(|r| r.ipv6),
+                Exit::None => None,
+            };
+            let exit = device.map_or(serde_json::json!({"via":"none"}), |p| exit_json(&after, p));
+            serde_json::json!({"peer":peer,"exit":exit,"agent":agent_name,"ipv6":ipv6,"warning":warning,"waiting":waiting})
+        }
+        AdminRequest::VpnExitClear { peer, agent } => {
+            let device = find_peer(&peer)?;
+            let matches = match (&agent, &device.exit) {
+                (None, Exit::Server) => true,
+                (Some(name), Exit::Agent(id)) => find_agent(snap, name)?.id == *id,
+                _ => false,
+            };
+            anyhow::ensure!(
+                matches,
+                "{peer} does not use {} as its internet exit",
+                agent
+                    .as_ref()
+                    .map_or("the server".to_string(), |a| format!("agent {a}"))
+            );
+            s.state.mutate("vpn-exit-clear", |x| {
+                x.vpn_peers
+                    .iter_mut()
+                    .filter(|p| p.name == peer)
+                    .for_each(|p| p.exit = Exit::None);
+                Ok(())
+            })?;
+            reconcile(s).await?;
+            serde_json::json!({"peer":peer,"agent":agent,"cleared":true})
         }
         AdminRequest::PanelAllow { name, allowed } => {
             find_peer(&name)?;
@@ -1581,10 +1749,27 @@ fn find_agent<'a>(snap: &'a StateSnapshot, name: &str) -> Result<&'a AgentRecord
         .ok_or_else(|| anyhow!("agent not found"))
 }
 fn host_port(host: &str, port: u16) -> String {
-    if host.parse::<std::net::Ipv6Addr>().is_ok() {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
+    crate::vpn::host_port(host, port)
+}
+/// The `exit` field of a device in `list devices` and after a change.
+fn exit_json(snap: &StateSnapshot, peer: &VpnPeer) -> serde_json::Value {
+    match &peer.exit {
+        Exit::None => serde_json::json!({"via":"none"}),
+        Exit::Server => serde_json::json!({"via":"server"}),
+        Exit::Agent(id) => {
+            let name = snap
+                .agents
+                .iter()
+                .find(|a| a.id == *id)
+                .map(|a| a.name.clone());
+            let problem = crate::vpn::exit_problem(snap, peer);
+            serde_json::json!({
+                "via":"agent",
+                "agent":name,
+                "state":problem.as_ref().map_or("ok", |p| p.0),
+                "reason":problem.map(|p| p.1),
+            })
+        }
     }
 }
 
@@ -1594,6 +1779,7 @@ async fn run_agent_inner(
 ) -> Result<()> {
     config.validate()?;
     secure_dir(&config.state_dir)?;
+    ensure_exit_key(&config).await?;
     let id_path = config.identity_path();
     let key_path = config.private_key_path();
     let mut identity = if id_path.exists() {
@@ -1904,6 +2090,27 @@ async fn connect_control(w: &Welcome) -> Result<TcpStream> {
     }
     Err(last.unwrap_or_else(|| anyhow!("no WireGuard control address")))
 }
+/// Creates the key of the exit interface once, on an agent that offers an internet exit.
+async fn ensure_exit_key(config: &Config) -> Result<()> {
+    let path = config.exit_key_path();
+    if config.agent_allow_exit && !path.exists() {
+        let (private, _) = net::generate_keypair().await?;
+        atomic_write(&path, private.as_bytes(), 0o600)?;
+    }
+    Ok(())
+}
+/// What the agent tells the server about its exit interface; `None` when it offers no exit.
+async fn exit_report(config: &Config) -> Option<ExitReport> {
+    if !config.agent_allow_exit {
+        return None;
+    }
+    let private = std::fs::read_to_string(config.exit_key_path()).ok()?;
+    Some(ExitReport {
+        public_key: net::wg_public_key(private.trim()).await.ok()?,
+        listen_port: net::exit_listen_port().await,
+        ipv6: net::has_global_ipv6().await,
+    })
+}
 /// Refusal text for the next sync, so the server shows it as the agent's last error.
 static AGENT_REFUSALS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// Remembers the refusals for the next sync and logs them only when they change.
@@ -1953,6 +2160,7 @@ async fn agent_sync(
             applied_generation: identity.applied_generation,
             error: AGENT_REFUSALS.lock().ok().and_then(|r| r.clone()),
             limits: config.agent_limits(),
+            exit: exit_report(config).await,
         },
     )
     .await?;
@@ -2145,6 +2353,8 @@ mod tests {
             enabled,
             created_at: 0,
             panel: false,
+            exit: Exit::None,
+            ipv6: std::net::Ipv6Addr::LOCALHOST,
         }
     }
     fn grant(name: &str, access: VpnAccess) -> VpnGrant {
@@ -2169,6 +2379,7 @@ mod tests {
             target_family: Family::V4,
             enabled: true,
             generation: 2,
+            purpose: Purpose::User,
         };
         let mut agent = AgentRecord {
             id: "home".into(),
@@ -2184,6 +2395,8 @@ mod tests {
             created_at: 0,
             pending_deadline: None,
             limits: None,
+            exit: None,
+            exit_port: None,
         };
         let snap = |agent: &AgentRecord| StateSnapshot {
             generation: 2,
@@ -2210,6 +2423,7 @@ mod tests {
         agent.limits = Some(AgentLimits {
             ports: crate::config::parse_port_allow("3001,1337,8090").unwrap(),
             subnets: vec![],
+            exit: false,
         });
         let limited = snap(&agent);
         let (state, why) = forward_state(&limited, &limited.forwards[0]);
@@ -2226,7 +2440,12 @@ mod tests {
             1,
             "the whole-host grant is left out"
         );
-        let policy = policy_for(&limited, "home", "10.14.0.0/24".parse().unwrap());
+        let policy = policy_for(
+            &limited,
+            "home",
+            "10.14.0.0/24".parse().unwrap(),
+            "fd88:5249:4655::/64".parse().unwrap(),
+        );
         assert_eq!(policy.forwards.len(), 1);
         assert_eq!(
             policy.generation, 2,
@@ -2236,6 +2455,99 @@ mod tests {
         let mut stale = limited.clone();
         stale.forwards[1].generation = 3;
         assert_eq!(forward_state(&stale, &stale.forwards[1]).0, "pending");
+    }
+
+    #[test]
+    fn an_agent_that_refuses_the_exit_loses_it_and_its_forward_until_it_allows_it() {
+        let mut agent = AgentRecord {
+            id: "home".into(),
+            name: "core".into(),
+            public_key: "k".into(),
+            tunnel_ipv4: "10.13.0.2".parse().unwrap(),
+            tunnel_ipv6: "fd88:5249:4654::2".parse().unwrap(),
+            status: AgentStatus::Active,
+            attempt_id: "a".into(),
+            generation: 2,
+            applied_generation: 2,
+            last_error: None,
+            created_at: 0,
+            pending_deadline: None,
+            limits: None,
+            exit: Some(ExitReport {
+                public_key: "EXIT".into(),
+                listen_port: Some(51821),
+                ipv6: true,
+            }),
+            exit_port: Some(51821),
+        };
+        let mut device = peer("phone", true);
+        device.exit = Exit::Agent("home".into());
+        let ports = PortRange {
+            start: 51821,
+            end: 51821,
+        };
+        let exit_forward = Forward {
+            id: 1,
+            agent_id: "home".into(),
+            listen_ip: "203.0.113.1".parse().unwrap(),
+            listen_ports: ports,
+            target_ports: ports,
+            protocol: Protocol::Udp,
+            mode: ForwardMode::Transparent,
+            ingress: Ingress::Public,
+            target_family: Family::V4,
+            enabled: true,
+            generation: 2,
+            purpose: Purpose::Exit,
+        };
+        let snap = |agent: &AgentRecord| StateSnapshot {
+            generation: 2,
+            agents: vec![agent.clone()],
+            forwards: vec![exit_forward.clone()],
+            vpn_peers: vec![device.clone()],
+            ..Default::default()
+        };
+        let pool = "10.14.0.0/24".parse().unwrap();
+        let pool6 = "fd88:5249:4655::/64".parse().unwrap();
+        // Allowed (and before the first sync, when nothing is known): the agent is told.
+        for limits in [
+            None,
+            Some(AgentLimits {
+                exit: true,
+                ports: crate::config::parse_port_allow("22/tcp").unwrap(),
+                ..Default::default()
+            }),
+        ] {
+            agent.limits = limits;
+            let allowed = snap(&agent);
+            assert_eq!(forward_state(&allowed, &allowed.forwards[0]).0, "enabled");
+            let policy = policy_for(&allowed, "home", pool, pool6);
+            assert_eq!(
+                policy.forwards.len(),
+                1,
+                "the port needs no allowlist entry"
+            );
+            let exit = policy.exit.expect("the device's exit");
+            assert_eq!(exit.listen_port, 51821);
+            assert_eq!(exit.peers.len(), 1);
+            assert_eq!(exit.gateway_v4.to_string(), "10.14.0.1");
+        }
+        // Refused: no exit for the agent, no public forward on the VPS, device shown as refused.
+        agent.limits = Some(AgentLimits::default());
+        let refused = snap(&agent);
+        let (state, why) = forward_state(&refused, &refused.forwards[0]);
+        assert_eq!(state, "refused");
+        assert!(why.unwrap().contains("RIFT_AGENT_ALLOW_EXIT"));
+        let applied = without_refused(refused.clone());
+        assert!(applied.forwards.is_empty());
+        assert_eq!(applied.vpn_peers[0].exit, Exit::None);
+        let policy = policy_for(&refused, "home", pool, pool6);
+        assert!(policy.exit.is_none() && policy.forwards.is_empty());
+        let shown = exit_json(&refused, &refused.vpn_peers[0]);
+        assert_eq!(shown["state"], "refused");
+        assert_eq!(shown["agent"], "core");
+        // The stored choice survives, so allowing the exit later brings it back.
+        assert_eq!(refused.vpn_peers[0].exit, Exit::Agent("home".into()));
     }
 
     #[test]

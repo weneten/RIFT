@@ -78,6 +78,14 @@ function access(a) {
   return JSON.stringify(a);
 }
 
+// "internet via core (refused by the agent)" for a device's exit; empty without one.
+function exitText(exit) {
+  if (!exit || exit.via === "none" || !exit.via) return "";
+  if (exit.via === "server") return "internet via this server";
+  const note = exit.state === "refused" ? " (refused by the agent)" : exit.state === "waiting" ? " (waiting for the agent)" : "";
+  return `internet via ${exit.agent || "?"}${note}`;
+}
+
 function showBanner(text) {
   const banner = $("banner");
   banner.textContent = text || "";
@@ -319,6 +327,19 @@ function twoFactorOffDialog() {
   }));
 }
 
+// After an exit change the device needs its new configuration.
+function exitNoticeDialog(name, result) {
+  const notes = [];
+  if (result.warning) notes.push(result.warning);
+  if (result.waiting) notes.push(`Not ready yet: ${result.waiting}`);
+  if (result.ipv6 === false) notes.push("This exit has no IPv6: the device's IPv6 traffic is dropped, not leaked.");
+  openModal(`Internet exit of ${name}`,
+    ...notes.map((text) => el("p", { class: "hint" }, text)),
+    el("p", {}, "Re-import the configuration on the device."),
+    el("div", { class: "form" }, el("div", { class: "buttons" },
+      button("Show configuration", () => configDialog(name), "primary"), button("Done", closeModal))));
+}
+
 function grantsDialog(name) {
   const peer = (data.vpn_peers || []).find((p) => p.name === name);
   if (!peer) { closeModal(); return; }
@@ -333,6 +354,16 @@ function grantsDialog(name) {
       button("Withdraw", async () => {
         try {
           await act({ action: "vpn_deny", peer: name, agent: g.agent, access: g.access });
+          await refresh();
+        } catch (e) { showBanner(e.message); }
+      }, "danger")));
+  }
+  const currentExit = peer.exit || { via: "none" };
+  if (currentExit.via !== "none") {
+    list.append(el("li", {}, el("span", { title: currentExit.reason || "" }, exitText(currentExit)),
+      button("Withdraw", async () => {
+        try {
+          await act({ action: "vpn_exit", peer: name, exit: "none" });
           await refresh();
         } catch (e) { showBanner(e.message); }
       }, "danger")));
@@ -370,6 +401,20 @@ function grantsDialog(name) {
       if ((result.warnings || []).length) showBanner(result.warnings.join(" "));
     }));
   }
+  const exitChoices = [["none", "none"], ["server", "via this server"], ...agents.map(([n]) => [`agent:${n}`, `via agent ${n}`])];
+  const exitValue = currentExit.via === "agent" ? `agent:${currentExit.agent}` : currentExit.via;
+  if (!exitChoices.some(([v]) => v === exitValue)) exitChoices.push([exitValue, `via agent ${currentExit.agent} (not active)`]);
+  const exitSelect = select(exitChoices, exitValue);
+  content.push(el("hr", { class: "sep" }), el("h4", {}, "Internet exit"), form([
+    row("Send all traffic", exitSelect),
+    el("p", { class: "hint" }, "A device has one exit. Via an agent, the device uses a separate profile that reaches the internet through that agent's connection; the web panel and the grants above are not reachable with it, so use a second device for those. The agent must allow it with RIFT_AGENT_ALLOW_EXIT=true."),
+  ], "Apply", async () => {
+    const choice = exitSelect.value;
+    const exit = choice.startsWith("agent:") ? { agent: choice.slice(6) } : choice;
+    const result = await act({ action: "vpn_exit", peer: name, exit });
+    await load();
+    exitNoticeDialog(name, result);
+  }));
   content.push(el("p", { class: "hint" }, "After a change, re-import the device's configuration so it routes the new addresses."),
     el("div", { class: "form" }, el("div", { class: "buttons" },
       button("Show configuration", () => configDialog(name)), button("Done", closeModal, "primary"))));
@@ -466,7 +511,8 @@ function render() {
     const statePill = !f.enabled ? pill("disabled", "off")
       : f.refused ? Object.assign(pill("refused", "bad"), { title: f.refused })
       : f.pending ? pill("pending", "warn") : pill("active", "ok");
-    const mode = [f.mode, f.ingress === "local" ? "local" : null, f.target_family].filter(Boolean).join(" · ");
+    const isExit = f.purpose === "exit";
+    const mode = [isExit ? "exit" : null, f.mode, f.ingress === "local" ? "local" : null, f.target_family].filter(Boolean).join(" · ");
     return el("tr", {},
       el("td", {}, f.id),
       el("td", {}, f.agent),
@@ -475,7 +521,7 @@ function render() {
       el("td", {}, range(f.target_ports)),
       el("td", { class: "muted" }, mode),
       el("td", {}, statePill),
-      el("td", { class: "actions" }, btns(
+      el("td", { class: "actions" }, isExit ? el("span", { class: "muted small" }, "managed by RIFT") : btns(
         f.mode === "translate" ? button("Ban", () => banDialog(f)) : null,
         f.enabled
           ? actionButton("Disable", { action: "forward_enable", id: f.id, enabled: false })
@@ -495,6 +541,8 @@ function render() {
   fill($("vpn"), peers.map((p) => {
     const grants = (p.grants || []).map((g) => `${g.agent || "?"}: ${access(g.access)}${g.refused ? " (refused)" : ""}`);
     if (p.panel) grants.unshift("panel");
+    const exit = exitText(p.exit);
+    if (exit) grants.push(exit);
     return el("tr", {},
       el("td", {}, p.name),
       el("td", {}, el("code", {}, p.ipv4)),

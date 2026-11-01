@@ -172,7 +172,15 @@ pub struct Config {
     pub server_ipv4: Ipv4Addr,
     pub server_ipv6: Ipv6Addr,
     /// Addresses for private VPN peers (phones, laptops). Must not overlap `ipv4_pool`.
+    /// The first host is the internet exit's gateway address and is never handed out.
     pub vpn_pool: Ipv4Net,
+    /// The IPv6 addresses of VPN peers: a ULA network that does not overlap `ipv6_pool`.
+    pub vpn_pool6: Ipv6Net,
+    /// DNS servers written into the configuration of devices that have an internet exit.
+    pub vpn_dns: Vec<IpAddr>,
+    /// UDP ports the server assigns to the internet exits of agents.
+    pub exit_port_min: u16,
+    pub exit_port_max: u16,
     pub route_table: u32,
     pub rule_priority: u32,
     pub mark: u32,
@@ -202,6 +210,8 @@ pub struct Config {
     /// Agent only. Networks behind the agent that VPN subnet grants may reach. Empty means
     /// the agent refuses every subnet grant.
     pub agent_allow_subnets: Vec<Ipv4Net>,
+    /// Agent only. Whether the agent offers its internet connection as an exit for VPN devices.
+    pub agent_allow_exit: bool,
     pub server_address: Option<String>,
     #[serde(skip)]
     pub enrollment_token: Option<String>,
@@ -226,6 +236,10 @@ impl Default for Config {
             server_ipv4: "10.13.0.1".parse().unwrap(),
             server_ipv6: "fd88:5249:4654::1".parse().unwrap(),
             vpn_pool: "10.14.0.0/24".parse().unwrap(),
+            vpn_pool6: "fd88:5249:4655::/64".parse().unwrap(),
+            vpn_dns: vec!["9.9.9.9".parse().unwrap(), "2620:fe::fe".parse().unwrap()],
+            exit_port_min: 51821,
+            exit_port_max: 51899,
             route_table: 51888,
             rule_priority: 11000,
             mark: 0x52490000,
@@ -245,6 +259,7 @@ impl Default for Config {
             agent_name: None,
             agent_allow_ports: None,
             agent_allow_subnets: vec![],
+            agent_allow_exit: false,
             server_address: None,
             enrollment_token: None,
             tls_cert: None,
@@ -304,6 +319,13 @@ impl Config {
         env_parse!("RIFT_SERVER_IPV4", server_ipv4);
         env_parse!("RIFT_SERVER_IPV6", server_ipv6);
         env_parse!("RIFT_VPN_POOL", vpn_pool);
+        env_parse!("RIFT_VPN_POOL6", vpn_pool6);
+        env_parse!("RIFT_AGENT_ALLOW_EXIT", agent_allow_exit);
+        if let Ok(v) = std::env::var("RIFT_VPN_DNS") {
+            if !v.trim().is_empty() {
+                config.vpn_dns = parse_dns_list(&v).context("invalid RIFT_VPN_DNS")?;
+            }
+        }
         env_parse!("RIFT_WEBPANEL", webpanel);
         env_parse!("RIFT_WEBPANEL_ACCESS", webpanel_access);
         env_parse!("RIFT_WEBPANEL_PORT", webpanel_port);
@@ -380,6 +402,27 @@ impl Config {
                 && self.ipv6_pool.prefix_len() <= 120,
             "IPv6 pool must be ULA with room for agents"
         );
+        ensure!(
+            (u128::from(self.vpn_pool6.network()) >> 121) == 0x7e
+                && self.vpn_pool6.prefix_len() <= 120,
+            "VPN IPv6 pool must be a ULA network (fd00::/8) with room for devices"
+        );
+        ensure!(
+            !self.vpn_pool6.contains(&self.ipv6_pool.network())
+                && !self.ipv6_pool.contains(&self.vpn_pool6.network()),
+            "VPN IPv6 pool {} overlaps the IPv6 tunnel pool {}; set RIFT_VPN_POOL6",
+            self.vpn_pool6,
+            self.ipv6_pool
+        );
+        ensure!(
+            self.exit_port_min >= 1024
+                && self.exit_port_min <= self.exit_port_max
+                && !(self.exit_port_min..=self.exit_port_max).contains(&self.wg_port)
+                && !(self.exit_port_min..=self.exit_port_max).contains(&self.control_port)
+                && !(self.exit_port_min..=self.exit_port_max).contains(&self.enrollment_bind.port()),
+            "the exit port range must start at 1024 or above, be ordered and not contain the WireGuard, control or enrollment port"
+        );
+        check_dns_list(&self.vpn_dns)?;
         ensure!(
             self.ipv4_pool.contains(&self.server_ipv4)
                 && self.ipv6_pool.contains(&self.server_ipv6),
@@ -473,6 +516,13 @@ impl Config {
             "VPN pool {} overlaps the IPv4 tunnel pool or a public IP; set RIFT_VPN_POOL (restart required)",
             self.vpn_pool
         );
+        ensure!(
+            self.public_ips
+                .iter()
+                .all(|ip| !matches!(ip, IpAddr::V6(v) if self.vpn_pool6.contains(v))),
+            "VPN IPv6 pool {} contains a public IP; set RIFT_VPN_POOL6 (restart required)",
+            self.vpn_pool6
+        );
         Ok(())
     }
     /// What this agent's owner allows the server to open here.
@@ -480,7 +530,12 @@ impl Config {
         AgentLimits {
             ports: self.agent_allow_ports.clone(),
             subnets: self.agent_allow_subnets.clone(),
+            exit: self.agent_allow_exit,
         }
+    }
+    /// Private key of the agent's `rift-exit` interface.
+    pub fn exit_key_path(&self) -> PathBuf {
+        self.state_dir.join("exit.key")
     }
     pub fn socket_path(&self) -> PathBuf {
         self.state_dir.join("admin.sock")
@@ -491,6 +546,32 @@ impl Config {
     pub fn identity_path(&self) -> PathBuf {
         self.state_dir.join("identity.json")
     }
+}
+/// Comma-separated IP addresses of DNS servers.
+pub fn parse_dns_list(text: &str) -> Result<Vec<IpAddr>> {
+    let list = text
+        .split(',')
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .map(|x| {
+            x.parse::<IpAddr>()
+                .with_context(|| format!("{x:?} is not an IP address"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    check_dns_list(&list)?;
+    Ok(list)
+}
+fn check_dns_list(list: &[IpAddr]) -> Result<()> {
+    ensure!(
+        list.iter()
+            .all(|ip| !ip.is_unspecified() && !ip.is_multicast() && !ip.is_loopback()),
+        "DNS servers must be unicast addresses"
+    );
+    ensure!(
+        list.iter().any(IpAddr::is_ipv4),
+        "the DNS servers need at least one IPv4 address, for exits without IPv6"
+    );
+    Ok(())
 }
 /// Comma-separated addresses or networks; a bare address means that single host.
 pub fn parse_allow_list(text: &str) -> Result<Vec<IpNet>> {
@@ -672,6 +753,58 @@ mod tests {
         ] {
             assert!(parse_subnet_allow(bad).is_err(), "{bad} must be rejected");
         }
+    }
+    #[test]
+    fn vpn_ipv6_pool_is_a_ula_network_apart_from_the_tunnel_pool() {
+        let pool = |text: &str| Config {
+            vpn_pool6: text.parse().unwrap(),
+            ..Default::default()
+        };
+        assert_eq!(
+            Config::default().vpn_pool6.to_string(),
+            "fd88:5249:4655::/64"
+        );
+        pool("fd00:1::/64").validate().unwrap();
+        assert!(pool("2001:db8::/64").validate().is_err(), "not a ULA");
+        assert!(
+            pool("fd88:5249:4654::/64").validate().is_err(),
+            "tunnel pool"
+        );
+        assert!(
+            pool("fd88:5249:4654:0:8000::/65").validate().is_err(),
+            "inside it"
+        );
+        assert!(pool("fd00:1::/125").validate().is_err(), "room for devices");
+        let public = Config {
+            public_ips: vec!["fd00:1::5".parse().unwrap()],
+            allow_private_listeners: true,
+            ..pool("fd00:1::/64")
+        };
+        assert!(public.check_vpn_pool().is_err());
+    }
+    #[test]
+    fn dns_defaults_to_quad9_and_needs_an_ipv4_server() {
+        assert_eq!(
+            parse_dns_list("9.9.9.9, 2620:fe::fe").unwrap(),
+            Config::default().vpn_dns
+        );
+        assert!(parse_dns_list("2620:fe::fe").is_err());
+        assert!(parse_dns_list("dns.example").is_err());
+        assert!(parse_dns_list("0.0.0.0").is_err());
+        assert!(parse_dns_list("").is_err());
+    }
+    #[test]
+    fn exit_ports_stay_clear_of_the_other_ports() {
+        let range = |a, b| Config {
+            exit_port_min: a,
+            exit_port_max: b,
+            ..Default::default()
+        };
+        range(51821, 51899).validate().unwrap();
+        assert!(range(51820, 51899).validate().is_err(), "WireGuard port");
+        assert!(range(51899, 51821).validate().is_err(), "order");
+        assert!(range(80, 90).validate().is_err(), "privileged ports");
+        assert!(!Config::default().agent_allow_exit);
     }
     #[test]
     fn rejects_non_ula() {

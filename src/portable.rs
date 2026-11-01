@@ -79,7 +79,12 @@ pub fn export(snap: &StateSnapshot) -> Export {
             .find(|a| a.id == id)
             .map(|a| a.name.clone())
     };
-    let mut forwards: Vec<_> = snap.forwards.iter().collect();
+    // The forwards of internet exits follow from the devices and are not exported.
+    let mut forwards: Vec<_> = snap
+        .forwards
+        .iter()
+        .filter(|f| f.purpose == Purpose::User)
+        .collect();
     forwards.sort_by_key(|f| f.id);
     Export {
         format: FORMAT,
@@ -455,6 +460,7 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
             target_family: entry.target_family,
             enabled: entry.enabled,
             generation: 0,
+            purpose: Purpose::User,
         };
         let what = describe_forward(&agent, &forward);
         if let Err(error) = forward.validate() {
@@ -662,6 +668,8 @@ mod tests {
             created_at: 0,
             pending_deadline: None,
             limits: None,
+            exit: None,
+            exit_port: None,
         }
     }
     fn entry(agent: &str, listen: u16, target: u16) -> ExportForward {
@@ -749,6 +757,7 @@ mod tests {
             target_family: Family::V4,
             enabled: true,
             generation: 5,
+            purpose: Purpose::User,
         });
         snap.vpn_peers.push(VpnPeer {
             name: "phone".into(),
@@ -757,6 +766,8 @@ mod tests {
             enabled: false,
             created_at: 1,
             panel: true,
+            exit: Exit::None,
+            ipv6: std::net::Ipv6Addr::LOCALHOST,
         });
         snap.vpn_grants.push(VpnGrant {
             peer: "phone".into(),
@@ -879,6 +890,7 @@ mod tests {
             target_family: old.target_family,
             enabled: false,
             generation: 1,
+            purpose: Purpose::User,
         });
         old.enabled = true;
         let clash = entry("core", 2222, 23);
@@ -986,6 +998,7 @@ mod tests {
             target_family: Family::V4,
             enabled: true,
             generation: 1,
+            purpose: Purpose::User,
         };
         let ips = [ip("198.51.100.5"), ip("2001:db8::5")];
         let forwards = vec![
@@ -1051,6 +1064,8 @@ mod tests {
             enabled: true,
             created_at: 0,
             panel: false,
+            exit: Exit::None,
+            ipv6: std::net::Ipv6Addr::LOCALHOST,
         });
         snap.vpn_grants.push(VpnGrant {
             peer: "phone".into(),

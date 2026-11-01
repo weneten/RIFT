@@ -151,14 +151,18 @@ impl std::fmt::Display for PortAllow {
 }
 
 /// What an agent's owner allows the server to open there (`RIFT_AGENT_ALLOW_PORTS`,
-/// `RIFT_AGENT_ALLOW_SUBNETS`). The agent enforces it and reports it with every sync, so the
-/// server can warn about and leave out what the agent would refuse anyway.
+/// `RIFT_AGENT_ALLOW_SUBNETS`, `RIFT_AGENT_ALLOW_EXIT`). The agent enforces it and reports it
+/// with every sync, so the server can warn about and leave out what the agent would refuse
+/// anyway.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentLimits {
     /// `None` means any port.
     pub ports: Option<Vec<PortAllow>>,
     /// Networks behind the agent that subnet grants may reach; empty means none.
     pub subnets: Vec<Ipv4Net>,
+    /// Whether the agent offers its internet connection as an exit for VPN devices. The UDP
+    /// port of that exit is implied by this and needs no entry in `ports`.
+    pub exit: bool,
 }
 impl AgentLimits {
     fn ports_allowed(&self, protocol: Protocol, ports: PortRange) -> bool {
@@ -174,8 +178,19 @@ impl AgentLimits {
             .collect::<Vec<_>>()
             .join(",")
     }
-    /// Why the agent refuses this forward, if it does.
+    /// Why the agent refuses to be an internet exit, if it does.
+    pub fn refuse_exit(&self) -> Option<String> {
+        (!self.exit).then(|| {
+            "the agent does not offer an internet exit; set RIFT_AGENT_ALLOW_EXIT=true on the agent"
+                .to_string()
+        })
+    }
+    /// Why the agent refuses this forward, if it does. The forward of an internet exit is
+    /// allowed by `RIFT_AGENT_ALLOW_EXIT` alone, whatever `RIFT_AGENT_ALLOW_PORTS` says.
     pub fn refuse_forward(&self, forward: &Forward) -> Option<String> {
+        if forward.purpose == Purpose::Exit {
+            return self.refuse_exit();
+        }
         (!self.ports_allowed(forward.protocol, forward.target_ports)).then(|| {
             format!(
                 "the agent allows only ports {} (RIFT_AGENT_ALLOW_PORTS); add {}/{}",
@@ -244,6 +259,29 @@ pub struct AgentRecord {
     pub pending_deadline: Option<i64>,
     /// The agent's own limits as of its last sync; `None` before the first one.
     pub limits: Option<AgentLimits>,
+    /// What the agent last reported about its exit interface; `None` when it has none.
+    pub exit: Option<ExitReport>,
+    /// The UDP port the server assigned to this agent's exit. Kept once assigned, so the
+    /// configurations of devices stay valid while the exit is switched off and on.
+    pub exit_port: Option<u16>,
+}
+/// What an agent that offers an internet exit tells the server with every sync.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExitReport {
+    /// Public key of the agent's `rift-exit` interface; devices connect to it.
+    pub public_key: String,
+    /// The port `rift-exit` listens on right now; `None` until the agent applied the exit.
+    pub listen_port: Option<u16>,
+    /// Whether the agent host has a global IPv6 address, so the exit can carry IPv6.
+    pub ipv6: bool,
+}
+/// Why a forward exists. The forward of an internet exit is managed by RIFT.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Purpose {
+    #[default]
+    User,
+    Exit,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Forward {
@@ -259,6 +297,7 @@ pub struct Forward {
     pub target_family: Family,
     pub enabled: bool,
     pub generation: u64,
+    pub purpose: Purpose,
 }
 impl Forward {
     pub fn target_ip(&self, agent: &AgentRecord) -> IpAddr {
@@ -317,6 +356,21 @@ pub struct VpnPeer {
     pub created_at: i64,
     /// May open the web panel on the VPS's tunnel address.
     pub panel: bool,
+    pub ipv6: Ipv6Addr,
+    /// Where the device's internet traffic leaves; one exit per device.
+    pub exit: Exit,
+}
+/// Where a device's internet traffic leaves. `Agent` holds the agent's ID in the state and
+/// its name in requests.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Exit {
+    #[default]
+    None,
+    /// Through the VPS.
+    Server,
+    /// Through an agent, in a second WireGuard tunnel to that agent.
+    Agent(String),
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -350,6 +404,21 @@ pub struct AgentVpnRule {
     pub source: Ipv4Addr,
     pub access: VpnAccess,
 }
+/// The internet exit an agent is asked to run on its `rift-exit` interface.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExitPolicy {
+    pub listen_port: u16,
+    /// Addresses of the interface itself: the first host of the VPN pools.
+    pub gateway_v4: Ipv4Addr,
+    pub gateway_v6: Ipv6Addr,
+    pub peers: Vec<ExitPeer>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExitPeer {
+    pub public_key: String,
+    pub ipv4: Ipv4Addr,
+    pub ipv6: Ipv6Addr,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct StateSnapshot {
     pub generation: u64,
@@ -366,6 +435,8 @@ pub struct AgentPolicy {
     /// None only in the empty policy an agent applies before its first sync.
     pub vpn_pool: Option<Ipv4Net>,
     pub vpn: Vec<AgentVpnRule>,
+    /// Present while a device uses this agent as its internet exit.
+    pub exit: Option<ExitPolicy>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Welcome {
@@ -527,6 +598,7 @@ pub fn build_forwards(
                 target_family,
                 enabled: true,
                 generation: 0,
+                purpose: Purpose::User,
             };
             forward.validate()?;
             out.push(forward);

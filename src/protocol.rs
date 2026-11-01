@@ -38,6 +38,8 @@ pub enum ControlRequest {
         error: Option<String>,
         /// The agent's own limits, so the server can leave out what it would refuse.
         limits: AgentLimits,
+        /// The agent's exit interface; `None` unless the agent offers an internet exit.
+        exit: Option<ExitReport>,
     },
     Ban {
         version: u16,
@@ -133,6 +135,17 @@ pub enum AdminRequest {
         peer: String,
         agent: String,
         access: Option<VpnAccess>,
+    },
+    /// Sets where a device's internet traffic leaves; `Exit::Agent` names the agent.
+    VpnExit {
+        peer: String,
+        exit: Exit,
+    },
+    /// Takes the internet exit away again, but only the one named: the VPS when `agent` is
+    /// `None`, else that agent.
+    VpnExitClear {
+        peer: String,
+        agent: Option<String>,
     },
     VpnConfig {
         name: String,

@@ -1,5 +1,5 @@
 use rift::protocol::AdminRequest;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 
 fn text(value: &Value) -> String {
@@ -96,6 +96,10 @@ fn forwards(data: &Value, names: &HashMap<String, String>) -> String {
                 field(f, "target_family"),
                 field(f, "ingress"),
                 field(f, "mode"),
+                match f["purpose"].as_str() {
+                    Some("exit") => "exit".into(),
+                    _ => "user".into(),
+                },
                 match f["state"].as_str() {
                     Some(state) => state.into(),
                     None if f["enabled"].as_bool() == Some(true) => "enabled".into(),
@@ -106,7 +110,8 @@ fn forwards(data: &Value, names: &HashMap<String, String>) -> String {
         .collect();
     table(
         &[
-            "ID", "AGENT", "PROTO", "LISTEN", "TARGET", "FAMILY", "INGRESS", "MODE", "STATE",
+            "ID", "AGENT", "PROTO", "LISTEN", "TARGET", "FAMILY", "INGRESS", "MODE", "PURPOSE",
+            "STATE",
         ],
         rows,
         "No forwards configured.",
@@ -397,6 +402,55 @@ fn vpn_access(value: &Value) -> String {
     }
 }
 
+/// "internet via server" or "internet via core (refused by agent)"; None without an exit.
+fn vpn_exit(exit: &Value) -> Option<String> {
+    match exit["via"].as_str()? {
+        "server" => Some("internet via server".into()),
+        "agent" => {
+            let note = match exit["state"].as_str() {
+                Some("refused") => " (refused by agent)",
+                Some("waiting") => " (waiting for the agent)",
+                _ => "",
+            };
+            Some(format!("internet via {}{note}", field(exit, "agent")))
+        }
+        _ => None,
+    }
+}
+
+/// The confirmation of a changed internet exit, with what the user still has to do.
+fn exit_changed(peer: &str, data: &Value) -> String {
+    let mut lines = Vec::new();
+    match data["exit"]["via"].as_str() {
+        Some("server") => {
+            lines.push(format!(
+                "{peer} now sends its internet traffic through this server."
+            ));
+            if data["ipv6"].as_bool() == Some(false) {
+                lines.push("This server has no IPv6 address in RIFT_PUBLIC_IPS: the device's IPv6 traffic is dropped, not leaked.".into());
+            }
+        }
+        Some("agent") => {
+            lines.push(format!(
+                "{peer} now sends its internet traffic through agent {}.",
+                field(data, "agent")
+            ));
+            if let Some(waiting) = data["waiting"].as_str() {
+                lines.push(format!("Not ready yet: {waiting}"));
+            }
+            if data["ipv6"].as_bool() == Some(false) {
+                lines.push("The agent host has no global IPv6 address: the device's IPv6 traffic is dropped, not leaked.".into());
+            }
+            lines.push("This profile reaches neither the web panel nor other RIFT grants; use a second device for those.".into());
+        }
+        _ => lines.push(format!("{peer} has no internet exit any more.")),
+    }
+    lines.push(format!(
+        "Re-import the configuration on the device: rift vpn config qr {peer}"
+    ));
+    lines.join("\n")
+}
+
 fn vpn_peers(data: &Value) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -429,6 +483,9 @@ fn vpn_peers(data: &Value) -> String {
                 .collect::<Vec<_>>();
             if p["panel"].as_bool() == Some(true) {
                 grants.insert(0, "web panel".into());
+            }
+            if let Some(exit) = vpn_exit(&p["exit"]) {
+                grants.push(exit);
             }
             vec![
                 field(p, "name"),
@@ -520,12 +577,14 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
             let rows = data.as_array().into_iter().flatten().map(|b| vec![field(b, "id"), field(b, "forward_id"), field(b, "ip"), field(b, "expires_at")]).collect();
             table(&["ID", "FORWARD", "ADDRESS", "EXPIRES (UNIX)"], rows, "No active bans.")
         },
-        AdminRequest::VpnPeerAdd { name } => format!("VPN device {name} registered with address {}.\nNext: rift vpn allow {name} AGENT 22/tcp (or server), then rift vpn config qr {name}", field(data, "ipv4")),
+        AdminRequest::VpnPeerAdd { name } => format!("VPN device {name} registered with addresses {} and {}.\nNext: rift vpn allow {name} AGENT 22/tcp (or server), then rift vpn config qr {name}\nFor the internet instead: rift vpn allow {name} internet", field(data, "ipv4"), field(data, "ipv6")),
         AdminRequest::VpnPeerList => vpn_peers(data),
         AdminRequest::VpnPeerEnable { name, enabled } => format!("VPN device {name} {}.", if *enabled { "enabled" } else { "disabled; it can no longer connect" }),
         AdminRequest::VpnPeerRevoke { name } => format!("VPN device {name} revoked. Its key and grants are gone."),
         AdminRequest::VpnAllow { peer, agent, access } => format!("{peer} may now reach {agent}: {}.", vpn_access(&serde_json::to_value(access).unwrap_or_default())),
         AdminRequest::VpnDeny { peer, agent, .. } => format!("Access of {peer} to {agent} withdrawn."),
+        AdminRequest::VpnExit { peer, .. } => exit_changed(peer, data),
+        AdminRequest::VpnExitClear { peer, .. } => exit_changed(peer, &json!({"exit":{"via":"none"}})),
         AdminRequest::PanelStatus => panel_status(data),
         AdminRequest::PanelPassword => field(data, "password"),
         AdminRequest::PanelTwoFactorStatus => {

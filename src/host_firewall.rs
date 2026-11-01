@@ -59,6 +59,8 @@ pub struct ServerSpec<'a> {
     pub local_ingress: bool,
     /// VPN peers reach agents through `rift0` and leave by `rift0` again.
     pub vpn: bool,
+    /// Some device exits to the internet through the VPS: forward `rift0` to the uplinks.
+    pub exit: bool,
     /// The web panel's TCP port, when it is on. Who may connect is decided in the RIFT
     /// table and by the panel itself; UFW only has to let the port through.
     pub panel: Option<PanelSpec>,
@@ -77,6 +79,15 @@ pub struct AgentSpec<'a> {
     pub tunnel_v6: Ipv6Addr,
     pub forwards: &'a [&'a Forward],
     pub vpn: &'a [AgentVpnRule],
+    /// Set while the agent runs an internet exit.
+    pub exit: Option<ExitSpec<'a>>,
+}
+
+/// The exit interface of an agent and the interfaces its traffic leaves by.
+pub struct ExitSpec<'a> {
+    pub interface: &'a str,
+    /// Interfaces with the host's default routes; empty means any other interface.
+    pub uplinks: &'a [String],
 }
 
 pub struct DoctorReport {
@@ -214,6 +225,9 @@ pub fn plan_server(obs: &Observation, spec: &ServerSpec<'_>) -> Result<Plan> {
                 spec.interface
             ));
         }
+        if spec.exit {
+            rules.extend(exit_rules(spec.interface, spec.uplinks));
+        }
         push_chain(&mut plan, obs, chain, CHAIN_FWD, &rules);
     }
     plan.summary = format!(
@@ -257,7 +271,7 @@ pub fn plan_agent(obs: &Observation, spec: &AgentSpec<'_>) -> Result<Plan> {
         push_chain(&mut plan, obs, chain, CHAIN_IN, &rules);
     }
     for chain in &obs.forward {
-        let rules = vec![
+        let mut rules = vec![
             format!(
                 "iifname \"{}\" accept comment \"rift:ingress\"",
                 spec.interface
@@ -267,6 +281,13 @@ pub fn plan_agent(obs: &Observation, spec: &AgentSpec<'_>) -> Result<Plan> {
                 spec.interface
             ),
         ];
+        if let Some(exit) = &spec.exit {
+            require_ifname(exit.interface)?;
+            for uplink in exit.uplinks {
+                require_ifname(uplink)?;
+            }
+            rules.extend(exit_rules(exit.interface, exit.uplinks));
+        }
         push_chain(&mut plan, obs, chain, CHAIN_FWD, &rules);
     }
     plan.summary = format!(
@@ -277,6 +298,25 @@ pub fn plan_agent(obs: &Observation, spec: &AgentSpec<'_>) -> Result<Plan> {
             .count()
     );
     Ok(plan)
+}
+
+/// Forwarding between an exit interface and the uplinks: out freely, back only for replies.
+fn exit_rules(interface: &str, uplinks: &[String]) -> Vec<String> {
+    if uplinks.is_empty() {
+        return vec![
+            format!("iifname \"{interface}\" oifname != \"{interface}\" accept comment \"rift:exit\""),
+            format!("iifname != \"{interface}\" oifname \"{interface}\" ct state established,related accept comment \"rift:exit\""),
+        ];
+    }
+    uplinks
+        .iter()
+        .flat_map(|uplink| {
+            [
+                format!("iifname \"{interface}\" oifname \"{uplink}\" accept comment \"rift:exit\""),
+                format!("iifname \"{uplink}\" oifname \"{interface}\" ct state established,related accept comment \"rift:exit\""),
+            ]
+        })
+        .collect()
 }
 
 pub fn plan_remove(obs: &Observation) -> String {
@@ -564,6 +604,7 @@ mod tests {
             local_ingress: false,
             vpn: false,
             panel: None,
+            exit: false,
         }
     }
 
@@ -664,6 +705,7 @@ mod tests {
             target_family: Family::V4,
             enabled: true,
             generation: 1,
+            purpose: crate::model::Purpose::User,
         };
         let plan = plan_agent(
             &obs,
@@ -673,6 +715,7 @@ mod tests {
                 tunnel_v6: "fd88:5249:4654::2".parse().unwrap(),
                 forwards: &[&forward],
                 vpn: &[],
+                exit: None,
             },
         )
         .unwrap();
@@ -713,10 +756,74 @@ mod tests {
                 tunnel_v6: "fd88:5249:4654::2".parse().unwrap(),
                 forwards: &[],
                 vpn: &[rule],
+                exit: None,
             },
         )
         .unwrap();
         assert!(plan.fill.contains("iifname \"rift0\" ip saddr 10.14.0.2 ip daddr 10.88.0.2 meta l4proto { tcp, udp, icmp } accept comment \"rift:vpn\""));
+    }
+
+    #[test]
+    fn ufw_forwards_exit_traffic_only_while_a_device_exits_through_this_host() {
+        let obs = observe(&ruleset()).unwrap();
+        let uplinks = vec!["eth0".to_string()];
+        let mut spec = server_spec(&uplinks);
+        assert!(!plan_server(&obs, &spec).unwrap().fill.contains("rift:exit"));
+        spec.exit = true;
+        let plan = plan_server(&obs, &spec).unwrap();
+        assert!(plan
+            .fill
+            .contains("iifname \"rift0\" oifname \"eth0\" accept comment \"rift:exit\""));
+        assert!(plan.fill.contains(
+            "iifname \"eth0\" oifname \"rift0\" ct state established,related accept comment \"rift:exit\""
+        ));
+        // Without a known uplink, any other interface will do.
+        spec.uplinks = &[];
+        let plan = plan_server(&obs, &spec).unwrap();
+        assert!(plan
+            .fill
+            .contains("iifname \"rift0\" oifname != \"rift0\" accept comment \"rift:exit\""));
+    }
+
+    #[test]
+    fn agent_ufw_forwards_the_exit_interface_to_the_uplinks() {
+        let obs = observe(&ruleset()).unwrap();
+        let uplinks = vec!["enp3s0".to_string()];
+        let spec = |exit| AgentSpec {
+            interface: "rift0",
+            tunnel_v4: Ipv4Addr::new(10, 88, 0, 2),
+            tunnel_v6: "fd88:5249:4654::2".parse().unwrap(),
+            forwards: &[],
+            vpn: &[],
+            exit,
+        };
+        assert!(!plan_agent(&obs, &spec(None))
+            .unwrap()
+            .fill
+            .contains("rift:exit"));
+        let plan = plan_agent(
+            &obs,
+            &spec(Some(ExitSpec {
+                interface: "rift-exit",
+                uplinks: &uplinks,
+            })),
+        )
+        .unwrap();
+        assert!(plan
+            .fill
+            .contains("iifname \"rift-exit\" oifname \"enp3s0\" accept comment \"rift:exit\""));
+        assert!(plan.fill.contains(
+            "iifname \"enp3s0\" oifname \"rift-exit\" ct state established,related accept comment \"rift:exit\""
+        ));
+        let bad = vec!["eth0;drop".to_string()];
+        assert!(plan_agent(
+            &obs,
+            &spec(Some(ExitSpec {
+                interface: "rift-exit",
+                uplinks: &bad
+            }))
+        )
+        .is_err());
     }
 
     #[test]

@@ -35,12 +35,20 @@ pub fn restrict(policy: &AgentPolicy, limits: &AgentLimits) -> (AgentPolicy, Vec
             Some(why) => refusals.push(format!("{} refused: {why}", describe_rule(rule))),
         }
     }
+    let exit = match (&policy.exit, limits.refuse_exit()) {
+        (Some(_), Some(why)) => {
+            refusals.push(format!("internet exit refused: {why}"));
+            None
+        }
+        (exit, _) => exit.clone(),
+    };
     (
         AgentPolicy {
             generation: policy.generation,
             forwards,
             vpn_pool: policy.vpn_pool,
             vpn,
+            exit,
         },
         refusals,
     )
@@ -71,6 +79,7 @@ mod tests {
             target_family: Family::V4,
             enabled: true,
             generation,
+            purpose: crate::model::Purpose::User,
         }
     }
     fn rule(access: VpnAccess) -> AgentVpnRule {
@@ -83,6 +92,7 @@ mod tests {
         AgentLimits {
             ports: parse_port_allow(ports).unwrap(),
             subnets: parse_subnet_allow(subnets).unwrap(),
+            exit: false,
         }
     }
     fn policy(forwards: Vec<Forward>, vpn: Vec<AgentVpnRule>) -> AgentPolicy {
@@ -91,6 +101,7 @@ mod tests {
             forwards,
             vpn_pool: None,
             vpn,
+            exit: None,
         }
     }
     fn subnet(net: &str) -> VpnAccess {
@@ -123,6 +134,58 @@ mod tests {
             out.generation, 9,
             "refusals do not hold the generation back"
         );
+    }
+
+    fn exit_forward(id: u64) -> Forward {
+        Forward {
+            protocol: Protocol::Udp,
+            purpose: crate::model::Purpose::Exit,
+            ..forward(id, Protocol::Udp, pr(51821, 51821), 3)
+        }
+    }
+    fn exit_policy() -> crate::model::ExitPolicy {
+        crate::model::ExitPolicy {
+            listen_port: 51821,
+            gateway_v4: Ipv4Addr::new(10, 14, 0, 1),
+            gateway_v6: "fd88:5249:4655::1".parse().unwrap(),
+            peers: vec![],
+        }
+    }
+
+    #[test]
+    fn the_exit_needs_the_agents_own_permission_and_implies_its_udp_port() {
+        let mut p = policy(
+            vec![
+                exit_forward(1),
+                forward(2, Protocol::Udp, pr(51821, 51821), 3),
+            ],
+            vec![],
+        );
+        p.exit = Some(exit_policy());
+        // Allowed: the exit forward passes although RIFT_AGENT_ALLOW_PORTS names other ports;
+        // a user forward to the same port is still checked against the list.
+        let mut limits = cfg("22/tcp", "");
+        limits.exit = true;
+        let (out, refusals) = restrict(&p, &limits);
+        assert_eq!(out.forwards.iter().map(|f| f.id).collect::<Vec<_>>(), [1]);
+        assert_eq!(out.exit, Some(exit_policy()));
+        assert_eq!(refusals.len(), 1);
+        assert!(refusals[0].contains("forward 2"), "{refusals:?}");
+        // Refused: neither the exit nor its forward is applied, and the owner is told why.
+        let (out, refusals) = restrict(&p, &cfg("", ""));
+        assert!(out.forwards.iter().all(|f| f.id != 1));
+        assert!(out.exit.is_none());
+        assert!(
+            refusals
+                .iter()
+                .any(|r| r.contains("internet exit refused")
+                    && r.contains("RIFT_AGENT_ALLOW_EXIT=true")),
+            "{refusals:?}"
+        );
+        assert!(refusals.iter().any(|r| r.contains("forward 1")));
+        // Nothing to refuse without an exit in the policy.
+        let (_, refusals) = restrict(&policy(vec![], vec![]), &cfg("", ""));
+        assert!(refusals.is_empty());
     }
 
     #[test]

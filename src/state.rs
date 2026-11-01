@@ -271,6 +271,8 @@ impl StateStore {
             created_at: t,
             pending_deadline: Some(stage_deadline),
             limits: None,
+            exit: None,
+            exit_port: None,
         };
         s.agents.push(record.clone());
         tx.execute("UPDATE invites SET reserved_agent=?1,reserved_attempt=?2,reserved_key=?3,stage_deadline=?4 WHERE token_hash=?5", params![id,attempt,key,stage_deadline,token_hash])?;
@@ -357,6 +359,7 @@ impl StateStore {
         applied: u64,
         error: Option<String>,
         limits: AgentLimits,
+        exit: Option<ExitReport>,
     ) -> Result<StateSnapshot> {
         let mut c = self.lock()?;
         let tx = c.transaction()?;
@@ -374,11 +377,13 @@ impl StateStore {
                 .ok_or_else(|| anyhow!("unknown agent"))?;
             let changed = a.applied_generation != applied
                 || a.last_error != error
-                || a.limits.as_ref() != Some(&limits);
+                || a.limits.as_ref() != Some(&limits)
+                || a.exit != exit;
             if changed {
                 a.applied_generation = applied;
                 a.last_error = error;
                 a.limits = Some(limits);
+                a.exit = exit;
             }
             changed
         };
@@ -494,6 +499,11 @@ impl StateStore {
         s.forwards.retain(|f| f.agent_id != id);
         s.bans.retain(|b| b.agent_id != id);
         s.vpn_grants.retain(|g| g.agent_id != id);
+        for peer in &mut s.vpn_peers {
+            if peer.exit == Exit::Agent(id.into()) {
+                peer.exit = Exit::None;
+            }
+        }
         tx.execute("DELETE FROM invites WHERE reserved_agent=?1", [id])?;
         tx.execute("DELETE FROM rotations WHERE agent_id=?1", [id])?;
         let out = Self::commit_snapshot(&tx, s, "agent-remove")?;
@@ -575,11 +585,22 @@ fn validate_snapshot(s: &StateSnapshot) -> Result<()> {
             }
         }
     }
-    let (mut peer_names, mut peer_ips) = (HashSet::new(), HashSet::new());
+    let (mut peer_names, mut peer_ips, mut peer_ips6) =
+        (HashSet::new(), HashSet::new(), HashSet::new());
+    let mut exit_ports = HashSet::new();
+    for a in &s.agents {
+        if let Some(port) = a.exit_port {
+            anyhow::ensure!(exit_ports.insert(port), "duplicate exit port");
+        }
+    }
     for p in &s.vpn_peers {
         crate::config::validate_name(&p.name)?;
         anyhow::ensure!(peer_names.insert(&p.name), "duplicate VPN peer name");
         anyhow::ensure!(peer_ips.insert(p.ipv4), "duplicate VPN peer address");
+        anyhow::ensure!(peer_ips6.insert(p.ipv6), "duplicate VPN peer IPv6 address");
+        if let Exit::Agent(id) = &p.exit {
+            anyhow::ensure!(ids.contains(id), "VPN peer exit references unknown agent");
+        }
         anyhow::ensure!(
             keys.insert(&p.public_key),
             "VPN peer reuses a WireGuard public key"
@@ -666,6 +687,8 @@ mod tests {
             created_at: 0,
             pending_deadline: None,
             limits: None,
+            exit: None,
+            exit_port: None,
         };
         let subnet = |net: &str| VpnAccess::Subnet {
             net: net.parse().unwrap(),
@@ -678,6 +701,8 @@ mod tests {
             enabled: true,
             created_at: 0,
             panel: false,
+            exit: Exit::None,
+            ipv6: std::net::Ipv6Addr::LOCALHOST,
         };
         let grant = |agent: &str, access| VpnGrant {
             peer: "iphone".into(),
@@ -712,6 +737,69 @@ mod tests {
         s.vpn_peers[0].public_key = "k-a".into();
         assert!(validate_snapshot(&s).is_err(), "key shared with an agent");
     }
+    #[test]
+    fn exits_are_validated_and_follow_their_agent() {
+        let store = StateStore::open(&tempdir().unwrap().path().join("s.db")).unwrap();
+        let agent = |id: &str, n: u8, port: Option<u16>| AgentRecord {
+            id: id.into(),
+            name: id.into(),
+            public_key: format!("k-{id}"),
+            tunnel_ipv4: Ipv4Addr::new(10, 13, 0, n),
+            tunnel_ipv6: Ipv6Addr::new(0xfd88, 0x5249, 0x4654, 0, 0, 0, 0, n.into()),
+            status: AgentStatus::Active,
+            attempt_id: id.into(),
+            generation: 1,
+            applied_generation: 1,
+            last_error: None,
+            created_at: 0,
+            pending_deadline: None,
+            limits: None,
+            exit: None,
+            exit_port: port,
+        };
+        let device = |name: &str, n: u8, exit: Exit| VpnPeer {
+            name: name.into(),
+            public_key: format!("k-{name}"),
+            ipv4: Ipv4Addr::new(10, 14, 0, n),
+            enabled: true,
+            created_at: 0,
+            panel: false,
+            ipv6: Ipv6Addr::new(0xfd88, 0x5249, 0x4655, 0, 0, 0, 0, n.into()),
+            exit,
+        };
+        let base = StateSnapshot {
+            agents: vec![agent("a", 2, Some(51821)), agent("b", 3, Some(51822))],
+            vpn_peers: vec![device("phone", 2, Exit::Agent("a".into()))],
+            ..Default::default()
+        };
+        validate_snapshot(&base).unwrap();
+        let mut s = base.clone();
+        s.vpn_peers[0].exit = Exit::Agent("zzz".into());
+        assert!(validate_snapshot(&s).is_err(), "unknown exit agent");
+        let mut s = base.clone();
+        s.agents[1].exit_port = Some(51821);
+        assert!(
+            validate_snapshot(&s).is_err(),
+            "one exit port for two agents"
+        );
+        let mut s = base.clone();
+        s.vpn_peers.push(device("tablet", 3, Exit::Server));
+        s.vpn_peers[1].ipv6 = s.vpn_peers[0].ipv6;
+        assert!(
+            validate_snapshot(&s).is_err(),
+            "duplicate device IPv6 address"
+        );
+        // Removing the agent leaves the device without an exit.
+        store
+            .mutate("seed", |x| {
+                *x = base.clone();
+                Ok(())
+            })
+            .unwrap();
+        let after = store.remove_agent("a").unwrap();
+        assert_eq!(after.vpn_peers[0].exit, Exit::None);
+    }
+
     #[test]
     fn forward_ids_fill_gaps_before_growing() {
         assert_eq!(lowest_free_id([]), 1);
@@ -1035,6 +1123,7 @@ mod tests {
             target_family: Family::V4,
             enabled: true,
             generation: 1,
+            purpose: Purpose::User,
         };
         st.mutate("forward-add", |s| {
             s.forwards.push(f.clone());
@@ -1128,6 +1217,8 @@ mod tests {
                     created_at: now(),
                     pending_deadline: None,
                     limits: None,
+                    exit: None,
+                    exit_port: None,
                 });
                 Ok(())
             })
@@ -1148,7 +1239,7 @@ mod tests {
             .as_i64()
             .is_some());
         assert!(store
-            .update_agent_sync("a", 2, None, AgentLimits::default())
+            .update_agent_sync("a", 2, None, AgentLimits::default(), None)
             .is_err());
     }
 }

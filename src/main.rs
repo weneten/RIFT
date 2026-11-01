@@ -156,8 +156,14 @@ fn parse_map(value: &str) -> Result<(String, String), String> {
 enum Vpn {
     /// Let a device reach an agent: `rift vpn allow DEVICE AGENT TARGET...`, for example
     /// `rift vpn allow iphone core 22/tcp 53/both`. Without an allow, a device reaches nothing.
+    ///
+    /// Use `internet` as a target to send the device's whole internet traffic through that
+    /// agent's connection (`rift vpn allow iphone core internet`), or alone to send it
+    /// through this server (`rift vpn allow iphone internet`). A device has one exit.
     Allow(VpnAccessArgs),
-    /// Withdraw access again. Without a target, withdraws all of it on that agent.
+    /// Withdraw access again. Without a target, withdraws all of it on that agent, including
+    /// an internet exit through it. `rift vpn deny DEVICE internet` ends the exit through
+    /// this server.
     Deny(VpnAccessArgs),
     /// Export the WireGuard configuration of a device.
     Config {
@@ -176,24 +182,50 @@ enum VpnConfig {
 struct VpnAccessArgs {
     /// Device name.
     peer: String,
-    agent: String,
-    /// What to allow: PORT/tcp, PORT/udp or PORT/both (ranges like 8000-8010/tcp), `server`,
-    /// `full`, or a network behind the agent such as 192.168.178.0/24. Several are allowed.
-    #[arg(value_name = "TARGET")]
-    targets: Vec<String>,
+    /// The agent, then what to allow: PORT/tcp, PORT/udp or PORT/both (ranges like
+    /// 8000-8010/tcp), `server`, `full`, a network behind the agent such as 192.168.178.0/24,
+    /// or `internet`. Several are allowed. Just `internet` means the exit through this server.
+    #[arg(value_name = "AGENT TARGET", required = true, num_args = 1..)]
+    rest: Vec<String>,
     /// Masquerade the device's address on the agent, for LANs without a route to the VPN pool.
     #[arg(long)]
     snat: bool,
 }
+/// What a `vpn allow` or `vpn deny` command names.
+#[derive(Debug, PartialEq, Eq)]
+struct VpnPlan {
+    agent: Option<String>,
+    accesses: Vec<VpnAccess>,
+    /// The internet exit: the server, or the agent that the command names.
+    exit: Option<Exit>,
+}
 impl VpnAccessArgs {
-    fn agent(&self) -> String {
-        self.agent.clone()
+    fn plan(&self) -> Result<VpnPlan> {
+        if self.rest == ["internet"] {
+            return Ok(VpnPlan {
+                agent: None,
+                accesses: Vec::new(),
+                exit: Some(Exit::Server),
+            });
+        }
+        let agent = self.rest[0].clone();
+        anyhow::ensure!(
+            agent != "internet",
+            "name the agent first: `rift vpn allow DEVICE AGENT ... internet`. The exit through this server is `rift vpn allow DEVICE internet` on its own"
+        );
+        let internet = self.rest[1..].iter().any(|t| t == "internet");
+        Ok(VpnPlan {
+            accesses: self.accesses(&self.rest[1..])?,
+            exit: internet.then(|| Exit::Agent(agent.clone())),
+            agent: Some(agent),
+        })
     }
-    fn accesses(&self) -> Result<Vec<VpnAccess>> {
+    fn accesses(&self, targets: &[String]) -> Result<Vec<VpnAccess>> {
         let (mut server, mut full) = (false, false);
         let (mut ports, mut subnets) = (Vec::new(), Vec::new());
-        for target in &self.targets {
+        for target in targets {
             match target.as_str() {
+                "internet" => {}
                 "server" => server = true,
                 "full" => full = true,
                 t if t
@@ -204,7 +236,7 @@ impl VpnAccessArgs {
                     ports.push(t.to_string())
                 }
                 t => subnets.push(t.parse::<Ipv4Net>().with_context(|| {
-                    format!("{t:?} is not PORT/tcp|udp|both, server, full or a network like 192.168.178.0/24")
+                    format!("{t:?} is not PORT/tcp|udp|both, server, full, internet or a network like 192.168.178.0/24")
                 })?),
             }
         }
@@ -451,32 +483,15 @@ async fn run() -> Result<()> {
         },
         Command::Vpn { command } => match command {
             Vpn::Allow(args) => {
-                let mut requests =
-                    args.accesses()?
-                        .into_iter()
-                        .map(|access| AdminRequest::VpnAllow {
-                            peer: args.peer.clone(),
-                            agent: args.agent(),
-                            access,
-                        });
+                let mut requests = vpn_allow_requests(&args)?.into_iter();
                 let first = requests.next().context(
-                    "choose what to allow, for example: 22/tcp, server, full or 192.168.178.0/24",
+                    "choose what to allow, for example: 22/tcp, server, full, 192.168.178.0/24 or internet",
                 )?;
                 more.extend(requests);
                 first
             }
             Vpn::Deny(args) => {
-                let accesses = args.accesses()?;
-                let selected: Vec<Option<VpnAccess>> = if accesses.is_empty() {
-                    vec![None]
-                } else {
-                    accesses.into_iter().map(Some).collect()
-                };
-                let mut requests = selected.into_iter().map(|access| AdminRequest::VpnDeny {
-                    peer: args.peer.clone(),
-                    agent: args.agent(),
-                    access,
-                });
+                let mut requests = vpn_deny_requests(&args)?.into_iter();
                 let first = requests.next().context("nothing to deny")?;
                 more.extend(requests);
                 first
@@ -587,10 +602,10 @@ async fn run() -> Result<()> {
     for request in more {
         let response = rift::daemon::admin_call(&config, request.clone())
             .await
-            .context("earlier forwards of this command were already added")?;
+            .context("earlier parts of this command were already applied")?;
         if !response.ok {
             bail!(
-                "{} (earlier forwards of this command were already added)",
+                "{} (earlier parts of this command were already applied)",
                 response.error.unwrap_or_else(|| "operation failed".into())
             );
         }
@@ -598,7 +613,61 @@ async fn run() -> Result<()> {
     }
     Ok(())
 }
-/// Checks only the running server can answer. Skipped on agents and when the server is down.
+/// The requests of `rift vpn allow`: the grants first, then the internet exit.
+fn vpn_allow_requests(args: &VpnAccessArgs) -> Result<Vec<AdminRequest>> {
+    let plan = args.plan()?;
+    let mut requests = Vec::new();
+    if let Some(agent) = &plan.agent {
+        for access in plan.accesses {
+            requests.push(AdminRequest::VpnAllow {
+                peer: args.peer.clone(),
+                agent: agent.clone(),
+                access,
+            });
+        }
+    }
+    if let Some(exit) = plan.exit {
+        requests.push(AdminRequest::VpnExit {
+            peer: args.peer.clone(),
+            exit,
+        });
+    }
+    Ok(requests)
+}
+/// The requests of `rift vpn deny`. Without any target, everything on the agent goes.
+fn vpn_deny_requests(args: &VpnAccessArgs) -> Result<Vec<AdminRequest>> {
+    let plan = args.plan()?;
+    let mut requests = Vec::new();
+    if plan.accesses.is_empty() && plan.exit.is_none() {
+        requests.push(AdminRequest::VpnDeny {
+            peer: args.peer.clone(),
+            agent: plan
+                .agent
+                .clone()
+                .context("name the agent whose access to withdraw")?,
+            access: None,
+        });
+    }
+    if let Some(agent) = &plan.agent {
+        for access in plan.accesses {
+            requests.push(AdminRequest::VpnDeny {
+                peer: args.peer.clone(),
+                agent: agent.clone(),
+                access: Some(access),
+            });
+        }
+    }
+    if let Some(exit) = plan.exit {
+        requests.push(AdminRequest::VpnExitClear {
+            peer: args.peer.clone(),
+            agent: match exit {
+                Exit::Agent(agent) => Some(agent),
+                _ => None,
+            },
+        });
+    }
+    Ok(requests)
+}
 fn dated(prefix: &str, suffix: &str) -> PathBuf {
     format!(
         "{prefix}-{}.{suffix}",
@@ -720,6 +789,7 @@ async fn server_checks(config: &Config, checks: &mut rift::net::Checks) {
             checks.push(WARN, format!("Agent {name}"), error.to_string());
         }
     }
+    exit_checks(config, &status, checks);
     for refused in status["refused_forwards"].as_array().into_iter().flatten() {
         checks.push(
             WARN,
@@ -758,6 +828,74 @@ async fn server_checks(config: &Config, checks: &mut rift::net::Checks) {
                 format!("nothing answers on 127.0.0.1:{}", config.webpanel_port)
             },
         );
+    }
+}
+/// The internet exits in use: how many devices, whether the VPS carries IPv6 for them, and
+/// whether each agent they use has what it needs.
+fn exit_checks(config: &Config, status: &serde_json::Value, checks: &mut rift::net::Checks) {
+    use rift::net::{OK, WARN};
+    let empty = Vec::new();
+    let devices = status["snapshot"]["vpn_peers"].as_array().unwrap_or(&empty);
+    let enabled = |p: &&serde_json::Value| p["enabled"].as_bool() == Some(true);
+    let via_server = devices
+        .iter()
+        .filter(enabled)
+        .filter(|p| p["exit"] == "server")
+        .count();
+    let via_agents: Vec<&serde_json::Value> = devices
+        .iter()
+        .filter(enabled)
+        .filter(|p| p["exit"]["agent"].is_string())
+        .collect();
+    if via_server + via_agents.len() == 0 {
+        return;
+    }
+    checks.push(
+        OK,
+        "Internet exits".into(),
+        format!(
+            "{via_server} device(s) via this server, {} via agents",
+            via_agents.len()
+        ),
+    );
+    if via_server > 0 {
+        let ipv6 = config.public_ips.iter().any(IpAddr::is_ipv6);
+        checks.push(
+            if ipv6 { OK } else { WARN },
+            "Server exit IPv6".into(),
+            if ipv6 {
+                "the IPv6 address in RIFT_PUBLIC_IPS carries the devices' IPv6 traffic".into()
+            } else {
+                "RIFT_PUBLIC_IPS has no IPv6 address: devices exiting here get no IPv6 (it is dropped, not leaked)".into()
+            },
+        );
+    }
+    for agent in status["snapshot"]["agents"].as_array().unwrap_or(&empty) {
+        let id = &agent["id"];
+        if !via_agents.iter().any(|p| p["exit"]["agent"] == *id) {
+            continue;
+        }
+        let name = agent["name"].as_str().unwrap_or("?");
+        let problem = if agent["limits"]["exit"].as_bool() == Some(false) {
+            Some("refuses the exit: set RIFT_AGENT_ALLOW_EXIT=true on the agent")
+        } else if agent["exit"].is_null() {
+            Some("has not reported its exit key yet; is it online and RIFT_AGENT_ALLOW_EXIT=true?")
+        } else {
+            None
+        };
+        match problem {
+            Some(problem) => checks.push(WARN, format!("Exit via agent {name}"), problem.into()),
+            None => checks.push(
+                OK,
+                format!("Exit via agent {name}"),
+                if agent["exit"]["ipv6"].as_bool() == Some(true) {
+                    "ready, with IPv6".into()
+                } else {
+                    "ready; the agent host has no global IPv6, so the devices' IPv6 is dropped"
+                        .into()
+                },
+            ),
+        }
     }
 }
 async fn admin_ok(config: &Config, request: AdminRequest) -> Result<serde_json::Value> {
@@ -938,17 +1076,30 @@ mod tests {
         else {
             unreachable!()
         };
-        assert!(args.accesses().is_err());
+        assert!(args.plan().is_err());
+    }
+    fn vpn_plan(argv: &[&str]) -> Option<Result<VpnPlan>> {
+        match Cli::try_parse_from(argv).map(|c| c.command) {
+            Ok(Command::Vpn {
+                command: Vpn::Allow(args) | Vpn::Deny(args),
+            }) => Some(args.plan()),
+            _ => None,
+        }
+    }
+    fn vpn_requests(argv: &[&str]) -> Result<Vec<AdminRequest>> {
+        match Cli::try_parse_from(argv).unwrap().command {
+            Command::Vpn {
+                command: Vpn::Allow(args),
+            } => vpn_allow_requests(&args),
+            Command::Vpn {
+                command: Vpn::Deny(args),
+            } => vpn_deny_requests(&args),
+            _ => unreachable!(),
+        }
     }
     #[test]
     fn vpn_short_form_names_device_agent_and_targets() {
-        let parse = |argv: &[&str]| match Cli::try_parse_from(argv).map(|c| c.command) {
-            Ok(Command::Vpn {
-                command: Vpn::Allow(args) | Vpn::Deny(args),
-            }) => Some((args.agent(), args.accesses())),
-            _ => None,
-        };
-        let (agent, accesses) = parse(&[
+        let plan = vpn_plan(&[
             "rift",
             "vpn",
             "allow",
@@ -960,10 +1111,12 @@ mod tests {
             "192.168.178.0/24",
             "--snat",
         ])
+        .unwrap()
         .unwrap();
-        assert_eq!(agent, "core");
+        assert_eq!(plan.agent.as_deref(), Some("core"));
+        assert_eq!(plan.exit, None);
         assert_eq!(
-            accesses.unwrap(),
+            plan.accesses,
             vec![
                 VpnAccess::Server,
                 VpnAccess::Port {
@@ -985,32 +1138,107 @@ mod tests {
             ]
         );
         // Without targets, deny withdraws everything on that agent.
-        let (agent, accesses) = parse(&["rift", "vpn", "deny", "iphone", "core"]).unwrap();
-        assert_eq!((agent.as_str(), accesses.unwrap().len()), ("core", 0));
-        assert!(parse(&["rift", "vpn", "allow", "iphone", "core", "22"])
+        let plan = vpn_plan(&["rift", "vpn", "deny", "iphone", "core"])
             .unwrap()
-            .1
+            .unwrap();
+        assert_eq!(plan.agent.as_deref(), Some("core"));
+        assert!(plan.accesses.is_empty() && plan.exit.is_none());
+        assert!(vpn_plan(&["rift", "vpn", "allow", "iphone", "core", "22"])
+            .unwrap()
             .is_err());
-        assert!(parse(&["rift", "vpn", "allow", "iphone", "core", "nas"])
+        assert!(vpn_plan(&["rift", "vpn", "allow", "iphone", "core", "nas"])
             .unwrap()
-            .1
             .is_err());
         // The agent is required and the old long options are gone.
-        assert!(parse(&["rift", "vpn", "allow", "iphone"]).is_none());
-        assert!(parse(&["rift", "vpn", "allow", "iphone", "core", "--server"]).is_none());
-        assert!(parse(&["rift", "vpn", "allow", "iphone", "--agent", "core", "server"]).is_none());
+        assert!(vpn_plan(&["rift", "vpn", "allow", "iphone"]).is_none());
+        assert!(vpn_plan(&["rift", "vpn", "allow", "iphone", "core", "--server"]).is_none());
+        assert!(
+            vpn_plan(&["rift", "vpn", "allow", "iphone", "--agent", "core", "server"]).is_none()
+        );
+    }
+    #[test]
+    fn internet_selects_the_exit_through_the_server_or_an_agent() {
+        // Alone: the VPS.
+        let plan = vpn_plan(&["rift", "vpn", "allow", "iphone", "internet"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plan,
+            VpnPlan {
+                agent: None,
+                accesses: vec![],
+                exit: Some(Exit::Server)
+            }
+        );
+        // After an agent: that agent, and it may come with grants.
+        let plan = vpn_plan(&["rift", "vpn", "allow", "iphone", "core", "internet"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.exit, Some(Exit::Agent("core".into())));
+        assert!(plan.accesses.is_empty());
+        let requests = vpn_requests(&[
+            "rift", "vpn", "allow", "iphone", "core", "22/tcp", "internet",
+        ])
+        .unwrap();
+        assert_eq!(requests.len(), 2, "the grant, then the exit");
+        assert!(matches!(
+            &requests[0],
+            AdminRequest::VpnAllow { agent, .. } if agent == "core"
+        ));
+        assert!(matches!(
+            &requests[1],
+            AdminRequest::VpnExit { peer, exit: Exit::Agent(agent) } if peer == "iphone" && agent == "core"
+        ));
+        let requests = vpn_requests(&["rift", "vpn", "allow", "iphone", "internet"]).unwrap();
+        assert!(matches!(
+            requests.as_slice(),
+            [AdminRequest::VpnExit {
+                exit: Exit::Server,
+                ..
+            }]
+        ));
+        // `internet` first with more behind it is ambiguous.
+        assert!(
+            vpn_plan(&["rift", "vpn", "allow", "iphone", "internet", "22/tcp"])
+                .unwrap()
+                .is_err()
+        );
+        // Allowing nothing is an error the command reports; the agent alone allows nothing.
+        assert!(vpn_requests(&["rift", "vpn", "allow", "iphone", "core"])
+            .unwrap()
+            .is_empty());
+    }
+    #[test]
+    fn deny_internet_clears_only_the_named_exit() {
+        let requests = vpn_requests(&["rift", "vpn", "deny", "iphone", "internet"]).unwrap();
+        assert!(matches!(
+            requests.as_slice(),
+            [AdminRequest::VpnExitClear { agent: None, .. }]
+        ));
+        let requests =
+            vpn_requests(&["rift", "vpn", "deny", "iphone", "core", "internet"]).unwrap();
+        assert!(matches!(
+            requests.as_slice(),
+            [AdminRequest::VpnExitClear { agent: Some(a), .. }] if a == "core"
+        ));
+        // Without targets everything on the agent goes; with some, only those.
+        let requests = vpn_requests(&["rift", "vpn", "deny", "iphone", "core"]).unwrap();
+        assert!(matches!(
+            requests.as_slice(),
+            [AdminRequest::VpnDeny { access: None, .. }]
+        ));
+        let requests = vpn_requests(&[
+            "rift", "vpn", "deny", "iphone", "core", "22/tcp", "internet",
+        ])
+        .unwrap();
+        assert_eq!(requests.len(), 2);
     }
     #[test]
     fn vpn_targets_become_accesses() {
         let args = |extra: &[&str]| {
             let mut argv = vec!["rift", "vpn", "allow", "iphone", "home"];
             argv.extend(extra);
-            match Cli::try_parse_from(argv).unwrap().command {
-                Command::Vpn {
-                    command: Vpn::Allow(args),
-                } => args.accesses(),
-                _ => unreachable!(),
-            }
+            vpn_plan(&argv).unwrap().map(|plan| plan.accesses)
         };
         assert!(args(&[]).unwrap().is_empty());
         assert_eq!(args(&["53/both"]).unwrap().len(), 2);
@@ -1023,6 +1251,74 @@ mod tests {
                 snat: true
             }]
         );
+    }
+    #[test]
+    fn doctor_reports_exits_and_what_each_agent_still_needs() {
+        let status = serde_json::json!({"snapshot":{
+            "agents":[
+                {"id":"a","name":"core","limits":{"exit":true},"exit":{"ipv6":false}},
+                {"id":"b","name":"cabin","limits":{"exit":false},"exit":null},
+                {"id":"c","name":"idle","limits":{"exit":false},"exit":null}],
+            "vpn_peers":[
+                {"enabled":true,"exit":"server"},
+                {"enabled":true,"exit":{"agent":"a"}},
+                {"enabled":true,"exit":{"agent":"b"}},
+                {"enabled":false,"exit":{"agent":"c"}},
+                {"enabled":true,"exit":"none"}]}});
+        let run = |config: &Config| {
+            let mut checks = rift::net::Checks::default();
+            exit_checks(config, &status, &mut checks);
+            checks
+                .0
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{} {}: {}",
+                        c["status"].as_str().unwrap(),
+                        c["check"].as_str().unwrap(),
+                        c["detail"].as_str().unwrap()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let v4 = Config {
+            public_ips: vec!["203.0.113.10".parse().unwrap()],
+            ..Default::default()
+        };
+        let text = run(&v4);
+        assert!(
+            text.contains("1 device(s) via this server, 2 via agents"),
+            "{text}"
+        );
+        assert!(text.contains("warn Server exit IPv6"), "{text}");
+        assert!(
+            text.contains("ok Exit via agent core: ready; the agent host has no global IPv6"),
+            "{text}"
+        );
+        assert!(
+            text.contains("warn Exit via agent cabin: refuses the exit"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("idle"),
+            "a disabled device does not count: {text}"
+        );
+        let v6 = Config {
+            public_ips: vec![
+                "203.0.113.10".parse().unwrap(),
+                "2001:db8::10".parse().unwrap(),
+            ],
+            ..Default::default()
+        };
+        assert!(run(&v6).contains("ok Server exit IPv6"));
+        let mut none = rift::net::Checks::default();
+        exit_checks(
+            &v4,
+            &serde_json::json!({"snapshot":{"vpn_peers":[]}}),
+            &mut none,
+        );
+        assert!(none.0.is_empty(), "nothing to report without exits");
     }
     #[test]
     fn documented_cli_parses() {
