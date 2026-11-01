@@ -566,7 +566,7 @@ The backup is one `.tar.gz` with three parts: a small manifest, `server/` (every
 Agents, devices and sites keep working; only the address changes.
 
 1. On the old server: `sudo rift backup`. Copy the file to the new server over a channel you trust (`scp`). It holds every key.
-2. On the new server, install RIFT as in [Install the server](#install-the-server), with the same `.env` values for `RIFT_PUBLIC_ENDPOINT` (the enrollment certificate is issued for that name) and for the pools and ports you changed (`RIFT_IPV4_POOL`, `RIFT_WG_PORT`, ...). Set `RIFT_PUBLIC_IPS` to the **new** addresses, run `docker compose up -d` and `sudo sh deploy/vps/install-cli`. For websites, have your reverse proxy running too.
+2. On the new server, install RIFT as in [Install the server](#install-the-server), with your `.env` (`RIFT_PUBLIC_ENDPOINT` may be a new name: RIFT issues a new enrollment certificate for it from the same CA, which agents already trust) and the same values for the pools and ports you changed (`RIFT_IPV4_POOL`, `RIFT_WG_PORT`, ...). Set `RIFT_PUBLIC_IPS` to the **new** addresses, run `docker compose up -d` and `sudo sh deploy/vps/install-cli`. For websites, have your reverse proxy running too.
 3. Stop the old server's container (`docker compose down`) so two servers never use the same keys.
 4. Run `sudo rift restore rift-backup-2026-11-01.tar.gz` on the new server.
 5. Point DNS at the new server: the name in `RIFT_PUBLIC_ENDPOINT` and the names of your sites. If your agents connect to a raw IP address instead of a name, edit `RIFT_SERVER` in each agent's `.env` to the new address and run `docker compose up -d` there; the agent then dials that address with the WireGuard port it already knows. Nothing else changes on the agent.
@@ -705,7 +705,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 
 `host_firewall = "auto"` adds RIFT-owned UFW chain jumps when UFW user chains exist; it does not configure upstream firewalls or override unrelated firewall drops. With another firewall or `host_firewall = "off"`, configure the required input and forwarding paths yourself. TCP 8444 is for tunnel control only. See [deployment preflight](docs/deploy.md#preflight-before-changing-host-networking) for details.
 
-For external enrollment TLS material, configure `tls_cert`, `tls_key` and `tls_ca` together in TOML and mount all files read-only into the container at those paths. Without them, RIFT generates its own CA and certificate; the automatic certificate is valid for one year, so plan certificate maintenance before future enrollments. Consult [architecture and security](docs/architecture.md) for trust and recovery details.
+For external enrollment TLS material, configure `tls_cert`, `tls_key` and `tls_ca` together in TOML and mount all files read-only into the container at those paths. Without them, RIFT generates its own CA (valid for ten years) and a server certificate valid for one year. It issues a new server certificate from the same CA by itself when `RIFT_PUBLIC_ENDPOINT` changes or less than 30 days are left (at start and whenever the enrollment port opens); agents keep trusting it. External certificates are never replaced. Consult [architecture and security](docs/architecture.md) for trust and recovery details.
 
 Validate the effective configuration and inspect prerequisites in the relevant running container:
 

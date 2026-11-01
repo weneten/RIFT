@@ -101,6 +101,7 @@ pub fn prepare(config: &mut Config) -> Result<()> {
         }
     };
 
+    let bundle = renew_if_needed(&paths, bundle, &config.public_endpoint)?;
     validate_bundle(&bundle, &config.public_endpoint)?;
     materialize(&paths, &bundle)?;
     config.tls_ca = Some(paths.ca_cert);
@@ -212,36 +213,131 @@ fn materialize(paths: &MaterialPaths, bundle: &TlsBundle) -> Result<()> {
     Ok(())
 }
 
-fn generate_bundle(public_endpoint: &str) -> Result<TlsBundle> {
-    let host = endpoint_host(public_endpoint)?;
-    let now = time::OffsetDateTime::now_utc();
+/// Renews the automatic certificate if needed while the server runs, before the enrollment
+/// port opens. External TLS material is left alone.
+pub fn refresh(config: &Config) -> Result<()> {
+    let paths = MaterialPaths::in_dir(&config.state_dir);
+    if config.tls_cert.as_ref() != Some(&paths.server_cert) || !path_is_file(&paths.bundle)? {
+        return Ok(());
+    }
+    let bundle = read_bundle(&paths.bundle)?;
+    renew_if_needed(&paths, bundle, &config.public_endpoint)?;
+    Ok(())
+}
 
+/// Days of validity left at which the automatic server certificate is renewed.
+const RENEW_DAYS: i64 = 30;
+
+/// Re-issues the automatic server certificate from the same CA when `public_endpoint` changed
+/// (for example after a restore onto a server with a new name) or when it expires within
+/// `RENEW_DAYS`. Agents trust the CA, which stays, so nothing changes for them.
+fn renew_if_needed(
+    paths: &MaterialPaths,
+    bundle: TlsBundle,
+    public_endpoint: &str,
+) -> Result<TlsBundle> {
+    let soon = UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+        UnixTime::now().as_secs() + RENEW_DAYS as u64 * 86400,
+    ));
+    if leaf_verifies(&bundle, public_endpoint, soon).unwrap_or(false) {
+        return Ok(bundle);
+    }
+    let renewed = TlsBundle {
+        server_key_pem: String::new(),
+        server_cert_pem: String::new(),
+        ..bundle
+    };
+    let renewed = issue_leaf(renewed, public_endpoint)?;
+    validate_bundle(&renewed, public_endpoint)?;
+    replace_file(&paths.bundle, &serde_json::to_vec(&renewed)?, 0o600)?;
+    replace_file(&paths.server_key, renewed.server_key_pem.as_bytes(), 0o600)?;
+    replace_file(
+        &paths.server_cert,
+        renewed.server_cert_pem.as_bytes(),
+        0o644,
+    )?;
+    tracing::info!(
+        "issued a new enrollment certificate for {public_endpoint} from the existing RIFT CA"
+    );
+    Ok(renewed)
+}
+
+/// Whether the bundle's server certificate verifies for `public_endpoint` at `at`.
+fn leaf_verifies(bundle: &TlsBundle, public_endpoint: &str, at: UnixTime) -> Result<bool> {
+    let ca = parse_certs(bundle.ca_cert_pem.as_bytes())?;
+    let leaf = parse_certs(bundle.server_cert_pem.as_bytes())?;
+    anyhow::ensure!(!ca.is_empty() && !leaf.is_empty(), "empty certificate");
+    let mut roots = RootCertStore::empty();
+    roots.add(ca[0].clone())?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier =
+        WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider).build()?;
+    let host = endpoint_host(public_endpoint)?;
+    let name = match host.parse::<IpAddr>() {
+        Ok(ip) => ServerName::IpAddress(ip.into()),
+        Err(_) => ServerName::try_from(host).map_err(|_| anyhow!("invalid public_endpoint"))?,
+    };
+    Ok(verifier
+        .verify_server_cert(&leaf[0], &leaf[1..], &name, &[], at)
+        .is_ok())
+}
+
+fn ca_params() -> CertificateParams {
     let mut ca_params = CertificateParams::default();
     ca_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "RIFT local enrollment CA");
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    ca_params.not_before = now - time::Duration::minutes(5);
-    ca_params.not_after = now + time::Duration::days(365 * 10);
-    let ca_key = KeyPair::generate()?;
-    let ca_cert = ca_params.self_signed(&ca_key)?;
+    ca_params
+}
 
+/// A new server key and certificate for `public_endpoint`, signed with the bundle's CA key.
+/// The issuer is rebuilt from the same name and key, so the stored CA certificate verifies it.
+fn issue_leaf(bundle: TlsBundle, public_endpoint: &str) -> Result<TlsBundle> {
+    let host = endpoint_host(public_endpoint)?;
+    let now = time::OffsetDateTime::now_utc();
+    let ca_key = KeyPair::from_pem(&bundle.ca_key_pem).context("parse automatic CA private key")?;
+    let issuer = ca_params().self_signed(&ca_key)?;
     let mut leaf_params = CertificateParams::new(vec![host])?;
     leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     leaf_params.not_before = now - time::Duration::minutes(5);
     leaf_params.not_after = now + time::Duration::days(365);
     let leaf_key = KeyPair::generate()?;
-    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key)?;
-
+    let leaf_cert = leaf_params.signed_by(&leaf_key, &issuer, &ca_key)?;
     Ok(TlsBundle {
-        version: BUNDLE_VERSION,
-        ca_key_pem: ca_key.serialize_pem(),
-        ca_cert_pem: ca_cert.pem(),
         server_key_pem: leaf_key.serialize_pem(),
         server_cert_pem: leaf_cert.pem(),
+        ..bundle
     })
+}
+
+fn replace_file(path: &Path, data: &[u8], mode: u32) -> Result<()> {
+    let tmp = path.with_extension("rift-tmp");
+    let _ = std::fs::remove_file(&tmp);
+    create_once(&tmp, data, mode)?;
+    std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
+    sync_dir(path.parent().context("TLS file has no directory")?)
+}
+
+fn generate_bundle(public_endpoint: &str) -> Result<TlsBundle> {
+    let now = time::OffsetDateTime::now_utc();
+    let mut params = ca_params();
+    params.not_before = now - time::Duration::minutes(5);
+    params.not_after = now + time::Duration::days(365 * 10);
+    let ca_key = KeyPair::generate()?;
+    let ca_cert = params.self_signed(&ca_key)?;
+    issue_leaf(
+        TlsBundle {
+            version: BUNDLE_VERSION,
+            ca_key_pem: ca_key.serialize_pem(),
+            ca_cert_pem: ca_cert.pem(),
+            server_key_pem: String::new(),
+            server_cert_pem: String::new(),
+        },
+        public_endpoint,
+    )
 }
 
 fn endpoint_host(endpoint: &str) -> Result<String> {
@@ -477,6 +573,40 @@ mod tests {
             public_endpoint: "localhost".into(),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn a_new_endpoint_gets_a_new_certificate_from_the_same_ca() {
+        let temp = tempdir().unwrap();
+        let mut first = config(temp.path());
+        prepare(&mut first).unwrap();
+        let ca = std::fs::read(first.tls_ca.as_ref().unwrap()).unwrap();
+        let old_cert = std::fs::read(first.tls_cert.as_ref().unwrap()).unwrap();
+
+        let mut moved = Config {
+            public_endpoint: "rift.example.net".into(),
+            ..config(temp.path())
+        };
+        prepare(&mut moved).unwrap();
+        assert_eq!(
+            std::fs::read(moved.tls_ca.as_ref().unwrap()).unwrap(),
+            ca,
+            "the CA stays"
+        );
+        assert_ne!(
+            std::fs::read(moved.tls_cert.as_ref().unwrap()).unwrap(),
+            old_cert
+        );
+        // The new certificate verifies against the CA agents already trust.
+        assert!(days_left(&moved).unwrap().unwrap() >= 363);
+        // A further start keeps it.
+        let renewed = std::fs::read(moved.tls_cert.as_ref().unwrap()).unwrap();
+        let mut again = Config {
+            public_endpoint: "rift.example.net".into(),
+            ..config(temp.path())
+        };
+        prepare(&mut again).unwrap();
+        assert_eq!(std::fs::read(again.tls_cert.unwrap()).unwrap(), renewed);
     }
 
     #[test]
