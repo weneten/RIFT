@@ -23,6 +23,21 @@ const ROUTE_PROTOCOL: &str = "242"; // RIFT-owned custom route protocol; 186 is 
 const OWNER_VERSION: &str = "rift-net-v1";
 static APPLY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+pub const OK: &str = "ok";
+pub const WARN: &str = "warn";
+pub const FAIL: &str = "fail";
+
+/// One line of `rift doctor`: status (`ok`, `warn`, `fail`), what was checked, and the finding
+/// or what to do about it.
+#[derive(Default)]
+pub struct Checks(pub Vec<Value>);
+impl Checks {
+    pub fn push(&mut self, status: &str, what: String, detail: String) {
+        self.0
+            .push(json!({"status": status, "check": what, "detail": detail}));
+    }
+}
+
 /// The Linux dataplane adapter. Every command is executed directly (never through a shell).
 pub struct Kernel {
     config: Config,
@@ -424,12 +439,160 @@ impl Kernel {
         let nft_owned = self.is_nft_owned().await;
         let interface_owned = self.is_interface_owned().await;
         let host = self.host_firewall_doctor().await;
-        let mut warnings = vec![
-            "Global forwarding sysctls are inspected but never changed by RIFT.".to_string(),
-            "IPv6 wildcard UDP services should bind the WireGuard address or use IPV6_PKTINFO for replies."
-                .to_string(),
-        ];
-        warnings.extend(host.warnings);
+        let server = !self.config.public_ips.is_empty() || !self.config.public_endpoint.is_empty();
+        let mut checks = Checks::default();
+        for (name, info) in &commands {
+            let found = info["available"].as_bool() == Some(true);
+            checks.push(
+                if found { OK } else { FAIL },
+                format!("{name} command"),
+                if found {
+                    "available".into()
+                } else {
+                    format!("{name} is missing in the image")
+                },
+            );
+        }
+        let present = link.as_ref().is_ok_and(|s| !s.is_empty());
+        checks.push(
+            if present && interface_owned { OK } else { FAIL },
+            format!("WireGuard interface {}", self.interface()),
+            if present && interface_owned {
+                "up and managed by RIFT".into()
+            } else if present {
+                "exists but is not RIFT's".into()
+            } else {
+                "missing; is the RIFT container running?".into()
+            },
+        );
+        checks.push(
+            if nft_owned { OK } else { FAIL },
+            "nftables table inet rift".into(),
+            if nft_owned {
+                "present".into()
+            } else {
+                "missing; is the RIFT container running?".into()
+            },
+        );
+        if server && present {
+            let port = run_output("wg", ["show", self.interface(), "listen-port"]).await;
+            let wanted = self.config.wg_port.to_string();
+            let ok = port.as_ref().is_ok_and(|p| p.trim() == wanted);
+            checks.push(
+                if ok { OK } else { FAIL },
+                "WireGuard port".into(),
+                if ok {
+                    format!("UDP {wanted}; allow it in your cloud firewall too")
+                } else {
+                    format!(
+                        "expected UDP {wanted}, found {}",
+                        port.map(|p| p.trim().to_string()).unwrap_or_default()
+                    )
+                },
+            );
+        }
+        let sysctl = |name: &str| {
+            sysctls
+                .get(name)
+                .and_then(|v| v["value"].as_str())
+                .map(str::trim)
+                .map(String::from)
+        };
+        let forward_needed = if server { FAIL } else { WARN };
+        for (name, label) in [
+            ("ipv4_forward", "IPv4 forwarding"),
+            ("ipv6_forward", "IPv6 forwarding"),
+        ] {
+            let on = sysctl(name).as_deref() == Some("1");
+            checks.push(
+                if on {
+                    OK
+                } else if name == "ipv4_forward" {
+                    forward_needed
+                } else {
+                    WARN
+                },
+                label.into(),
+                if on {
+                    "on".into()
+                } else {
+                    "off; run `sudo sh deploy/prepare-host`".into()
+                },
+            );
+        }
+        let rp = sysctl("rp_filter_all");
+        checks.push(
+            if rp.as_deref() == Some("1") { WARN } else { OK },
+            "Reverse-path filter".into(),
+            if rp.as_deref() == Some("1") {
+                "strict (1) can drop tunnel replies; run `sudo sh deploy/prepare-host`".into()
+            } else {
+                format!("{} (not strict)", rp.unwrap_or_else(|| "unknown".into()))
+            },
+        );
+        let mark = sysctl("src_valid_mark_all").as_deref() == Some("1");
+        checks.push(
+            if mark { OK } else { WARN },
+            "src_valid_mark".into(),
+            if mark {
+                "on".into()
+            } else {
+                "off; run `sudo sh deploy/prepare-host`".into()
+            },
+        );
+        let backend = host.status["backend"]
+            .as_str()
+            .unwrap_or("none")
+            .to_string();
+        checks.push(
+            if host.warnings.is_empty() { OK } else { WARN },
+            "Host firewall".into(),
+            match (backend.as_str(), host.status["mode"].as_str()) {
+                ("ufw", Some("auto")) => "UFW; RIFT keeps its own rules in it".into(),
+                ("ufw", _) => "UFW, but host_firewall is off: open the ports yourself".into(),
+                _ => "no UFW found; open the ports in your firewall yourself".into(),
+            },
+        );
+        for warning in &host.warnings {
+            checks.push(WARN, "Host firewall".into(), warning.clone());
+        }
+        if server && !self.config.public_ips.is_empty() {
+            let uplinks = host.status["uplinks"].as_array().map_or(0, Vec::len);
+            checks.push(
+                if uplinks > 0 { OK } else { WARN },
+                "Public addresses".into(),
+                if uplinks > 0 {
+                    format!("{} on this host", self.config.public_ips.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))
+                } else {
+                    "RIFT_PUBLIC_IPS is not on any interface here; behind a cloud NAT set RIFT_ALLOW_PRIVATE_LISTENERS=true and use the private address".into()
+                },
+            );
+        }
+        if server && self.config.enrollment != crate::config::EnrollmentMode::Off {
+            match crate::tls_material::days_left(&self.config) {
+                Ok(Some(days)) if days < 0 => checks.push(
+                    FAIL,
+                    "Enrollment certificate".into(),
+                    "expired; new agents cannot enroll".into(),
+                ),
+                Ok(Some(days)) if days < 30 => checks.push(
+                    WARN,
+                    "Enrollment certificate".into(),
+                    format!("expires in {days} days"),
+                ),
+                Ok(Some(days)) => checks.push(
+                    OK,
+                    "Enrollment certificate".into(),
+                    format!("valid for {days} more days"),
+                ),
+                Ok(None) => {}
+                Err(error) => checks.push(
+                    WARN,
+                    "Enrollment certificate".into(),
+                    format!("cannot be read: {error}"),
+                ),
+            }
+        }
         Ok(json!({
             "interface": self.interface(),
             "interface_present": link.as_ref().is_ok_and(|s| !s.is_empty()),
@@ -442,7 +605,7 @@ impl Kernel {
             "mark": format!("{:#x}/{:#x}", self.config.mark, self.config.mark_mask),
             "public_ips": self.config.public_ips,
             "host_firewall": host.status,
-            "warnings": warnings
+            "checks": checks.0,
         }))
     }
 

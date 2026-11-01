@@ -166,8 +166,37 @@ fn pairs(value: &Value, depth: usize, out: &mut Vec<String>) {
 }
 
 pub fn doctor(data: &Value) -> String {
-    let mut lines = vec!["Networking diagnostics".into()];
-    pairs(data, 0, &mut lines);
+    let checks: Vec<&Value> = data["checks"].as_array().into_iter().flatten().collect();
+    let width = checks
+        .iter()
+        .map(|c| field(c, "check").chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut lines = Vec::new();
+    let (mut warnings, mut failures) = (0, 0);
+    for check in &checks {
+        let mark = match check["status"].as_str() {
+            Some("ok") => "✓",
+            Some("fail") => {
+                failures += 1;
+                "✗"
+            }
+            _ => {
+                warnings += 1;
+                "!"
+            }
+        };
+        let name = field(check, "check");
+        let pad = " ".repeat(width - name.chars().count());
+        lines.push(format!("{mark} {name}{pad}  {}", field(check, "detail")));
+    }
+    lines.push(String::new());
+    lines.push(match (failures, warnings) {
+        (0, 0) => "Everything looks fine.".into(),
+        (0, w) => format!("{w} warning(s); RIFT works, but see above."),
+        (f, _) => format!("{f} problem(s) to fix, see ✗ above."),
+    });
+    lines.push("Raw details: rift --json doctor".into());
     lines.join("\n")
 }
 
@@ -490,6 +519,21 @@ mod tests {
             render(&AdminRequest::ForwardsList, &json!([]), None),
             "No forwards configured."
         );
+    }
+
+    #[test]
+    fn doctor_prints_a_checklist_and_a_verdict() {
+        let data = json!({"checks": [
+            {"status": "ok", "check": "wg command", "detail": "available"},
+            {"status": "warn", "check": "Reverse-path filter", "detail": "strict"},
+        ]});
+        let out = doctor(&data);
+        assert!(out.contains("✓ wg command           available"), "{out}");
+        assert!(out.contains("! Reverse-path filter  strict"), "{out}");
+        assert!(out.contains("1 warning(s)"));
+        let failed = doctor(&json!({"checks": [{"status": "fail", "check": "x", "detail": "y"}]}));
+        assert!(failed.contains("✗ x  y") && failed.contains("1 problem(s)"));
+        assert!(doctor(&json!({"checks": []})).contains("Everything looks fine."));
     }
 
     #[test]

@@ -321,7 +321,12 @@ async fn run() -> Result<()> {
         Command::Server => return rift::daemon::run_server(config, cli.config).await,
         Command::Agent => return rift::daemon::run_agent(config).await,
         Command::Doctor => {
-            let result = rift::net::Kernel::new(config).doctor().await?;
+            let mut result = rift::net::Kernel::new(config.clone()).doctor().await?;
+            let mut checks = rift::net::Checks::default();
+            server_checks(&config, &mut checks).await;
+            if let Some(list) = result["checks"].as_array_mut() {
+                list.extend(checks.0);
+            }
             if cli.json {
                 println!("{}", serde_json::to_string(&result)?);
             } else {
@@ -527,6 +532,71 @@ async fn run() -> Result<()> {
         show(&config, cli.json, false, &request, &response).await?;
     }
     Ok(())
+}
+/// Checks only the running server can answer. Skipped on agents and when the server is down.
+async fn server_checks(config: &Config, checks: &mut rift::net::Checks) {
+    use rift::net::{FAIL, OK, WARN};
+    if config.public_ips.is_empty() && config.public_endpoint.is_empty() {
+        return;
+    }
+    let Ok(status) = admin_ok(config, AdminRequest::Status).await else {
+        checks.push(
+            FAIL,
+            "RIFT server".into(),
+            "not reachable on its admin socket; is the container running?".into(),
+        );
+        return;
+    };
+    match status["apply_error"].as_str() {
+        Some(error) => checks.push(
+            FAIL,
+            "Configuration".into(),
+            format!("not applied: {error}"),
+        ),
+        None => checks.push(OK, "Configuration".into(), "applied".into()),
+    }
+    for agent in status["agent_health"].as_array().into_iter().flatten() {
+        let name = agent["name"].as_str().unwrap_or("?");
+        let online = agent["online"].as_bool() == Some(true);
+        let ready = agent["configuration_ready"].as_bool() == Some(true);
+        let (state, detail) = match (online, ready) {
+            (true, true) => (OK, "online and up to date".to_string()),
+            (true, false) => (
+                WARN,
+                "online but has not applied the latest configuration; are both sides on the same version?".into(),
+            ),
+            (false, _) => (WARN, "offline; check the agent's container and logs".into()),
+        };
+        checks.push(state, format!("Agent {name}"), detail);
+        if let Some(error) = agent["last_error"].as_str() {
+            checks.push(WARN, format!("Agent {name}"), error.to_string());
+        }
+    }
+    for refused in status["refused_forwards"].as_array().into_iter().flatten() {
+        checks.push(
+            WARN,
+            format!("Forward {}", refused["id"]),
+            refused["reason"].as_str().unwrap_or("refused").to_string(),
+        );
+    }
+    if config.webpanel {
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], config.webpanel_port));
+        let up = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::TcpStream::connect(address),
+        )
+        .await
+        .is_ok_and(|c| c.is_ok());
+        checks.push(
+            if up { OK } else { FAIL },
+            "Web panel".into(),
+            if up {
+                format!("answers on port {}", config.webpanel_port)
+            } else {
+                format!("nothing answers on 127.0.0.1:{}", config.webpanel_port)
+            },
+        );
+    }
 }
 async fn admin_ok(config: &Config, request: AdminRequest) -> Result<serde_json::Value> {
     let response = rift::daemon::admin_call(config, request).await?;

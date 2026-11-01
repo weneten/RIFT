@@ -317,6 +317,62 @@ fn validate_bundle(bundle: &TlsBundle, public_endpoint: &str) -> Result<()> {
     Ok(())
 }
 
+/// Days until the enrollment certificate stops verifying for `public_endpoint` (negative once
+/// it has), or `None` when there is no certificate yet. Uses the same verifier as enrollment.
+pub fn days_left(config: &Config) -> Result<Option<i64>> {
+    let paths = MaterialPaths::in_dir(&config.state_dir);
+    let cert = config.tls_cert.clone().unwrap_or(paths.server_cert);
+    let ca = config.tls_ca.clone().unwrap_or(paths.ca_cert);
+    if !cert.exists() || !ca.exists() || config.public_endpoint.is_empty() {
+        return Ok(None);
+    }
+    let leaf = parse_certs(&std::fs::read(&cert)?)?;
+    let roots_pem = parse_certs(&std::fs::read(&ca)?)?;
+    anyhow::ensure!(
+        !leaf.is_empty() && !roots_pem.is_empty(),
+        "empty certificate file"
+    );
+    let mut roots = RootCertStore::empty();
+    for root in roots_pem {
+        roots.add(root)?;
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier =
+        WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider).build()?;
+    let host = endpoint_host(&config.public_endpoint)?;
+    let name = match host.parse::<IpAddr>() {
+        Ok(ip) => ServerName::IpAddress(ip.into()),
+        Err(_) => ServerName::try_from(host).map_err(|_| anyhow!("invalid public_endpoint"))?,
+    };
+    let now = UnixTime::now().as_secs();
+    let valid_after = |days: i64| {
+        let at = now.saturating_add_signed(days * 86400);
+        verifier
+            .verify_server_cert(
+                &leaf[0],
+                &leaf[1..],
+                &name,
+                &[],
+                UnixTime::since_unix_epoch(std::time::Duration::from_secs(at)),
+            )
+            .is_ok()
+    };
+    if !valid_after(0) {
+        return Ok(Some(-1));
+    }
+    // The largest day count that still verifies; certificates here last at most ten years.
+    let (mut low, mut high) = (0i64, 3660i64);
+    while low < high {
+        let mid = (low + high + 1) / 2;
+        if valid_after(mid) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Ok(Some(low))
+}
+
 fn parse_certs(pem: &[u8]) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     rustls_pemfile::certs(&mut BufReader::new(pem))
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -420,6 +476,19 @@ mod tests {
             state_dir: dir.to_path_buf(),
             public_endpoint: "localhost".into(),
             ..Config::default()
+        }
+    }
+
+    #[test]
+    fn the_generated_certificate_has_about_a_year_left() {
+        let temp = tempdir().unwrap();
+        assert_eq!(days_left(&config(temp.path())).unwrap(), None);
+        let mut prepared = config(temp.path());
+        prepare(&mut prepared).unwrap();
+        // Both the automatic paths and the configured ones point at the same files.
+        for cfg in [config(temp.path()), prepared] {
+            let days = days_left(&cfg).unwrap().unwrap();
+            assert!((363..=365).contains(&days), "{days}");
         }
     }
 
