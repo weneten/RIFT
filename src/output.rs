@@ -618,6 +618,7 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rift::model::Exit;
     use serde_json::json;
 
     #[test]
@@ -644,6 +645,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn devices_show_their_exit_and_forwards_their_purpose() {
+        let devices = json!([
+            {"name":"iphone","ipv4":"10.14.0.2","enabled":true,"panel":false,"last_handshake":null,"grants":[],"exit":{"via":"server"}},
+            {"name":"ipad","ipv4":"10.14.0.3","enabled":true,"panel":true,"last_handshake":null,"grants":[{"agent":"core","access":"server","refused":null}],"exit":{"via":"agent","agent":"core","state":"ok","reason":null}},
+            {"name":"mac","ipv4":"10.14.0.4","enabled":true,"panel":false,"last_handshake":null,"grants":[],"exit":{"via":"agent","agent":"cabin","state":"refused","reason":"no"}},
+            {"name":"tv","ipv4":"10.14.0.5","enabled":true,"panel":false,"last_handshake":null,"grants":[],"exit":{"via":"none"}}
+        ]);
+        let output = render(&AdminRequest::VpnPeerList, &devices, None);
+        for expected in [
+            "internet via server",
+            "web panel; core: server; internet via core",
+            "internet via cabin (refused by agent)",
+        ] {
+            assert!(output.contains(expected), "missing {expected}: {output}");
+        }
+        assert!(output.lines().last().unwrap().contains("none"), "{output}");
+        let forwards = json!([
+            {"id":1,"agent_id":"a","protocol":"udp","listen_ip":"203.0.113.1","listen_ports":{"start":51821,"end":51821},"target_ports":{"start":51821,"end":51821},"target_family":"v4","ingress":"public","mode":"transparent","enabled":true,"purpose":"exit","state":"enabled"},
+            {"id":2,"agent_id":"a","protocol":"tcp","listen_ip":"203.0.113.1","listen_ports":{"start":22,"end":22},"target_ports":{"start":22,"end":22},"target_family":"v4","ingress":"public","mode":"transparent","enabled":true,"purpose":"user","state":"enabled"}
+        ]);
+        let table = render(&AdminRequest::ForwardsList, &forwards, None);
+        let mut rows = table.lines().skip(1);
+        assert!(rows.next().unwrap().contains(" exit "), "{table}");
+        assert!(rows.next().unwrap().contains(" user "), "{table}");
+        assert!(table.lines().next().unwrap().contains("PURPOSE"));
+    }
+    #[test]
+    fn exit_changes_say_what_to_do_on_the_device() {
+        let set = |exit, data| {
+            render(
+                &AdminRequest::VpnExit {
+                    peer: "iphone".into(),
+                    exit,
+                },
+                &data,
+                None,
+            )
+        };
+        let server = set(
+            Exit::Server,
+            json!({"exit":{"via":"server"},"ipv6":false,"warning":null}),
+        );
+        assert!(
+            server.contains("through this server") && server.contains("IPv6 traffic is dropped")
+        );
+        assert!(
+            server.contains("Re-import the configuration on the device: rift vpn config qr iphone")
+        );
+        let agent = set(
+            Exit::Agent("core".into()),
+            json!({"exit":{"via":"agent","agent":"core"},"agent":"core","ipv6":true,"waiting":"agent core has not reported"}),
+        );
+        assert!(agent.contains("through agent core") && agent.contains("Not ready yet"));
+        assert!(agent.contains("second device") && !agent.contains("dropped"));
+        let cleared = render(
+            &AdminRequest::VpnExitClear {
+                peer: "iphone".into(),
+                agent: None,
+            },
+            &json!({}),
+            None,
+        );
+        assert!(cleared.contains("no internet exit any more") && cleared.contains("Re-import"));
+    }
     #[test]
     fn doctor_prints_a_checklist_and_a_verdict() {
         let data = json!({"checks": [
