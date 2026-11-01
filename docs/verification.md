@@ -43,6 +43,17 @@ The `rift vpn` feature has unit coverage only: rule rendering and ordering, stat
 7. Existing public forwards behave as before, with the home router still closed to inbound connections.
 8. UFW with `host_firewall = "auto"`: device traffic works and unrelated drops remain.
 
+## Internet exit: unit-tested only
+
+The internet exit (devices with `internet via server` or `internet via AGENT`) has unit coverage only: allocation of the device IPv6 address and the reserved gateway, CLI parsing of `internet`, client configurations for no exit, the server and an agent (AllowedIPs, DNS families, MTU, endpoint port, error text before the agent reported a key), server nftables (masquerade, IPv6 masquerade versus explicit drop, order before the final drops, exclusion of the pools), agent nftables (masquerade, private-range block with the allowed-subnet exception in front, IPv6 dropped without a global address, always-present lockdown), the agent's refusal and the implied exit port, creation, port assignment and removal of the managed exit forward and its protection from `remove forward`/`disable forward`, UFW plans, and the panel action needing a trusted connection. No Linux runtime test has been executed. On a disposable VPS and a disposable agent with real WireGuard and nftables:
+
+1. Exit through the VPS: handshake, `curl https://ifconfig.me` shows the VPS address; `ping -6` and a site that needs IPv6 work only if `RIFT_PUBLIC_IPS` has an IPv6 address, otherwise IPv6 fails and nothing leaks; DNS goes through `RIFT_VPN_DNS`; the device cannot reach another device, the VPS's control port or `169.254.169.254`.
+2. Exit through an agent with `RIFT_AGENT_ALLOW_EXIT=true`: `rift-exit` exists with the right peers, `rift list forwards` shows the `exit` forward on the first IPv4/IPv6 address, the phone gets a handshake with the agent, shows the agent's home address and cannot reach the home LAN (but can reach a network listed in `RIFT_AGENT_ALLOW_SUBNETS`) or services on the agent host; MTU 1300 passes full-size packets in both directions (`ping -M do -s 1272`).
+3. An agent host without global IPv6: the device's IPv6 does not work and does not leak. An agent with `RIFT_AGENT_ALLOW_EXIT=false`: `rift vpn allow DEVICE AGENT internet` warns, the device shows `refused by agent`, no forward is published.
+4. `rift vpn deny`, `rift disable device` and `rift remove device` remove the forward (when no other device uses it), the peer on `rift-exit` and, after the last device, the interface; a server and agent restart restores the same state.
+5. With UFW: `rift:exit` rules appear and disappear on both sides, and unrelated drops stay.
+6. Re-import of a configuration after each change, and test-ipv6.com on the device.
+
 ## Web panel: not yet verified on a kernel
 
 The web panel has unit coverage (configuration parsing, source checks, read/write separation, proxy headers, nft and UFW rule rendering, client AllowedIPs, HTTP parsing limits, login, session, CSRF header, action list, short-form forwards, password file mode, and two-factor login against the RFC 6238 test vectors: window, replay, lockout, required mode; this is unit-tested only, with no real authenticator app) and was driven in headless Chromium against a fake backend (login, invitation, forwards, devices with QR code, grants, cancel, log, diagnostics, read-only view behind a proxy header, light/dark, 390 px width, no CSP violations). It has not run inside a real server container. Before relying on it, check on a disposable server:

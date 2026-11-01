@@ -27,6 +27,7 @@ services:
       RIFT_ENROLLMENT_TOKEN: ${RIFT_ENROLLMENT_TOKEN:-}
       RIFT_AGENT_ALLOW_PORTS: ${RIFT_AGENT_ALLOW_PORTS:-}
       RIFT_AGENT_ALLOW_SUBNETS: ${RIFT_AGENT_ALLOW_SUBNETS:-}
+      RIFT_AGENT_ALLOW_EXIT: ${RIFT_AGENT_ALLOW_EXIT:-}
     command: ["--config", "/etc/rift/config.toml", "agent"]
 
 volumes:

@@ -295,6 +295,10 @@ class FileProviderTests(unittest.TestCase):
             {"id": 3, "agent_id": "a1", "protocol": "tcp", "listen_ip": "2001:db8::1",
              "listen_ports": {"start": 1337, "end": 1339}, "target_ports": {"start": 1337, "end": 1339},
              "target_family": "v6", "ingress": "public", "mode": "transparent", "enabled": False},
+            {"id": 4, "agent_id": "a1", "protocol": "udp", "listen_ip": "10.0.0.207",
+             "listen_ports": {"start": 51821, "end": 51821}, "target_ports": {"start": 51821, "end": 51821},
+             "target_family": "v4", "ingress": "public", "mode": "transparent", "enabled": True,
+             "purpose": "exit", "state": "enabled"},
         ]
         agents = [{"id": "a1", "name": "heim"}]
         sites = {"beszel.example.net": {"forward_id": 1, "proxy": "traefik"}}
@@ -302,11 +306,13 @@ class FileProviderTests(unittest.TestCase):
         self.assertEqual(rows[0][-1], "SITE")
         self.assertEqual(
             rows[1],
-            ("1", "heim", "TCP", "10.0.0.207:20000", "8091", "v4", "local", "transparent", "enabled",
-             "beszel.example.net (traefik)"),
+            ("1", "heim", "TCP", "10.0.0.207:20000", "8091", "v4", "local", "transparent", "user",
+             "enabled", "beszel.example.net (traefik)"),
         )
         self.assertEqual(rows[2][3], "[2001:db8::1]:1337-1339")
-        self.assertEqual(rows[2][8:], ("disabled", ""))
+        self.assertEqual(rows[2][8:], ("user", "disabled", ""))
+        # The managed forward of an internet exit says so.
+        self.assertEqual(rows[3][8:], ("exit", "enabled", ""))
 
     def test_add_arguments_and_the_proxy_word(self):
         self.assertEqual(
