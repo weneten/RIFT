@@ -262,40 +262,24 @@ enum AddWhat {
 #[derive(Subcommand)]
 enum RemoveWhat {
     /// Delete an agent with its forwards and VPN grants.
-    Agent {
-        name: String,
-    },
+    Agent { name: String },
     /// Cancel an open invitation.
-    Invite {
-        name: String,
-    },
+    Invite { name: String },
     /// Delete a forward by its ID.
-    Forward {
-        id: u64,
-    },
+    Forward { id: u64 },
     /// Delete the device, its key and its grants. This cannot be undone.
-    Device {
-        name: String,
-    },
+    Device { name: String },
     /// Remove a site (host command only).
-    Site {
-        host: String,
-    },
+    Site { host: String },
 }
 #[derive(Subcommand)]
 enum ToggleWhat {
     /// An agent with all its forwards and VPN grants.
-    Agent {
-        name: String,
-    },
+    Agent { name: String },
     /// One forward by its ID.
-    Forward {
-        id: u64,
-    },
+    Forward { id: u64 },
     /// A VPN device; it keeps its key and grants.
-    Device {
-        name: String,
-    },
+    Device { name: String },
 }
 #[derive(Subcommand)]
 enum RenameWhat {
