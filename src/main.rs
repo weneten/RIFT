@@ -90,6 +90,67 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         lines: usize,
     },
+    /// Save settings (agents, forwards, devices, sites) to a JSON file.
+    ///
+    /// The file holds no keys, tokens or IDs, so it is safe to keep and share. Default file:
+    /// rift-export-YYYY-MM-DD.json in the current directory. Load it again with `rift import`.
+    Export {
+        /// Where to write; `-` prints to standard output.
+        file: Option<PathBuf>,
+    },
+    /// Create what an export file holds and this server lacks.
+    ///
+    /// Agents are never created: add and enroll them first with `rift add agent`. Entries of an
+    /// agent that does not exist or is not active are skipped and reported. Existing things are
+    /// left alone; a conflict (a port in use) is reported and the rest goes on. New VPN devices
+    /// get new keys, so their configuration must be imported again on the device.
+    Import(ImportArgs),
+    /// Save everything, including every key, as one private archive.
+    ///
+    /// For moving the server or recovering it with `rift restore`. The file contains every key
+    /// of this server: keep it private. Default file: rift-backup-YYYY-MM-DD.tar.gz in the
+    /// current directory.
+    Backup {
+        /// Where to write; `-` writes the archive to standard output.
+        file: Option<PathBuf>,
+    },
+    /// Replace all state on this server with a backup (host command, run with sudo).
+    ///
+    /// Stops the server container, replaces its state with the backup, starts it again and
+    /// re-creates the proxy configuration of the restored sites. Everything that is on this
+    /// server now is lost.
+    Restore {
+        /// A file made by `rift backup`.
+        file: PathBuf,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+#[derive(Args)]
+struct ImportArgs {
+    /// Export file; `-` reads standard input.
+    file: PathBuf,
+    /// Import only entries of this agent (after --map). Repeatable.
+    #[arg(long = "agent", value_name = "NAME")]
+    agents: Vec<String>,
+    /// Leave out entries of this agent (after --map). Repeatable.
+    #[arg(long = "skip-agent", value_name = "NAME")]
+    skip_agents: Vec<String>,
+    /// Put the entries of agent OLD on agent NEW. Repeatable.
+    #[arg(long, value_name = "OLD=NEW", value_parser = parse_map)]
+    map: Vec<(String, String)>,
+    /// Show what would happen and change nothing.
+    #[arg(long)]
+    dry_run: bool,
+}
+fn parse_map(value: &str) -> Result<(String, String), String> {
+    match value.split_once('=') {
+        Some((old, new)) if !old.is_empty() && !new.is_empty() && !new.contains('=') => {
+            Ok((old.into(), new.into()))
+        }
+        _ => Err("use OLD=NEW, for example core2=core".into()),
+    }
 }
 #[derive(Subcommand)]
 enum Vpn {
@@ -319,6 +380,10 @@ async fn run() -> Result<()> {
     let mut more: Vec<AdminRequest> = Vec::new();
     let request = match cli.command {
         Command::Server => return rift::daemon::run_server(config, cli.config).await,
+        Command::Export { file } => return export_command(&config, cli.json, file).await,
+        Command::Import(args) => return import_command(&config, cli.json, args).await,
+        Command::Backup { file } => return backup_command(&config, cli.json, file),
+        Command::Restore { .. } => bail!("restore replaces the state of the server and runs on the server host, not inside the container; run `sudo rift restore FILE` there"),
         Command::Agent => return rift::daemon::run_agent(config).await,
         Command::Doctor => {
             let mut result = rift::net::Kernel::new(config.clone()).doctor().await?;
@@ -534,6 +599,89 @@ async fn run() -> Result<()> {
     Ok(())
 }
 /// Checks only the running server can answer. Skipped on agents and when the server is down.
+fn dated(prefix: &str, suffix: &str) -> PathBuf {
+    format!(
+        "{prefix}-{}.{suffix}",
+        time::OffsetDateTime::now_utc().date()
+    )
+    .into()
+}
+async fn export_command(config: &Config, json: bool, file: Option<PathBuf>) -> Result<()> {
+    let data = admin_ok(config, AdminRequest::Export).await?;
+    let export: rift::portable::Export = serde_json::from_value(data)?;
+    let text = serde_json::to_string_pretty(&export)? + "\n";
+    let grants: usize = export.devices.iter().map(|d| d.grants.len()).sum();
+    let summary = format!(
+        "{} agent(s), {} forward(s), {} device(s) with {grants} grant(s)",
+        export.agents.len(),
+        export.forwards.len(),
+        export.devices.len()
+    );
+    if file.as_deref() == Some(std::path::Path::new("-")) {
+        print!("{text}");
+        eprintln!("Exported {summary}.");
+        return Ok(());
+    }
+    let path = file.unwrap_or_else(|| dated("rift-export", "json"));
+    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"file":path,"agents":export.agents.len(),"forwards":export.forwards.len(),"devices":export.devices.len(),"grants":grants})
+        );
+    } else {
+        println!(
+            "{}\nExported {summary}. It holds no keys or tokens.",
+            path.display()
+        );
+    }
+    Ok(())
+}
+async fn import_command(config: &Config, json: bool, args: ImportArgs) -> Result<()> {
+    let bytes = if args.file == std::path::Path::new("-") {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)?;
+        bytes
+    } else {
+        std::fs::read(&args.file).with_context(|| format!("read {}", args.file.display()))?
+    };
+    let data = rift::portable::Export::parse(&bytes)?;
+    let sites = data.sites.len();
+    let options = rift::portable::ImportOptions {
+        agents: args.agents,
+        skip_agents: args.skip_agents,
+        map: args.map,
+        dry_run: args.dry_run,
+    };
+    let report = admin_ok(config, AdminRequest::Import { data, options }).await?;
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!("{}", output::import_report(&report)?);
+        if sites > 0 {
+            eprintln!("The file lists {sites} site(s). Sites are imported by the host command: run `sudo rift import` on the server.");
+        }
+    }
+    Ok(())
+}
+fn backup_command(config: &Config, json: bool, file: Option<PathBuf>) -> Result<()> {
+    let to_stdout = file.as_deref() == Some(std::path::Path::new("-"));
+    let path = if to_stdout {
+        None
+    } else {
+        Some(file.unwrap_or_else(|| dated("rift-backup", "tar.gz")))
+    };
+    rift::backup::write(config, path.as_deref())?;
+    if let Some(path) = path {
+        if json {
+            println!("{}", serde_json::json!({"file":path}));
+        } else {
+            println!("{}", path.display());
+        }
+    }
+    eprintln!("This backup contains every key of this server. Keep it private.");
+    Ok(())
+}
 async fn server_checks(config: &Config, checks: &mut rift::net::Checks) {
     use rift::net::{FAIL, OK, WARN};
     if config.public_ips.is_empty() && config.public_endpoint.is_empty() {
@@ -577,6 +725,20 @@ async fn server_checks(config: &Config, checks: &mut rift::net::Checks) {
             WARN,
             format!("Forward {}", refused["id"]),
             refused["reason"].as_str().unwrap_or("refused").to_string(),
+        );
+    }
+    for stuck in status["inapplicable_forwards"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        checks.push(
+            WARN,
+            format!("Forward {}", stuck["id"]),
+            stuck["reason"]
+                .as_str()
+                .unwrap_or("not applicable")
+                .to_string(),
         );
     }
     if config.webpanel {
@@ -1057,5 +1219,55 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
         }
+    }
+    #[test]
+    fn export_import_backup_and_restore_parse() {
+        for args in [
+            vec!["rift", "export"],
+            vec!["rift", "export", "mine.json"],
+            vec!["rift", "backup"],
+            vec!["rift", "backup", "-"],
+            vec!["rift", "restore", "b.tar.gz"],
+            vec!["rift", "restore", "b.tar.gz", "--yes"],
+            vec!["rift", "import", "mine.json"],
+            vec!["rift", "import", "-", "--dry-run"],
+        ] {
+            Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        }
+        let cli = Cli::try_parse_from([
+            "rift",
+            "import",
+            "f.json",
+            "--agent",
+            "core",
+            "--agent",
+            "nas",
+            "--skip-agent",
+            "core2",
+            "--map",
+            "core2=core",
+            "--map",
+            "a=b",
+            "--dry-run",
+        ])
+        .unwrap();
+        let Command::Import(args) = cli.command else {
+            panic!("import");
+        };
+        assert_eq!(args.agents, ["core", "nas"]);
+        assert_eq!(args.skip_agents, ["core2"]);
+        assert_eq!(
+            args.map,
+            [("core2".into(), "core".into()), ("a".into(), "b".into())]
+        );
+        assert!(args.dry_run);
+        for bad in ["core2", "=core", "core2=", "a=b=c"] {
+            assert!(
+                Cli::try_parse_from(["rift", "import", "f.json", "--map", bad]).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(Cli::try_parse_from(["rift", "import"]).is_err());
+        assert!(Cli::try_parse_from(["rift", "restore"]).is_err());
     }
 }

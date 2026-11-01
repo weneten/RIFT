@@ -1,4 +1,7 @@
-use crate::model::*;
+use crate::{
+    model::*,
+    portable::{Export, ImportOptions},
+};
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -151,6 +154,13 @@ pub enum AdminRequest {
         name: String,
         allowed: bool,
     },
+    /// The settings of this installation, without secrets.
+    Export,
+    /// Creates what an export file holds and the server lacks.
+    Import {
+        data: Export,
+        options: ImportOptions,
+    },
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AdminResponse {
@@ -203,6 +213,19 @@ async fn receive_limited<T: serde::de::DeserializeOwned, R: AsyncRead + Unpin>(
     let mut data = vec![0; len];
     stream.read_exact(&mut data).await?;
     Ok(serde_json::from_slice(&data)?)
+}
+/// Admin requests may carry an export file, which exceeds the frame limit of the public
+/// protocols. The admin socket is local and root-only.
+pub async fn send_admin_request<T: Serialize, W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    value: &T,
+) -> Result<()> {
+    send_limited(stream, value, MAX_ADMIN_RESPONSE).await
+}
+pub async fn receive_admin_request<T: serde::de::DeserializeOwned, R: AsyncRead + Unpin>(
+    stream: &mut R,
+) -> Result<T> {
+    receive_limited(stream, MAX_ADMIN_RESPONSE).await
 }
 pub async fn send_admin<W: AsyncWrite + Unpin>(
     stream: &mut W,

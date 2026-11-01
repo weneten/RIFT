@@ -200,6 +200,51 @@ pub fn doctor(data: &Value) -> String {
     lines.join("\n")
 }
 
+/// The result of `rift import`: what was created, what was there, what was skipped and what
+/// failed. The host command prints the same layout after adding the sites.
+pub fn import_report(data: &Value) -> anyhow::Result<String> {
+    use rift::portable::{Report, Status};
+    let report: Report = serde_json::from_value(data.clone())?;
+    let mut lines = Vec::new();
+    if report.dry_run {
+        lines.push("Dry run: nothing was changed.".to_string());
+    }
+    let groups = [
+        (
+            Status::Created,
+            if report.dry_run {
+                "Would create"
+            } else {
+                "Created"
+            },
+        ),
+        (Status::Present, "Already present"),
+        (Status::Skipped, "Skipped"),
+        (Status::Failed, "Failed"),
+    ];
+    for (status, title) in groups {
+        let items: Vec<_> = report.items.iter().filter(|i| i.status == status).collect();
+        if items.is_empty() {
+            continue;
+        }
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(format!("{title} ({})", items.len()));
+        for item in items {
+            lines.push(match (&item.detail, status) {
+                (Some(detail), Status::Created) => format!("  {} ({detail})", item.what),
+                (Some(detail), _) => format!("  {}: {detail}", item.what),
+                (None, _) => format!("  {}", item.what),
+            });
+        }
+    }
+    if report.items.is_empty() {
+        lines.push("Nothing to import.".into());
+    }
+    Ok(lines.join("\n"))
+}
+
 fn status(data: &Value) -> String {
     if let Some(snapshot) = data.get("snapshot") {
         let mut lines = vec![format!(
@@ -227,6 +272,25 @@ fn status(data: &Value) -> String {
                 "Forward {} refused by its agent: {}",
                 field(refused, "id"),
                 field(refused, "reason")
+            ));
+        }
+        for moved in data["moved_forwards"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "Forward {} moved from {} to {}: the server no longer has the first address (RIFT_PUBLIC_IPS).",
+                field(moved, "id"),
+                field(moved, "from"),
+                field(moved, "to")
+            ));
+        }
+        for stuck in data["inapplicable_forwards"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            lines.push(format!(
+                "Forward {} not applicable: {}",
+                field(stuck, "id"),
+                field(stuck, "reason")
             ));
         }
         let rows = data["agent_health"]
@@ -534,6 +598,46 @@ mod tests {
         let failed = doctor(&json!({"checks": [{"status": "fail", "check": "x", "detail": "y"}]}));
         assert!(failed.contains("✗ x  y") && failed.contains("1 problem(s)"));
         assert!(doctor(&json!({"checks": []})).contains("Everything looks fine."));
+    }
+
+    #[test]
+    fn the_import_report_is_grouped_and_a_dry_run_says_so() {
+        let data = json!({"dry_run": true, "items": [
+            {"status": "created", "what": "forward core 22/tcp on 1.2.3.4", "detail": null},
+            {"status": "created", "what": "device phone", "detail": "new keys"},
+            {"status": "present", "what": "device tv", "detail": null},
+            {"status": "skipped", "what": "3 entries for agent core2", "detail": "no such agent"},
+            {"status": "failed", "what": "forward core 80/tcp", "detail": "overlaps forward 1"},
+        ]});
+        let out = import_report(&data).unwrap();
+        for expected in [
+            "Dry run: nothing was changed.",
+            "Would create (2)\n  forward core 22/tcp on 1.2.3.4\n  device phone (new keys)",
+            "Already present (1)\n  device tv",
+            "Skipped (1)\n  3 entries for agent core2: no such agent",
+            "Failed (1)\n  forward core 80/tcp: overlaps forward 1",
+        ] {
+            assert!(out.contains(expected), "missing {expected:?} in\n{out}");
+        }
+        let done = import_report(&json!({"dry_run": false, "items": []})).unwrap();
+        assert_eq!(done, "Nothing to import.");
+    }
+
+    #[test]
+    fn status_shows_moved_and_inapplicable_forwards() {
+        let data = json!({"snapshot":{"generation":2,"forwards":[]},"fully_applied":true,
+            "moved_forwards":[{"id":3,"from":"203.0.113.10","to":"198.51.100.5"}],
+            "inapplicable_forwards":[{"id":4,"listen_ip":"2001:db8::1","reason":"the server has no IPv6 address 2001:db8::1"}],
+            "agent_health":[]});
+        let output = render(&AdminRequest::Status, &data, None);
+        assert!(
+            output.contains("Forward 3 moved from 203.0.113.10 to 198.51.100.5"),
+            "{output}"
+        );
+        assert!(
+            output.contains("Forward 4 not applicable: the server has no IPv6"),
+            "{output}"
+        );
     }
 
     #[test]

@@ -346,7 +346,11 @@ impl Kernel {
         let peer = peers
             .iter()
             .find(|p| p.public_key == welcome.server_public_key);
-        let candidates = match resolve_endpoints(&welcome.server_endpoint).await {
+        let endpoint = crate::enrollment::wireguard_endpoint(
+            &welcome.server_endpoint,
+            self.config.server_address.as_deref(),
+        );
+        let candidates = match resolve_endpoints(&endpoint).await {
             Ok(addresses) => addresses,
             Err(error) => {
                 let cached = peer

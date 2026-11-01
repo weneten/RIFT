@@ -351,7 +351,8 @@ pub async fn enroll_agent(config: &Config, identity: &mut AgentIdentity) -> Resu
     }
 }
 
-async fn server_addr(value: &str) -> Result<(String, Vec<SocketAddr>)> {
+/// Host and port of `RIFT_SERVER`. A bare host or address means the enrollment port 8443.
+fn split_server(value: &str) -> Result<(String, u16)> {
     let (host, port) = if let Some(rest) = value.strip_prefix('[') {
         let i = rest
             .find(']')
@@ -367,6 +368,11 @@ async fn server_addr(value: &str) -> Result<(String, Vec<SocketAddr>)> {
         (value.to_string(), 8443)
     };
     anyhow::ensure!(!host.is_empty(), "RIFT_SERVER hostname is empty");
+    Ok((host, port))
+}
+
+async fn server_addr(value: &str) -> Result<(String, Vec<SocketAddr>)> {
+    let (host, port) = split_server(value)?;
     let addresses: Vec<_> = timeout(
         Duration::from_secs(10),
         tokio::net::lookup_host((host.as_str(), port)),
@@ -375,6 +381,27 @@ async fn server_addr(value: &str) -> Result<(String, Vec<SocketAddr>)> {
     .collect();
     anyhow::ensure!(!addresses.is_empty(), "RIFT_SERVER did not resolve");
     Ok((host, addresses))
+}
+
+/// The WireGuard endpoint an agent dials. It is the one the server announced at enrollment
+/// (`HOST:PORT`), except that a `RIFT_SERVER` in the agent's `.env` with another host wins
+/// for the host, with the stored WireGuard port. After a move of the server to a new address,
+/// editing `RIFT_SERVER` is then all the agent needs.
+pub fn wireguard_endpoint(stored: &str, server_address: Option<&str>) -> String {
+    let Some(configured) = server_address.and_then(|v| split_server(v).ok()) else {
+        return stored.to_string();
+    };
+    let Some((stored_host, port)) = stored.rsplit_once(':') else {
+        return stored.to_string();
+    };
+    let stored_host = stored_host.trim_start_matches('[').trim_end_matches(']');
+    if configured.0.eq_ignore_ascii_case(stored_host) {
+        return stored.to_string();
+    }
+    match port.parse::<u16>() {
+        Ok(port) => host_port(&configured.0, port),
+        Err(_) => stored.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -399,5 +426,40 @@ mod tests {
     fn invite_payload_rejects_unknown_versions_and_oversize() {
         assert!(parse_invite("v2.deadbeef").is_err());
         assert!(parse_invite(&format!("v1.{}", "x".repeat(MAX_INVITE))).is_err());
+    }
+    #[test]
+    fn a_changed_server_host_in_the_env_replaces_the_stored_endpoint_host() {
+        let stored = "vps.example.net:51820";
+        // No setting, the same host, or the same host with another case: nothing changes.
+        assert_eq!(wireguard_endpoint(stored, None), stored);
+        assert_eq!(
+            wireguard_endpoint(stored, Some("vps.example.net:8443")),
+            stored
+        );
+        assert_eq!(wireguard_endpoint(stored, Some("VPS.example.net")), stored);
+        // A different host or address wins; the WireGuard port stays the stored one.
+        assert_eq!(
+            wireguard_endpoint(stored, Some("203.0.113.9:8443")),
+            "203.0.113.9:51820"
+        );
+        assert_eq!(
+            wireguard_endpoint(stored, Some("203.0.113.9")),
+            "203.0.113.9:51820"
+        );
+        assert_eq!(
+            wireguard_endpoint(stored, Some("[2001:db8::9]:8443")),
+            "[2001:db8::9]:51820"
+        );
+        assert_eq!(
+            wireguard_endpoint("[2001:db8::1]:51820", Some("[2001:db8::1]:8443")),
+            "[2001:db8::1]:51820"
+        );
+        assert_eq!(
+            wireguard_endpoint("203.0.113.9:40000", Some("new.example.net:9000")),
+            "new.example.net:40000"
+        );
+        // An unusable setting never breaks a working endpoint.
+        assert_eq!(wireguard_endpoint(stored, Some("host:notaport")), stored);
+        assert_eq!(wireguard_endpoint(stored, Some("")), stored);
     }
 }

@@ -5,6 +5,7 @@ use crate::{
     enrollment,
     model::*,
     net::{self, Kernel},
+    portable,
     protocol::{self, *},
     state::StateStore,
     translation::TranslationManager,
@@ -37,6 +38,14 @@ struct Server {
     /// The running enrollment listener, if any. Shared with the kernel for the host firewall.
     enrollment: Mutex<Option<tokio::task::JoinHandle<()>>>,
     enrollment_open: Arc<std::sync::atomic::AtomicBool>,
+    listen_notes: std::sync::Mutex<ListenNotes>,
+}
+/// What the repair of forward addresses did, for `rift status`.
+#[derive(Default)]
+struct ListenNotes {
+    moved: Vec<serde_json::Value>,
+    /// Forwards already reported as stuck, so the log does not repeat every reconcile.
+    blocked_logged: Vec<u64>,
 }
 
 /// The web panel acts through the same admin requests as the CLI.
@@ -91,6 +100,7 @@ pub async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
         two_factor: Arc::new(crate::totp::TwoFactor::new(crate::totp::path(&config))),
         enrollment: Mutex::new(None),
         enrollment_open,
+        listen_notes: std::sync::Mutex::new(ListenNotes::default()),
     });
     reconcile(&server).await?;
     let admin = bind_admin(config.socket_path()).await?;
@@ -283,8 +293,10 @@ async fn reconcile(s: &Server) -> Result<()> {
         tracing::error!("enrollment endpoint: {error:#}");
     }
     let config = s.config.read().await.clone();
+    fix_listen_addresses(s, &config.public_ips);
     let k = s.kernel.lock().await;
-    let snapshot = without_refused(s.state.snapshot()?);
+    let snapshot =
+        portable::without_inapplicable(without_refused(s.state.snapshot()?), &config.public_ips);
     let result = async {
         k.apply_server(&snapshot, &config.private_key_path())
             .await?;
@@ -310,6 +322,53 @@ async fn reconcile(s: &Server) -> Result<()> {
             s.state
                 .mark_failed(snapshot.generation, &sanitize_error(&error.to_string()))?;
             Err(error.context("desired configuration not applied; retained safe previously confirmed grants where possible"))
+        }
+    }
+}
+/// A server on a new address (a restored backup on another VPS) keeps its forwards: those on
+/// an address the server no longer has move to its first address of the same IP version. The
+/// ones that cannot move stay and show up as not applicable in `rift status`.
+fn fix_listen_addresses(s: &Server, public_ips: &[IpAddr]) {
+    let Ok(snap) = s.state.snapshot() else { return };
+    let fix = portable::fix_listen_ips(&snap.forwards, public_ips);
+    if !fix.moves.is_empty() {
+        let result = s.state.mutate("listen-ip-remap", |x| {
+            let generation = x.generation + 1;
+            for m in &fix.moves {
+                if let Some(f) = x.forwards.iter_mut().find(|f| f.id == m.id) {
+                    f.listen_ip = m.to;
+                    f.generation = generation;
+                }
+            }
+            Ok(())
+        });
+        match result {
+            Ok(_) => {
+                for m in &fix.moves {
+                    tracing::warn!(
+                        "forward {} moved from {} to {}: the server no longer has the first address (RIFT_PUBLIC_IPS)",
+                        m.id, m.from, m.to
+                    );
+                }
+                if let Ok(mut notes) = s.listen_notes.lock() {
+                    notes.moved.extend(
+                        fix.moves
+                            .iter()
+                            .map(|m| serde_json::json!({"id":m.id,"from":m.from,"to":m.to})),
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::error!("could not move forwards to the server's addresses: {error:#}")
+            }
+        }
+    }
+    if let Ok(mut notes) = s.listen_notes.lock() {
+        for id in &fix.blocked {
+            if !notes.blocked_logged.contains(id) {
+                tracing::warn!("forward {id} listens on an address this server does not have, and its ports are taken on the replacement; it stays inactive");
+                notes.blocked_logged.push(*id);
+            }
         }
     }
 }
@@ -627,6 +686,27 @@ fn forward_json(snap: &StateSnapshot, forward: &Forward) -> Result<serde_json::V
     value["refused"] = refusal.into();
     Ok(value)
 }
+/// Forwards on an address the server does not have; they are left out until it has one again.
+fn inapplicable(snap: &StateSnapshot, public_ips: &[IpAddr]) -> Vec<serde_json::Value> {
+    if public_ips.is_empty() {
+        return Vec::new();
+    }
+    snap.forwards
+        .iter()
+        .filter(|f| !public_ips.contains(&f.listen_ip))
+        .map(|f| {
+            serde_json::json!({
+                "id": f.id,
+                "listen_ip": f.listen_ip,
+                "reason": format!(
+                    "the server has no {} address {} (RIFT_PUBLIC_IPS); change RIFT_PUBLIC_IPS or remove the forward",
+                    if f.listen_ip.is_ipv4() { "IPv4" } else { "IPv6" },
+                    f.listen_ip
+                ),
+            })
+        })
+        .collect()
+}
 fn policy_for(snapshot: &StateSnapshot, id: &str, vpn_pool: ipnet::Ipv4Net) -> AgentPolicy {
     let snapshot = &without_refused(snapshot.clone());
     AgentPolicy {
@@ -686,16 +766,23 @@ async fn serve_admin(listener: tokio::net::UnixListener, s: Arc<Server>) -> Resu
         let s = s.clone();
         requests.spawn(async move {
             let _p = permit;
-            let result = timeout(Duration::from_secs(15), async {
-                let req: AdminRequest = protocol::receive(&mut stream).await?;
-                let response = match admin_call_impl(&s, req).await {
-                    Ok(v) => AdminResponse::success(v),
-                    Err(e) => AdminResponse::error(sanitize_error(&e.to_string())),
+            let result = async {
+                let req: AdminRequest = timeout(
+                    Duration::from_secs(5),
+                    protocol::receive_admin_request(&mut stream),
+                )
+                .await??;
+                // An import creates many things and applies them once; it gets more time.
+                let limit = Duration::from_secs(request_seconds(&req) - 1);
+                let response = match timeout(limit, admin_call_impl(&s, req)).await {
+                    Ok(Ok(v)) => AdminResponse::success(v),
+                    Ok(Err(e)) => AdminResponse::error(sanitize_error(&e.to_string())),
+                    Err(_) => AdminResponse::error("the request took too long"),
                 };
                 protocol::send_admin(&mut stream, &response).await
-            })
+            }
             .await;
-            if let Err(e) = result.unwrap_or_else(|_| Err(anyhow!("admin request timed out"))) {
+            if let Err(e) = result {
                 tracing::warn!("admin socket request failed: {e}");
             }
         });
@@ -725,6 +812,14 @@ fn sanitize_error(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).take(300).collect()
 }
 
+/// How long a caller waits for the answer.
+fn request_seconds(request: &AdminRequest) -> u64 {
+    match request {
+        AdminRequest::Import { .. } => 125,
+        _ => 10,
+    }
+}
+
 #[cfg(unix)]
 pub async fn admin_call(config: &Config, request: AdminRequest) -> Result<AdminResponse> {
     let mut stream = timeout(
@@ -732,9 +827,9 @@ pub async fn admin_call(config: &Config, request: AdminRequest) -> Result<AdminR
         tokio::net::UnixStream::connect(config.socket_path()),
     )
     .await??;
-    protocol::send(&mut stream, &request).await?;
+    protocol::send_admin_request(&mut stream, &request).await?;
     timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(request_seconds(&request)),
         protocol::receive_admin(&mut stream),
     )
     .await?
@@ -782,7 +877,13 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
                 .map(|(name, expires_at)| serde_json::json!({"name":name,"expires_at":expires_at}))
                 .collect();
             let enrollment = serde_json::json!({"mode":cfg.enrollment,"open":s.enrollment_open.load(Ordering::SeqCst),"bind":cfg.enrollment_bind});
-            serde_json::json!({"snapshot":snap,"enrollment":enrollment,"invites":invites,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"refused_forwards":refused_forwards,"fully_applied":fully_applied,"connection_history":s.state.health()?})
+            let moved_forwards = s
+                .listen_notes
+                .lock()
+                .map(|n| n.moved.clone())
+                .unwrap_or_default();
+            let inapplicable_forwards = inapplicable(&snap, &cfg.public_ips);
+            serde_json::json!({"moved_forwards":moved_forwards,"inapplicable_forwards":inapplicable_forwards,"snapshot":snap,"enrollment":enrollment,"invites":invites,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"refused_forwards":refused_forwards,"fully_applied":fully_applied,"connection_history":s.state.health()?})
         }
         AdminRequest::AgentsList => serde_json::to_value(snap.agents)?,
         AdminRequest::AgentsShow { name } => {
@@ -881,12 +982,25 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
             s.state.request_rotation(&id, &rotation)?;
             serde_json::json!({"agent":id,"rotation_id":rotation,"status":"requested; agent will rotate on next WireGuard control sync"})
         }
-        AdminRequest::ForwardsList => serde_json::Value::Array(
-            snap.forwards
-                .iter()
-                .map(|f| forward_json(&snap, f))
-                .collect::<Result<_>>()?,
-        ),
+        AdminRequest::ForwardsList => {
+            let ips = s.config.read().await.public_ips.clone();
+            let stuck = inapplicable(&snap, &ips);
+            serde_json::Value::Array(
+                snap.forwards
+                    .iter()
+                    .map(|f| {
+                        let mut value = forward_json(&snap, f)?;
+                        if let Some(why) = stuck.iter().find(|x| x["id"] == f.id) {
+                            value["state"] = "not applicable".into();
+                            value["refused"] = why["reason"].clone();
+                        }
+                        Ok(value)
+                    })
+                    .collect::<Result<_>>()?,
+            )
+        }
+        AdminRequest::Export => serde_json::to_value(portable::export(&snap))?,
+        AdminRequest::Import { data, options } => import_admin(s, data, options).await?,
         AdminRequest::ForwardAdd(mut f) => {
             f.validate()?;
             let cfg = s.config.read().await.clone();
@@ -1051,6 +1165,207 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
         vpn_request => vpn_admin(s, &snap, vpn_request).await?,
     };
     Ok(data)
+}
+
+/// Creates what an export holds and this server lacks. Everything that passes the checks is
+/// written in one transaction and applied once; a dry run stops before that.
+async fn import_admin(
+    s: &Server,
+    data: portable::Export,
+    options: portable::ImportOptions,
+) -> Result<serde_json::Value> {
+    use portable::{Item, Op, Status};
+    let cfg = s.config.read().await.clone();
+    let snap = s.state.snapshot()?;
+    let plan = portable::plan(
+        &data,
+        &options,
+        &portable::World {
+            snap: &snap,
+            public_ips: &cfg.public_ips,
+            panel_enabled: cfg.webpanel,
+        },
+    );
+    let mut items = plan.items;
+    let mut ready: Vec<portable::Step> = Vec::new();
+    let mut lost_devices: Vec<String> = Vec::new();
+    for step in plan.steps {
+        let checked: Result<()> = async {
+            match &step.op {
+                Op::Forward(f) => {
+                    if f.enabled {
+                        s.kernel
+                            .lock()
+                            .await
+                            .check_port(f.listen_ip, f.listen_ports, f.protocol)
+                            .await?;
+                    }
+                }
+                Op::Device(_) => cfg.check_vpn_pool()?,
+                Op::Flags { name, .. } => {
+                    anyhow::ensure!(
+                        !lost_devices.contains(name),
+                        "the device could not be created"
+                    )
+                }
+                Op::Grant(g) => {
+                    anyhow::ensure!(
+                        !lost_devices.contains(&g.peer),
+                        "the device could not be created"
+                    );
+                    if let VpnAccess::Subnet { net, .. } = &g.access {
+                        anyhow::ensure!(
+                            !(net.contains(&cfg.vpn_pool.network())
+                                || cfg.vpn_pool.contains(&net.network())
+                                || net.contains(&cfg.ipv4_pool.network())
+                                || cfg.ipv4_pool.contains(&net.network())),
+                            "subnet {net} overlaps a RIFT address pool"
+                        );
+                        s.kernel.lock().await.check_vpn_subnet(*net).await?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+        match checked {
+            Ok(()) => ready.push(step),
+            Err(error) => {
+                if let Op::Device(name) = &step.op {
+                    lost_devices.push(name.clone());
+                }
+                items.push(Item::new(
+                    Status::Failed,
+                    step.what,
+                    Some(sanitize_error(&error.to_string())),
+                ));
+            }
+        }
+    }
+    if options.dry_run || ready.is_empty() {
+        for step in ready {
+            items.push(Item::new(Status::Created, step.what, step.detail));
+        }
+        return Ok(serde_json::to_value(portable::Report {
+            dry_run: options.dry_run,
+            items,
+        })?);
+    }
+    // Keys first: a device the state knows must have its private key on disk.
+    let mut keys: Vec<(String, String, PathBuf)> = Vec::new();
+    let mut applying: Vec<portable::Step> = Vec::new();
+    for step in ready {
+        let Op::Device(name) = &step.op else {
+            applying.push(step);
+            continue;
+        };
+        let name = name.clone();
+        let made: Result<()> = async {
+            let (private, public) = net::generate_keypair().await?;
+            let path = vpn_key_path(&cfg, &public);
+            if let Some(dir) = path.parent() {
+                secure_dir(dir)?;
+            }
+            atomic_write(&path, private.as_bytes(), 0o600)?;
+            keys.push((name.clone(), public, path));
+            Ok(())
+        }
+        .await;
+        match made {
+            Ok(()) => applying.push(step),
+            Err(error) => {
+                lost_devices.push(name);
+                items.push(Item::new(
+                    Status::Failed,
+                    step.what,
+                    Some(sanitize_error(&error.to_string())),
+                ));
+            }
+        }
+    }
+    applying.retain(|step| match &step.op {
+        Op::Flags { name, .. } => !lost_devices.contains(name),
+        Op::Grant(g) => !lost_devices.contains(&g.peer),
+        _ => true,
+    });
+    let committed = s.state.mutate("import", |x| {
+        for step in &applying {
+            match &step.op {
+                Op::Forward(f) => {
+                    let mut f = f.clone();
+                    f.id = crate::state::lowest_free_id(x.forwards.iter().map(|f| f.id));
+                    f.generation = x.generation + 1;
+                    x.forwards.push(f);
+                }
+                Op::Device(name) => {
+                    let public = keys
+                        .iter()
+                        .find(|(n, ..)| n == name)
+                        .map(|(_, public, _)| public.clone())
+                        .ok_or_else(|| anyhow!("no key for device {name}"))?;
+                    let ipv4 = crate::vpn::allocate(cfg.vpn_pool, &x.vpn_peers)?;
+                    x.vpn_peers.push(VpnPeer {
+                        name: name.clone(),
+                        public_key: public,
+                        ipv4,
+                        enabled: true,
+                        created_at: now(),
+                        panel: false,
+                    });
+                }
+                Op::Flags {
+                    name,
+                    enabled,
+                    panel,
+                } => {
+                    for p in x.vpn_peers.iter_mut().filter(|p| &p.name == name) {
+                        p.enabled = enabled.unwrap_or(p.enabled);
+                        p.panel = panel.unwrap_or(p.panel);
+                    }
+                }
+                Op::Grant(g) => {
+                    x.vpn_grants.retain(|old| {
+                        !(old.peer == g.peer
+                            && old.agent_id == g.agent_id
+                            && crate::vpn::same_target(&old.access, &g.access))
+                    });
+                    x.vpn_grants.push(g.clone());
+                }
+            }
+        }
+        Ok(())
+    });
+    if let Err(error) = committed {
+        for (_, _, path) in &keys {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(error.context("nothing was imported"));
+    }
+    reconcile(s).await?;
+    let after = s.state.snapshot()?;
+    for step in applying {
+        let mut detail = step.detail;
+        if let Op::Forward(f) = &step.op {
+            let refusal = after
+                .forwards
+                .iter()
+                .find(|x| {
+                    x.agent_id == f.agent_id
+                        && x.listen_ip == f.listen_ip
+                        && x.listen_ports == f.listen_ports
+                        && x.protocol == f.protocol
+                })
+                .and_then(|x| forward_refusal(&after, x));
+            if let Some(why) = refusal {
+                detail = Some(format!("added, but the agent will refuse it: {why}"));
+            }
+        }
+        items.push(Item::new(Status::Created, step.what, detail));
+    }
+    Ok(serde_json::to_value(portable::Report {
+        dry_run: false,
+        items,
+    })?)
 }
 
 fn vpn_key_path(config: &Config, public_key: &str) -> PathBuf {

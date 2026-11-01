@@ -1,11 +1,13 @@
 pub mod agent_policy;
 pub mod audit;
+pub mod backup;
 pub mod config;
 pub mod daemon;
 pub mod enrollment;
 pub(crate) mod host_firewall;
 pub mod model;
 pub mod net;
+pub mod portable;
 pub mod protocol;
 pub mod state;
 pub mod tls_material;
