@@ -1472,7 +1472,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
         snap.vpn_peers
             .iter()
             .find(|p| p.name == name)
-            .ok_or_else(|| anyhow!("VPN peer not found"))
+            .ok_or_else(|| missing_device(snap, name))
     };
     let data = match r {
         AdminRequest::VpnPeerAdd { name } => {
@@ -1480,7 +1480,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
             cfg.check_vpn_pool()?;
             anyhow::ensure!(
                 !snap.vpn_peers.iter().any(|p| p.name == name),
-                "VPN peer {name} already exists"
+                "device {name} already exists"
             );
             let (private, public) = net::generate_keypair().await?;
             let key_path = vpn_key_path(&cfg, &public);
@@ -1764,6 +1764,21 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
     };
     Ok(data)
 }
+/// "no device X" with the next step, and the right spelling if only the case differs.
+fn missing_device(snap: &StateSnapshot, name: &str) -> anyhow::Error {
+    if let Some(other) = snap
+        .vpn_peers
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case(name))
+    {
+        return anyhow!(
+            "no device {name}; did you mean {}? Device names are case-sensitive",
+            other.name
+        );
+    }
+    anyhow!("no device {name}; create it with `rift add device {name}`, or `rift panel connect {name}` to create it with panel access in one step")
+}
+
 fn find_agent<'a>(snap: &'a StateSnapshot, name: &str) -> Result<&'a AgentRecord> {
     snap.agents
         .iter()
@@ -2392,6 +2407,19 @@ mod tests {
             agent_id: "home".into(),
             access,
         }
+    }
+
+    #[test]
+    fn a_missing_device_names_the_next_step_or_the_right_spelling() {
+        let snap = StateSnapshot {
+            vpn_peers: vec![peer("iphone", true)],
+            ..Default::default()
+        };
+        let error = missing_device(&snap, "Trololol").to_string();
+        assert!(error.contains("rift add device Trololol"), "{error}");
+        assert!(error.contains("rift panel connect Trololol"), "{error}");
+        let error = missing_device(&snap, "iPhone").to_string();
+        assert!(error.contains("did you mean iphone?"), "{error}");
     }
 
     #[test]
