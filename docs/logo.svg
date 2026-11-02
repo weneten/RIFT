@@ -1,18 +1,18 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="327.67 301 624 624" role="img" aria-label="RIFT">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="310.0 286.7 654.6 654.6" role="img" aria-label="RIFT">
   <defs>
-    <linearGradient id="rift" gradientUnits="userSpaceOnUse" x1="362" y1="321" x2="917.34" y2="905">
+    <linearGradient id="rift" gradientUnits="userSpaceOnUse" x1="330" y1="323" x2="945" y2="905">
       <stop offset="0" stop-color="#8a2cff"/>
       <stop offset="1" stop-color="#45b0ff"/>
     </linearGradient>
   </defs>
   <g fill="url(#rift)">
-    <path d="M362 321H581A219 219 0 0 1 800 540A219 219 0 0 1 765.6 657.84L917.34 905H800L700 742.12V540A119 119 0 0 0 462 540V742.12L362 905Z"/>
+    <path d="M330.00 323H685C790 323 872 410 872 520C872 572 851 618 788.09 650L944.65 905H832.00L700.00 690V540A119 119 0 0 0 462.00 540V690L330.00 905Z"/>
     <circle cx="581" cy="520" r="28"/>
-    <circle cx="581" cy="579.33" r="9"/>
-    <circle cx="581" cy="619.67" r="9"/>
+    <circle cx="581" cy="579.333" r="9"/>
+    <circle cx="581" cy="619.667" r="9"/>
     <circle cx="581" cy="660" r="9"/>
-    <circle cx="581" cy="700.33" r="9"/>
-    <circle cx="581" cy="740.67" r="9"/>
+    <circle cx="581" cy="700.333" r="9"/>
+    <circle cx="581" cy="740.667" r="9"/>
     <circle cx="581" cy="800" r="28"/>
   </g>
 </svg>
