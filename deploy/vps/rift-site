@@ -39,11 +39,11 @@ class SiteError(Exception):
 
 
 def valid_host(host):
-    return bool(HOST_RE.match(host))
+    return bool(HOST_RE.fullmatch(host))
 
 
 def valid_agent(agent):
-    return bool(AGENT_RE.match(agent))
+    return bool(AGENT_RE.fullmatch(agent))
 
 
 def router_name(host):
@@ -1876,7 +1876,7 @@ def command_process_queue(queue=None, now=None):
     while True:
         found = []
         for entry in os.scandir(queue):
-            match = QUEUE_REQUEST.match(entry.name)
+            match = QUEUE_REQUEST.fullmatch(entry.name)
             if match:
                 try:
                     found.append((entry.stat(follow_symlinks=False).st_mtime, entry.name, match.group(1)))

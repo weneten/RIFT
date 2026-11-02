@@ -919,6 +919,12 @@ class BackupTests(unittest.TestCase):
 
 
 class QueueTests(unittest.TestCase):
+    def test_a_trailing_newline_is_not_a_valid_host_or_agent(self):
+        self.assertFalse(rift_site.valid_host("a.example\n"))
+        self.assertFalse(rift_site.valid_host("a.example\nserver {"))
+        self.assertFalse(rift_site.valid_agent("core\n"))
+        self.assertTrue(rift_site.valid_host("a.example"))
+
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
