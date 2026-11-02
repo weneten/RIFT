@@ -49,7 +49,7 @@ The internet exit (devices with `internet via server` or `internet via AGENT`) h
 
 1. Exit through the VPS: handshake, `curl https://ifconfig.me` shows the VPS address; `ping -6` and a site that needs IPv6 work only if `RIFT_PUBLIC_IPS` has an IPv6 address, otherwise IPv6 fails and nothing leaks; DNS goes through `RIFT_VPN_DNS`; the device cannot reach another device, the VPS's control port or `169.254.169.254`.
 2. Exit through an agent with `RIFT_AGENT_ALLOW_EXIT=true`: `rift-exit` exists with the right peers, `rift list forwards` shows the `exit` forward on the first IPv4/IPv6 address, the phone gets a handshake with the agent, shows the agent's home address and cannot reach the home LAN (but can reach a network listed in `RIFT_AGENT_ALLOW_SUBNETS`) or services on the agent host; MTU 1300 passes full-size packets in both directions (`ping -M do -s 1272`).
-3. An agent host without global IPv6: the device's IPv6 does not work and does not leak. An agent with `RIFT_AGENT_ALLOW_EXIT=false`: `rift vpn allow DEVICE AGENT internet` warns, the device shows `refused by agent`, no forward is published.
+3. An agent host without global IPv6: the device's IPv6 does not work and does not leak. An agent with `RIFT_AGENT_ALLOW_EXIT=false`: `rift vpn allow DEVICE AGENT exit` warns, the device shows `refused by agent`, no forward is published.
 4. `rift vpn deny`, `rift disable device` and `rift remove device` remove the forward (when no other device uses it), the peer on `rift-exit` and, after the last device, the interface; a server and agent restart restores the same state.
 5. With UFW: `rift:exit` rules appear and disappear on both sides, and unrelated drops stay.
 6. Re-import of a configuration after each change, and test-ipv6.com on the device.

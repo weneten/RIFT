@@ -967,8 +967,8 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
             let cfg = s.config.read().await.clone();
             validate_name(&name)?;
             anyhow::ensure!(
-                name != "internet",
-                "an agent cannot be called internet: `rift vpn allow DEVICE internet` would be ambiguous"
+                name != "exit",
+                "an agent cannot be called exit: `rift vpn allow DEVICE exit` would be ambiguous"
             );
             anyhow::ensure!(
                 cfg.enrollment != EnrollmentMode::Off,
@@ -1031,8 +1031,8 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
         AdminRequest::AgentRename { name, new_name } => {
             validate_name(&new_name)?;
             anyhow::ensure!(
-                new_name != "internet",
-                "an agent cannot be called internet: `rift vpn allow DEVICE internet` would be ambiguous"
+                new_name != "exit",
+                "an agent cannot be called exit: `rift vpn allow DEVICE exit` would be ambiguous"
             );
             let id = find_agent(&snap, &name)?.id.clone();
             s.state.mutate("agent-rename", |x| {

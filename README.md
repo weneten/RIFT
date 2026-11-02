@@ -23,7 +23,7 @@ The agent initiates the connection to the server. RIFT manages the tunnel, expli
 - [Publish websites with HTTPS](#publish-websites-with-https)
 - [Manage agents and forwards](#manage-agents-and-forwards)
 - [Private VPN access](#private-vpn-access)
-- [Use RIFT as a VPN (internet exit)](#use-rift-as-a-vpn-internet-exit)
+- [Use RIFT as a VPN (exit)](#use-rift-as-a-vpn-exit)
 - [Web panel](#web-panel)
 - [Back up, move or rebuild](#back-up-move-or-rebuild)
 - [Command reference](#command-reference)
@@ -155,8 +155,8 @@ The server tells each agent which ports to forward and which VPN grants to enfor
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `RIFT_AGENT_ALLOW_PORTS` | empty (no limit) | Comma-separated `PORT` or `PORT-PORT`, each optionally with `/tcp`, `/udp` or `/both` (default both), for example `22/tcp,80,443,27015-27020/udp`. The agent refuses forwards and VPN port grants that are not entirely inside this list. It also refuses `server` and `full` VPN grants, because they reach every port. |
-| `RIFT_AGENT_ALLOW_SUBNETS` | empty (no LAN access) | Comma-separated private IPv4 networks behind the agent, for example `192.168.178.0/24`. A VPN network grant works only when its network lies inside one of these, and devices that use the agent as [internet exit](#use-rift-as-a-vpn-internet-exit) may reach them. |
-| `RIFT_AGENT_ALLOW_EXIT` | `false` | `true` offers the agent's internet connection as an [exit for VPN devices](#use-rift-as-a-vpn-internet-exit). It also allows the one UDP port of that exit, whatever `RIFT_AGENT_ALLOW_PORTS` says. |
+| `RIFT_AGENT_ALLOW_SUBNETS` | empty (no LAN access) | Comma-separated private IPv4 networks behind the agent, for example `192.168.178.0/24`. A VPN network grant works only when its network lies inside one of these, and devices that use the agent as [internet exit](#use-rift-as-a-vpn-exit) may reach them. |
+| `RIFT_AGENT_ALLOW_EXIT` | `false` | `true` offers the agent's internet connection as an [exit for VPN devices](#use-rift-as-a-vpn-exit). It also allows the one UDP port of that exit, whatever `RIFT_AGENT_ALLOW_PORTS` says. |
 
 The secure default for subnets is deliberate: until you list a network, no device can reach your LAN through this agent, whatever the server grants. Restart the agent after changing `.env` (`docker compose up -d --force-recreate`).
 
@@ -423,7 +423,7 @@ rift vpn config export iphone > iphone.conf    # or export a file (contains the 
 
 Manage devices with `rift list devices`, `rift disable device NAME` / `rift enable device NAME` (reversible) and `rift remove device NAME` (deletes the device, its key and its grants). `rift vpn deny NAME AGENT [TARGET...]` withdraws grants; without selectors it withdraws everything on that agent. Revocation and denial close the path on the server in the same reconcile pass; the agent follows on its next sync.
 
-Client configurations are split-tunnel unless the device has an [internet exit](#use-rift-as-a-vpn-internet-exit): `AllowedIPs` lists only the granted addresses. Every device has an IPv4 and an IPv6 address; grants use IPv4 only. Exported files and QR codes contain the device's private key, which stays in a mode-0600 file under the state volume and is never logged.
+Client configurations are split-tunnel unless the device has an [internet exit](#use-rift-as-a-vpn-exit): `AllowedIPs` lists only the granted addresses. Every device has an IPv4 and an IPv6 address; grants use IPv4 only. Exported files and QR codes contain the device's private key, which stays in a mode-0600 file under the state volume and is never logged.
 
 **Reaching the LAN.** A network grant (for example `rift vpn allow iphone home 192.168.178.0/24`) forwards through the agent host and is the only grant that touches the LAN. The agent refuses it unless its owner lists the network in `RIFT_AGENT_ALLOW_SUBNETS` (see [Harden the agent](#harden-the-agent)). Then choose one:
 
@@ -434,23 +434,25 @@ The agent host itself answers on its LAN address too, as long as that address li
 
 **Trust boundary.** The server authenticates devices by WireGuard key, and the agent enforces its own input and forwarding rules by the device's VPN source address. A compromised server can forge an allowed source address, so the agent-side rules limit mistakes and stolen device keys, not a hostile server. What a hostile server can reach is capped by the agent's own `RIFT_AGENT_ALLOW_PORTS` and `RIFT_AGENT_ALLOW_SUBNETS`: it can never open a port outside the first or the LAN outside the second. Protecting against that needs end-to-end authentication between device and agent, which RIFT does not provide for grants; an exit through an agent is end to end between the device and the agent.
 
-## Use RIFT as a VPN (internet exit)
+## Use RIFT as a VPN (exit)
 
 A device can also send **all** its internet traffic through RIFT, like a commercial VPN. Each device has exactly one exit:
 
 | Exit | Where the traffic leaves | Set with |
 | --- | --- | --- |
-| none (default) | The device only reaches what its grants name. | `rift vpn deny DEVICE internet` or `rift vpn deny DEVICE AGENT internet` |
-| the server | The VPS's connection; websites see the VPS's address. | `rift vpn allow DEVICE internet` |
-| an agent | The agent's connection, for example your home line; websites see your home address. | `rift vpn allow DEVICE AGENT internet` |
+| none (default) | The device only reaches what its grants name. | `rift vpn deny DEVICE exit` or `rift vpn deny DEVICE AGENT exit` |
+| the server | The VPS's connection; websites see the VPS's address. | `rift vpn allow DEVICE exit` |
+| an agent | The agent's connection, for example your home line; websites see your home address. | `rift vpn allow DEVICE AGENT exit` |
 
 ```sh
 rift add device iphone
-rift vpn allow iphone internet          # exit through the VPS
-rift vpn config qr iphone                # scan in the WireGuard app
+rift vpn allow iphone exit       # exit through the VPS
+rift vpn config qr iphone        # scan in the WireGuard app
 ```
 
-`internet` may sit beside other targets: `rift vpn allow iphone core 22/tcp internet` grants port 22 on `core` and makes `core` the exit. A new exit replaces the previous one. Every change needs the **new configuration on the device**: RIFT says so, and `rift vpn config qr DEVICE` prints it. `rift list devices` shows the choice in the ACCESS column (`internet via server`, `internet via core`, with `(refused by agent)` or `(waiting for the agent)` when it does not work yet). The agent name `internet` is reserved.
+`exit` may sit beside other targets: `rift vpn allow iphone core 22/tcp exit` grants port 22 on `core` and makes `core` the exit. A new exit replaces the previous one. Every change needs the **new configuration on the device**: RIFT says so, and `rift vpn config qr DEVICE` prints it. `rift list devices` shows the choice in the ACCESS column (`exit via server`, `exit via core`, with `(refused by agent)` or `(waiting for the agent)` when it does not work yet). The agent name `exit` is reserved.
+
+**One device, one profile.** A device has exactly one WireGuard configuration. With no exit or the exit through the VPS, that configuration reaches the web panel and the grants as usual. With the exit through an agent, the device's tunnel ends at that agent instead, so the panel and the grants on the VPS are **not** reachable with it. If you want both on one phone, register two devices, for example `iphone` (panel and grants, optionally the VPS exit) and `iphone-home` (`rift vpn allow iphone-home core exit`), import both configurations and switch between them in the WireGuard app.
 
 ### Exit through the VPS
 
@@ -464,7 +466,7 @@ An agent can offer its own internet connection. It is **off by default**; the ag
 RIFT_AGENT_ALLOW_EXIT=true
 ```
 
-Then `rift vpn allow iphone core internet` sends the device through `core`. If the agent has not opted in, RIFT stores the choice but warns (`agent core will refuse it: … set RIFT_AGENT_ALLOW_EXIT=true on the agent`), and the device shows `refused by agent`.
+Then `rift vpn allow iphone core exit` sends the device through `core`. If the agent has not opted in, RIFT stores the choice but warns (`agent core will refuse it: … set RIFT_AGENT_ALLOW_EXIT=true on the agent`), and the device shows `refused by agent`.
 
 How it works: the device runs a **second WireGuard tunnel to the agent**, inside the agent's tunnel to the VPS.
 
@@ -682,7 +684,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | … `--mode translate` | Bridges IPv6 clients to an IPv4-only service (the service then sees the server, not the client). |
 | … `--ingress local` | Only for a reverse proxy on the server; not reachable from the Internet. |
 | … `--listen-ip ADDRESS` | A specific server address, only needed with several addresses of the same IP version. |
-| `rift list forwards` | All forwards with ID, purpose (`user`, or `exit` for the managed forward of an [internet exit](#use-rift-as-a-vpn-internet-exit)) and state (`enabled`, `disabled`, `pending`, `refused`); on the server with a SITE column. |
+| `rift list forwards` | All forwards with ID, purpose (`user`, or `exit` for the managed forward of an [internet exit](#use-rift-as-a-vpn-exit)) and state (`enabled`, `disabled`, `pending`, `refused`); on the server with a SITE column. |
 | `rift remove forward ID` | Deletes a forward. Refuses an `exit` forward. |
 | `rift disable forward ID` / `rift enable forward ID` | Switches a forward off and on again. |
 | `rift add ban AGENT FORWARD_ID IP [--ttl 1h]` | Blocks a client address on a translated forward for a while. |
@@ -702,11 +704,11 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | Command | What it does |
 | --- | --- |
 | `rift add device NAME` | Registers a device with a key and an address. It reaches nothing yet. |
-| `rift list devices` | All devices with state, last handshake and access, including the internet exit (`internet via server`, `internet via core`). |
+| `rift list devices` | All devices with state, last handshake and access, including the exit (`exit via server`, `exit via core`). |
 | `rift vpn allow DEVICE AGENT TARGET... [--snat]` | Grants access. `TARGET` is `22/tcp` (port or range), `server` (the agent host), `full` (all protocols to the host), a network such as `192.168.178.30/32` (`--snat` for networks whose router has no route back), or `internet`: the agent becomes the device's internet exit. |
-| `rift vpn allow DEVICE internet` | Makes the server the device's internet exit. A device has one exit; re-import its configuration afterwards. |
+| `rift vpn allow DEVICE exit` | Makes the server the device's internet exit. A device has one exit; re-import its configuration afterwards. |
 | `rift vpn deny DEVICE AGENT [TARGET...]` | Withdraws access; without a target everything on that agent, including an exit through it. |
-| `rift vpn deny DEVICE internet` / `rift vpn deny DEVICE AGENT internet` | Ends the internet exit, only if it is the server / that agent. |
+| `rift vpn deny DEVICE exit` / `rift vpn deny DEVICE AGENT exit` | Ends the internet exit, only if it is the server / that agent. |
 | `rift vpn config qr DEVICE` / `rift vpn config export DEVICE` | WireGuard configuration as a QR code or file (contains the private key). |
 | `rift disable device NAME` / `rift enable device NAME` | Cuts a device off and lets it back in; key and grants stay. |
 | `rift remove device NAME` | Deletes the device, its key and its grants. |
@@ -753,7 +755,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | `RIFT_IPV6_POOL`, `RIFT_SERVER_IPV6` | `fd88:5249:4654::/64`, `fd88:5249:4654::1` | Server. Same for IPv6 (ULA pool). |
 | `RIFT_VPN_POOL` | `10.14.0.0/24` | Server. IPv4 addresses for [private VPN devices](#private-vpn-access); must not overlap the IPv4 tunnel pool or a granted LAN; restart required. The first host is reserved for the exit interface of agents. |
 | `RIFT_VPN_POOL6` | `fd88:5249:4655::/64` | Server. IPv6 addresses of VPN devices; a ULA network that must not overlap `RIFT_IPV6_POOL`; restart required. The first host is reserved. |
-| `RIFT_VPN_DNS` | `9.9.9.9,2620:fe::fe` | Server. DNS servers written into configurations that have an [internet exit](#use-rift-as-a-vpn-internet-exit); needs one IPv4 address, IPv6 ones are used only where the exit carries IPv6. |
+| `RIFT_VPN_DNS` | `9.9.9.9,2620:fe::fe` | Server. DNS servers written into configurations that have an [internet exit](#use-rift-as-a-vpn-exit); needs one IPv4 address, IPv6 ones are used only where the exit carries IPv6. |
 | `RIFT_WEBPANEL` | `false` | Server. Serves the [web panel](#web-panel). Restart required. |
 | `RIFT_WEBPANEL_ACCESS` | `private` | Server. `private`: loopback and tunnel address only; `public`: every address. |
 | `RIFT_WEBPANEL_PORT` | `8090` | Server. TCP port of the panel. |
@@ -764,7 +766,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | `RIFT_SERVER`, `RIFT_AGENT_NAME`, `RIFT_ENROLLMENT_TOKEN` | Agent | Invitation values; remove token after enrollment. If the host of `RIFT_SERVER` later differs from the server address stored at enrollment, the agent dials the new host with the stored WireGuard port; after a server move, editing `RIFT_SERVER` is enough. |
 | `RIFT_AGENT_ALLOW_PORTS` | empty | Agent. Ports the agent may open for forwards and VPN grants, e.g. `22/tcp,80,27015-27020/udp`; empty means no limit. See [Harden the agent](#harden-the-agent). |
 | `RIFT_AGENT_ALLOW_SUBNETS` | empty | Agent. Networks behind the agent that VPN network grants and internet-exit devices may reach; empty means no LAN access. |
-| `RIFT_AGENT_ALLOW_EXIT` | `false` | Agent. `true` offers the agent's internet connection as an [exit for VPN devices](#use-rift-as-a-vpn-internet-exit). |
+| `RIFT_AGENT_ALLOW_EXIT` | `false` | Agent. `true` offers the agent's internet connection as an [exit for VPN devices](#use-rift-as-a-vpn-exit). |
 | `exit_port_min`, `exit_port_max` | `51821`, `51899` | Server, in `config.toml`. UDP ports the server assigns to the internet exits of agents; must not contain the WireGuard, control or enrollment port. Restart required. |
 | `interface`, `wg_port`, `control_port` | `rift0`, `51820`, `8444` | WireGuard interface and ports. |
 | `ipv4_pool`, `ipv6_pool` | `10.13.0.0/24`, `fd88:5249:4654::/64` | Tunnel address pools; avoid overlaps. |

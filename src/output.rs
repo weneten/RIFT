@@ -402,17 +402,17 @@ fn vpn_access(value: &Value) -> String {
     }
 }
 
-/// "internet via server" or "internet via core (refused by agent)"; None without an exit.
+/// "exit via server" or "exit via core (refused by agent)"; None without an exit.
 fn vpn_exit(exit: &Value) -> Option<String> {
     match exit["via"].as_str()? {
-        "server" => Some("internet via server".into()),
+        "server" => Some("exit via server".into()),
         "agent" => {
             let note = match exit["state"].as_str() {
                 Some("refused") => " (refused by agent)",
                 Some("waiting") => " (waiting for the agent)",
                 _ => "",
             };
-            Some(format!("internet via {}{note}", field(exit, "agent")))
+            Some(format!("exit via {}{note}", field(exit, "agent")))
         }
         _ => None,
     }
@@ -443,7 +443,7 @@ fn exit_changed(peer: &str, data: &Value) -> String {
             }
             lines.push("This profile reaches neither the web panel nor other RIFT grants; use a second device for those.".into());
         }
-        _ => lines.push(format!("{peer} has no internet exit any more.")),
+        _ => lines.push(format!("{peer} has no exit any more.")),
     }
     lines.push(format!(
         "Re-import the configuration on the device: rift vpn config qr {peer}"
@@ -577,7 +577,7 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
             let rows = data.as_array().into_iter().flatten().map(|b| vec![field(b, "id"), field(b, "forward_id"), field(b, "ip"), field(b, "expires_at")]).collect();
             table(&["ID", "FORWARD", "ADDRESS", "EXPIRES (UNIX)"], rows, "No active bans.")
         },
-        AdminRequest::VpnPeerAdd { name } => format!("VPN device {name} registered with addresses {} and {}.\nNext: rift vpn allow {name} AGENT 22/tcp (or server), then rift vpn config qr {name}\nFor the internet instead: rift vpn allow {name} internet", field(data, "ipv4"), field(data, "ipv6")),
+        AdminRequest::VpnPeerAdd { name } => format!("VPN device {name} registered with addresses {} and {}.\nNext: rift vpn allow {name} AGENT 22/tcp (or server), then rift vpn config qr {name}\nTo send all its traffic through RIFT: rift vpn allow {name} exit", field(data, "ipv4"), field(data, "ipv6")),
         AdminRequest::VpnPeerList => vpn_peers(data),
         AdminRequest::VpnPeerEnable { name, enabled } => format!("VPN device {name} {}.", if *enabled { "enabled" } else { "disabled; it can no longer connect" }),
         AdminRequest::VpnPeerRevoke { name } => format!("VPN device {name} revoked. Its key and grants are gone."),
@@ -655,9 +655,9 @@ mod tests {
         ]);
         let output = render(&AdminRequest::VpnPeerList, &devices, None);
         for expected in [
-            "internet via server",
-            "web panel; core: server; internet via core",
-            "internet via cabin (refused by agent)",
+            "exit via server",
+            "web panel; core: server; exit via core",
+            "exit via cabin (refused by agent)",
         ] {
             assert!(output.contains(expected), "missing {expected}: {output}");
         }
@@ -708,7 +708,7 @@ mod tests {
             &json!({}),
             None,
         );
-        assert!(cleared.contains("no internet exit any more") && cleared.contains("Re-import"));
+        assert!(cleared.contains("no exit any more") && cleared.contains("Re-import"));
     }
     #[test]
     fn doctor_prints_a_checklist_and_a_verdict() {

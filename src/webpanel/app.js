@@ -78,12 +78,12 @@ function access(a) {
   return JSON.stringify(a);
 }
 
-// "internet via core (refused by the agent)" for a device's exit; empty without one.
+// "exit via core (refused by the agent)" for a device's exit; empty without one.
 function exitText(exit) {
   if (!exit || exit.via === "none" || !exit.via) return "";
-  if (exit.via === "server") return "internet via this server";
+  if (exit.via === "server") return "exit via this server";
   const note = exit.state === "refused" ? " (refused by the agent)" : exit.state === "waiting" ? " (waiting for the agent)" : "";
-  return `internet via ${exit.agent || "?"}${note}`;
+  return `exit via ${exit.agent || "?"}${note}`;
 }
 
 function showBanner(text) {
@@ -333,7 +333,7 @@ function exitNoticeDialog(name, result) {
   if (result.warning) notes.push(result.warning);
   if (result.waiting) notes.push(`Not ready yet: ${result.waiting}`);
   if (result.ipv6 === false) notes.push("This exit has no IPv6: the device's IPv6 traffic is dropped, not leaked.");
-  openModal(`Internet exit of ${name}`,
+  openModal(`Exit of ${name}`,
     ...notes.map((text) => el("p", { class: "hint" }, text)),
     el("p", {}, "Re-import the configuration on the device."),
     el("div", { class: "form" }, el("div", { class: "buttons" },
@@ -405,7 +405,7 @@ function grantsDialog(name) {
   const exitValue = currentExit.via === "agent" ? `agent:${currentExit.agent}` : currentExit.via;
   if (!exitChoices.some(([v]) => v === exitValue)) exitChoices.push([exitValue, `via agent ${currentExit.agent} (not active)`]);
   const exitSelect = select(exitChoices, exitValue);
-  content.push(el("hr", { class: "sep" }), el("h4", {}, "Internet exit"), form([
+  content.push(el("hr", { class: "sep" }), el("h4", {}, "Exit (all traffic through RIFT)"), form([
     row("Send all traffic", exitSelect),
     el("p", { class: "hint" }, "A device has one exit. Via an agent, the device uses a separate profile that reaches the internet through that agent's connection; the web panel and the grants above are not reachable with it, so use a second device for those. The agent must allow it with RIFT_AGENT_ALLOW_EXIT=true."),
   ], "Apply", async () => {

@@ -157,12 +157,12 @@ enum Vpn {
     /// Let a device reach an agent: `rift vpn allow DEVICE AGENT TARGET...`, for example
     /// `rift vpn allow iphone core 22/tcp 53/both`. Without an allow, a device reaches nothing.
     ///
-    /// Use `internet` as a target to send the device's whole internet traffic through that
-    /// agent's connection (`rift vpn allow iphone core internet`), or alone to send it
-    /// through this server (`rift vpn allow iphone internet`). A device has one exit.
+    /// Use `exit` as a target to send all the device's traffic through that agent's
+    /// connection (`rift vpn allow iphone core exit`), or alone to send it through this
+    /// server (`rift vpn allow iphone exit`). A device has one exit.
     Allow(VpnAccessArgs),
     /// Withdraw access again. Without a target, withdraws all of it on that agent, including
-    /// an internet exit through it. `rift vpn deny DEVICE internet` ends the exit through
+    /// an exit through it. `rift vpn deny DEVICE exit` ends the exit through
     /// this server.
     Deny(VpnAccessArgs),
     /// Export the WireGuard configuration of a device.
@@ -201,7 +201,7 @@ struct VpnPlan {
 }
 impl VpnAccessArgs {
     fn plan(&self) -> Result<VpnPlan> {
-        if self.rest == ["internet"] {
+        if self.rest == ["exit"] {
             return Ok(VpnPlan {
                 agent: None,
                 accesses: Vec::new(),
@@ -210,13 +210,13 @@ impl VpnAccessArgs {
         }
         let agent = self.rest[0].clone();
         anyhow::ensure!(
-            agent != "internet",
-            "name the agent first: `rift vpn allow DEVICE AGENT ... internet`. The exit through this server is `rift vpn allow DEVICE internet` on its own"
+            agent != "exit",
+            "name the agent first: `rift vpn allow DEVICE AGENT ... exit`. The exit through this server is `rift vpn allow DEVICE exit` on its own"
         );
-        let internet = self.rest[1..].iter().any(|t| t == "internet");
+        let exit = self.rest[1..].iter().any(|t| t == "exit");
         Ok(VpnPlan {
             accesses: self.accesses(&self.rest[1..])?,
-            exit: internet.then(|| Exit::Agent(agent.clone())),
+            exit: exit.then(|| Exit::Agent(agent.clone())),
             agent: Some(agent),
         })
     }
@@ -225,7 +225,7 @@ impl VpnAccessArgs {
         let (mut ports, mut subnets) = (Vec::new(), Vec::new());
         for target in targets {
             match target.as_str() {
-                "internet" => {}
+                "exit" => {}
                 "server" => server = true,
                 "full" => full = true,
                 t if t
@@ -1159,7 +1159,7 @@ mod tests {
     #[test]
     fn internet_selects_the_exit_through_the_server_or_an_agent() {
         // Alone: the VPS.
-        let plan = vpn_plan(&["rift", "vpn", "allow", "iphone", "internet"])
+        let plan = vpn_plan(&["rift", "vpn", "allow", "iphone", "exit"])
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1171,15 +1171,13 @@ mod tests {
             }
         );
         // After an agent: that agent, and it may come with grants.
-        let plan = vpn_plan(&["rift", "vpn", "allow", "iphone", "core", "internet"])
+        let plan = vpn_plan(&["rift", "vpn", "allow", "iphone", "core", "exit"])
             .unwrap()
             .unwrap();
         assert_eq!(plan.exit, Some(Exit::Agent("core".into())));
         assert!(plan.accesses.is_empty());
-        let requests = vpn_requests(&[
-            "rift", "vpn", "allow", "iphone", "core", "22/tcp", "internet",
-        ])
-        .unwrap();
+        let requests =
+            vpn_requests(&["rift", "vpn", "allow", "iphone", "core", "22/tcp", "exit"]).unwrap();
         assert_eq!(requests.len(), 2, "the grant, then the exit");
         assert!(matches!(
             &requests[0],
@@ -1189,7 +1187,7 @@ mod tests {
             &requests[1],
             AdminRequest::VpnExit { peer, exit: Exit::Agent(agent) } if peer == "iphone" && agent == "core"
         ));
-        let requests = vpn_requests(&["rift", "vpn", "allow", "iphone", "internet"]).unwrap();
+        let requests = vpn_requests(&["rift", "vpn", "allow", "iphone", "exit"]).unwrap();
         assert!(matches!(
             requests.as_slice(),
             [AdminRequest::VpnExit {
@@ -1199,7 +1197,7 @@ mod tests {
         ));
         // `internet` first with more behind it is ambiguous.
         assert!(
-            vpn_plan(&["rift", "vpn", "allow", "iphone", "internet", "22/tcp"])
+            vpn_plan(&["rift", "vpn", "allow", "iphone", "exit", "22/tcp"])
                 .unwrap()
                 .is_err()
         );
@@ -1210,13 +1208,12 @@ mod tests {
     }
     #[test]
     fn deny_internet_clears_only_the_named_exit() {
-        let requests = vpn_requests(&["rift", "vpn", "deny", "iphone", "internet"]).unwrap();
+        let requests = vpn_requests(&["rift", "vpn", "deny", "iphone", "exit"]).unwrap();
         assert!(matches!(
             requests.as_slice(),
             [AdminRequest::VpnExitClear { agent: None, .. }]
         ));
-        let requests =
-            vpn_requests(&["rift", "vpn", "deny", "iphone", "core", "internet"]).unwrap();
+        let requests = vpn_requests(&["rift", "vpn", "deny", "iphone", "core", "exit"]).unwrap();
         assert!(matches!(
             requests.as_slice(),
             [AdminRequest::VpnExitClear { agent: Some(a), .. }] if a == "core"
@@ -1227,10 +1224,8 @@ mod tests {
             requests.as_slice(),
             [AdminRequest::VpnDeny { access: None, .. }]
         ));
-        let requests = vpn_requests(&[
-            "rift", "vpn", "deny", "iphone", "core", "22/tcp", "internet",
-        ])
-        .unwrap();
+        let requests =
+            vpn_requests(&["rift", "vpn", "deny", "iphone", "core", "22/tcp", "exit"]).unwrap();
         assert_eq!(requests.len(), 2);
     }
     #[test]
