@@ -2,8 +2,10 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import os
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -914,6 +916,181 @@ class BackupTests(unittest.TestCase):
         with mock.patch.object(rift_site.os, "geteuid", return_value=1000):
             with self.assertRaisesRegex(rift_site.SiteError, "sudo"):
                 rift_site.command_restore(["x.tar.gz", "--yes"])
+
+
+class QueueTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.queue = Path(self.dir.name)
+        self.counter = 0
+
+    def request(self, document, raw=None):
+        """Queues a request file; returns its id."""
+        self.counter += 1
+        name = f"{self.counter:032x}"
+        if isinstance(document, dict) and raw is None and "id" not in document:
+            document = {"id": name, **document}
+        text = raw if raw is not None else json.dumps(document)
+        path = self.queue / f"{name}.json"
+        path.write_text(text, encoding="utf-8")
+        # Oldest first by modification time.
+        os.utime(path, (1000 + self.counter, 1000 + self.counter))
+        return name
+
+    def result(self, name):
+        return json.loads((self.queue / f"{name}.result.json").read_text())
+
+    def process(self, add=None, remove=None):
+        with mock.patch.object(rift_site, "command_add", add or mock.Mock()) as a, mock.patch.object(
+            rift_site, "command_rm", remove or mock.Mock()
+        ) as r:
+            count = rift_site.command_process_queue(self.queue, now=time.time())
+        return count, a, r
+
+    def good_add(self, **changes):
+        return {"action": "add", "agent": "core", "host": "app.example.net", "port": 8080, **changes}
+
+    def test_an_add_runs_the_add_logic_and_answers(self):
+        def add(agent, host, port, proxy):
+            print(f"https://{host}")
+
+        mocked = mock.Mock(side_effect=add)
+        name = self.request(self.good_add(proxy="caddy"))
+        count, _, _ = self.process(add=mocked)
+        self.assertEqual(count, 1)
+        mocked.assert_called_once_with("core", "app.example.net", 8080, "caddy")
+        self.assertEqual(
+            self.result(name), {"id": name, "ok": True, "message": "https://app.example.net"}
+        )
+        self.assertFalse((self.queue / f"{name}.json").exists())
+
+    def test_the_proxy_is_optional(self):
+        self.request(self.good_add())
+        _, add, _ = self.process()
+        add.assert_called_once_with("core", "app.example.net", 8080, None)
+
+    def test_a_remove_runs_the_remove_logic(self):
+        name = self.request({"action": "remove", "host": "app.example.net"})
+        _, add, remove = self.process()
+        remove.assert_called_once_with("app.example.net")
+        add.assert_not_called()
+        self.assertTrue(self.result(name)["ok"])
+
+    def test_a_failure_is_reported_with_the_helpers_message(self):
+        failing = mock.Mock(side_effect=rift_site.SiteError("agent not found"))
+        name = self.request(self.good_add())
+        self.process(add=failing)
+        answer = self.result(name)
+        self.assertFalse(answer["ok"])
+        self.assertEqual(answer["message"], "agent not found")
+        self.assertFalse((self.queue / f"{name}.json").exists())
+
+    def test_an_unexpected_error_does_not_stop_the_next_request(self):
+        crashing = mock.Mock(side_effect=[KeyError("x"), None])
+        first = self.request(self.good_add())
+        second = self.request(self.good_add(host="b.example.net"))
+        self.process(add=crashing)
+        self.assertFalse(self.result(first)["ok"])
+        self.assertTrue(self.result(second)["ok"])
+
+    def test_requests_run_oldest_first(self):
+        order = []
+        add = mock.Mock(side_effect=lambda agent, host, port, proxy: order.append(host))
+        for host in ("c.example.net", "a.example.net", "b.example.net"):
+            self.request(self.good_add(host=host))
+        self.process(add=add)
+        self.assertEqual(order, ["c.example.net", "a.example.net", "b.example.net"])
+
+    def test_bad_input_is_refused_and_never_executed(self):
+        bad = [
+            self.good_add(agent="x;id"),
+            self.good_add(agent=""),
+            self.good_add(agent=5),
+            self.good_add(host="a b.net"),
+            self.good_add(host="-a.net"),
+            self.good_add(host="$(id).net"),
+            self.good_add(host="a." * 130 + "net"),
+            self.good_add(port=0),
+            self.good_add(port=65536),
+            self.good_add(port="80"),
+            self.good_add(port=True),
+            self.good_add(port=80.5),
+            self.good_add(proxy="apache"),
+            self.good_add(proxy=["caddy"]),
+            self.good_add(command="id"),
+            {"action": "add", "host": "a.net"},
+            {"action": "remove", "host": "a.net", "agent": "core"},
+            {"action": "remove", "host": "a.net;id"},
+            {"action": "remove"},
+            {"action": "restore", "host": "a.net"},
+            {"action": "purge"},
+            {"action": ["add"], "host": "a.net"},
+            ["add"],
+        ]
+        names = [self.request(document) for document in bad]
+        names += [
+            self.request(None, raw="not json"),
+            self.request(None, raw="\xff"),
+            self.request(None, raw="x" * 5000),
+        ]
+        count, add, remove = self.process()
+        self.assertEqual(count, len(names))
+        add.assert_not_called()
+        remove.assert_not_called()
+        for name in names:
+            answer = self.result(name)
+            self.assertFalse(answer["ok"])
+            self.assertTrue(answer["message"].startswith("request refused"), answer)
+            self.assertFalse((self.queue / f"{name}.json").exists())
+
+    def test_the_id_must_match_the_file_name(self):
+        name = self.request({"id": "f" * 32, **self.good_add()})
+        _, add, _ = self.process()
+        add.assert_not_called()
+        self.assertIn("id", self.result(name)["message"])
+
+    def test_links_are_not_followed(self):
+        outside = self.queue / "outside.txt"
+        outside.write_text(json.dumps(self.good_add(id="0" * 32)))
+        link = self.queue / f"{'0' * 32}.json"
+        link.symlink_to(outside)
+        _, add, _ = self.process()
+        add.assert_not_called()
+        self.assertFalse(link.is_symlink())
+        self.assertTrue(outside.exists())
+        self.assertFalse(self.result("0" * 32)["ok"])
+
+    def test_other_files_are_left_alone(self):
+        for name in ("notes.txt", f"{'a' * 32}.json.tmp", f"{'A' * 32}.json", "short.json"):
+            (self.queue / name).write_text("{}")
+        count, _, _ = self.process()
+        self.assertEqual(count, 0)
+        self.assertEqual(len(list(self.queue.iterdir())), 4)
+
+    def test_old_results_are_cleaned_up(self):
+        old = self.queue / f"{'1' * 32}.result.json"
+        fresh = self.queue / f"{'2' * 32}.result.json"
+        stale_tmp = self.queue / f"{'3' * 32}.result.json.tmp"
+        for path in (old, fresh, stale_tmp):
+            path.write_text("{}")
+        long_ago = time.time() - 2 * 24 * 3600
+        for path in (old, stale_tmp):
+            os.utime(path, (long_ago, long_ago))
+        self.process()
+        self.assertFalse(old.exists())
+        self.assertFalse(stale_tmp.exists())
+        self.assertTrue(fresh.exists())
+
+    def test_a_missing_queue_is_not_an_error(self):
+        self.assertEqual(rift_site.command_process_queue(self.queue / "none"), 0)
+
+    def test_the_command_is_wired_into_main(self):
+        with mock.patch.object(rift_site, "command_process_queue") as run:
+            rift_site.main(["rift-site", "process-queue"])
+        run.assert_called_once_with()
+        with self.assertRaises(rift_site.SiteError):
+            rift_site.main(["rift-site", "process-queue", "extra"])
 
 
 if __name__ == "__main__":

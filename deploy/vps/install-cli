@@ -1,5 +1,6 @@
 #!/bin/sh
-# Install the host-side server CLI and website helper.
+# Install the host-side server CLI and website helper, and the host service that carries
+# site requests from the web panel (see README: Web panel). Safe to run again.
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -7,3 +8,40 @@ install -d -m 755 /usr/local/bin /usr/local/lib/rift
 install -m 755 "$script_dir/rift-site" /usr/local/lib/rift/rift-site
 install -m 755 "$script_dir/rift" /usr/local/bin/rift
 printf '%s\n' 'Installed /usr/local/bin/rift and /usr/local/lib/rift/rift-site.'
+
+# The server container reads the site records (read-only) and writes requests into the queue
+# (read-write); only the queue is writable from the container. Created before the first
+# `docker compose up`, with the modes the host service expects.
+install -d -m 755 /var/lib/rift-site
+install -d -m 700 /var/lib/rift-site-queue
+chmod 700 /var/lib/rift-site-queue
+
+if [ ! -d /run/systemd/system ] || ! command -v systemctl > /dev/null 2>&1; then
+    printf '%s\n' 'No systemd here: the web panel cannot add or remove sites. Run' \
+        '  sudo rift add site / sudo rift remove site' \
+        'on the server instead.'
+    exit 0
+fi
+
+cat > /etc/systemd/system/rift-site-queue.path << 'EOF'
+[Unit]
+Description=Site requests from the RIFT web panel
+
+[Path]
+PathExistsGlob=/var/lib/rift-site-queue/????????????????????????????????.json
+
+[Install]
+WantedBy=multi-user.target
+EOF
+cat > /etc/systemd/system/rift-site-queue.service << 'EOF'
+[Unit]
+Description=Process site requests from the RIFT web panel
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/rift/rift-site process-queue
+EOF
+systemctl daemon-reload
+systemctl enable --now rift-site-queue.path
+printf '%s\n' 'Enabled rift-site-queue.path: the web panel can now add and remove sites.'

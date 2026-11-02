@@ -32,6 +32,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     future::Future,
     net::{IpAddr, Ipv6Addr, SocketAddr},
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -227,6 +228,9 @@ pub struct Panel<B> {
     epoch: std::sync::atomic::AtomicU64,
     /// How long a failed login waits before it is answered.
     penalty: Duration,
+    /// The site helper's records (read-only mount) and the request queue for the host service.
+    sites_dir: PathBuf,
+    queue_dir: PathBuf,
 }
 
 impl<B: Backend> Panel<B> {
@@ -240,6 +244,8 @@ impl<B: Backend> Panel<B> {
             epoch: two_factor.epoch().into(),
             two_factor,
             penalty: Duration::from_secs(1),
+            sites_dir: crate::sites::SITES_DIR.into(),
+            queue_dir: crate::sites::QUEUE_DIR.into(),
         }
     }
 
@@ -452,6 +458,8 @@ impl<B: Backend> Panel<B> {
         let panel = self.backend.admin(AdminRequest::PanelStatus).await?;
         let mut overview = compose_overview(&status, &peers, &panel);
         overview["can_write"] = can_write.into();
+        let forwards = overview["forwards"].as_array().cloned().unwrap_or_default();
+        overview["sites"] = crate::sites::overview(&self.sites_dir, &self.queue_dir, &forwards);
         overview["public_ips"] = json!(self.config.public_ips);
         overview["two_factor"] = json!({
             "enabled": self.two_factor.enabled(),
@@ -600,6 +608,22 @@ enum Action {
         name: String,
         allowed: bool,
     },
+    /// Queues "publish `host` through `agent`'s `port`" for the host service; see `crate::sites`.
+    /// Without `proxy` the helper's default applies.
+    SiteAdd {
+        agent: String,
+        host: String,
+        port: u32,
+        #[serde(default)]
+        proxy: Option<String>,
+    },
+    SiteRemove {
+        host: String,
+    },
+    /// The host service's answer to a queued request; `{"done": false}` until it exists.
+    SiteResult {
+        id: String,
+    },
     /// Starts turning two-factor login on: a new pending secret to scan.
     TwoFactorSetup,
     TwoFactorConfirm {
@@ -623,7 +647,10 @@ impl std::fmt::Debug for Code {
 
 impl Action {
     fn writes(&self) -> bool {
-        !matches!(self, Self::Logs { .. } | Self::Diagnostics)
+        !matches!(
+            self,
+            Self::Logs { .. } | Self::Diagnostics | Self::SiteResult { .. }
+        )
     }
 
     async fn run<B: Backend>(self, panel: &Panel<B>) -> Result<Value> {
@@ -842,6 +869,20 @@ impl Action {
                     .admin(AdminRequest::PanelAllow { name, allowed })
                     .await?
             }
+            Self::SiteAdd {
+                agent,
+                host,
+                port,
+                proxy,
+            } => {
+                let request = crate::sites::add(&agent, &host, port, proxy.as_deref())?;
+                json!({"id": crate::sites::enqueue(&panel.queue_dir, &request)?})
+            }
+            Self::SiteRemove { host } => {
+                let request = crate::sites::remove(&host)?;
+                json!({"id": crate::sites::enqueue(&panel.queue_dir, &request)?})
+            }
+            Self::SiteResult { id } => crate::sites::result(&panel.queue_dir, &id)?,
             Self::TwoFactorSetup => {
                 let setup = panel.two_factor.setup(crate::totp::host(&panel.config))?;
                 json!({"secret": setup.secret, "uri": setup.uri, "qr_svg": crate::vpn::qr_svg(&setup.uri)?})
@@ -1517,6 +1558,77 @@ mod tests {
             .unwrap()
             .iter()
             .any(|c| c.contains("VpnConfig") && c.contains("home")));
+    }
+
+    #[tokio::test]
+    async fn site_requests_are_queued_from_trusted_connections_only() {
+        let (mut panel, _) = panel(config(PanelAccess::Private, ""));
+        let sites = tempfile::tempdir().unwrap();
+        let queue = tempfile::tempdir().unwrap();
+        panel.sites_dir = sites.path().into();
+        panel.queue_dir = queue.path().into();
+        let cookie = logged_in(&panel).await;
+        // Behind a reverse proxy the connection is read-only.
+        const PROXIED: &str = "X-Forwarded-For: 203.0.113.7\r\n";
+        let add = r#"{"action":"site_add","agent":"home","host":"app.example.net","port":8080,"proxy":"caddy"}"#;
+        let remove = r#"{"action":"site_remove","host":"app.example.net"}"#;
+        for body in [add, remove] {
+            let refused = act(&panel, "127.0.0.1", &cookie, body, PROXIED).await;
+            assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+        }
+        assert_eq!(crate::sites::pending(queue.path()).unwrap(), 0);
+        let queued = act(&panel, "127.0.0.1", &cookie, add, "").await;
+        assert!(queued.starts_with("HTTP/1.1 200"), "{queued}");
+        let id = queued.split("\"id\":\"").nth(1).unwrap()[..32].to_string();
+        assert!(act(&panel, "10.14.0.2", &cookie, remove, "")
+            .await
+            .starts_with("HTTP/1.1 200"));
+        assert_eq!(crate::sites::pending(queue.path()).unwrap(), 2);
+        // Bad parameters never reach the queue, and neither do unknown fields.
+        for bad in [
+            r#"{"action":"site_add","agent":"home","host":"a b","port":80}"#,
+            r#"{"action":"site_add","agent":"x;id","host":"a.net","port":80}"#,
+            r#"{"action":"site_add","agent":"home","host":"a.net","port":0}"#,
+            r#"{"action":"site_add","agent":"home","host":"a.net","port":99999}"#,
+            r#"{"action":"site_add","agent":"home","host":"a.net","port":80,"proxy":"apache"}"#,
+            r#"{"action":"site_add","agent":"home","host":"a.net","port":80,"command":"id"}"#,
+            r#"{"action":"site_remove","host":"../x"}"#,
+        ] {
+            let answer = act(&panel, "127.0.0.1", &cookie, bad, "").await;
+            assert!(answer.starts_with("HTTP/1.1 400"), "{bad}: {answer}");
+        }
+        assert_eq!(crate::sites::pending(queue.path()).unwrap(), 2);
+        // The answer is a read: any logged-in connection may poll for it.
+        let poll = format!(r#"{{"action":"site_result","id":"{id}"}}"#);
+        let waiting = act(&panel, "127.0.0.1", &cookie, &poll, PROXIED).await;
+        assert!(waiting.contains("\"done\":false"), "{waiting}");
+        std::fs::write(
+            queue.path().join(format!("{id}.result.json")),
+            r#"{"id":"x","ok":true,"message":"https://app.example.net"}"#,
+        )
+        .unwrap();
+        let done = act(&panel, "127.0.0.1", &cookie, &poll, PROXIED).await;
+        assert!(done.contains("\"ok\":true") && done.contains("https://app.example.net"));
+        let traversal = act(
+            &panel,
+            "127.0.0.1",
+            &cookie,
+            r#"{"action":"site_result","id":"../../etc/passwd"}"#,
+            "",
+        )
+        .await;
+        assert!(traversal.starts_with("HTTP/1.1 400"), "{traversal}");
+        // The overview carries the sites card, also without the host helper.
+        let overview = panel.overview(true).await.unwrap();
+        assert_eq!(overview["sites"]["available"], false);
+        std::fs::write(
+            sites.path().join("sites.json"),
+            r#"{"sites":{"app.example.net":{"agent":"home","target":80,"listen":20000,"proxy":"caddy","forward_id":3}}}"#,
+        )
+        .unwrap();
+        let overview = panel.overview(true).await.unwrap();
+        assert_eq!(overview["sites"]["sites"][0]["host"], "app.example.net");
+        assert_eq!(overview["sites"]["sites"][0]["forward"], "missing");
     }
 
     #[tokio::test]

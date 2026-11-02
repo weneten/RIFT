@@ -240,3 +240,12 @@ hr.sep { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
 .dialog .pre + .form, .dialog .qr + .pre, .dialog > .form:last-child { margin-top: 12px; }
 ul.refused { margin-top: 10px; }
 ul.refused li { color: var(--bad); font-size: 13px; }
+.exit-block { margin: 10px 0; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; }
+.exit-block h5 { margin: 0 0 6px; font-size: 13px; }
+.profile-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 4px 0; }
+.profile-row .check { margin: 0; }
+.profile-extra { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.modal .notice { margin: 8px 0; }
+.modal .notice p { margin: 4px 0; }
+.exit-block .check { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.exit-block .check input { width: auto; }

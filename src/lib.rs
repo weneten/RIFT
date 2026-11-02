@@ -10,6 +10,7 @@ pub mod model;
 pub mod net;
 pub mod portable;
 pub mod protocol;
+pub mod sites;
 pub mod state;
 pub mod tls_material;
 pub mod totp;

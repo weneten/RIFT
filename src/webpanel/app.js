@@ -78,12 +78,24 @@ function access(a) {
   return JSON.stringify(a);
 }
 
-// "exit via core (refused by the agent)" for one exit of a device.
+// One exit of a device as text: the main profile sends everything through this server,
+// every agent exit is a separate extra profile.
 function exitText(exit) {
   if (!exit || !exit.via) return "";
-  if (exit.via === "server") return "exit via this server";
+  if (exit.via === "server") return "main profile: all traffic through this server";
   const note = exit.state === "refused" ? " (refused by the agent)" : exit.state === "waiting" ? " (waiting for the agent)" : "";
-  return `exit via ${exit.agent || "?"}${note}`;
+  return `extra profile via ${exit.agent || "?"}${note}`;
+}
+
+// "main: exit via server · profiles: core, cabin (refused)" for the devices table.
+function exitSummary(peer) {
+  const exits = peer.exits || [];
+  const parts = [];
+  if (exits.some((x) => x.via === "server")) parts.push("main: exit via server");
+  const profiles = exits.filter((x) => x.via === "agent")
+    .map((x) => `${x.agent || "?"}${x.state === "refused" ? " (refused)" : x.state === "waiting" ? " (waiting)" : ""}`);
+  if (profiles.length) parts.push(`profiles: ${profiles.join(", ")}`);
+  return parts.join(" · ");
 }
 
 function showBanner(text) {
@@ -288,11 +300,11 @@ async function configDialog(name, agent) {
     closeModal();
     return;
   }
-  const profile = agent ? `exit via ${agent}` : "main profile";
+  const profile = agent ? `extra profile via ${agent}` : "main profile";
   const image = el("img", { alt: `WireGuard QR code for ${name}, ${profile}`, src: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(result.qr_svg)}` });
   const content = [];
   if (agentExits.length) {
-    const choice = select([["", "Main profile"], ...agentExits.map((n) => [n, `Exit via ${n}`])], agent || "");
+    const choice = select([["", "Main profile"], ...agentExits.map((n) => [n, `Extra profile via ${n}`])], agent || "");
     choice.addEventListener("change", () => configDialog(name, choice.value || undefined));
     content.push(row("Profile", choice));
   }
@@ -340,37 +352,33 @@ function twoFactorOffDialog() {
   }));
 }
 
-// After exit changes, which profiles the device needs again. `changes` holds
-// { exit: "server" | { agent }, on, result } for each exit that was added or removed.
-function exitNoticeDialog(name, changes) {
+// Switches one exit of a device and says which profile to import again or delete in the
+// WireGuard app. `exit` is "server" (the main profile) or { agent } (an extra profile).
+async function changeExit(name, exit, on) {
+  const result = await act({ action: "vpn_exit", peer: name, exit, on });
+  await load();
   const notes = [];
-  const profiles = [];
-  for (const { exit, on, result } of changes) {
-    const label = exit === "server" ? "this server" : exit.agent;
-    if (exit === "server") profiles.push({ label: "main profile" });
-    else if (on) profiles.push({ label: `exit via ${exit.agent}`, agent: exit.agent });
-    if (!on) {
-      notes.push(exit === "server"
-        ? "The exit via this server is gone: re-import the main profile."
-        : `The exit via ${exit.agent} is gone: delete that profile in the WireGuard app.`);
-      continue;
-    }
+  if (exit === "server") {
+    notes.push(on
+      ? "Main profile: it now sends all traffic through this server. Delete the old profile of this device in the WireGuard app and import the main profile again."
+      : "Main profile: it no longer sends all traffic through this server. Delete the old profile of this device in the WireGuard app and import the main profile again.");
+  } else if (on) {
+    notes.push(`New extra profile via ${exit.agent}: import it in the WireGuard app with its QR code / config. The main profile stays as it is; switch between the profiles in the app.`);
+  } else {
+    notes.push(`Extra profile via ${exit.agent} removed: delete that profile in the WireGuard app. The main profile is unchanged.`);
+  }
+  if (on) {
     if (result.warning) notes.push(result.warning);
     if (result.waiting) notes.push(`Not ready yet: ${result.waiting}`);
-    if (result.ipv6 === false) notes.push(`The exit via ${label} has no IPv6: the device's IPv6 traffic is dropped, not leaked.`);
+    if (result.ipv6 === false) notes.push(`The profile has no IPv6: the device's IPv6 traffic is dropped, not leaked.`);
   }
-  const buttons = profiles.map((p) => button(`Show ${p.label}`, () => configDialog(name, p.agent), "primary"));
-  const todo = profiles.length ? `Import again on the device: ${profiles.map((p) => p.label).join(", ")}.` : "Nothing to import.";
-  openModal(`Exits of ${name}`,
-    ...notes.map((text) => el("p", { class: "hint" }, text)),
-    el("p", {}, todo),
-    el("div", { class: "form" }, el("div", { class: "buttons" }, ...buttons, button("Done", closeModal))));
+  return notes;
 }
 
-function grantsDialog(name) {
+function grantsDialog(name, notes) {
   const peer = (data.vpn_peers || []).find((p) => p.name === name);
   if (!peer) { closeModal(); return; }
-  const refresh = async () => { await load(); grantsDialog(name); };
+  const refresh = async (notes) => { await load(); grantsDialog(name, notes); };
   const list = el("ul", { class: "grant-list" });
   if (peer.panel) {
     list.append(el("li", {}, el("span", {}, "web panel"),
@@ -389,8 +397,8 @@ function grantsDialog(name) {
     list.append(el("li", {}, el("span", { title: x.reason || "" }, exitText(x)),
       button("Withdraw", async () => {
         try {
-          await act({ action: "vpn_exit", peer: name, exit: x.via === "server" ? "server" : { agent: x.agent }, on: false });
-          await refresh();
+          const exit = x.via === "server" ? "server" : { agent: x.agent };
+          refresh(await changeExit(name, exit, false));
         } catch (e) { showBanner(e.message); }
       }, "danger")));
   }
@@ -427,30 +435,101 @@ function grantsDialog(name) {
       if ((result.warnings || []).length) showBanner(result.warnings.join(" "));
     }));
   }
-  const has = (test) => (peer.exits || []).some(test);
-  const serverBox = el("input", { type: "checkbox", checked: has((x) => x.via === "server") });
-  const agentBoxes = agents.map(([n]) => [n, el("input", { type: "checkbox", checked: has((x) => x.via === "agent" && x.agent === n) })]);
-  content.push(el("hr", { class: "sep" }), el("h4", {}, "Exits (all traffic through RIFT)"), form([
-    check("Exit via this server", serverBox),
-    ...agentBoxes.map(([n, box]) => check(`Exit via ${n}`, box)),
-    el("p", { class: "hint" }, "Each exit is its own WireGuard profile of this device, with the same keys and addresses; switch between them in the WireGuard app. Only the main profile reaches the web panel and the grants above. An agent must allow its exit with RIFT_AGENT_ALLOW_EXIT=true."),
-  ], "Apply", async () => {
-    const wanted = [["server", serverBox.checked, has((x) => x.via === "server")],
-      ...agentBoxes.map(([n, box]) => [{ agent: n }, box.checked, has((x) => x.via === "agent" && x.agent === n)])];
-    const changes = [];
-    for (const [exit, on, was] of wanted) {
-      if (on === was) continue;
-      const result = await act({ action: "vpn_exit", peer: name, exit, on });
-      changes.push({ exit, on, result });
-    }
-    await load();
-    if (changes.length) exitNoticeDialog(name, changes);
-    else closeModal();
-  }));
-  content.push(el("p", { class: "hint" }, "After a change, import the profile again on the device so it routes the new addresses."),
-    el("div", { class: "form" }, el("div", { class: "buttons" },
-      button("Show configuration", () => configDialog(name)), button("Done", closeModal, "primary"))));
+  const exitOf = (agent) => (peer.exits || []).find((x) => agent ? x.via === "agent" && x.agent === agent : x.via === "server");
+  const toggle = (label, current, exit, extra) => {
+    const box = el("input", { type: "checkbox", checked: !!current });
+    box.addEventListener("change", async () => {
+      box.disabled = true;
+      try {
+        refresh(await changeExit(name, exit, box.checked));
+      } catch (e) {
+        box.checked = !box.checked;
+        box.disabled = false;
+        showBanner(`Exit of ${name}: ${e.message}`);
+      }
+    });
+    return el("div", { class: "profile-row" }, check(label, box), extra);
+  };
+  const profileNames = [...new Set([...agents.map(([n]) => n),
+    ...(peer.exits || []).filter((x) => x.via === "agent" && x.agent).map((x) => x.agent)])];
+  content.push(el("hr", { class: "sep" }), el("h4", {}, "Exit (all traffic through RIFT)"),
+    notes && notes.length ? el("div", { class: "notice", role: "status" }, ...notes.map((t) => el("p", {}, t))) : null,
+    el("div", { class: "exit-block" },
+      el("h5", {}, "Main profile (panel and grants)"),
+      toggle("Send all traffic through this server", exitOf(), "server",
+        button("QR code / config", () => configDialog(name))),
+      el("p", { class: "hint" }, "The main profile is the only one that reaches the web panel and the grants above. Without this box it routes only what the grants name.")),
+    el("div", { class: "exit-block" },
+      el("h5", {}, "Extra profiles (one WireGuard entry each, all traffic through that home server)"),
+      ...(profileNames.length ? profileNames.map((n) => {
+        const x = exitOf(n);
+        return toggle(`Profile via ${n}`, x, { agent: n }, x ? el("span", { class: "profile-extra" },
+          button("QR code / config", () => configDialog(name, n)),
+          x.state === "refused" ? el("span", { class: "error small", title: x.reason || "" }, ` refused by the agent${x.reason ? `: ${x.reason}` : ""}`)
+            : x.state === "waiting" ? el("span", { class: "muted small" }, " waiting for the agent") : null) : null);
+      }) : [el("p", { class: "muted" }, "No active agent yet.")]),
+      el("p", { class: "hint" }, "Each extra profile is its own WireGuard entry with the same keys and addresses as the main one; switch between them in the WireGuard app. An agent must allow it with RIFT_AGENT_ALLOW_EXIT=true.")));
+  content.push(el("div", { class: "form" }, el("div", { class: "buttons" }, button("Done", closeModal, "primary"))));
   openModal(`Access of ${name}`, ...content);
+}
+
+// ---------- sites (carried out by the host service, see the README) ----------
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const HOST_MISSING = "The host service did not pick up the request; is `rift-site-queue.path` installed and active? (sudo sh deploy/vps/install-cli)";
+
+// Waits up to 30 seconds for the host's answer to a queued request and shows it.
+async function awaitSite(id, title) {
+  const status = el("p", {}, "Waiting for the host service…");
+  openModal(title, status, el("div", { class: "form" }, el("div", { class: "buttons" }, button("Close", closeModal))));
+  const finish = (ok, text) => {
+    if (!$("modal-body").contains(status)) return;
+    openModal(title,
+      el("p", { class: ok ? "" : "error", role: ok ? "status" : "alert" }, ok ? "Done." : "The host refused or failed:"),
+      text ? el("pre", { class: "pre" }, text) : null,
+      el("div", { class: "form" }, el("div", { class: "buttons" }, button("Done", closeModal, "primary"))));
+  };
+  for (let waited = 0; waited < 30000; waited += 1000) {
+    await sleep(1000);
+    if (!$("modal-body").contains(status)) { await load(); return; }
+    let result;
+    try {
+      result = await act({ action: "site_result", id });
+    } catch (e) {
+      finish(false, e.message);
+      return;
+    }
+    if (result.done) {
+      await load();
+      finish(result.ok, result.message);
+      return;
+    }
+  }
+  finish(false, HOST_MISSING);
+}
+
+function siteDialog() {
+  const agents = agentOptions(true);
+  if (!agents.length) {
+    showBanner("No active agent yet. Invite one first.");
+    return;
+  }
+  const agent = select(agents, agents[0][0]);
+  const host = el("input", { required: true, placeholder: "app.example.net", maxlength: 253 });
+  const port = el("input", { required: true, type: "number", min: 1, max: 65535, placeholder: "8080" });
+  const proxy = select([["", "default"], ["traefik", "Traefik"], ["caddy", "Caddy"], ["nginx", "Nginx"], ["npm", "Nginx Proxy Manager"]], "");
+  openModal("Add site", form([
+    row("Agent", agent),
+    row("Domain", host),
+    row("Target port on the agent", port),
+    row("Proxy", proxy),
+    el("p", { class: "hint" }, "The server's host service publishes https://DOMAIN through your reverse proxy to this port. The domain must already point at this server."),
+  ], "Add site", async () => {
+    const body = { action: "site_add", agent: agent.value, host: host.value.trim(), port: Number(port.value) };
+    if (proxy.value) body.proxy = proxy.value;
+    const queued = await act(body);
+    await awaitSite(queued.id, `Adding ${body.host}`);
+  }));
 }
 
 // ---------- rendering ----------
@@ -573,7 +652,8 @@ function render() {
   fill($("vpn"), peers.map((p) => {
     const grants = (p.grants || []).map((g) => `${g.agent || "?"}: ${access(g.access)}${g.refused ? " (refused)" : ""}`);
     if (p.panel) grants.unshift("panel");
-    for (const x of p.exits || []) grants.push(exitText(x));
+    const exits = exitSummary(p);
+    if (exits) grants.push(exits);
     return el("tr", {},
       el("td", {}, p.name),
       el("td", {}, el("code", {}, p.ipv4)),
@@ -591,6 +671,27 @@ function render() {
           `Revoke ${p.name}? Its key and all grants are deleted. If you are connected through it, you lose the panel.`, "danger"))));
   }), 6, "No VPN devices registered.");
 
+  const sites = data.sites || {};
+  $("sites-hint").hidden = !!sites.available;
+  fill($("sites"), (sites.sites || []).map((site) => {
+    const statePill = site.forward === "ok" ? pill("ok", "ok")
+      : site.forward === "refused" ? Object.assign(pill("refused", "bad"), { title: site.reason || "" })
+      : pill("missing", "warn");
+    return el("tr", {},
+      el("td", {}, site.host),
+      el("td", {}, site.agent),
+      el("td", {}, site.target),
+      el("td", {}, site.proxy),
+      el("td", {}, statePill, site.forward_id ? el("span", { class: "muted small" }, ` #${site.forward_id}`) : null),
+      el("td", { class: "actions" }, btns(button("Remove", async () => {
+        if (!window.confirm(`Remove the site ${site.host} and its forward?`)) return;
+        try {
+          const queued = await act({ action: "site_remove", host: site.host });
+          await awaitSite(queued.id, `Removing ${site.host}`);
+        } catch (e) { showBanner(`Action failed: ${e.message}`); }
+      }, "danger"))));
+  }), 6, sites.available ? "No sites." : "");
+
   const urls = $("panel-urls");
   urls.replaceChildren();
   for (const u of panel.urls || []) {
@@ -603,6 +704,7 @@ function render() {
   }
 
   const factor = data.two_factor || {};
+  $("add-site").onclick = siteDialog;
   $("two-factor").replaceChildren(...[
     el("span", { class: "muted" }, "Two-factor login: "),
     factor.enabled ? pill("on", "ok") : pill("off", "off"),

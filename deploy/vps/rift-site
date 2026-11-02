@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -1757,6 +1758,148 @@ def restore_next_steps():
     )
 
 
+QUEUE_DIR = Path(os.environ.get("RIFT_SITE_QUEUE", "/var/lib/rift-site-queue"))
+QUEUE_REQUEST = re.compile(r"^([0-9a-f]{32})\.json$")
+QUEUE_RESULT_AGE = 24 * 3600
+QUEUE_MAX_BYTES = 4096
+QUEUE_MAX_MESSAGE = 4000
+QUEUE_KEYS = {
+    "add": ({"id", "action", "agent", "host", "port"}, {"proxy"}),
+    "remove": ({"id", "action", "host"}, set()),
+}
+
+
+def parse_queue_request(name, raw):
+    """A request from the web panel's container, checked as if it came from anyone.
+
+    Only `add` and `remove` exist, each with exactly its own keys. Raises SiteError otherwise.
+    """
+    try:
+        request = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        raise SiteError("the request is not valid JSON") from None
+    if not isinstance(request, dict):
+        raise SiteError("the request must be a JSON object")
+    action = request.get("action")
+    if not isinstance(action, str) or action not in QUEUE_KEYS:
+        raise SiteError("only the actions add and remove are accepted")
+    required, optional = QUEUE_KEYS[action]
+    keys = set(request)
+    if not required <= keys or keys - required - optional:
+        raise SiteError(f"a {action} request has exactly the keys {', '.join(sorted(required | optional))}")
+    if request["id"] != name:
+        raise SiteError("the request id does not match its file name")
+    host = request["host"]
+    if not isinstance(host, str) or not valid_host(host):
+        raise SiteError("host is not a valid domain name")
+    if action == "remove":
+        return action, (host,)
+    agent, port, proxy = request["agent"], request["port"], request.get("proxy")
+    if not isinstance(agent, str) or not valid_agent(agent):
+        raise SiteError("agent is not a usable name")
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise SiteError("port must be a number in 1..65535")
+    if proxy is not None and (not isinstance(proxy, str) or proxy not in PROXIES):
+        raise SiteError("proxy must be traefik, caddy, nginx or npm")
+    return action, (agent, host, port, proxy)
+
+
+def read_queue_file(path):
+    """The bytes of a regular file in the queue. Links and other file types are refused."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        raise SiteError("the request is not a regular file") from None
+    with os.fdopen(descriptor, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise SiteError("the request is not a regular file")
+        data = handle.read(QUEUE_MAX_BYTES + 1)
+    if len(data) > QUEUE_MAX_BYTES:
+        raise SiteError("the request is too large")
+    return data
+
+
+def join_message(output, error):
+    return "\n".join(part for part in (output.strip(), error.strip()) if part)
+
+
+def run_queue_request(action, args):
+    """Runs the validated request through the same code as the command line."""
+    output = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            if action == "add":
+                command_add(*args)
+            else:
+                command_rm(*args)
+    except SiteError as error:
+        return False, join_message(output.getvalue(), str(error))
+    except Exception as error:  # a failing request must not stop the others
+        return False, join_message(output.getvalue(), f"{type(error).__name__}: {error}")
+    return True, output.getvalue().strip()
+
+
+def write_queue_result(queue, name, ok, message):
+    message = message.strip()
+    if len(message) > QUEUE_MAX_MESSAGE:
+        message = message[:QUEUE_MAX_MESSAGE] + "..."
+    document = json.dumps({"id": name, "ok": ok, "message": message}) + "\n"
+    temporary = queue / f"{name}.result.json.tmp"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(document)
+    os.replace(temporary, queue / f"{name}.result.json")
+
+
+def clean_queue_results(queue, now):
+    for entry in os.scandir(queue):
+        if not (entry.name.endswith(".result.json") or entry.name.endswith(".tmp")):
+            continue
+        try:
+            if now - entry.stat(follow_symlinks=False).st_mtime > QUEUE_RESULT_AGE:
+                os.unlink(entry.path)
+        except OSError:
+            pass
+
+
+def command_process_queue(queue=None, now=None):
+    """Handles the requests the web panel queued, oldest first, and answers each one.
+
+    Nothing from a request is used beyond the validated add/remove parameters. Every request
+    file is removed, whatever happened, so the path unit does not start again for it.
+    """
+    queue = Path(queue or QUEUE_DIR)
+    if not queue.is_dir():
+        return 0
+    processed = 0
+    while True:
+        found = []
+        for entry in os.scandir(queue):
+            match = QUEUE_REQUEST.match(entry.name)
+            if match:
+                try:
+                    found.append((entry.stat(follow_symlinks=False).st_mtime, entry.name, match.group(1)))
+                except OSError:
+                    pass
+        if not found:
+            break
+        for _, filename, name in sorted(found):
+            path = queue / filename
+            try:
+                action, args = parse_queue_request(name, read_queue_file(path))
+                ok, message = run_queue_request(action, args)
+            except SiteError as error:
+                ok, message = False, f"request refused: {error}"
+            try:
+                write_queue_result(queue, name, ok, message)
+            finally:
+                os.unlink(path)
+            processed += 1
+    clean_queue_results(queue, time.time() if now is None else now)
+    return processed
+
+
 def usage():
     return (
         "usage: rift add site AGENT HOST PORT [traefik|caddy|nginx|npm]\n"
@@ -1782,7 +1925,7 @@ def parse_add_args(args):
 
 def main(argv):
     """Commands as the host `rift` wrapper passes them: add, remove, list, forwards, proxy, purge,
-    export, import, backup, restore and resync."""
+    export, import, backup, restore, process-queue and resync."""
     if len(argv) < 2:
         raise SiteError(usage())
     command = argv[1]
@@ -1816,6 +1959,9 @@ def main(argv):
         return
     if command == "restore":
         command_restore(argv[2:])
+        return
+    if command == "process-queue" and len(argv) == 2:
+        command_process_queue()
         return
     if command == "resync" and len(argv) == 2:
         sys.exit(1 if resync_sites() else 0)

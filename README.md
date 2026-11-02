@@ -101,7 +101,7 @@ Wait for `RIFT server ready`, then leave the log view with Ctrl+C. On the **serv
 sudo sh deploy/vps/install-cli
 ```
 
-This installs `/usr/local/bin/rift` and the site helper under `/usr/local/lib/rift`. It replaces any existing files at those paths. The command runs on the server and forwards administrative arguments to the `rift-server` Docker container; it requires Docker access (use `sudo rift ...` if your user cannot access Docker). `sudo rift add site ...` and the other site commands run the host-side proxy helper and requires Python 3 and administrator access. Ensure `/usr/local/bin` is in your PATH, including sudo's PATH. The original `docker exec rift-server rift --config /etc/rift/config.toml ...` remains available.
+This installs `/usr/local/bin/rift` and the site helper under `/usr/local/lib/rift`. It replaces any existing files at those paths. The command runs on the server and forwards administrative arguments to the `rift-server` Docker container; it requires Docker access (use `sudo rift ...` if your user cannot access Docker). `sudo rift add site ...` and the other site commands run the host-side proxy helper and requires Python 3 and administrator access. Ensure `/usr/local/bin` is in your PATH, including sudo's PATH. The original `docker exec rift-server rift --config /etc/rift/config.toml ...` remains available. The script also creates `/var/lib/rift-site` and `/var/lib/rift-site-queue` (mounted into the server container) and enables the systemd path unit `rift-site-queue.path` that lets the web panel add and remove sites; run it before the first `docker compose up`.
 
 Check the server with:
 
@@ -348,7 +348,7 @@ sudo rift remove site app.example.net
 
 The helper remembers which RIFT installation its site records belong to. After a fresh installation (for example `docker compose down -v`), the next site command removes the old records and their proxy configuration and says so, so no domain keeps pointing at a dead port.
 
-`sudo rift list sites` shows the sites the helper manages with their forward ID and whether that forward still exists. On the server, `rift list forwards` (the installed CLI) adds a SITE column with the domain and proxy of each forward that `rift add site` created; `rift --json list forwards` and the command inside the container are unchanged. Manage these forwards only through the site commands: if you delete one with `rift remove forward`, `list` shows it as `missing` and running `rift add site` for the same site creates it again.
+The web panel adds and removes sites through a host service that runs these same commands; see [Web panel](#web-panel) for the queue and what it is allowed to do. `sudo rift list sites` shows the sites the helper manages with their forward ID and whether that forward still exists. On the server, `rift list forwards` (the installed CLI) adds a SITE column with the domain and proxy of each forward that `rift add site` created; `rift --json list forwards` and the command inside the container are unchanged. Manage these forwards only through the site commands: if you delete one with `rift remove forward`, `list` shows it as `missing` and running `rift add site` for the same site creates it again.
 
 To inspect or change the helper's default proxy:
 
@@ -454,7 +454,7 @@ rift vpn config qr iphone core   # scan the profile for core
 
 `exit` may sit beside other targets: `rift vpn allow iphone core 22/tcp exit` grants port 22 on `core` and adds the exit through `core`. Exits add up: allowing another one keeps the others. Remove one at a time: `rift vpn deny iphone exit` ends the server exit, `rift vpn deny iphone core exit` only the one through `core`, and `rift vpn deny iphone core` withdraws every grant on `core` together with that exit. After a change RIFT names the profile to import again, for example `Import the profile: rift vpn config qr iphone core`. `rift list devices` shows the exits in the ACCESS column (`exit via server; exit via core; exit via core2`, each with `(refused by agent)` or `(waiting for the agent)` when it does not work yet). The agent name `exit` is reserved.
 
-**One device, several profiles.** Every profile of a device uses the same key pair and the same addresses; only one of them is active on the phone at a time, so you switch between them in the WireGuard app. The main profile reaches the web panel and the grants as usual, and with the server exit it also carries all internet traffic. A profile for an agent ends at that agent instead, so the panel and the grants on the VPS are **not** reachable while it is active: switch back to the main profile for those. The web panel offers the same in a device's Access dialog (a checkbox per exit) and shows one QR code or configuration per profile.
+**One device, several profiles.** Every profile of a device uses the same key pair and the same addresses; only one of them is active on the phone at a time, so you switch between them in the WireGuard app. The main profile reaches the web panel and the grants as usual, and with the server exit it also carries all internet traffic. A profile for an agent ends at that agent instead, so the panel and the grants on the VPS are **not** reachable while it is active: switch back to the main profile for those. The web panel offers the same in a device's Access dialog: a "Main profile" block with the box "Send all traffic through this server", an "Extra profiles" block with one switch per agent, a QR code or configuration button per profile, and a note after each change saying which profile to import again or delete in the WireGuard app. The devices table shows them apart, for example `main: exit via server · profiles: core`.
 
 ### Exit through the VPS
 
@@ -500,7 +500,7 @@ Pools, DNS and ports in the configuration: see the [Configuration](#configuratio
 
 ## Web panel
 
-The server can serve a web panel with what the CLI does: agents and invitations, forwards and bans, VPN devices with their grants, internet exit and WireGuard configuration (as QR code or file), panel access, reconcile, the recent log and diagnostics. Only printing the panel password stays in the CLI. The panel is **off** by default. Enable it in the server `.env` and recreate the container:
+The server can serve a web panel with what the CLI does: agents and invitations, forwards and bans, VPN devices with their grants, internet exit and WireGuard configuration (as QR code or file), panel access, sites, reconcile, the recent log and diagnostics. Only printing the panel password stays in the CLI. The panel is **off** by default. Enable it in the server `.env` and recreate the container:
 
 ```dotenv
 RIFT_WEBPANEL=true
@@ -555,6 +555,14 @@ rift panel connect laptop --export > laptop.conf   # the same as a file (contain
 ```
 
 Import the configuration into the WireGuard app, connect, and open `http://10.13.0.1:8090` (the server's `RIFT_SERVER_IPV4`). The device reaches only that port on the server; its configuration routes only the server's tunnel address, plus whatever `rift vpn allow` grants it on agents. `rift panel allow NAME` grants an existing VPN device; re-import its configuration afterwards so it routes the server address. `rift panel deny NAME` withdraws panel access and keeps the device's other grants. Disabling or removing the device also ends its panel access.
+
+**Sites in the panel.** The panel has a Sites card (domain, agent, target port, proxy, and whether the site's forward is `ok`, `missing` or `refused`) with "Add site" and "Remove". Sites need root, Docker and the proxy's files, which the container does not have, so the panel works through a narrow bridge to the host:
+
+- The server container mounts `/var/lib/rift-site` **read-only** (the helper's `sites.json`, which the card lists) and `/var/lib/rift-site-queue` read-write. Nothing else of the host is visible, and the container cannot write to the site records or the proxy configuration.
+- An add or remove from a trusted connection (the same rule as every other change) validates the request in the panel first (agent name, domain of at most 253 characters, port 1-65535, proxy `traefik`, `caddy`, `nginx` or `npm`, or none) and writes one small JSON file into the queue: `{id, action: "add", agent, host, port, proxy?}` or `{id, action: "remove", host}`. At most 20 requests wait at a time.
+- On the host, the systemd units `rift-site-queue.path` and `rift-site-queue.service` (installed by `deploy/vps/install-cli`) run `rift-site process-queue` when a request appears. It checks every request again, trusting nothing from the container: only the actions `add` and `remove`, exactly their keys, a request id that matches the file name, the same name, domain, port and proxy rules, no links, at most 4 KiB. A request that fails any check is refused without running anything. A valid one goes through the same code as `sudo rift add site` and `sudo rift remove site`; no request text reaches a shell. The answer (`ok` and the helper's output or error) is written to `<id>.result.json`, the request file is deleted, and results older than a day are cleaned up. The panel polls for the answer for up to 30 seconds and shows it.
+
+If the host command is not installed, the card says that sites are managed on the host. If it is installed but the units are not active, a request ends with "The host service did not pick up the request; is `rift-site-queue.path` installed and active?". Run `sudo sh deploy/vps/install-cli` (also after `git pull`) and check `systemctl status rift-site-queue.path`. Run it before the first `docker compose up`: it creates `/var/lib/rift-site` and `/var/lib/rift-site-queue`. If Docker creates them first (Compose v2 does for a missing bind source) the panel works the same once the units exist. `sudo sh deploy/uninstall-host` removes the units and `--purge` also the queue directory.
 
 **Public mode** opens the port in UFW when RIFT manages it (`host_firewall = "auto"`); open it in any upstream firewall or cloud security group yourself. The panel speaks plain HTTP. In public mode the password and session cookie cross the network unencrypted, so prefer private mode, restrict `RIFT_WEBPANEL_ALLOW`, or put a TLS reverse proxy in front (the cookie is marked `Secure` when the proxy sends `X-Forwarded-Proto: https`). Public sessions are read-only, so a password read off the network alone allows no changes; it still shows your agents, ports and devices.
 
@@ -699,6 +707,9 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | `rift add site AGENT DOMAIN PORT [traefik\|caddy\|nginx\|npm]` | Publishes `https://DOMAIN` through your reverse proxy to `PORT` on the agent. Without a proxy word the default is used. |
 | `rift list sites` | All sites with their forward state (`ok`, `missing`, `refused`). |
 | `rift remove site DOMAIN` | Removes the site, its proxy configuration and its forward. |
+
+The web panel runs the same two commands through the host service (`rift-site-queue.path`, installed by `deploy/vps/install-cli`); see [Web panel](#web-panel).
+
 | `rift proxy [traefik\|caddy\|nginx\|npm]` | Shows or sets the default proxy. |
 
 **VPN devices (phones, laptops)**

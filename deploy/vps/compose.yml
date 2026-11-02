@@ -21,6 +21,10 @@ services:
     volumes:
       - rift-state:/var/lib/rift
       - ./config.toml:/etc/rift/config.toml:ro
+      # Web panel sites: the host helper's records (read-only) and the request queue the
+      # host service answers. Created by install-cli; Docker creates them empty otherwise.
+      - /var/lib/rift-site:/var/lib/rift-site:ro
+      - /var/lib/rift-site-queue:/var/lib/rift-site-queue
     environment:
       RIFT_PUBLIC_ENDPOINT: ${RIFT_PUBLIC_ENDPOINT:?Set RIFT_PUBLIC_ENDPOINT in the root .env}
       RIFT_PUBLIC_IPS: ${RIFT_PUBLIC_IPS:?Set RIFT_PUBLIC_IPS in the root .env}
