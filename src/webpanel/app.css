@@ -249,3 +249,5 @@ ul.refused li { color: var(--bad); font-size: 13px; }
 .modal .notice p { margin: 4px 0; }
 .exit-block .check { display: flex; align-items: center; gap: 8px; font-size: 14px; }
 .exit-block .check input { width: auto; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }

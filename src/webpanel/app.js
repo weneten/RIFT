@@ -43,6 +43,14 @@ function el(tag, attrs, ...children) {
   return node;
 }
 
+// A link that opens in a new tab. Only http(s) addresses become links, anything else stays text.
+function link(href, text) {
+  let url;
+  try { url = new URL(href); } catch (_) { return text; }
+  if (url.protocol !== "https:" && url.protocol !== "http:") return text;
+  return el("a", { href: url.href, target: "_blank", rel: "noopener noreferrer" }, text);
+}
+
 const pill = (text, kind) => el("span", { class: `pill ${kind}` }, text);
 
 function ago(unix, now) {
@@ -678,7 +686,7 @@ function render() {
       : site.forward === "refused" ? Object.assign(pill("refused", "bad"), { title: site.reason || "" })
       : pill("missing", "warn");
     return el("tr", {},
-      el("td", {}, site.host),
+      el("td", {}, link(`https://${site.host}`, site.host)),
       el("td", {}, site.agent),
       el("td", {}, site.target),
       el("td", {}, site.proxy),
@@ -695,7 +703,7 @@ function render() {
   const urls = $("panel-urls");
   urls.replaceChildren();
   for (const u of panel.urls || []) {
-    urls.append(el("li", {}, el("code", {}, u.url), el("span", { class: "muted" }, u.via)));
+    urls.append(el("li", {}, el("code", {}, link(u.url, u.url)), el("span", { class: "muted" }, u.via)));
   }
   const devices = (panel.devices || []).map((d) => d.name);
   urls.append(el("li", {}, el("span", { class: "muted" }, "Devices with panel access:"), devices.length ? devices.join(", ") : "none"));
