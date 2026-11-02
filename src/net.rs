@@ -701,7 +701,10 @@ impl Kernel {
             match (backend.as_str(), host.status["mode"].as_str()) {
                 ("ufw", Some("auto")) => "UFW; RIFT keeps its own rules in it".into(),
                 ("ufw", _) => "UFW, but host_firewall is off: open the ports yourself".into(),
-                _ => "no UFW found; open the ports in your firewall yourself".into(),
+                _ if host.warnings.is_empty() => {
+                    "no UFW, and nothing found that blocks RIFT".into()
+                }
+                _ => "no UFW; another firewall blocks RIFT, see below".into(),
             },
         );
         for warning in &host.warnings {
@@ -991,7 +994,7 @@ impl Kernel {
                 };
             }
         };
-        let obs = match crate::host_firewall::observe(&ruleset) {
+        let obs = match crate::host_firewall::observe_for(&ruleset, self.interface()) {
             Ok(obs) => obs,
             Err(error) => {
                 return crate::host_firewall::DoctorReport {

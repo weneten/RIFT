@@ -38,6 +38,13 @@ pub struct Observation {
     jumps: Vec<JumpRef>,
     pub forward_policy_drop: bool,
     pub input_policy_drop: bool,
+    /// Base chains (family, table, name) hooked at input or forward, with that hook.
+    hooked: Vec<(String, String, String, String)>,
+    /// The tunnel interface is accepted on input / forwarded in / forwarded out by a rule of
+    /// another table (for example `iptables -I INPUT -i rift0 -j ACCEPT`).
+    pub input_open: bool,
+    pub forward_in_open: bool,
+    pub forward_out_open: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -96,6 +103,12 @@ pub struct DoctorReport {
 }
 
 pub fn observe(document: &Value) -> Result<Observation> {
+    observe_for(document, "rift0")
+}
+
+/// Like `observe`, and also notes catch-all rejects (as on Oracle Cloud images) and rules of
+/// other tables that already accept `interface`.
+pub fn observe_for(document: &Value, interface: &str) -> Result<Observation> {
     let entries = document
         .get("nftables")
         .and_then(Value::as_array)
@@ -105,11 +118,62 @@ pub fn observe(document: &Value) -> Result<Observation> {
         if let Some(chain) = entry.get("chain") {
             observe_chain(&mut obs, chain);
         }
+    }
+    for entry in entries {
         if let Some(rule) = entry.get("rule") {
             observe_rule(&mut obs, rule);
+            observe_base_rule(&mut obs, rule, interface);
         }
     }
     Ok(obs)
+}
+
+/// A rule in a hooked input/forward chain of another table: a final `reject`/`drop` without
+/// matches counts like a drop policy; an `accept` matching the tunnel interface opens it.
+fn observe_base_rule(obs: &mut Observation, rule: &Value, interface: &str) {
+    let Some(reference) = chain_ref(rule) else {
+        return;
+    };
+    if reference.table == "rift" {
+        return;
+    }
+    let Some(hook) = obs
+        .hooked
+        .iter()
+        .find(|(f, t, n, _)| {
+            *f == reference.family && *t == reference.table && *n == reference.name
+        })
+        .map(|(_, _, _, hook)| hook.clone())
+    else {
+        return;
+    };
+    let Some(expr) = rule.get("expr").and_then(Value::as_array) else {
+        return;
+    };
+    let has = |key: &str| expr.iter().any(|e| e.get(key).is_some());
+    let matches_iface = |key: &str| {
+        expr.iter().any(|e| {
+            e.get("match").is_some_and(|m| {
+                m["left"]["meta"]["key"] == key && m["right"] == interface && m["op"] == "=="
+            })
+        })
+    };
+    let plain = !has("match");
+    if plain && (has("reject") || has("drop")) {
+        match hook.as_str() {
+            "input" => obs.input_policy_drop = true,
+            "forward" => obs.forward_policy_drop = true,
+            _ => {}
+        }
+    }
+    if has("accept") && expr.iter().filter(|e| e.get("match").is_some()).count() == 1 {
+        match hook.as_str() {
+            "input" if matches_iface("iifname") => obs.input_open = true,
+            "forward" if matches_iface("iifname") => obs.forward_in_open = true,
+            "forward" if matches_iface("oifname") => obs.forward_out_open = true,
+            _ => {}
+        }
+    }
 }
 
 pub fn uplinks(addresses: &Value, public_ips: &[IpAddr]) -> Result<Vec<String>> {
@@ -349,15 +413,18 @@ pub fn report(
     };
     let uplinks_missing = public_ips_configured && uplinks.is_empty() && !obs.forward.is_empty();
     let mut warnings = Vec::new();
-    if obs.forward_policy_drop && obs.forward.is_empty() {
+    if obs.forward_policy_drop
+        && obs.forward.is_empty()
+        && !(obs.forward_in_open && obs.forward_out_open)
+    {
         warnings.push(
-            "Host filter drops forwarded packets and has no UFW user chain RIFT can extend."
+            "Another firewall (not UFW) drops forwarded packets, for example Docker or the final REJECT of Oracle Cloud images; RIFT cannot open it, so forwards and exits fail. Fix: sudo iptables -I FORWARD 1 -i rift0 -j ACCEPT && sudo iptables -I FORWARD 1 -o rift0 -j ACCEPT, then keep it with sudo netfilter-persistent save (or your firewall's own way)."
                 .to_string(),
         );
     }
-    if obs.input_policy_drop && obs.input.is_empty() {
+    if obs.input_policy_drop && obs.input.is_empty() && !obs.input_open {
         warnings.push(
-            "Host filter drops input and has no UFW user chain RIFT can extend. Tunnel control stays blocked."
+            "Another firewall (not UFW) drops incoming packets, for example the final REJECT of Oracle Cloud images; agents, the web panel and enrollment over the tunnel are blocked. Fix: sudo iptables -I INPUT 1 -i rift0 -j ACCEPT, then keep it with sudo netfilter-persistent save (or your firewall's own way)."
                 .to_string(),
         );
     }
@@ -406,6 +473,14 @@ fn observe_chain(obs: &mut Observation, chain: &Value) {
     if chain.get("hook").is_some() {
         let policy = chain.get("policy").and_then(Value::as_str).unwrap_or("");
         let hook = chain.get("hook").and_then(Value::as_str).unwrap_or("");
+        if hook == "input" || hook == "forward" {
+            obs.hooked.push((
+                reference.family.clone(),
+                reference.table.clone(),
+                reference.name.clone(),
+                hook.to_string(),
+            ));
+        }
         if policy == "drop" && hook == "forward" {
             obs.forward_policy_drop = true;
         }
@@ -606,6 +681,50 @@ mod tests {
             panel: None,
             exit: false,
         }
+    }
+
+    fn oracle_like(input_accepts_rift0: bool, forward_open: bool) -> Value {
+        let chain = |name: &str, hook: &str| json!({"chain": {"family": "ip", "table": "filter", "name": name, "hook": hook, "policy": "accept"}});
+        let accept = |chain: &str, key: &str| {
+            json!({"rule": {"family": "ip", "table": "filter", "chain": chain, "expr": [
+                {"match": {"op": "==", "left": {"meta": {"key": key}}, "right": "rift0"}},
+                {"counter": {"packets": 0, "bytes": 0}},
+                {"accept": null}
+            ]}})
+        };
+        let reject = |chain: &str| {
+            json!({"rule": {"family": "ip", "table": "filter", "chain": chain, "expr": [
+                {"counter": {"packets": 0, "bytes": 0}},
+                {"reject": {"type": "icmp", "expr": "host-prohibited"}}
+            ]}})
+        };
+        let mut entries = vec![chain("INPUT", "input"), chain("FORWARD", "forward")];
+        if input_accepts_rift0 {
+            entries.push(accept("INPUT", "iifname"));
+        }
+        if forward_open {
+            entries.push(accept("FORWARD", "iifname"));
+            entries.push(accept("FORWARD", "oifname"));
+        }
+        entries.push(reject("INPUT"));
+        entries.push(reject("FORWARD"));
+        json!({"nftables": entries})
+    }
+
+    #[test]
+    fn a_final_reject_without_ufw_is_reported_with_the_command_to_fix_it() {
+        let obs = observe_for(&oracle_like(false, false), "rift0").unwrap();
+        let warnings = report("auto", &obs, &[], true).warnings;
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("sudo iptables -I INPUT 1 -i rift0 -j ACCEPT")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("sudo iptables -I FORWARD 1 -o rift0 -j ACCEPT")));
+        // Once rift0 is accepted ahead of the reject, nothing is left to warn about.
+        let obs = observe_for(&oracle_like(true, true), "rift0").unwrap();
+        assert!(report("auto", &obs, &[], true).warnings.is_empty());
     }
 
     #[test]
