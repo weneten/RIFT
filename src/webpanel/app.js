@@ -78,9 +78,9 @@ function access(a) {
   return JSON.stringify(a);
 }
 
-// "exit via core (refused by the agent)" for a device's exit; empty without one.
+// "exit via core (refused by the agent)" for one exit of a device.
 function exitText(exit) {
-  if (!exit || exit.via === "none" || !exit.via) return "";
+  if (!exit || !exit.via) return "";
   if (exit.via === "server") return "exit via this server";
   const note = exit.state === "refused" ? " (refused by the agent)" : exit.state === "waiting" ? " (waiting for the agent)" : "";
   return `exit via ${exit.agent || "?"}${note}`;
@@ -274,23 +274,36 @@ function deviceDialog() {
   }));
 }
 
-async function configDialog(name) {
+// The profiles of a device: the main one, then one per agent exit. Each is its own
+// WireGuard configuration; the device uses the same keys and addresses in all of them.
+async function configDialog(name, agent) {
+  const peer = (data.vpn_peers || []).find((p) => p.name === name);
+  const agentExits = ((peer && peer.exits) || []).filter((x) => x.via === "agent" && x.agent).map((x) => x.agent);
+  if (agent && !agentExits.includes(agent)) agent = undefined;
   let result;
   try {
-    result = await act({ action: "vpn_config", name });
+    result = await act({ action: "vpn_config", name, ...(agent ? { agent } : {}) });
   } catch (e) {
     showBanner(`Configuration of ${name}: ${e.message}`);
     closeModal();
     return;
   }
-  const image = el("img", { alt: `WireGuard QR code for ${name}`, src: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(result.qr_svg)}` });
+  const profile = agent ? `exit via ${agent}` : "main profile";
+  const image = el("img", { alt: `WireGuard QR code for ${name}, ${profile}`, src: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(result.qr_svg)}` });
+  const content = [];
+  if (agentExits.length) {
+    const choice = select([["", "Main profile"], ...agentExits.map((n) => [n, `Exit via ${n}`])], agent || "");
+    choice.addEventListener("change", () => configDialog(name, choice.value || undefined));
+    content.push(row("Profile", choice));
+  }
   openModal(`WireGuard configuration: ${name}`,
+    ...content,
     el("p", { class: "warn-text" }, "Contains the device's private key. Do not share or store it carelessly."),
     el("div", { class: "qr" }, image),
     el("pre", { class: "pre" }, result.config),
     el("div", { class: "form" }, el("div", { class: "buttons" },
       button("Copy", (e) => copy(result.config, e.currentTarget)),
-      button("Download .conf", () => download(`${name}.conf`, result.config)),
+      button("Download .conf", () => download(agent ? `${name}-${agent}.conf` : `${name}.conf`, result.config)),
       button("Done", closeModal, "primary"))));
 }
 
@@ -327,17 +340,31 @@ function twoFactorOffDialog() {
   }));
 }
 
-// After an exit change the device needs its new configuration.
-function exitNoticeDialog(name, result) {
+// After exit changes, which profiles the device needs again. `changes` holds
+// { exit: "server" | { agent }, on, result } for each exit that was added or removed.
+function exitNoticeDialog(name, changes) {
   const notes = [];
-  if (result.warning) notes.push(result.warning);
-  if (result.waiting) notes.push(`Not ready yet: ${result.waiting}`);
-  if (result.ipv6 === false) notes.push("This exit has no IPv6: the device's IPv6 traffic is dropped, not leaked.");
-  openModal(`Exit of ${name}`,
+  const profiles = [];
+  for (const { exit, on, result } of changes) {
+    const label = exit === "server" ? "this server" : exit.agent;
+    if (exit === "server") profiles.push({ label: "main profile" });
+    else if (on) profiles.push({ label: `exit via ${exit.agent}`, agent: exit.agent });
+    if (!on) {
+      notes.push(exit === "server"
+        ? "The exit via this server is gone: re-import the main profile."
+        : `The exit via ${exit.agent} is gone: delete that profile in the WireGuard app.`);
+      continue;
+    }
+    if (result.warning) notes.push(result.warning);
+    if (result.waiting) notes.push(`Not ready yet: ${result.waiting}`);
+    if (result.ipv6 === false) notes.push(`The exit via ${label} has no IPv6: the device's IPv6 traffic is dropped, not leaked.`);
+  }
+  const buttons = profiles.map((p) => button(`Show ${p.label}`, () => configDialog(name, p.agent), "primary"));
+  const todo = profiles.length ? `Import again on the device: ${profiles.map((p) => p.label).join(", ")}.` : "Nothing to import.";
+  openModal(`Exits of ${name}`,
     ...notes.map((text) => el("p", { class: "hint" }, text)),
-    el("p", {}, "Re-import the configuration on the device."),
-    el("div", { class: "form" }, el("div", { class: "buttons" },
-      button("Show configuration", () => configDialog(name), "primary"), button("Done", closeModal))));
+    el("p", {}, todo),
+    el("div", { class: "form" }, el("div", { class: "buttons" }, ...buttons, button("Done", closeModal))));
 }
 
 function grantsDialog(name) {
@@ -358,12 +385,11 @@ function grantsDialog(name) {
         } catch (e) { showBanner(e.message); }
       }, "danger")));
   }
-  const currentExit = peer.exit || { via: "none" };
-  if (currentExit.via !== "none") {
-    list.append(el("li", {}, el("span", { title: currentExit.reason || "" }, exitText(currentExit)),
+  for (const x of peer.exits || []) {
+    list.append(el("li", {}, el("span", { title: x.reason || "" }, exitText(x)),
       button("Withdraw", async () => {
         try {
-          await act({ action: "vpn_exit", peer: name, exit: "none" });
+          await act({ action: "vpn_exit", peer: name, exit: x.via === "server" ? "server" : { agent: x.agent }, on: false });
           await refresh();
         } catch (e) { showBanner(e.message); }
       }, "danger")));
@@ -401,21 +427,27 @@ function grantsDialog(name) {
       if ((result.warnings || []).length) showBanner(result.warnings.join(" "));
     }));
   }
-  const exitChoices = [["none", "none"], ["server", "via this server"], ...agents.map(([n]) => [`agent:${n}`, `via agent ${n}`])];
-  const exitValue = currentExit.via === "agent" ? `agent:${currentExit.agent}` : currentExit.via;
-  if (!exitChoices.some(([v]) => v === exitValue)) exitChoices.push([exitValue, `via agent ${currentExit.agent} (not active)`]);
-  const exitSelect = select(exitChoices, exitValue);
-  content.push(el("hr", { class: "sep" }), el("h4", {}, "Exit (all traffic through RIFT)"), form([
-    row("Send all traffic", exitSelect),
-    el("p", { class: "hint" }, "A device has one exit. Via an agent, the device uses a separate profile that reaches the internet through that agent's connection; the web panel and the grants above are not reachable with it, so use a second device for those. The agent must allow it with RIFT_AGENT_ALLOW_EXIT=true."),
+  const has = (test) => (peer.exits || []).some(test);
+  const serverBox = el("input", { type: "checkbox", checked: has((x) => x.via === "server") });
+  const agentBoxes = agents.map(([n]) => [n, el("input", { type: "checkbox", checked: has((x) => x.via === "agent" && x.agent === n) })]);
+  content.push(el("hr", { class: "sep" }), el("h4", {}, "Exits (all traffic through RIFT)"), form([
+    check("Exit via this server", serverBox),
+    ...agentBoxes.map(([n, box]) => check(`Exit via ${n}`, box)),
+    el("p", { class: "hint" }, "Each exit is its own WireGuard profile of this device, with the same keys and addresses; switch between them in the WireGuard app. Only the main profile reaches the web panel and the grants above. An agent must allow its exit with RIFT_AGENT_ALLOW_EXIT=true."),
   ], "Apply", async () => {
-    const choice = exitSelect.value;
-    const exit = choice.startsWith("agent:") ? { agent: choice.slice(6) } : choice;
-    const result = await act({ action: "vpn_exit", peer: name, exit });
+    const wanted = [["server", serverBox.checked, has((x) => x.via === "server")],
+      ...agentBoxes.map(([n, box]) => [{ agent: n }, box.checked, has((x) => x.via === "agent" && x.agent === n)])];
+    const changes = [];
+    for (const [exit, on, was] of wanted) {
+      if (on === was) continue;
+      const result = await act({ action: "vpn_exit", peer: name, exit, on });
+      changes.push({ exit, on, result });
+    }
     await load();
-    exitNoticeDialog(name, result);
+    if (changes.length) exitNoticeDialog(name, changes);
+    else closeModal();
   }));
-  content.push(el("p", { class: "hint" }, "After a change, re-import the device's configuration so it routes the new addresses."),
+  content.push(el("p", { class: "hint" }, "After a change, import the profile again on the device so it routes the new addresses."),
     el("div", { class: "form" }, el("div", { class: "buttons" },
       button("Show configuration", () => configDialog(name)), button("Done", closeModal, "primary"))));
   openModal(`Access of ${name}`, ...content);
@@ -541,8 +573,7 @@ function render() {
   fill($("vpn"), peers.map((p) => {
     const grants = (p.grants || []).map((g) => `${g.agent || "?"}: ${access(g.access)}${g.refused ? " (refused)" : ""}`);
     if (p.panel) grants.unshift("panel");
-    const exit = exitText(p.exit);
-    if (exit) grants.push(exit);
+    for (const x of p.exits || []) grants.push(exitText(x));
     return el("tr", {},
       el("td", {}, p.name),
       el("td", {}, el("code", {}, p.ipv4)),

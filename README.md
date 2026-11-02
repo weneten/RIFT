@@ -423,7 +423,7 @@ rift vpn config export iphone > iphone.conf    # or export a file (contains the 
 
 Manage devices with `rift list devices`, `rift disable device NAME` / `rift enable device NAME` (reversible) and `rift remove device NAME` (deletes the device, its key and its grants). `rift vpn deny NAME AGENT [TARGET...]` withdraws grants; without selectors it withdraws everything on that agent. Revocation and denial close the path on the server in the same reconcile pass; the agent follows on its next sync.
 
-Client configurations are split-tunnel unless the device has an [internet exit](#use-rift-as-a-vpn-exit): `AllowedIPs` lists only the granted addresses. Every device has an IPv4 and an IPv6 address; grants use IPv4 only. Exported files and QR codes contain the device's private key, which stays in a mode-0600 file under the state volume and is never logged.
+Main profiles are split-tunnel unless the device has the server [internet exit](#use-rift-as-a-vpn-exit): `AllowedIPs` lists only the granted addresses. Every device has an IPv4 and an IPv6 address; grants use IPv4 only. Exported files and QR codes contain the device's private key, which stays in a mode-0600 file under the state volume and is never logged.
 
 **Reaching the LAN.** A network grant (for example `rift vpn allow iphone home 192.168.178.0/24`) forwards through the agent host and is the only grant that touches the LAN. The agent refuses it unless its owner lists the network in `RIFT_AGENT_ALLOW_SUBNETS` (see [Harden the agent](#harden-the-agent)). Then choose one:
 
@@ -436,23 +436,25 @@ The agent host itself answers on its LAN address too, as long as that address li
 
 ## Use RIFT as a VPN (exit)
 
-A device can also send **all** its internet traffic through RIFT, like a commercial VPN. Each device has exactly one exit:
+A device can also send **all** its internet traffic through RIFT, like a commercial VPN. One device can have several exits at once, each as its own WireGuard profile:
 
-| Exit | Where the traffic leaves | Set with |
-| --- | --- | --- |
-| none (default) | The device only reaches what its grants name. | `rift vpn deny DEVICE exit` or `rift vpn deny DEVICE AGENT exit` |
-| the server | The VPS's connection; websites see the VPS's address. | `rift vpn allow DEVICE exit` |
-| an agent | The agent's connection, for example your home line; websites see your home address. | `rift vpn allow DEVICE AGENT exit` |
+| Profile | Where the traffic leaves | Add with | Import with |
+| --- | --- | --- | --- |
+| main profile | Without an exit, only what the device's grants and the panel name. With the server exit, the VPS's connection; websites see the VPS's address. | `rift vpn allow DEVICE exit` (the server exit) | `rift vpn config qr DEVICE` |
+| one per agent | That agent's connection, for example your home line; websites see your home address. | `rift vpn allow DEVICE AGENT exit` | `rift vpn config qr DEVICE AGENT` |
 
 ```sh
 rift add device iphone
-rift vpn allow iphone exit       # exit through the VPS
-rift vpn config qr iphone        # scan in the WireGuard app
+rift vpn allow iphone exit       # main profile: exit through the VPS
+rift vpn allow iphone core exit  # extra profile: exit through the agent core
+rift vpn allow iphone core2 exit # and another one through core2
+rift vpn config qr iphone        # scan the main profile in the WireGuard app
+rift vpn config qr iphone core   # scan the profile for core
 ```
 
-`exit` may sit beside other targets: `rift vpn allow iphone core 22/tcp exit` grants port 22 on `core` and makes `core` the exit. A new exit replaces the previous one. Every change needs the **new configuration on the device**: RIFT says so, and `rift vpn config qr DEVICE` prints it. `rift list devices` shows the choice in the ACCESS column (`exit via server`, `exit via core`, with `(refused by agent)` or `(waiting for the agent)` when it does not work yet). The agent name `exit` is reserved.
+`exit` may sit beside other targets: `rift vpn allow iphone core 22/tcp exit` grants port 22 on `core` and adds the exit through `core`. Exits add up: allowing another one keeps the others. Remove one at a time: `rift vpn deny iphone exit` ends the server exit, `rift vpn deny iphone core exit` only the one through `core`, and `rift vpn deny iphone core` withdraws every grant on `core` together with that exit. After a change RIFT names the profile to import again, for example `Import the profile: rift vpn config qr iphone core`. `rift list devices` shows the exits in the ACCESS column (`exit via server; exit via core; exit via core2`, each with `(refused by agent)` or `(waiting for the agent)` when it does not work yet). The agent name `exit` is reserved.
 
-**One device, one profile.** A device has exactly one WireGuard configuration. With no exit or the exit through the VPS, that configuration reaches the web panel and the grants as usual. With the exit through an agent, the device's tunnel ends at that agent instead, so the panel and the grants on the VPS are **not** reachable with it. If you want both on one phone, register two devices, for example `iphone` (panel and grants, optionally the VPS exit) and `iphone-home` (`rift vpn allow iphone-home core exit`), import both configurations and switch between them in the WireGuard app.
+**One device, several profiles.** Every profile of a device uses the same key pair and the same addresses; only one of them is active on the phone at a time, so you switch between them in the WireGuard app. The main profile reaches the web panel and the grants as usual, and with the server exit it also carries all internet traffic. A profile for an agent ends at that agent instead, so the panel and the grants on the VPS are **not** reachable while it is active: switch back to the main profile for those. The web panel offers the same in a device's Access dialog (a checkbox per exit) and shows one QR code or configuration per profile.
 
 ### Exit through the VPS
 
@@ -466,7 +468,7 @@ An agent can offer its own internet connection. It is **off by default**; the ag
 RIFT_AGENT_ALLOW_EXIT=true
 ```
 
-Then `rift vpn allow iphone core exit` sends the device through `core`. If the agent has not opted in, RIFT stores the choice but warns (`agent core will refuse it: … set RIFT_AGENT_ALLOW_EXIT=true on the agent`), and the device shows `refused by agent`.
+Then `rift vpn allow iphone core exit` gives the device a profile that sends its traffic through `core`. If the agent has not opted in, RIFT stores the choice but warns (`agent core will refuse it: … set RIFT_AGENT_ALLOW_EXIT=true on the agent`), and the device shows `refused by agent`.
 
 How it works: the device runs a **second WireGuard tunnel to the agent**, inside the agent's tunnel to the VPS.
 
@@ -479,7 +481,7 @@ phone ── WireGuard A (end to end) ──────────────
 - The server assigns each agent that is in use one UDP port from `exit_port_min`..`exit_port_max` (default 51821 to 51899, never the WireGuard port) and publishes it like a normal transparent UDP forward on the server's first IPv4 address (and first IPv6 address, if `RIFT_PUBLIC_IPS` has one). **Open that UDP port in your cloud firewall**, as for any forward. The forward belongs to RIFT: it shows in `rift list forwards` with purpose `exit`, `rift remove forward` and `rift disable forward` refuse it, and it disappears when no enabled device uses that exit. The agent accepts it without an entry in `RIFT_AGENT_ALLOW_PORTS`: `RIFT_AGENT_ALLOW_EXIT` implies that one port.
 - The traffic between the phone and the agent is encrypted end to end with the device key (the same key the server holds for the device) and the agent's exit key. The VPS relays only ciphertext. A hostile VPS could still add a device of its own to the agent's exit, which is why the agent's owner must opt in.
 - The agent masquerades the traffic towards its internet connection. It **blocks private and local destinations** (RFC 1918, `100.64.0.0/10`, `169.254.0.0/16`, loopback, multicast, `fc00::/7`, `fe80::/10`, and with them every RIFT pool) unless they lie inside `RIFT_AGENT_ALLOW_SUBNETS`, and devices on this interface reach nothing on the agent host itself. Your home network is therefore closed to the device unless you list it.
-- The configuration is a separate profile: `MTU` is the server's `mtu` minus 80 (1300 by default) because of the second tunnel, and the endpoint is `RIFT_PUBLIC_ENDPOINT` with the exit port. The profile reaches neither the web panel nor the grants of the device. **One device is one profile**: to use the panel and a home exit at the same time, make a second device (`rift panel connect laptop`).
+- The configuration is a profile of its own (`rift vpn config qr DEVICE AGENT`): `MTU` is the server's `mtu` minus 80 (1300 by default) because of the second tunnel, and the endpoint is `RIFT_PUBLIC_ENDPOINT` with the exit port. The profile reaches neither the web panel nor the grants of the device. Panel and grants work in the main profile only, so switch profiles in the WireGuard app to use them.
 - Traffic crosses the VPS twice (phone to VPS to home, and back), so the VPS's bandwidth and the home upload speed both limit you. If the agent has not reported its exit key yet, `rift vpn config` says why there is no configuration yet.
 - On the agent, `rift doctor` shows whether the exit is offered and whether the host has a global IPv6 address; on the server it counts the exit devices and names what an agent still lacks. If UFW manages the agent, RIFT adds `rift:exit` forwarding rules for `rift-exit` and the default-route interfaces. `rift-exit`, its key and its rules disappear when the exit is no longer used or the agent stops offering it.
 
@@ -704,12 +706,12 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | Command | What it does |
 | --- | --- |
 | `rift add device NAME` | Registers a device with a key and an address. It reaches nothing yet. |
-| `rift list devices` | All devices with state, last handshake and access, including the exit (`exit via server`, `exit via core`). |
-| `rift vpn allow DEVICE AGENT TARGET... [--snat]` | Grants access. `TARGET` is `22/tcp` (port or range), `server` (the agent host), `full` (all protocols to the host), a network such as `192.168.178.30/32` (`--snat` for networks whose router has no route back), or `internet`: the agent becomes the device's internet exit. |
-| `rift vpn allow DEVICE exit` | Makes the server the device's internet exit. A device has one exit; re-import its configuration afterwards. |
-| `rift vpn deny DEVICE AGENT [TARGET...]` | Withdraws access; without a target everything on that agent, including an exit through it. |
-| `rift vpn deny DEVICE exit` / `rift vpn deny DEVICE AGENT exit` | Ends the internet exit, only if it is the server / that agent. |
-| `rift vpn config qr DEVICE` / `rift vpn config export DEVICE` | WireGuard configuration as a QR code or file (contains the private key). |
+| `rift list devices` | All devices with state, last handshake and access, including the exits (`exit via server; exit via core; exit via core2`). |
+| `rift vpn allow DEVICE AGENT TARGET... [--snat]` | Grants access. `TARGET` is `22/tcp` (port or range), `server` (the agent host), `full` (all protocols to the host), a network such as `192.168.178.30/32` (`--snat` for networks whose router has no route back), or `exit`: adds an internet exit through that agent, as an extra profile of the device. |
+| `rift vpn allow DEVICE exit` | Adds the server as an internet exit of the device (main profile). Other exits stay; import the profile RIFT names. |
+| `rift vpn deny DEVICE AGENT [TARGET...]` | Withdraws access; without a target everything on that agent, including the exit through it. |
+| `rift vpn deny DEVICE exit` / `rift vpn deny DEVICE AGENT exit` | Ends the exit through the server / through that agent; the device's other exits stay. |
+| `rift vpn config qr DEVICE [AGENT]` / `rift vpn config export DEVICE [AGENT]` | WireGuard configuration as a QR code or file (contains the private key): the main profile, or with `AGENT` the profile of the exit through that agent. |
 | `rift disable device NAME` / `rift enable device NAME` | Cuts a device off and lets it back in; key and grants stay. |
 | `rift remove device NAME` | Deletes the device, its key and its grants. |
 

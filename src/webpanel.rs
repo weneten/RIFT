@@ -583,14 +583,18 @@ enum Action {
         #[serde(default)]
         access: Option<VpnAccess>,
     },
-    /// Where the device's internet traffic leaves: `"none"`, `"server"` or `{"agent": NAME}`.
+    /// Adds (`on`) or removes one internet exit of the device: `"server"` or `{"agent": NAME}`.
     VpnExit {
         peer: String,
         exit: Exit,
+        on: bool,
     },
-    /// Contains the device's private key, so it counts as a change.
+    /// Contains the device's private key, so it counts as a change. Without `agent` it is the
+    /// main profile, else the exit profile through that agent.
     VpnConfig {
         name: String,
+        #[serde(default)]
+        agent: Option<String>,
     },
     PanelAllow {
         name: String,
@@ -809,11 +813,26 @@ impl Action {
                     })
                     .await?
             }
-            Self::VpnExit { peer, exit } => {
-                panel.admin(AdminRequest::VpnExit { peer, exit }).await?
+            Self::VpnExit {
+                peer,
+                exit,
+                on: true,
+            } => panel.admin(AdminRequest::VpnExit { peer, exit }).await?,
+            Self::VpnExit {
+                peer,
+                exit,
+                on: false,
+            } => {
+                let agent = match exit {
+                    Exit::Server => None,
+                    Exit::Agent(name) => Some(name),
+                };
+                panel
+                    .admin(AdminRequest::VpnExitClear { peer, agent })
+                    .await?
             }
-            Self::VpnConfig { name } => {
-                let mut data = panel.admin(AdminRequest::VpnConfig { name }).await?;
+            Self::VpnConfig { name, agent } => {
+                let mut data = panel.admin(AdminRequest::VpnConfig { name, agent }).await?;
                 let text = data["config"].as_str().unwrap_or_default().to_string();
                 data["qr_svg"] = crate::vpn::qr_svg(&text)?.into();
                 data
@@ -1222,7 +1241,8 @@ mod tests {
             enabled,
             created_at: 0,
             panel,
-            exit: Exit::None,
+            server_exit: false,
+            agent_exits: Vec::new(),
             ipv6: std::net::Ipv6Addr::LOCALHOST,
         };
         let snap = StateSnapshot {
@@ -1436,8 +1456,8 @@ mod tests {
         assert!(session.contains("\"can_write\":false"), "{session}");
         let session = exchange(&panel, "10.14.0.2", "GET /api/session HTTP/1.1\r\n\r\n").await;
         assert!(session.contains("\"can_write\":true"), "{session}");
-        // The internet exit of a device is a change as well.
-        let exit = r#"{"action":"vpn_exit","peer":"laptop","exit":{"agent":"home"}}"#;
+        // The internet exits of a device are changes as well.
+        let exit = r#"{"action":"vpn_exit","peer":"laptop","exit":{"agent":"home"},"on":true}"#;
         let refused = act(&panel, "203.0.113.7", &cookie, exit, "").await;
         assert!(
             refused.starts_with("HTTP/1.1 403") && refused.contains("read-only"),
@@ -1446,19 +1466,31 @@ mod tests {
         assert!(act(&panel, "127.0.0.1", &cookie, exit, "")
             .await
             .starts_with("HTTP/1.1 200"));
-        let none = r#"{"action":"vpn_exit","peer":"laptop","exit":"none"}"#;
-        assert!(act(&panel, "10.14.0.2", &cookie, none, "")
+        let off = r#"{"action":"vpn_exit","peer":"laptop","exit":"server","on":false}"#;
+        assert!(act(&panel, "203.0.113.7", &cookie, off, "")
+            .await
+            .starts_with("HTTP/1.1 403"));
+        assert!(act(&panel, "10.14.0.2", &cookie, off, "")
             .await
             .starts_with("HTTP/1.1 200"));
-        // Only the three known choices parse.
-        let bad = r#"{"action":"vpn_exit","peer":"laptop","exit":"everywhere"}"#;
+        // Only a named exit parses, and the direction is required.
+        let bad = r#"{"action":"vpn_exit","peer":"laptop","exit":"everywhere","on":true}"#;
         assert!(act(&panel, "127.0.0.1", &cookie, bad, "")
+            .await
+            .starts_with("HTTP/1.1 400"));
+        let none = r#"{"action":"vpn_exit","peer":"laptop","exit":"none","on":true}"#;
+        assert!(act(&panel, "127.0.0.1", &cookie, none, "")
             .await
             .starts_with("HTTP/1.1 400"));
         let calls = fake.calls.lock().unwrap().clone();
         assert_eq!(
-            calls.iter().filter(|c| c.contains("VpnExit")).count(),
-            2,
+            calls.iter().filter(|c| c.contains("VpnExit\"")).count(),
+            1,
+            "{calls:?}"
+        );
+        assert_eq!(
+            calls.iter().filter(|c| c.contains("VpnExitClear")).count(),
+            1,
             "{calls:?}"
         );
         // Private keys count as a change.
@@ -1471,6 +1503,20 @@ mod tests {
             shown.contains("<svg") && shown.contains("PrivateKey"),
             "{shown}"
         );
+        // The profile of an agent exit is one as well.
+        let profile = r#"{"action":"vpn_config","name":"laptop","agent":"home"}"#;
+        assert!(act(&panel, "203.0.113.7", &cookie, profile, "")
+            .await
+            .starts_with("HTTP/1.1 403"));
+        assert!(act(&panel, "127.0.0.1", &cookie, profile, "")
+            .await
+            .starts_with("HTTP/1.1 200"));
+        assert!(fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains("VpnConfig") && c.contains("home")));
     }
 
     #[tokio::test]

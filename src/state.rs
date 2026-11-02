@@ -511,9 +511,7 @@ impl StateStore {
         s.bans.retain(|b| b.agent_id != id);
         s.vpn_grants.retain(|g| g.agent_id != id);
         for peer in &mut s.vpn_peers {
-            if peer.exit == Exit::Agent(id.into()) {
-                peer.exit = Exit::None;
-            }
+            peer.agent_exits.retain(|x| x != id);
         }
         tx.execute("DELETE FROM invites WHERE reserved_agent=?1", [id])?;
         tx.execute("DELETE FROM rotations WHERE agent_id=?1", [id])?;
@@ -609,8 +607,10 @@ fn validate_snapshot(s: &StateSnapshot) -> Result<()> {
         anyhow::ensure!(peer_names.insert(&p.name), "duplicate VPN peer name");
         anyhow::ensure!(peer_ips.insert(p.ipv4), "duplicate VPN peer address");
         anyhow::ensure!(peer_ips6.insert(p.ipv6), "duplicate VPN peer IPv6 address");
-        if let Exit::Agent(id) = &p.exit {
+        let mut exits = HashSet::new();
+        for id in &p.agent_exits {
             anyhow::ensure!(ids.contains(id), "VPN peer exit references unknown agent");
+            anyhow::ensure!(exits.insert(id), "VPN peer lists an agent exit twice");
         }
         anyhow::ensure!(
             keys.insert(&p.public_key),
@@ -712,7 +712,8 @@ mod tests {
             enabled: true,
             created_at: 0,
             panel: false,
-            exit: Exit::None,
+            server_exit: false,
+            agent_exits: Vec::new(),
             ipv6: std::net::Ipv6Addr::LOCALHOST,
         };
         let grant = |agent: &str, access| VpnGrant {
@@ -768,7 +769,7 @@ mod tests {
             exit: None,
             exit_port: port,
         };
-        let device = |name: &str, n: u8, exit: Exit| VpnPeer {
+        let device = |name: &str, n: u8, agent_exits: Vec<String>| VpnPeer {
             name: name.into(),
             public_key: format!("k-{name}"),
             ipv4: Ipv4Addr::new(10, 14, 0, n),
@@ -776,17 +777,24 @@ mod tests {
             created_at: 0,
             panel: false,
             ipv6: Ipv6Addr::new(0xfd88, 0x5249, 0x4655, 0, 0, 0, 0, n.into()),
-            exit,
+            server_exit: false,
+            agent_exits,
         };
         let base = StateSnapshot {
             agents: vec![agent("a", 2, Some(51821)), agent("b", 3, Some(51822))],
-            vpn_peers: vec![device("phone", 2, Exit::Agent("a".into()))],
+            vpn_peers: vec![device("phone", 2, vec!["a".into()])],
             ..Default::default()
         };
         validate_snapshot(&base).unwrap();
         let mut s = base.clone();
-        s.vpn_peers[0].exit = Exit::Agent("zzz".into());
+        s.vpn_peers[0].agent_exits = vec!["zzz".into()];
         assert!(validate_snapshot(&s).is_err(), "unknown exit agent");
+        let mut s = base.clone();
+        s.vpn_peers[0].agent_exits = vec!["a".into(), "a".into()];
+        assert!(validate_snapshot(&s).is_err(), "the same exit twice");
+        let mut s = base.clone();
+        s.vpn_peers[0].agent_exits = vec!["a".into(), "b".into()];
+        validate_snapshot(&s).unwrap();
         let mut s = base.clone();
         s.agents[1].exit_port = Some(51821);
         assert!(
@@ -794,7 +802,7 @@ mod tests {
             "one exit port for two agents"
         );
         let mut s = base.clone();
-        s.vpn_peers.push(device("tablet", 3, Exit::Server));
+        s.vpn_peers.push(device("tablet", 3, vec![]));
         s.vpn_peers[1].ipv6 = s.vpn_peers[0].ipv6;
         assert!(
             validate_snapshot(&s).is_err(),
@@ -808,7 +816,7 @@ mod tests {
             })
             .unwrap();
         let after = store.remove_agent("a").unwrap();
-        assert_eq!(after.vpn_peers[0].exit, Exit::None);
+        assert!(after.vpn_peers[0].agent_exits.is_empty());
     }
 
     #[test]

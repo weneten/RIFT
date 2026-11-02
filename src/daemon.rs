@@ -711,17 +711,14 @@ fn without_refused(snap: StateSnapshot) -> StateSnapshot {
     out.forwards.retain(|f| forward_refusal(&snap, f).is_none());
     out.vpn_grants.retain(|g| grant_refusal(&snap, g).is_none());
     for peer in &mut out.vpn_peers {
-        if let Exit::Agent(id) = &peer.exit {
-            let refused = snap
+        peer.agent_exits.retain(|id| {
+            !snap
                 .agents
                 .iter()
                 .find(|a| a.id == *id)
                 .and_then(|a| a.limits.as_ref())
-                .is_some_and(|limits| limits.refuse_exit().is_some());
-            if refused {
-                peer.exit = Exit::None;
-            }
-        }
+                .is_some_and(|limits| limits.refuse_exit().is_some())
+        });
     }
     out.bans
         .retain(|b| out.forwards.iter().any(|f| f.id == b.forward_id));
@@ -1281,7 +1278,7 @@ async fn import_admin(
                     }
                 }
                 Op::Device(_) => cfg.check_vpn_pool()?,
-                Op::Flags { name, .. } => {
+                Op::Flags { name, .. } | Op::AgentExit { name, .. } => {
                     anyhow::ensure!(
                         !lost_devices.contains(name),
                         "the device could not be created"
@@ -1363,7 +1360,7 @@ async fn import_admin(
         }
     }
     applying.retain(|step| match &step.op {
-        Op::Flags { name, .. } => !lost_devices.contains(name),
+        Op::Flags { name, .. } | Op::AgentExit { name, .. } => !lost_devices.contains(name),
         Op::Grant(g) => !lost_devices.contains(&g.peer),
         _ => true,
     });
@@ -1392,17 +1389,27 @@ async fn import_admin(
                         created_at: now(),
                         panel: false,
                         ipv6,
-                        exit: Exit::None,
+                        server_exit: false,
+                        agent_exits: Vec::new(),
                     });
                 }
                 Op::Flags {
                     name,
                     enabled,
                     panel,
+                    server_exit,
                 } => {
                     for p in x.vpn_peers.iter_mut().filter(|p| &p.name == name) {
                         p.enabled = enabled.unwrap_or(p.enabled);
                         p.panel = panel.unwrap_or(p.panel);
+                        p.server_exit = server_exit.unwrap_or(p.server_exit);
+                    }
+                }
+                Op::AgentExit { name, agent_id } => {
+                    for p in x.vpn_peers.iter_mut().filter(|p| &p.name == name) {
+                        if !p.agent_exits.contains(agent_id) {
+                            p.agent_exits.push(agent_id.clone());
+                        }
                     }
                 }
                 Op::Grant(g) => {
@@ -1492,7 +1499,8 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                     created_at: now(),
                     panel: false,
                     ipv6,
-                    exit: Exit::None,
+                    server_exit: false,
+                    agent_exits: Vec::new(),
                 });
                 Ok(())
             });
@@ -1515,7 +1523,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                     let agent = snap.agents.iter().find(|a| a.id == g.agent_id).map(|a| a.name.clone());
                     serde_json::json!({"agent":agent,"access":g.access,"refused":grant_refusal(snap, g)})
                 }).collect();
-                serde_json::json!({"name":p.name,"ipv4":p.ipv4,"ipv6":p.ipv6,"enabled":p.enabled,"panel":p.panel,"public_key":p.public_key,"last_handshake":handshake,"grants":grants,"exit":exit_json(snap, p)})
+                serde_json::json!({"name":p.name,"ipv4":p.ipv4,"ipv6":p.ipv6,"enabled":p.enabled,"panel":p.panel,"public_key":p.public_key,"last_handshake":handshake,"grants":grants,"exits":exits_json(snap, p)})
             }).collect();
             serde_json::Value::Array(rows)
         }
@@ -1608,10 +1616,9 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                 // Withdrawing everything on an agent also ends an exit through it.
                 if access.is_none() {
                     for p in x.vpn_peers.iter_mut().filter(|p| p.name == peer) {
-                        if p.exit == Exit::Agent(agent_id.clone()) {
-                            p.exit = Exit::None;
-                            removed = true;
-                        }
+                        let before = p.agent_exits.len();
+                        p.agent_exits.retain(|id| *id != agent_id);
+                        removed |= before != p.agent_exits.len();
                     }
                 }
                 anyhow::ensure!(removed, "no matching grant");
@@ -1620,8 +1627,12 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
             reconcile(s).await?;
             serde_json::json!({"peer":peer,"agent":agent,"denied":true})
         }
-        AdminRequest::VpnConfig { name } => {
+        AdminRequest::VpnConfig { name, agent } => {
             let peer = find_peer(&name)?;
+            let agent_id = match &agent {
+                Some(agent) => Some(find_agent(snap, agent)?.id.clone()),
+                None => None,
+            };
             anyhow::ensure!(
                 !cfg.public_endpoint.is_empty(),
                 "public_endpoint is not configured"
@@ -1641,13 +1652,13 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                     dns: &cfg.vpn_dns,
                     server_ipv6: cfg.public_ips.iter().any(IpAddr::is_ipv6),
                 },
+                agent_id.as_deref(),
             )?;
-            serde_json::json!({"name":name,"config":config})
+            serde_json::json!({"name":name,"agent":agent,"config":config})
         }
         AdminRequest::VpnExit { peer, exit } => {
             find_peer(&peer)?;
             let chosen = match &exit {
-                Exit::None => Exit::None,
                 Exit::Server => Exit::Server,
                 Exit::Agent(name) => {
                     let target = find_agent(snap, name)?;
@@ -1656,23 +1667,30 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                 }
             };
             s.state.mutate("vpn-exit", |x| {
-                x.vpn_peers
-                    .iter_mut()
-                    .filter(|p| p.name == peer)
-                    .for_each(|p| p.exit = chosen.clone());
+                for p in x.vpn_peers.iter_mut().filter(|p| p.name == peer) {
+                    match &chosen {
+                        Exit::Server => p.server_exit = true,
+                        Exit::Agent(id) if !p.agent_exits.contains(id) => {
+                            p.agent_exits.push(id.clone());
+                        }
+                        Exit::Agent(_) => {}
+                    }
+                }
                 Ok(())
             })?;
             reconcile(s).await?;
             let after = s.state.snapshot()?;
-            let device = after.vpn_peers.iter().find(|p| p.name == peer);
-            let problem = device.and_then(|p| crate::vpn::exit_problem(&after, p));
             let agent_name = match &chosen {
                 Exit::Agent(id) => after
                     .agents
                     .iter()
                     .find(|a| a.id == *id)
                     .map(|a| a.name.clone()),
-                _ => None,
+                Exit::Server => None,
+            };
+            let problem = match &chosen {
+                Exit::Agent(id) => crate::vpn::exit_problem(&after, id),
+                Exit::Server => None,
             };
             let warning = problem.as_ref().filter(|p| p.0 == "refused").map(|p| {
                 format!(
@@ -1693,30 +1711,33 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                     .find(|a| a.id == id)
                     .and_then(|a| a.exit.as_ref())
                     .map(|r| r.ipv6),
-                Exit::None => None,
             };
-            let exit = device.map_or(serde_json::json!({"via":"none"}), |p| exit_json(&after, p));
-            serde_json::json!({"peer":peer,"exit":exit,"agent":agent_name,"ipv6":ipv6,"warning":warning,"waiting":waiting})
+            serde_json::json!({"peer":peer,"agent":agent_name,"ipv6":ipv6,"warning":warning,"waiting":waiting})
         }
         AdminRequest::VpnExitClear { peer, agent } => {
             let device = find_peer(&peer)?;
-            let matches = match (&agent, &device.exit) {
-                (None, Exit::Server) => true,
-                (Some(name), Exit::Agent(id)) => find_agent(snap, name)?.id == *id,
-                _ => false,
+            let agent_id = match &agent {
+                Some(name) => Some(find_agent(snap, name)?.id.clone()),
+                None => None,
+            };
+            let present = match &agent_id {
+                None => device.server_exit,
+                Some(id) => device.agent_exits.contains(id),
             };
             anyhow::ensure!(
-                matches,
-                "{peer} does not use {} as its internet exit",
+                present,
+                "{peer} does not use {} as an internet exit",
                 agent
                     .as_ref()
                     .map_or("the server".to_string(), |a| format!("agent {a}"))
             );
             s.state.mutate("vpn-exit-clear", |x| {
-                x.vpn_peers
-                    .iter_mut()
-                    .filter(|p| p.name == peer)
-                    .for_each(|p| p.exit = Exit::None);
+                for p in x.vpn_peers.iter_mut().filter(|p| p.name == peer) {
+                    match &agent_id {
+                        None => p.server_exit = false,
+                        Some(id) => p.agent_exits.retain(|x| x != id),
+                    }
+                }
                 Ok(())
             })?;
             reconcile(s).await?;
@@ -1751,26 +1772,27 @@ fn find_agent<'a>(snap: &'a StateSnapshot, name: &str) -> Result<&'a AgentRecord
 fn host_port(host: &str, port: u16) -> String {
     crate::vpn::host_port(host, port)
 }
-/// The `exit` field of a device in `list devices` and after a change.
-fn exit_json(snap: &StateSnapshot, peer: &VpnPeer) -> serde_json::Value {
-    match &peer.exit {
-        Exit::None => serde_json::json!({"via":"none"}),
-        Exit::Server => serde_json::json!({"via":"server"}),
-        Exit::Agent(id) => {
-            let name = snap
-                .agents
-                .iter()
-                .find(|a| a.id == *id)
-                .map(|a| a.name.clone());
-            let problem = crate::vpn::exit_problem(snap, peer);
-            serde_json::json!({
-                "via":"agent",
-                "agent":name,
-                "state":problem.as_ref().map_or("ok", |p| p.0),
-                "reason":problem.map(|p| p.1),
-            })
-        }
+/// The `exits` field of a device in `list devices`: the VPS first, then each agent.
+fn exits_json(snap: &StateSnapshot, peer: &VpnPeer) -> serde_json::Value {
+    let mut exits = Vec::new();
+    if peer.server_exit {
+        exits.push(serde_json::json!({"via":"server"}));
     }
+    for id in &peer.agent_exits {
+        let name = snap
+            .agents
+            .iter()
+            .find(|a| a.id == *id)
+            .map(|a| a.name.clone());
+        let problem = crate::vpn::exit_problem(snap, id);
+        exits.push(serde_json::json!({
+            "via":"agent",
+            "agent":name,
+            "state":problem.as_ref().map_or("ok", |p| p.0),
+            "reason":problem.map(|p| p.1),
+        }));
+    }
+    serde_json::Value::Array(exits)
 }
 
 async fn run_agent_inner(
@@ -2358,7 +2380,8 @@ mod tests {
             enabled,
             created_at: 0,
             panel: false,
-            exit: Exit::None,
+            server_exit: false,
+            agent_exits: Vec::new(),
             ipv6: std::net::Ipv6Addr::LOCALHOST,
         }
     }
@@ -2486,7 +2509,7 @@ mod tests {
             exit_port: Some(51821),
         };
         let mut device = peer("phone", true);
-        device.exit = Exit::Agent("home".into());
+        device.agent_exits = vec!["home".into()];
         let ports = PortRange {
             start: 51821,
             end: 51821,
@@ -2545,14 +2568,14 @@ mod tests {
         assert!(why.unwrap().contains("RIFT_AGENT_ALLOW_EXIT"));
         let applied = without_refused(refused.clone());
         assert!(applied.forwards.is_empty());
-        assert_eq!(applied.vpn_peers[0].exit, Exit::None);
+        assert!(applied.vpn_peers[0].agent_exits.is_empty());
         let policy = policy_for(&refused, "home", pool, pool6);
         assert!(policy.exit.is_none() && policy.forwards.is_empty());
-        let shown = exit_json(&refused, &refused.vpn_peers[0]);
-        assert_eq!(shown["state"], "refused");
-        assert_eq!(shown["agent"], "core");
+        let shown = exits_json(&refused, &refused.vpn_peers[0]);
+        assert_eq!(shown[0]["state"], "refused");
+        assert_eq!(shown[0]["agent"], "core");
         // The stored choice survives, so allowing the exit later brings it back.
-        assert_eq!(refused.vpn_peers[0].exit, Exit::Agent("home".into()));
+        assert_eq!(refused.vpn_peers[0].agent_exits, ["home"]);
     }
 
     #[test]

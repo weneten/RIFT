@@ -357,19 +357,16 @@ pub struct VpnPeer {
     /// May open the web panel on the VPS's tunnel address.
     pub panel: bool,
     pub ipv6: Ipv6Addr,
-    /// Where the device's internet traffic leaves; one exit per device.
-    pub exit: Exit,
+    /// The main profile routes all traffic through the VPS.
+    pub server_exit: bool,
+    /// Agents (by ID) that each end an extra profile with the same keys and addresses.
+    pub agent_exits: Vec<String>,
 }
-/// Where a device's internet traffic leaves. `Agent` holds the agent's ID in the state and
-/// its name in requests.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// One internet exit of a device in requests: the VPS or the agent that the name gives.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Exit {
-    #[default]
-    None,
-    /// Through the VPS.
     Server,
-    /// Through an agent, in a second WireGuard tunnel to that agent.
     Agent(String),
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

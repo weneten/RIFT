@@ -1,5 +1,6 @@
+use rift::model::Exit;
 use rift::protocol::AdminRequest;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashMap;
 
 fn text(value: &Value) -> String {
@@ -402,38 +403,44 @@ fn vpn_access(value: &Value) -> String {
     }
 }
 
-/// "exit via server" or "exit via core (refused by agent)"; None without an exit.
-fn vpn_exit(exit: &Value) -> Option<String> {
-    match exit["via"].as_str()? {
-        "server" => Some("exit via server".into()),
-        "agent" => {
-            let note = match exit["state"].as_str() {
-                Some("refused") => " (refused by agent)",
-                Some("waiting") => " (waiting for the agent)",
-                _ => "",
-            };
-            Some(format!("exit via {}{note}", field(exit, "agent")))
-        }
-        _ => None,
-    }
+/// "exit via server" or "exit via core (refused by agent)", one per exit of a device.
+fn vpn_exits(exits: &Value) -> Vec<String> {
+    exits
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|exit| match exit["via"].as_str()? {
+            "server" => Some("exit via server".to_string()),
+            "agent" => {
+                let note = match exit["state"].as_str() {
+                    Some("refused") => " (refused by agent)",
+                    Some("waiting") => " (waiting for the agent)",
+                    _ => "",
+                };
+                Some(format!("exit via {}{note}", field(exit, "agent")))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
-/// The confirmation of a changed internet exit, with what the user still has to do.
-fn exit_changed(peer: &str, data: &Value) -> String {
+/// The confirmation of an added internet exit, with the profile to import.
+fn exit_added(peer: &str, exit: &Exit, data: &Value) -> String {
     let mut lines = Vec::new();
-    match data["exit"]["via"].as_str() {
-        Some("server") => {
+    let profile = match exit {
+        Exit::Server => {
             lines.push(format!(
-                "{peer} now sends its internet traffic through this server."
+                "{peer} can now send its internet traffic through this server (its main profile)."
             ));
             if data["ipv6"].as_bool() == Some(false) {
                 lines.push("This server has no IPv6 address in RIFT_PUBLIC_IPS: the device's IPv6 traffic is dropped, not leaked.".into());
             }
+            format!("rift vpn config qr {peer}")
         }
-        Some("agent") => {
+        Exit::Agent(agent) => {
+            let agent = data["agent"].as_str().unwrap_or(agent);
             lines.push(format!(
-                "{peer} now sends its internet traffic through agent {}.",
-                field(data, "agent")
+                "{peer} can now send its internet traffic through agent {agent} (a profile of its own)."
             ));
             if let Some(waiting) = data["waiting"].as_str() {
                 lines.push(format!("Not ready yet: {waiting}"));
@@ -441,14 +448,24 @@ fn exit_changed(peer: &str, data: &Value) -> String {
             if data["ipv6"].as_bool() == Some(false) {
                 lines.push("The agent host has no global IPv6 address: the device's IPv6 traffic is dropped, not leaked.".into());
             }
-            lines.push("This profile reaches neither the web panel nor other RIFT grants; use a second device for those.".into());
+            lines.push("That profile reaches neither the web panel nor other RIFT grants; switch to the main profile for those.".into());
+            format!("rift vpn config qr {peer} {agent}")
         }
-        _ => lines.push(format!("{peer} has no exit any more.")),
-    }
-    lines.push(format!(
-        "Re-import the configuration on the device: rift vpn config qr {peer}"
-    ));
+    };
+    lines.push(format!("Import the profile: {profile}"));
     lines.join("\n")
+}
+
+/// The confirmation of a removed internet exit, with what the user still has to do.
+fn exit_removed(peer: &str, agent: Option<&str>) -> String {
+    match agent {
+        None => format!(
+            "{peer} no longer exits through this server.\nImport the main profile again: rift vpn config qr {peer}"
+        ),
+        Some(agent) => format!(
+            "{peer} no longer exits through agent {agent}.\nDelete the profile for {agent} in the WireGuard app; it does not work any more."
+        ),
+    }
 }
 
 fn vpn_peers(data: &Value) -> String {
@@ -484,9 +501,7 @@ fn vpn_peers(data: &Value) -> String {
             if p["panel"].as_bool() == Some(true) {
                 grants.insert(0, "web panel".into());
             }
-            if let Some(exit) = vpn_exit(&p["exit"]) {
-                grants.push(exit);
-            }
+            grants.extend(vpn_exits(&p["exits"]));
             vec![
                 field(p, "name"),
                 field(p, "ipv4"),
@@ -577,14 +592,14 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
             let rows = data.as_array().into_iter().flatten().map(|b| vec![field(b, "id"), field(b, "forward_id"), field(b, "ip"), field(b, "expires_at")]).collect();
             table(&["ID", "FORWARD", "ADDRESS", "EXPIRES (UNIX)"], rows, "No active bans.")
         },
-        AdminRequest::VpnPeerAdd { name } => format!("VPN device {name} registered with addresses {} and {}.\nNext: rift vpn allow {name} AGENT 22/tcp (or server), then rift vpn config qr {name}\nTo send all its traffic through RIFT: rift vpn allow {name} exit", field(data, "ipv4"), field(data, "ipv6")),
+        AdminRequest::VpnPeerAdd { name } => format!("VPN device {name} registered with addresses {} and {}.\nNext: rift vpn allow {name} AGENT 22/tcp (or server), then rift vpn config qr {name}\nFor an internet exit, which is a profile of its own: rift vpn allow {name} exit (this server) or rift vpn allow {name} AGENT exit, then rift vpn config qr {name} [AGENT]", field(data, "ipv4"), field(data, "ipv6")),
         AdminRequest::VpnPeerList => vpn_peers(data),
         AdminRequest::VpnPeerEnable { name, enabled } => format!("VPN device {name} {}.", if *enabled { "enabled" } else { "disabled; it can no longer connect" }),
         AdminRequest::VpnPeerRevoke { name } => format!("VPN device {name} revoked. Its key and grants are gone."),
         AdminRequest::VpnAllow { peer, agent, access } => format!("{peer} may now reach {agent}: {}.", vpn_access(&serde_json::to_value(access).unwrap_or_default())),
         AdminRequest::VpnDeny { peer, agent, .. } => format!("Access of {peer} to {agent} withdrawn."),
-        AdminRequest::VpnExit { peer, .. } => exit_changed(peer, data),
-        AdminRequest::VpnExitClear { peer, .. } => exit_changed(peer, &json!({"exit":{"via":"none"}})),
+        AdminRequest::VpnExit { peer, exit } => exit_added(peer, exit, data),
+        AdminRequest::VpnExitClear { peer, agent } => exit_removed(peer, agent.as_deref()),
         AdminRequest::PanelStatus => panel_status(data),
         AdminRequest::PanelPassword => field(data, "password"),
         AdminRequest::PanelTwoFactorStatus => {
@@ -618,7 +633,6 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rift::model::Exit;
     use serde_json::json;
 
     #[test]
@@ -646,17 +660,17 @@ mod tests {
     }
 
     #[test]
-    fn devices_show_their_exit_and_forwards_their_purpose() {
+    fn devices_show_their_exits_and_forwards_their_purpose() {
         let devices = json!([
-            {"name":"iphone","ipv4":"10.14.0.2","enabled":true,"panel":false,"last_handshake":null,"grants":[],"exit":{"via":"server"}},
-            {"name":"ipad","ipv4":"10.14.0.3","enabled":true,"panel":true,"last_handshake":null,"grants":[{"agent":"core","access":"server","refused":null}],"exit":{"via":"agent","agent":"core","state":"ok","reason":null}},
-            {"name":"mac","ipv4":"10.14.0.4","enabled":true,"panel":false,"last_handshake":null,"grants":[],"exit":{"via":"agent","agent":"cabin","state":"refused","reason":"no"}},
-            {"name":"tv","ipv4":"10.14.0.5","enabled":true,"panel":false,"last_handshake":null,"grants":[],"exit":{"via":"none"}}
+            {"name":"iphone","ipv4":"10.14.0.2","enabled":true,"panel":false,"last_handshake":null,"grants":[],"exits":[{"via":"server"}]},
+            {"name":"ipad","ipv4":"10.14.0.3","enabled":true,"panel":true,"last_handshake":null,"grants":[{"agent":"core","access":"server","refused":null}],"exits":[{"via":"server"},{"via":"agent","agent":"core","state":"ok","reason":null},{"via":"agent","agent":"core2","state":"waiting","reason":"x"}]},
+            {"name":"mac","ipv4":"10.14.0.4","enabled":true,"panel":false,"last_handshake":null,"grants":[],"exits":[{"via":"agent","agent":"cabin","state":"refused","reason":"no"}]},
+            {"name":"tv","ipv4":"10.14.0.5","enabled":true,"panel":false,"last_handshake":null,"grants":[],"exits":[]}
         ]);
         let output = render(&AdminRequest::VpnPeerList, &devices, None);
         for expected in [
             "exit via server",
-            "web panel; core: server; exit via core",
+            "web panel; core: server; exit via server; exit via core; exit via core2 (waiting for the agent)",
             "exit via cabin (refused by agent)",
         ] {
             assert!(output.contains(expected), "missing {expected}: {output}");
@@ -673,8 +687,8 @@ mod tests {
         assert!(table.lines().next().unwrap().contains("PURPOSE"));
     }
     #[test]
-    fn exit_changes_say_what_to_do_on_the_device() {
-        let set = |exit, data| {
+    fn exit_changes_say_which_profile_to_import() {
+        let add = |exit, data| {
             render(
                 &AdminRequest::VpnExit {
                     peer: "iphone".into(),
@@ -684,31 +698,34 @@ mod tests {
                 None,
             )
         };
-        let server = set(
-            Exit::Server,
-            json!({"exit":{"via":"server"},"ipv6":false,"warning":null}),
-        );
+        let server = add(Exit::Server, json!({"ipv6":false,"warning":null}));
         assert!(
             server.contains("through this server") && server.contains("IPv6 traffic is dropped")
         );
-        assert!(
-            server.contains("Re-import the configuration on the device: rift vpn config qr iphone")
-        );
-        let agent = set(
+        assert!(server.contains("Import the profile: rift vpn config qr iphone"));
+        assert!(!server.contains("config qr iphone core"));
+        let agent = add(
             Exit::Agent("core".into()),
-            json!({"exit":{"via":"agent","agent":"core"},"agent":"core","ipv6":true,"waiting":"agent core has not reported"}),
+            json!({"agent":"core","ipv6":true,"waiting":"agent core has not reported"}),
         );
         assert!(agent.contains("through agent core") && agent.contains("Not ready yet"));
-        assert!(agent.contains("second device") && !agent.contains("dropped"));
-        let cleared = render(
-            &AdminRequest::VpnExitClear {
-                peer: "iphone".into(),
-                agent: None,
-            },
-            &json!({}),
-            None,
-        );
-        assert!(cleared.contains("no exit any more") && cleared.contains("Re-import"));
+        assert!(agent.contains("main profile") && !agent.contains("dropped"));
+        assert!(agent.contains("Import the profile: rift vpn config qr iphone core"));
+        let removed = |agent: Option<&str>| {
+            render(
+                &AdminRequest::VpnExitClear {
+                    peer: "iphone".into(),
+                    agent: agent.map(Into::into),
+                },
+                &json!({}),
+                None,
+            )
+        };
+        let server = removed(None);
+        assert!(server.contains("no longer exits through this server"));
+        assert!(server.contains("Import the main profile again: rift vpn config qr iphone"));
+        let agent = removed(Some("core"));
+        assert!(agent.contains("Delete the profile for core") && !agent.contains("config qr"));
     }
     #[test]
     fn doctor_prints_a_checklist_and_a_verdict() {

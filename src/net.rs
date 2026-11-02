@@ -3183,7 +3183,8 @@ mod tests {
                 enabled: true,
                 created_at: 0,
                 panel: false,
-                exit: crate::model::Exit::None,
+                server_exit: false,
+                agent_exits: Vec::new(),
                 ipv6: std::net::Ipv6Addr::LOCALHOST,
             }],
             vpn_grants: vec![VpnGrant {
@@ -3254,7 +3255,7 @@ mod tests {
     }
     #[test]
     fn server_exit_accepts_sit_before_the_final_drops_and_nat_has_its_chain() {
-        use crate::model::{Exit, VpnPeer};
+        use crate::model::VpnPeer;
         let a = agent();
         let agents = BTreeMap::from([(a.id.clone(), &a)]);
         let f = forward(ForwardMode::Transparent);
@@ -3268,7 +3269,8 @@ mod tests {
                 created_at: 0,
                 panel: false,
                 ipv6: "fd88:5249:4655::2".parse().unwrap(),
-                exit: Exit::Server,
+                server_exit: true,
+                agent_exits: Vec::new(),
             }],
             ..Default::default()
         };
@@ -3326,7 +3328,7 @@ mod tests {
         assert!(!without.contains("ip6 saddr fd88:5249:4655::2 masquerade"));
         // A server without any exit device has no NAT chain at all.
         let mut none = snap.clone();
-        none.vpn_peers[0].exit = Exit::None;
+        none.vpn_peers[0].server_exit = false;
         let plain = render_server_rules(
             "rift0",
             0x52490000,

@@ -157,15 +157,18 @@ enum Vpn {
     /// Let a device reach an agent: `rift vpn allow DEVICE AGENT TARGET...`, for example
     /// `rift vpn allow iphone core 22/tcp 53/both`. Without an allow, a device reaches nothing.
     ///
-    /// Use `exit` as a target to send all the device's traffic through that agent's
-    /// connection (`rift vpn allow iphone core exit`), or alone to send it through this
-    /// server (`rift vpn allow iphone exit`). A device has one exit.
+    /// Use `exit` as a target to add an exit through that agent's connection
+    /// (`rift vpn allow iphone core exit`), or alone to add the exit through this server
+    /// (`rift vpn allow iphone exit`). A device can have both and several agent exits; each
+    /// is its own WireGuard profile (`rift vpn config qr iphone core`), and the device
+    /// switches between them in the WireGuard app.
     Allow(VpnAccessArgs),
     /// Withdraw access again. Without a target, withdraws all of it on that agent, including
-    /// an exit through it. `rift vpn deny DEVICE exit` ends the exit through
-    /// this server.
+    /// the exit through it. `rift vpn deny DEVICE exit` ends the exit through this server and
+    /// `rift vpn deny DEVICE AGENT exit` only the one through that agent.
     Deny(VpnAccessArgs),
-    /// Export the WireGuard configuration of a device.
+    /// Export the WireGuard configuration of a device: its main profile, or with an agent
+    /// name the profile of the exit through that agent.
     Config {
         #[command(subcommand)]
         command: VpnConfig,
@@ -173,10 +176,19 @@ enum Vpn {
 }
 #[derive(Subcommand)]
 enum VpnConfig {
-    /// Print the configuration, which contains the device's private key.
-    Export { name: String },
+    /// Print the configuration, which contains the device's private key: `rift vpn config
+    /// export DEVICE` for the main profile, `... DEVICE AGENT` for the exit through an agent.
+    Export {
+        name: String,
+        /// The agent whose exit profile to print.
+        agent: Option<String>,
+    },
     /// Print the configuration as a QR code for the WireGuard app.
-    Qr { name: String },
+    Qr {
+        name: String,
+        /// The agent whose exit profile to print.
+        agent: Option<String>,
+    },
 }
 #[derive(Args)]
 struct VpnAccessArgs {
@@ -184,7 +196,7 @@ struct VpnAccessArgs {
     peer: String,
     /// The agent, then what to allow: PORT/tcp, PORT/udp or PORT/both (ranges like
     /// 8000-8010/tcp), `server`, `full`, a network behind the agent such as 192.168.178.0/24,
-    /// or `internet`. Several are allowed. Just `internet` means the exit through this server.
+    /// or `exit`. Several are allowed. Just `exit` means the exit through this server.
     #[arg(value_name = "AGENT TARGET", required = true, num_args = 1..)]
     rest: Vec<String>,
     /// Masquerade the device's address on the agent, for LANs without a route to the VPN pool.
@@ -196,7 +208,7 @@ struct VpnAccessArgs {
 struct VpnPlan {
     agent: Option<String>,
     accesses: Vec<VpnAccess>,
-    /// The internet exit: the server, or the agent that the command names.
+    /// The internet exit this command adds or removes: the server, or the agent it names.
     exit: Option<Exit>,
 }
 impl VpnAccessArgs {
@@ -447,11 +459,11 @@ async fn run() -> Result<()> {
         Command::Vpn {
             command: Vpn::Config { command },
         } => {
-            let (name, qr) = match command {
-                VpnConfig::Export { name } => (name, false),
-                VpnConfig::Qr { name } => (name, true),
+            let (name, agent, qr) = match command {
+                VpnConfig::Export { name, agent } => (name, agent, false),
+                VpnConfig::Qr { name, agent } => (name, agent, true),
             };
-            return vpn_config(&config, cli.json, name, qr).await;
+            return vpn_config(&config, cli.json, name, agent, qr).await;
         }
         Command::Panel {
             command: PanelCommand::Connect { name, export },
@@ -840,12 +852,13 @@ fn exit_checks(config: &Config, status: &serde_json::Value, checks: &mut rift::n
     let via_server = devices
         .iter()
         .filter(enabled)
-        .filter(|p| p["exit"] == "server")
+        .filter(|p| p["server_exit"].as_bool() == Some(true))
         .count();
+    // One entry per agent exit of an enabled device: the agent's ID.
     let via_agents: Vec<&serde_json::Value> = devices
         .iter()
         .filter(enabled)
-        .filter(|p| p["exit"]["agent"].is_string())
+        .flat_map(|p| p["agent_exits"].as_array().unwrap_or(&empty))
         .collect();
     if via_server + via_agents.len() == 0 {
         return;
@@ -854,7 +867,7 @@ fn exit_checks(config: &Config, status: &serde_json::Value, checks: &mut rift::n
         OK,
         "Internet exits".into(),
         format!(
-            "{via_server} device(s) via this server, {} via agents",
+            "{via_server} device(s) via this server, {} exit(s) via agents",
             via_agents.len()
         ),
     );
@@ -872,7 +885,7 @@ fn exit_checks(config: &Config, status: &serde_json::Value, checks: &mut rift::n
     }
     for agent in status["snapshot"]["agents"].as_array().unwrap_or(&empty) {
         let id = &agent["id"];
-        if !via_agents.iter().any(|p| p["exit"]["agent"] == *id) {
+        if !via_agents.contains(&id) {
             continue;
         }
         let name = agent["name"].as_str().unwrap_or("?");
@@ -933,7 +946,7 @@ async fn panel_connect(config: &Config, json: bool, name: String, export: bool) 
         },
     )
     .await?;
-    vpn_config(config, json, name, !export).await?;
+    vpn_config(config, json, name, None, !export).await?;
     if !json {
         if let Some(url) = granted["urls"]
             .as_array()
@@ -963,8 +976,14 @@ async fn two_factor_setup(config: &Config, json: bool) -> Result<()> {
     eprintln!("Then turn two-factor login on with: rift panel 2fa confirm CODE");
     Ok(())
 }
-async fn vpn_config(config: &Config, json: bool, name: String, qr: bool) -> Result<()> {
-    let data = admin_ok(config, AdminRequest::VpnConfig { name }).await?;
+async fn vpn_config(
+    config: &Config,
+    json: bool,
+    name: String,
+    agent: Option<String>,
+    qr: bool,
+) -> Result<()> {
+    let data = admin_ok(config, AdminRequest::VpnConfig { name, agent }).await?;
     let text = data["config"].as_str().unwrap_or_default();
     if json {
         println!("{}", serde_json::to_string(&data)?);
@@ -1229,6 +1248,61 @@ mod tests {
         assert_eq!(requests.len(), 2);
     }
     #[test]
+    fn exits_add_up_and_come_off_one_at_a_time() {
+        // Several exits are added with separate commands; none replaces another.
+        let exits = |argv: &[&str]| {
+            vpn_requests(argv)
+                .unwrap()
+                .into_iter()
+                .map(|r| match r {
+                    AdminRequest::VpnExit { exit, .. } => format!("add {exit:?}"),
+                    AdminRequest::VpnExitClear { agent, .. } => format!("remove {agent:?}"),
+                    AdminRequest::VpnDeny { access: None, .. } => "deny all".to_string(),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            exits(&["rift", "vpn", "allow", "iphone", "exit"]),
+            ["add Server"]
+        );
+        assert_eq!(
+            exits(&["rift", "vpn", "allow", "iphone", "core2", "exit"]),
+            [r#"add Agent("core2")"#]
+        );
+        assert_eq!(
+            exits(&["rift", "vpn", "deny", "iphone", "exit"]),
+            ["remove None"]
+        );
+        assert_eq!(
+            exits(&["rift", "vpn", "deny", "iphone", "core2", "exit"]),
+            [r#"remove Some("core2")"#]
+        );
+        assert_eq!(
+            exits(&["rift", "vpn", "deny", "iphone", "core2"]),
+            ["deny all"]
+        );
+        // The profiles: the main one, or that of an agent's exit.
+        let config = |argv: &[&str]| match Cli::try_parse_from(argv).unwrap().command {
+            Command::Vpn {
+                command:
+                    Vpn::Config {
+                        command: VpnConfig::Export { name, agent } | VpnConfig::Qr { name, agent },
+                    },
+            } => (name, agent),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            config(&["rift", "vpn", "config", "qr", "iphone"]),
+            ("iphone".into(), None)
+        );
+        assert_eq!(
+            config(&["rift", "vpn", "config", "export", "iphone", "core"]),
+            ("iphone".into(), Some("core".into()))
+        );
+        assert!(Cli::try_parse_from(["rift", "vpn", "config", "qr", "iphone", "a", "b"]).is_err());
+    }
+    #[test]
     fn vpn_targets_become_accesses() {
         let args = |extra: &[&str]| {
             let mut argv = vec!["rift", "vpn", "allow", "iphone", "home"];
@@ -1255,11 +1329,10 @@ mod tests {
                 {"id":"b","name":"cabin","limits":{"exit":false},"exit":null},
                 {"id":"c","name":"idle","limits":{"exit":false},"exit":null}],
             "vpn_peers":[
-                {"enabled":true,"exit":"server"},
-                {"enabled":true,"exit":{"agent":"a"}},
-                {"enabled":true,"exit":{"agent":"b"}},
-                {"enabled":false,"exit":{"agent":"c"}},
-                {"enabled":true,"exit":"none"}]}});
+                {"enabled":true,"server_exit":true,"agent_exits":["a"]},
+                {"enabled":true,"server_exit":false,"agent_exits":["a","b"]},
+                {"enabled":false,"server_exit":false,"agent_exits":["c"]},
+                {"enabled":true,"server_exit":false,"agent_exits":[]}]}});
         let run = |config: &Config| {
             let mut checks = rift::net::Checks::default();
             exit_checks(config, &status, &mut checks);
@@ -1283,7 +1356,7 @@ mod tests {
         };
         let text = run(&v4);
         assert!(
-            text.contains("1 device(s) via this server, 2 via agents"),
+            text.contains("1 device(s) via this server, 3 exit(s) via agents"),
             "{text}"
         );
         assert!(text.contains("warn Server exit IPv6"), "{text}");

@@ -8,8 +8,9 @@
 //! allowed source address. Stronger isolation needs end-to-end authentication between the
 //! device and the agent, which this design does not provide.
 //!
-//! Internet exit: a device with `Exit::Server` sends everything through the VPS, which
-//! masquerades it. A device with `Exit::Agent` runs a second WireGuard tunnel to the agent's
+//! Internet exit: a device with `server_exit` sends everything through the VPS in its main
+//! profile, and the VPS masquerades it. Each agent in `agent_exits` is an extra profile of the
+//! device (same keys and addresses) that runs a second WireGuard tunnel to the agent's
 //! `rift-exit` interface, carried inside the agent's tunnel to the VPS by an ordinary UDP
 //! forward, so the VPS only relays ciphertext and the agent masquerades the traffic.
 
@@ -108,7 +109,7 @@ pub fn agent_subnets(effective: &[Effective<'_>], agent_id: &str) -> BTreeSet<Ip
 pub fn server_exit_peers(snap: &StateSnapshot) -> Vec<&VpnPeer> {
     snap.vpn_peers
         .iter()
-        .filter(|p| p.enabled && p.exit == Exit::Server)
+        .filter(|p| p.enabled && p.server_exit)
         .collect()
 }
 
@@ -116,7 +117,7 @@ pub fn server_exit_peers(snap: &StateSnapshot) -> Vec<&VpnPeer> {
 pub fn agent_exit_peers<'a>(snap: &'a StateSnapshot, agent_id: &str) -> Vec<&'a VpnPeer> {
     snap.vpn_peers
         .iter()
-        .filter(|p| p.enabled && matches!(&p.exit, Exit::Agent(id) if id == agent_id))
+        .filter(|p| p.enabled && p.agent_exits.iter().any(|id| id == agent_id))
         .collect()
 }
 
@@ -151,13 +152,10 @@ pub fn agent_exit_policy(
     })
 }
 
-/// Why the exit of `peer` does not work (yet), if it does not: `refused` when the agent will
-/// not offer it, `waiting` while the agent has not reported what devices need.
-pub fn exit_problem(snap: &StateSnapshot, peer: &VpnPeer) -> Option<(&'static str, String)> {
-    let Exit::Agent(id) = &peer.exit else {
-        return None;
-    };
-    let Some(agent) = snap.agents.iter().find(|a| a.id == *id) else {
+/// Why the exit through this agent does not work (yet), if it does not: `refused` when the
+/// agent will not offer it, `waiting` while the agent has not reported what devices need.
+pub fn exit_problem(snap: &StateSnapshot, agent_id: &str) -> Option<(&'static str, String)> {
+    let Some(agent) = snap.agents.iter().find(|a| a.id == agent_id) else {
         return Some(("refused", "the agent no longer exists".into()));
     };
     if agent.status != AgentStatus::Active {
@@ -481,22 +479,31 @@ fn dns_line(dns: &[IpAddr], ipv6: bool) -> Result<String> {
     Ok(format!("DNS = {}\n", list.join(", ")))
 }
 
-/// WireGuard configuration for one device. Without an exit it is a split tunnel: only the
-/// addresses the peer may reach. With one, everything goes through the exit.
+/// WireGuard configuration for one profile of a device. The main profile (`agent` is
+/// `None`) is a split tunnel to the panel and the grants, or sends everything through the VPS
+/// when the device has that exit. With an agent ID it is the profile that ends at that agent;
+/// every profile of a device has the same keys and addresses.
 pub fn client_config(
     snap: &StateSnapshot,
     peer: &VpnPeer,
     private_key: &str,
     p: &ClientParams<'_>,
+    agent: Option<&str>,
 ) -> Result<String> {
     let address = format!("{}/32, {}/128", peer.ipv4, peer.ipv6);
-    if let Exit::Agent(id) = &peer.exit {
+    if let Some(id) = agent {
         let agent = snap
             .agents
             .iter()
-            .find(|a| a.id == *id)
-            .context("the agent of this device's internet exit no longer exists")?;
-        if let Some((_, why)) = exit_problem(snap, peer) {
+            .find(|a| a.id == id)
+            .context("the agent of this internet exit no longer exists")?;
+        ensure!(
+            peer.agent_exits.iter().any(|x| x == id),
+            "{0} has no exit via {1}; add it with: rift vpn allow {0} {1} exit",
+            peer.name,
+            agent.name
+        );
+        if let Some((_, why)) = exit_problem(snap, id) {
             anyhow::bail!("{}: internet exit via {}: {why}", peer.name, agent.name);
         }
         let report = agent.exit.as_ref().context("exit key missing")?;
@@ -519,7 +526,7 @@ pub fn client_config(
         ));
     }
     let endpoint = host_port(p.host, p.wg_port);
-    let (routes, dns) = if peer.exit == Exit::Server {
+    let (routes, dns) = if peer.server_exit {
         (
             "0.0.0.0/0, ::/0".to_string(),
             dns_line(p.dns, p.server_ipv6)?,
@@ -623,7 +630,8 @@ mod tests {
             created_at: 0,
             panel: false,
             ipv6: format!("fd88:5249:4655::{last}").parse().unwrap(),
-            exit: Exit::None,
+            server_exit: false,
+            agent_exits: Vec::new(),
         }
     }
     fn grant(peer: &str, agent: &str, access: VpnAccess) -> VpnGrant {
@@ -677,7 +685,23 @@ mod tests {
     fn config(snap: &StateSnapshot, name: &str, server_ipv6: bool) -> Result<String> {
         let dns = dns();
         let peer = snap.vpn_peers.iter().find(|p| p.name == name).unwrap();
-        client_config(snap, peer, "SECRET", &params(&dns, None, server_ipv6))
+        client_config(snap, peer, "SECRET", &params(&dns, None, server_ipv6), None)
+    }
+    fn agent_config(
+        snap: &StateSnapshot,
+        name: &str,
+        agent: &str,
+        server_ipv6: bool,
+    ) -> Result<String> {
+        let dns = dns();
+        let peer = snap.vpn_peers.iter().find(|p| p.name == name).unwrap();
+        client_config(
+            snap,
+            peer,
+            "SECRET",
+            &params(&dns, None, server_ipv6),
+            Some(agent),
+        )
     }
     /// An agent that offers an exit and has reported its key.
     fn exit_agent(ipv6: bool) -> AgentRecord {
@@ -794,6 +818,7 @@ mod tests {
             &snap.vpn_peers[0],
             "SECRET",
             &params(&dns, Some(Ipv4Addr::new(10, 13, 0, 1)), true),
+            None,
         )
         .unwrap();
         assert!(
@@ -807,7 +832,7 @@ mod tests {
             "{text}"
         );
         let new = peer("new", 9, true);
-        assert!(client_config(&snap, &new, "k", &params(&dns, None, true)).is_err());
+        assert!(client_config(&snap, &new, "k", &params(&dns, None, true), None).is_err());
     }
 
     #[test]
@@ -817,22 +842,26 @@ mod tests {
         admin.panel = true;
         let dns = dns();
         let server = Some(Ipv4Addr::new(10, 13, 0, 1));
-        let text = client_config(&snap, &admin, "k", &params(&dns, server, false)).unwrap();
+        let text = client_config(&snap, &admin, "k", &params(&dns, server, false), None).unwrap();
         assert!(text.contains("AllowedIPs = 10.13.0.1/32\n"), "{text}");
         // Panel switched off on the VPS: the device has nothing to route.
-        assert!(client_config(&snap, &admin, "k", &params(&dns, None, false)).is_err());
+        assert!(client_config(&snap, &admin, "k", &params(&dns, None, false), None).is_err());
         // Without the flag the server address is never routed.
-        assert!(
-            client_config(&snap, &snap.vpn_peers[0], "k", &params(&dns, server, false))
-                .unwrap()
-                .contains("AllowedIPs = 10.13.0.2/32\n")
-        );
+        assert!(client_config(
+            &snap,
+            &snap.vpn_peers[0],
+            "k",
+            &params(&dns, server, false),
+            None
+        )
+        .unwrap()
+        .contains("AllowedIPs = 10.13.0.2/32\n"));
     }
 
     #[test]
     fn a_server_exit_routes_everything_and_takes_dns_for_the_families_it_carries() {
         let mut snap = snapshot();
-        snap.vpn_peers[0].exit = Exit::Server;
+        snap.vpn_peers[0].server_exit = true;
         // No grant is needed for an exit, and the VPS has IPv6: both DNS families.
         snap.vpn_grants.clear();
         let text = config(&snap, "iphone", true).unwrap();
@@ -850,15 +879,15 @@ mod tests {
         // A resolver list without any IPv4 address cannot serve an IPv4-only exit.
         let only6: Vec<IpAddr> = vec!["2620:fe::fe".parse().unwrap()];
         let device = &snap.vpn_peers[0];
-        assert!(client_config(&snap, device, "k", &params(&only6, None, false)).is_err());
+        assert!(client_config(&snap, device, "k", &params(&only6, None, false), None).is_err());
     }
 
     #[test]
     fn an_agent_exit_is_a_second_tunnel_to_the_agent() {
         let mut snap = snapshot();
         snap.agents[0] = exit_agent(true);
-        snap.vpn_peers[0].exit = Exit::Agent("home".into());
-        let text = config(&snap, "iphone", false).unwrap();
+        snap.vpn_peers[0].agent_exits = vec!["home".into()];
+        let text = agent_config(&snap, "iphone", "home", false).unwrap();
         // The agent's key and the exit port, on the VPS address; not the VPS's key and port.
         assert!(text.contains("PublicKey = EXITKEY\n"), "{text}");
         assert!(text.contains("Endpoint = vps.example:51821\n"), "{text}");
@@ -876,7 +905,7 @@ mod tests {
         assert!(text.contains("web panel and other RIFT grants are not reachable"));
         // An agent without global IPv6 leaves the IPv6 resolver out, even if the VPS has one.
         snap.agents[0] = exit_agent(false);
-        let text = config(&snap, "iphone", true).unwrap();
+        let text = agent_config(&snap, "iphone", "home", true).unwrap();
         assert!(
             text.contains("DNS = 9.9.9.9\n") && !text.contains("2620"),
             "{text}"
@@ -885,50 +914,51 @@ mod tests {
         let dns = dns();
         let mut p = params(&dns, None, false);
         p.host = "2001:db8::1";
-        let v6 = client_config(&snap, &snap.vpn_peers[0], "k", &p).unwrap();
+        let v6 = client_config(&snap, &snap.vpn_peers[0], "k", &p, Some("home")).unwrap();
         assert!(v6.contains("Endpoint = [2001:db8::1]:51821\n"), "{v6}");
     }
 
     #[test]
     fn an_agent_exit_explains_why_there_is_no_configuration_yet() {
         let mut snap = snapshot();
-        snap.vpn_peers[0].exit = Exit::Agent("home".into());
+        snap.vpn_peers[0].agent_exits = vec!["home".into()];
         // Before the agent reported anything.
-        let error = config(&snap, "iphone", true).unwrap_err().to_string();
+        let error = agent_config(&snap, "iphone", "home", true)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("not reported its exit key"), "{error}");
         assert!(error.contains("RIFT_AGENT_ALLOW_EXIT=true"), "{error}");
-        let waiting = exit_problem(&snap, &snap.vpn_peers[0]).unwrap();
+        let waiting = exit_problem(&snap, "home").unwrap();
         assert_eq!(waiting.0, "waiting");
         // The agent reported, but its owner does not allow exits.
         snap.agents[0] = exit_agent(true);
         snap.agents[0].limits = Some(AgentLimits::default());
-        let error = config(&snap, "iphone", true).unwrap_err().to_string();
+        let error = agent_config(&snap, "iphone", "home", true)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("does not offer an internet exit"), "{error}");
-        assert_eq!(
-            exit_problem(&snap, &snap.vpn_peers[0]).unwrap().0,
-            "refused"
-        );
+        assert_eq!(exit_problem(&snap, "home").unwrap().0, "refused");
         // No port assigned yet.
         snap.agents[0] = exit_agent(true);
         snap.agents[0].exit_port = None;
-        assert!(config(&snap, "iphone", true)
+        assert!(agent_config(&snap, "iphone", "home", true)
             .unwrap_err()
             .to_string()
             .contains("no exit port"));
         // Everything in place.
         snap.agents[0] = exit_agent(true);
-        assert!(exit_problem(&snap, &snap.vpn_peers[0]).is_none());
+        assert!(exit_problem(&snap, "home").is_none());
         // A tunnel MTU too small for the inner tunnel is an error, not a broken profile.
         let dns = dns();
         let mut p = params(&dns, None, true);
         p.mtu = 1340;
-        assert!(client_config(&snap, &snap.vpn_peers[0], "k", &p).is_err());
+        assert!(client_config(&snap, &snap.vpn_peers[0], "k", &p, Some("home")).is_err());
     }
 
     #[test]
     fn server_exit_rules_masquerade_and_reach_only_the_internet() {
         let mut snap = snapshot();
-        snap.vpn_peers[0].exit = Exit::Server;
+        snap.vpn_peers[0].server_exit = true;
         let rules = server_rules("rift0", pools(), true, &snap);
         let forward = &rules.forward;
         // Every private and local network is left out: RIFT pools, Docker bridges, provider
@@ -976,7 +1006,7 @@ mod tests {
     #[test]
     fn without_server_ipv6_the_devices_ipv6_is_dropped_and_not_masqueraded() {
         let mut snap = snapshot();
-        snap.vpn_peers[0].exit = Exit::Server;
+        snap.vpn_peers[0].server_exit = true;
         let rules = server_rules("rift0", pools(), false, &snap);
         assert!(rules
             .forward
@@ -985,14 +1015,15 @@ mod tests {
         assert!(!rules.nat.contains("ip6"), "{}", rules.nat);
         assert!(rules.nat.contains("ip saddr 10.14.0.2"));
         // Only exit devices get these rules.
-        snap.vpn_peers[0].exit = Exit::None;
+        snap.vpn_peers[0].server_exit = false;
+        snap.vpn_peers[0].agent_exits.clear();
         let none = server_rules("rift0", pools(), false, &snap);
         assert!(none.nat.is_empty() && !none.forward.contains("masquerade"));
         assert!(!none.forward.contains("ip6 saddr fd88:5249:4655::2 drop"));
         // A disabled device and an agent exit add nothing on the VPS.
-        snap.vpn_peers[0].exit = Exit::Agent("home".into());
+        snap.vpn_peers[0].agent_exits = vec!["home".into()];
         assert!(server_rules("rift0", pools(), true, &snap).nat.is_empty());
-        snap.vpn_peers[0].exit = Exit::Server;
+        snap.vpn_peers[0].server_exit = true;
         snap.vpn_peers[0].enabled = false;
         snap.vpn_peers[1].enabled = true;
         assert!(server_rules("rift0", pools(), true, &snap).nat.is_empty());
@@ -1106,7 +1137,7 @@ mod tests {
     #[test]
     fn the_exit_policy_names_the_devices_and_the_gateway_addresses() {
         let mut snap = snapshot();
-        snap.vpn_peers[0].exit = Exit::Agent("home".into());
+        snap.vpn_peers[0].agent_exits = vec!["home".into()];
         let pool: Ipv4Net = POOL.parse().unwrap();
         let pool6: Ipv6Net = POOL6.parse().unwrap();
         // The agent has no port yet: no policy.
@@ -1131,11 +1162,102 @@ mod tests {
         snap.vpn_peers[0].enabled = false;
         assert!(agent_exit_policy(&snap, "home", pool, pool6).is_none());
         snap.vpn_peers[0].enabled = true;
-        snap.vpn_peers[0].exit = Exit::Server;
+        snap.vpn_peers[0].server_exit = true;
+        snap.vpn_peers[0].agent_exits = vec!["cabin".into()];
         assert!(agent_exit_policy(&snap, "home", pool, pool6).is_none());
-        snap.vpn_peers[0].exit = Exit::Agent("home".into());
+        snap.vpn_peers[0].agent_exits = vec!["home".into()];
         snap.agents[0].status = AgentStatus::Disabled;
         assert!(agent_exit_policy(&snap, "home", pool, pool6).is_none());
+    }
+
+    #[test]
+    fn the_exit_policy_lists_every_enabled_device_that_has_the_agent() {
+        let mut snap = snapshot();
+        snap.agents[0].exit_port = Some(51821);
+        let mut third = peer("tablet", 4, true);
+        third.agent_exits = vec!["home".into(), "cabin".into()];
+        snap.vpn_peers.push(third);
+        snap.vpn_peers[0].agent_exits = vec!["home".into()];
+        snap.vpn_peers[1].agent_exits = vec!["cabin".into()];
+        snap.vpn_peers[1].enabled = true;
+        let pool: Ipv4Net = POOL.parse().unwrap();
+        let pool6: Ipv6Net = POOL6.parse().unwrap();
+        let keys = |snap: &StateSnapshot| -> Vec<String> {
+            agent_exit_policy(snap, "home", pool, pool6)
+                .unwrap()
+                .peers
+                .into_iter()
+                .map(|p| p.public_key)
+                .collect()
+        };
+        assert_eq!(keys(&snap), ["key-iphone", "key-tablet"]);
+        snap.vpn_peers[2].enabled = false;
+        assert_eq!(keys(&snap), ["key-iphone"]);
+        // The server exit of any of them is not the agent's business.
+        snap.vpn_peers[1].server_exit = true;
+        assert_eq!(keys(&snap), ["key-iphone"]);
+    }
+
+    #[test]
+    fn a_device_has_a_main_profile_and_one_profile_per_agent_exit() {
+        let mut snap = snapshot();
+        snap.agents[0] = exit_agent(true);
+        let mut second = exit_agent(false);
+        second.id = "cabin".into();
+        second.name = "cabin".into();
+        second.exit = Some(ExitReport {
+            public_key: "CABINKEY".into(),
+            listen_port: Some(51822),
+            ipv6: false,
+        });
+        second.exit_port = Some(51822);
+        snap.agents.push(second);
+        snap.vpn_peers[0].agent_exits = vec!["home".into(), "cabin".into()];
+        let dns = dns();
+        let panel = Some(Ipv4Addr::new(10, 13, 0, 1));
+        let device = snap.vpn_peers[0].clone();
+        // The main profile stays a split tunnel: no exit key, no default route.
+        let main =
+            client_config(&snap, &device, "SECRET", &params(&dns, panel, true), None).unwrap();
+        assert!(main.contains("PublicKey = PUB\n"), "{main}");
+        assert!(
+            !main.contains("0.0.0.0/0") && !main.contains("EXITKEY"),
+            "{main}"
+        );
+        // With the VPS exit it routes everything.
+        snap.vpn_peers[0].server_exit = true;
+        let device = snap.vpn_peers[0].clone();
+        let main =
+            client_config(&snap, &device, "SECRET", &params(&dns, panel, true), None).unwrap();
+        assert!(main.contains("AllowedIPs = 0.0.0.0/0, ::/0\n"), "{main}");
+        assert!(main.contains("PublicKey = PUB\n"), "{main}");
+        // Each agent has a profile of its own, with the same key pair and addresses.
+        let home = agent_config(&snap, "iphone", "home", true).unwrap();
+        let cabin = agent_config(&snap, "iphone", "cabin", true).unwrap();
+        assert!(home.contains("PublicKey = EXITKEY\n") && home.contains("vps.example:51821"));
+        assert!(cabin.contains("PublicKey = CABINKEY\n") && cabin.contains("vps.example:51822"));
+        for text in [&main, &home, &cabin] {
+            assert!(text.contains("PrivateKey = SECRET\n"), "{text}");
+            assert!(
+                text.contains("Address = 10.14.0.2/32, fd88:5249:4655::2/128\n"),
+                "{text}"
+            );
+        }
+        // The IPv4-only agent leaves the IPv6 resolver out; the other one has it.
+        assert!(home.contains("2620:fe::fe") && !cabin.contains("2620"));
+        // A profile for an agent the device has no exit via says how to add it.
+        snap.vpn_peers[0].agent_exits = vec!["home".into()];
+        let error = agent_config(&snap, "iphone", "cabin", true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("iphone has no exit via cabin")
+                && error.contains("rift vpn allow iphone cabin exit"),
+            "{error}"
+        );
+        assert!(agent_config(&snap, "iphone", "home", true).is_ok());
+        // An unknown agent is an error as well.
+        assert!(agent_config(&snap, "iphone", "nowhere", true).is_err());
     }
 
     #[test]

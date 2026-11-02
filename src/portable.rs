@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, net::IpAddr};
 
 /// Version of the export file. A file with another number is refused.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExportForward {
@@ -37,6 +37,10 @@ pub struct ExportDevice {
     pub enabled: bool,
     pub panel: bool,
     pub grants: Vec<ExportGrant>,
+    /// The main profile sends all traffic through the server.
+    pub server_exit: bool,
+    /// Names of the agents that each end an extra profile.
+    pub agent_exits: Vec<String>,
 }
 /// Added by the host helper; the server process knows nothing about sites.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,7 +60,7 @@ pub struct Export {
     pub sites: Vec<ExportSite>,
 }
 impl Export {
-    /// Reads an export file; refuses anything that is not format 1.
+    /// Reads an export file; refuses any other format.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let value: serde_json::Value =
             serde_json::from_slice(bytes).context("this is not a RIFT export file (not JSON)")?;
@@ -128,6 +132,8 @@ pub fn export(snap: &StateSnapshot) -> Export {
                         })
                     })
                     .collect(),
+                server_exit: p.server_exit,
+                agent_exits: p.agent_exits.iter().filter_map(|id| name(id)).collect(),
             })
             .collect(),
         sites: Vec::new(),
@@ -282,8 +288,14 @@ pub enum Op {
         name: String,
         enabled: Option<bool>,
         panel: Option<bool>,
+        server_exit: Option<bool>,
     },
     Grant(VpnGrant),
+    /// Adds the exit profile through this agent (by ID) to the device.
+    AgentExit {
+        name: String,
+        agent_id: String,
+    },
 }
 /// Something the import will create. `daemon.rs` checks it against the machine, then applies.
 pub struct Step {
@@ -517,27 +529,38 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
             .iter()
             .map(|g| resolve(options, ctx, &g.agent))
             .collect();
-        if !resolved.is_empty()
+        let resolved_exits: Vec<Resolved> = device
+            .agent_exits
+            .iter()
+            .map(|a| resolve(options, ctx, a))
+            .collect();
+        if !(resolved.is_empty() && resolved_exits.is_empty())
             && resolved
                 .iter()
+                .chain(&resolved_exits)
                 .all(|r| matches!(r, Resolved::Filtered { .. }))
         {
             plan.items.push(Item::new(
                 Status::Skipped,
                 what,
-                Some("all its grants are for agents left out by --agent or --skip-agent".into()),
+                Some(
+                    "all its grants and exits are for agents left out by --agent or --skip-agent"
+                        .into(),
+                ),
             ));
             continue;
         }
         let existing = ctx.snap.vpn_peers.iter().find(|p| p.name == device.name);
-        let (enabled, panel) = match existing {
+        let (enabled, panel, server_exit) = match existing {
             Some(p) => (
                 (p.enabled != device.enabled).then_some(device.enabled),
                 (p.panel != device.panel).then_some(device.panel),
+                (p.server_exit != device.server_exit).then_some(device.server_exit),
             ),
             None => (
                 (!device.enabled).then_some(false),
                 device.panel.then_some(true),
+                device.server_exit.then_some(true),
             ),
         };
         let panel = if panel == Some(true) && !ctx.panel_enabled {
@@ -560,7 +583,7 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
                 )),
             });
         }
-        if enabled.is_some() || panel.is_some() {
+        if enabled.is_some() || panel.is_some() || server_exit.is_some() {
             let mut changes = Vec::new();
             if let Some(on) = enabled {
                 changes.push(if on { "enabled" } else { "disabled" });
@@ -572,11 +595,19 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
                     "panel access off"
                 });
             }
+            if let Some(on) = server_exit {
+                changes.push(if on {
+                    "exit via this server on"
+                } else {
+                    "exit via this server off"
+                });
+            }
             plan.steps.push(Step {
                 op: Op::Flags {
                     name: device.name.clone(),
                     enabled,
                     panel,
+                    server_exit,
                 },
                 what: format!("{what}: {}", changes.join(", ")),
                 detail: None,
@@ -638,6 +669,34 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
                 op: Op::Grant(candidate),
                 what,
                 detail: None,
+            });
+        }
+        let mut planned_exits: Vec<String> =
+            existing.map(|p| p.agent_exits.clone()).unwrap_or_default();
+        for resolved in resolved_exits {
+            let (agent_id, agent) = match resolved {
+                Resolved::Agent { id, name } => (id, name),
+                Resolved::Filtered { name, why } | Resolved::Unavailable { name, why } => {
+                    skips.add(&name, &why);
+                    continue;
+                }
+            };
+            let what = format!("exit of {} via {agent}", device.name);
+            if planned_exits.contains(&agent_id) {
+                plan.items.push(Item::new(Status::Present, what, None));
+                continue;
+            }
+            planned_exits.push(agent_id.clone());
+            plan.steps.push(Step {
+                op: Op::AgentExit {
+                    name: device.name.clone(),
+                    agent_id,
+                },
+                what,
+                detail: Some(format!(
+                    "import the extra profile: rift vpn config qr {} {agent}",
+                    device.name
+                )),
             });
         }
     }
@@ -703,6 +762,8 @@ mod tests {
                     access,
                 })
                 .collect(),
+            server_exit: false,
+            agent_exits: Vec::new(),
         }
     }
     fn file(forwards: Vec<ExportForward>, devices: Vec<ExportDevice>) -> Export {
@@ -766,7 +827,8 @@ mod tests {
             enabled: false,
             created_at: 1,
             panel: true,
-            exit: Exit::None,
+            server_exit: false,
+            agent_exits: Vec::new(),
             ipv6: std::net::Ipv6Addr::LOCALHOST,
         });
         snap.vpn_grants.push(VpnGrant {
@@ -780,6 +842,7 @@ mod tests {
         assert_eq!(out.forwards[0].agent, "core");
         assert_eq!(out.devices[0].grants[0].agent, "core");
         assert!(!out.devices[0].enabled && out.devices[0].panel);
+        assert!(!out.devices[0].server_exit && out.devices[0].agent_exits.is_empty());
         let text = serde_json::to_string(&out).unwrap();
         for secret in [
             "SECRET-PUBLIC",
@@ -795,12 +858,128 @@ mod tests {
     }
 
     #[test]
+    fn exits_survive_an_export_and_an_import_round_trip() {
+        let mut snap = world();
+        snap.agents.push(agent("core2", AgentStatus::Active, 5));
+        snap.vpn_peers.push(VpnPeer {
+            name: "phone".into(),
+            public_key: "k".into(),
+            ipv4: Ipv4Addr::new(10, 14, 0, 2),
+            enabled: true,
+            created_at: 1,
+            panel: false,
+            server_exit: true,
+            agent_exits: vec!["id-core".into(), "id-core2".into()],
+            ipv6: std::net::Ipv6Addr::LOCALHOST,
+        });
+        let out = export(&snap);
+        assert!(out.devices[0].server_exit);
+        assert_eq!(out.devices[0].agent_exits, ["core", "core2"]);
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(!text.contains("id-core"), "IDs stay out: {text}");
+        assert_eq!(Export::parse(text.as_bytes()).unwrap(), out);
+
+        // Into an installation without the device: it is created with all three exits.
+        let mut target = world();
+        target.agents.push(agent("core2", AgentStatus::Active, 5));
+        let planned = run(&out, &ImportOptions::default(), &target);
+        let flags = planned
+            .steps
+            .iter()
+            .find_map(|s| match &s.op {
+                Op::Flags { server_exit, .. } => Some(*server_exit),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(flags, Some(true));
+        let added: Vec<_> = planned
+            .steps
+            .iter()
+            .filter_map(|s| match &s.op {
+                Op::AgentExit { agent_id, .. } => Some(agent_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(added, ["id-core", "id-core2"]);
+        assert!(planned.steps.iter().any(|s| {
+            s.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("rift vpn config qr phone core2"))
+        }));
+        // Mapped, filtered and missing agents.
+        let options = ImportOptions {
+            map: vec![("core2".into(), "core".into())],
+            ..Default::default()
+        };
+        let planned = run(&out, &options, &target);
+        let added = planned
+            .steps
+            .iter()
+            .filter(|s| matches!(s.op, Op::AgentExit { .. }))
+            .count();
+        assert_eq!(added, 1, "both exits land on core, which is added once");
+        let options = ImportOptions {
+            skip_agents: vec!["core2".into()],
+            ..Default::default()
+        };
+        let planned = run(&out, &options, &target);
+        assert_eq!(
+            planned
+                .steps
+                .iter()
+                .filter(|s| matches!(s.op, Op::AgentExit { .. }))
+                .count(),
+            1
+        );
+        assert!(planned
+            .items
+            .iter()
+            .any(|i| i.what == "1 entry for agent core2"));
+        let planned = run(&out, &ImportOptions::default(), &world());
+        assert!(planned
+            .items
+            .iter()
+            .any(|i| i.what == "1 entry for agent core2" && i.status == Status::Skipped));
+        // Into one that has the device with the same exits: nothing to do for them.
+        let mut same = target.clone();
+        same.vpn_peers = snap.vpn_peers.clone();
+        let planned = run(&out, &ImportOptions::default(), &same);
+        assert!(planned.steps.is_empty(), "{:?}", planned.steps.len());
+        assert_eq!(count(&planned, Status::Present), 3);
+        // A device whose exits are all for left-out agents is skipped as a whole.
+        let only = file(
+            vec![],
+            vec![ExportDevice {
+                agent_exits: vec!["core2".into()],
+                ..device("tablet", vec![])
+            }],
+        );
+        let options = ImportOptions {
+            skip_agents: vec!["core2".into()],
+            ..Default::default()
+        };
+        let planned = run(&only, &options, &target);
+        assert!(planned.steps.is_empty());
+        assert!(planned
+            .items
+            .iter()
+            .any(|i| i.what == "device tablet" && i.status == Status::Skipped));
+    }
+
+    #[test]
     fn other_formats_and_foreign_files_are_refused() {
-        let error = Export::parse(br#"{"format":2,"agents":[]}"#).unwrap_err();
-        assert!(error.to_string().contains("format 2"), "{error}");
+        let error = Export::parse(br#"{"format":3,"agents":[]}"#).unwrap_err();
+        assert!(error.to_string().contains("format 3"), "{error}");
+        // Files of the single-exit version are refused with the way forward.
+        let error =
+            Export::parse(br#"{"format":1,"agents":[],"forwards":[],"devices":[]}"#).unwrap_err();
+        assert!(
+            error.to_string().contains("format 1") && error.to_string().contains("export again"),
+            "{error}"
+        );
         assert!(Export::parse(b"{}").is_err());
         assert!(Export::parse(b"not json").is_err());
-        assert!(Export::parse(br#"{"format":1,"agents":[],"forwards":[],"devices":[]}"#).is_ok());
+        assert!(Export::parse(br#"{"format":2,"agents":[],"forwards":[],"devices":[]}"#).is_ok());
     }
 
     #[test]
@@ -1042,6 +1221,7 @@ mod tests {
                 Op::Flags { .. } => "flags",
                 Op::Grant(_) => "grant",
                 Op::Forward(_) => "forward",
+                Op::AgentExit { .. } => "exit",
             })
             .collect();
         assert_eq!(kinds, vec!["device", "flags", "grant"]);
@@ -1064,7 +1244,8 @@ mod tests {
             enabled: true,
             created_at: 0,
             panel: false,
-            exit: Exit::None,
+            server_exit: false,
+            agent_exits: Vec::new(),
             ipv6: std::net::Ipv6Addr::LOCALHOST,
         });
         snap.vpn_grants.push(VpnGrant {

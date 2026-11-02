@@ -136,7 +136,7 @@ pub enum AdminRequest {
         agent: String,
         access: Option<VpnAccess>,
     },
-    /// Sets where a device's internet traffic leaves; `Exit::Agent` names the agent.
+    /// Adds an internet exit to a device: the VPS, or an extra profile that ends at the agent.
     VpnExit {
         peer: String,
         exit: Exit,
@@ -147,8 +147,10 @@ pub enum AdminRequest {
         peer: String,
         agent: Option<String>,
     },
+    /// The WireGuard configuration of the main profile, or of the exit profile of `agent`.
     VpnConfig {
         name: String,
+        agent: Option<String>,
     },
     /// Whether the web panel is on, where it listens and which devices may open it.
     PanelStatus,
