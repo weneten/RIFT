@@ -597,7 +597,13 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
         AdminRequest::VpnPeerEnable { name, enabled } => format!("VPN device {name} {}.", if *enabled { "enabled" } else { "disabled; it can no longer connect" }),
         AdminRequest::VpnPeerRevoke { name } => format!("VPN device {name} revoked. Its key and grants are gone."),
         AdminRequest::VpnAllow { peer, agent, access } => format!("{peer} may now reach {agent}: {}.", vpn_access(&serde_json::to_value(access).unwrap_or_default())),
-        AdminRequest::VpnDeny { peer, agent, .. } => format!("Access of {peer} to {agent} withdrawn."),
+        AdminRequest::VpnDeny { peer, agent, .. } => {
+            let mut text = format!("Access of {peer} to {agent} withdrawn.");
+            if data["exit_removed"].as_bool() == Some(true) {
+                text.push_str(&format!("\nThe exit via {agent} is gone too: delete that profile of {peer} in the WireGuard app."));
+            }
+            text
+        }
         AdminRequest::VpnExit { peer, exit } => exit_added(peer, exit, data),
         AdminRequest::VpnExitClear { peer, agent } => exit_removed(peer, agent.as_deref()),
         AdminRequest::PanelStatus => panel_status(data),

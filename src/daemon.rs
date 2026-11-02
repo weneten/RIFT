@@ -1603,6 +1603,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
         } => {
             find_peer(&peer)?;
             let agent_id = find_agent(snap, &agent)?.id.clone();
+            let mut exit_removed = false;
             s.state.mutate("vpn-deny", |x| {
                 let before = x.vpn_grants.len();
                 x.vpn_grants.retain(|g| {
@@ -1612,20 +1613,20 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                             .as_ref()
                             .is_none_or(|a| crate::vpn::same_target(&g.access, a)))
                 });
-                let mut removed = before != x.vpn_grants.len();
+                let removed = before != x.vpn_grants.len();
                 // Withdrawing everything on an agent also ends an exit through it.
                 if access.is_none() {
                     for p in x.vpn_peers.iter_mut().filter(|p| p.name == peer) {
                         let before = p.agent_exits.len();
                         p.agent_exits.retain(|id| *id != agent_id);
-                        removed |= before != p.agent_exits.len();
+                        exit_removed |= before != p.agent_exits.len();
                     }
                 }
-                anyhow::ensure!(removed, "no matching grant");
+                anyhow::ensure!(removed || exit_removed, "no matching grant");
                 Ok(())
             })?;
             reconcile(s).await?;
-            serde_json::json!({"peer":peer,"agent":agent,"denied":true})
+            serde_json::json!({"peer":peer,"agent":agent,"denied":true,"exit_removed":exit_removed})
         }
         AdminRequest::VpnConfig { name, agent } => {
             let peer = find_peer(&name)?;
