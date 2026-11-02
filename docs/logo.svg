@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="RIFT">
+  <style>
+    .tile { fill: #2f5bd3; }
+    .mark { fill: #fff; stroke: #fff; }
+    @media (prefers-color-scheme: dark) {
+      .tile { fill: #6d8ff0; }
+      .mark { fill: #0d1020; stroke: #0d1020; }
+    }
+  </style>
+  <rect class="tile" width="64" height="64" rx="16"/>
+  <circle class="mark" cx="18" cy="32" r="5" stroke-width="0"/>
+  <circle class="mark" cx="46" cy="32" r="5" stroke-width="0"/>
+  <path class="mark" d="M36 18 28 46" stroke-width="5" stroke-linecap="round"/>
+</svg>

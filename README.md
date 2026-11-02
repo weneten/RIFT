@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.svg" alt="RIFT logo" width="96"></p>
+
 # RIFT — Rust Internet Forwarding Tunnel
 
 RIFT connects a public-facing **server** to one or more **agents** through WireGuard. It publishes selected TCP and UDP ports from the server to services reachable on an agent's tunnel address. A server or agent can be a physical machine, virtual machine, or another suitable Linux host; the names describe their roles, not where they run.

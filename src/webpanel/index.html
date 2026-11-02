@@ -5,13 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <title>RIFT Panel</title>
+<link rel="icon" href="/logo.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
 <script src="/app.js" defer></script>
 </head>
 <body>
 <main id="login" class="login" hidden>
   <form id="login-form" class="card login-card">
-    <h1 class="brand">RIFT</h1>
+    <h1 class="brand"><img src="/logo.svg" class="logo" alt="">RIFT</h1>
     <p class="muted">Server panel</p>
     <label for="password">Password</label>
     <input id="password" type="password" autocomplete="current-password" required autofocus>
@@ -28,7 +29,7 @@
 <div id="app" hidden>
   <header class="topbar">
     <div class="brand-row">
-      <span class="brand">RIFT</span>
+      <span class="brand"><img src="/logo.svg" class="logo" alt="">RIFT</span>
       <span id="state" class="pill">…</span>
       <span id="access" class="pill off">…</span>
     </div>

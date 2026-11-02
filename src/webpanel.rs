@@ -46,6 +46,7 @@ use tokio::{
 const INDEX: &str = include_str!("webpanel/index.html");
 const APP_JS: &str = include_str!("webpanel/app.js");
 const APP_CSS: &str = include_str!("webpanel/app.css");
+const LOGO: &str = include_str!("webpanel/logo.svg");
 
 const MAX_HEAD: usize = 8 * 1024;
 const MAX_BODY: usize = 16 * 1024;
@@ -301,6 +302,7 @@ impl<B: Backend> Panel<B> {
             ("GET", "/" | "/index.html") => Response::asset("text/html", INDEX),
             ("GET", "/app.js") => Response::asset("text/javascript", APP_JS),
             ("GET", "/app.css") => Response::asset("text/css", APP_CSS),
+            ("GET", "/logo.svg") => Response::asset("image/svg+xml", LOGO),
             ("GET", "/api/session") => Response::json(
                 200,
                 &json!({"authenticated": self.session(&request), "can_write": self.trusted(&request, source), "two_factor": self.two_factor.enabled()}),
@@ -348,8 +350,8 @@ impl<B: Backend> Panel<B> {
             }
             (
                 _,
-                "/" | "/index.html" | "/app.js" | "/app.css" | "/api/session" | "/api/login"
-                | "/api/logout" | "/api/overview" | "/api/action",
+                "/" | "/index.html" | "/app.js" | "/app.css" | "/logo.svg" | "/api/session"
+                | "/api/login" | "/api/logout" | "/api/overview" | "/api/action",
             ) => Response::error(405, "method not allowed"),
             _ => Response::error(404, "not found"),
         }
@@ -1125,11 +1127,18 @@ impl Response {
              X-Content-Type-Options: nosniff\r\n\
              X-Frame-Options: DENY\r\n\
              Referrer-Policy: no-referrer\r\n\
-             Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n",
+             Content-Security-Policy: {}\r\n",
             self.status,
             self.content_type,
             self.body.len(),
             if self.cache { "no-cache" } else { "no-store" },
+            // The logo switches colours for dark mode through its own
+            // embedded stylesheet; it is static and contains no script.
+            if self.content_type == "image/svg+xml" {
+                "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
+            } else {
+                "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+            },
         );
         if let Some(cookie) = &self.cookie {
             head.push_str(&format!("Set-Cookie: {cookie}\r\n"));
