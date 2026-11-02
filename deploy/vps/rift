@@ -49,4 +49,20 @@ if [ "${1-}" = list ] && [ "${2-}" = forwards ] && [ "$#" -eq 2 ] && [ -x "$site
     "$site" forwards 2> /dev/null && exit 0
 fi
 
+case "$(docker inspect -f '{{.State.Status}}' rift-server 2> /dev/null || true)" in
+    running) ;;
+    restarting)
+        echo "rift: the rift-server container keeps restarting. Its last message:" >&2
+        docker logs --tail 1 rift-server 2>&1 | sed 's/^/  /' >&2
+        exit 1
+        ;;
+    "")
+        echo "rift: there is no rift-server container; start it with 'docker compose up -d' in the RIFT directory" >&2
+        exit 1
+        ;;
+    *)
+        echo "rift: the rift-server container is not running; start it with 'docker compose up -d' in the RIFT directory" >&2
+        exit 1
+        ;;
+esac
 exec docker exec rift-server rift --config /etc/rift/config.toml $json "$@"

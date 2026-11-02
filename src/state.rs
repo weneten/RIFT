@@ -24,6 +24,11 @@ type InvitationRow = (
     i64,
 );
 
+/// Shown when stored state was written by another RIFT version. RIFT keeps no compatibility
+/// with older state formats.
+pub const OLD_STATE: &str =
+    "the stored RIFT state comes from a different RIFT version and cannot be read";
+
 impl StateStore {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -61,7 +66,13 @@ impl StateStore {
     }
     fn read_snapshot(c: &Connection) -> Result<StateSnapshot> {
         let body: String = c.query_row("SELECT body FROM snapshot WHERE id=1", [], |r| r.get(0))?;
-        let snapshot: StateSnapshot = serde_json::from_str(&body)?;
+        let snapshot: StateSnapshot = serde_json::from_str(&body).map_err(|e| {
+            anyhow!(
+                "{OLD_STATE} (state.db: {e}). On the server: remove it with `docker compose \
+                 down -v`, start again and set it up anew, or restore a backup made by this \
+                 version"
+            )
+        })?;
         validate_snapshot(&snapshot)?;
         Ok(snapshot)
     }
@@ -800,6 +811,25 @@ mod tests {
         assert_eq!(after.vpn_peers[0].exit, Exit::None);
     }
 
+    #[test]
+    fn state_from_another_version_says_what_to_do() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("state.db");
+        StateStore::open(&path).unwrap();
+        let c = Connection::open(&path).unwrap();
+        c.execute(
+            "UPDATE snapshot SET body='{\"generation\":1,\"agents\":[],\"forwards\":[],\"bans\":[]}' WHERE id=1",
+            [],
+        )
+        .unwrap();
+        let error = StateStore::open(&path)
+            .unwrap()
+            .snapshot()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("different RIFT version"), "{error}");
+        assert!(error.contains("docker compose down -v"), "{error}");
+    }
     #[test]
     fn forward_ids_fill_gaps_before_growing() {
         assert_eq!(lowest_free_id([]), 1);

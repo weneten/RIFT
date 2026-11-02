@@ -1783,7 +1783,9 @@ async fn run_agent_inner(
     let id_path = config.identity_path();
     let key_path = config.private_key_path();
     let mut identity = if id_path.exists() {
-        serde_json::from_slice::<AgentIdentity>(&std::fs::read(&id_path)?)?
+        serde_json::from_slice::<AgentIdentity>(&std::fs::read(&id_path)?).map_err(|e| {
+            anyhow!("{} (identity.json: {e}). On the agent: remove it with `docker compose down -v`, then enroll the agent again with a new invitation", crate::state::OLD_STATE)
+        })?
     } else {
         let (private, public) = net::generate_keypair().await?;
         atomic_write(&key_path, private.as_bytes(), 0o600)?;
@@ -2138,7 +2140,10 @@ fn note_refusals(refusals: &[String]) {
 /// takes effect on restart without waiting for the server.
 fn load_agent_policy(config: &Config) -> Result<AgentPolicy> {
     let cached: AgentPolicy =
-        serde_json::from_slice(&std::fs::read(config.state_dir.join("agent-policy.json"))?)?;
+        serde_json::from_slice(&std::fs::read(config.state_dir.join("agent-policy.json"))?)
+            .map_err(|e| {
+                anyhow!("{} (agent-policy.json: {e}). On the agent: remove it with `docker compose down -v`, then enroll the agent again with a new invitation", crate::state::OLD_STATE)
+            })?;
     Ok(agent_policy::restrict(&cached, &config.agent_limits()).0)
 }
 async fn agent_sync(
