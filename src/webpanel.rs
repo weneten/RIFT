@@ -1127,18 +1127,11 @@ impl Response {
              X-Content-Type-Options: nosniff\r\n\
              X-Frame-Options: DENY\r\n\
              Referrer-Policy: no-referrer\r\n\
-             Content-Security-Policy: {}\r\n",
+             Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n",
             self.status,
             self.content_type,
             self.body.len(),
             if self.cache { "no-cache" } else { "no-store" },
-            // The logo switches colours for dark mode through its own
-            // embedded stylesheet; it is static and contains no script.
-            if self.content_type == "image/svg+xml" {
-                "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
-            } else {
-                "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
-            },
         );
         if let Some(cookie) = &self.cookie {
             head.push_str(&format!("Set-Cookie: {cookie}\r\n"));
