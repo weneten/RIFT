@@ -403,7 +403,7 @@ fn vpn_access(value: &Value) -> String {
     }
 }
 
-/// "exit via server" or "exit via core (refused by agent)", one per exit of a device.
+/// "exit via server" or "exit via node1 (refused by agent)", one per exit of a device.
 fn vpn_exits(exits: &Value) -> Vec<String> {
     exits
         .as_array()

@@ -149,18 +149,18 @@ fn parse_map(value: &str) -> Result<(String, String), String> {
         Some((old, new)) if !old.is_empty() && !new.is_empty() && !new.contains('=') => {
             Ok((old.into(), new.into()))
         }
-        _ => Err("use OLD=NEW, for example core2=core".into()),
+        _ => Err("use OLD=NEW, for example node2=node1".into()),
     }
 }
 #[derive(Subcommand)]
 enum Vpn {
     /// Let a device reach an agent: `rift vpn allow DEVICE AGENT TARGET...`, for example
-    /// `rift vpn allow iphone core 22/tcp 53/both`. Without an allow, a device reaches nothing.
+    /// `rift vpn allow iphone node1 22/tcp 53/both`. Without an allow, a device reaches nothing.
     ///
     /// Use `exit` as a target to add an exit through that agent's connection
-    /// (`rift vpn allow iphone core exit`), or alone to add the exit through this server
+    /// (`rift vpn allow iphone node1 exit`), or alone to add the exit through this server
     /// (`rift vpn allow iphone exit`). A device can have both and several agent exits; each
-    /// is its own WireGuard profile (`rift vpn config qr iphone core`), and the device
+    /// is its own WireGuard profile (`rift vpn config qr iphone node1`), and the device
     /// switches between them in the WireGuard app.
     Allow(VpnAccessArgs),
     /// Withdraw access again. Without a target, withdraws all of it on that agent, including
