@@ -383,11 +383,7 @@ pub enum VpnAccess {
     },
     /// An explicitly named network behind the agent. `snat` masquerades the peer's address
     /// on the agent, for LANs whose router has no route back to the VPN pool.
-    Subnet {
-        net: Ipv4Net,
-        #[serde(default)]
-        snat: bool,
-    },
+    Subnet { net: Ipv4Net, snat: bool },
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VpnGrant {
