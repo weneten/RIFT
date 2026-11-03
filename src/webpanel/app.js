@@ -89,7 +89,8 @@ function forwardUrl(forward) {
   const ports = forward.listen_ports;
   const ip = String(forward.listen_ip || "");
   if (forward.protocol !== "tcp" || !forward.enabled || !ports || ports.start !== ports.end) return null;
-  if (!ip || ip === "0.0.0.0" || ip === "::") return null;
+  // Behind a cloud NAT the listener has a private address that is useless from outside.
+  if (!ip || ip === "0.0.0.0" || ip === "::" || /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|f[cd])/i.test(ip)) return null;
   const scheme = Object.prototype.hasOwnProperty.call(WEB_PORTS, ports.start) ? WEB_PORTS[ports.start] : null;
   if (!scheme) return null;
   const host = ip.includes(":") ? `[${ip}]` : ip;
