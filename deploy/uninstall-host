@@ -80,7 +80,7 @@ if [ "$purge" -eq 1 ] && [ -d /var/lib/rift-site-queue ]; then
   rm -rf /var/lib/rift-site-queue && echo "rift: removed /var/lib/rift-site-queue"
 fi
 
-# Host files installed by deploy/prepare-host and deploy/vps/install-cli.
+# Host files installed by deploy/prepare-host and deploy/install-cli.
 for f in /usr/local/bin/rift /usr/local/lib/rift/rift-site /etc/sysctl.d/99-rift.conf; do
   if [ -e "$f" ]; then
     rm -f "$f" && echo "rift: removed $f"

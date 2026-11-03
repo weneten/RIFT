@@ -97,13 +97,13 @@ docker compose up -d
 docker logs -f rift-server
 ```
 
-Wait for `RIFT server ready`, then leave the log view with Ctrl+C. On the **server**, install the host CLI from the checkout:
+Wait for `RIFT server ready`, then leave the log view with Ctrl+C. Install the host command from the checkout (it reads `COMPOSE_PROFILES` from `.env`, so `.env` must exist first):
 
 ```sh
-sudo sh deploy/vps/install-cli
+sudo sh deploy/install-cli
 ```
 
-This installs `/usr/local/bin/rift` and the site helper under `/usr/local/lib/rift`. It replaces any existing files at those paths. The command runs on the server and forwards administrative arguments to the `rift-server` Docker container; it requires Docker access (use `sudo rift ...` if your user cannot access Docker). `sudo rift add site ...` and the other site commands run the host-side proxy helper and requires Python 3 and administrator access. Ensure `/usr/local/bin` is in your PATH, including sudo's PATH. The original `docker exec rift-server rift --config /etc/rift/config.toml ...` remains available. The script also creates `/var/lib/rift-site` and `/var/lib/rift-site-queue` (mounted into the server container) and enables the systemd path unit `rift-site-queue.path` that lets the web panel add and remove sites; run it before the first `docker compose up`.
+This installs `/usr/local/bin/rift`, which runs `rift` inside the `rift-server` container, and replaces any existing file at that path. It requires Docker access (use `sudo rift ...` if your user cannot access Docker). Ensure `/usr/local/bin` is in your PATH, including sudo's PATH. The original `docker exec rift-server rift --config /etc/rift/config.toml ...` remains available. On the server the script also installs the site helper under `/usr/local/lib/rift`, which `sudo rift add site ...` and the other site commands run (they require Python 3 and administrator access). It creates `/var/lib/rift-site` and `/var/lib/rift-site-queue` (mounted into the server container) and enables the systemd path unit `rift-site-queue.path` that lets the web panel add and remove sites.
 
 Check the server with:
 
@@ -133,7 +133,13 @@ cp .env.agent.example .env
 chmod 600 .env
 ```
 
-Edit `.env`: keep `COMPOSE_PROFILES=agent` and replace the three invitation values with the exact output. `RIFT_SERVER` includes the enrollment port. Start the agent:
+Edit `.env`: keep `COMPOSE_PROFILES=agent` and replace the three invitation values with the exact output. `RIFT_SERVER` includes the enrollment port. Install the host command, as on the server, so `rift status`, `rift doctor` and `rift logs` work here (they run inside `rift-agent`):
+
+```sh
+sudo sh deploy/install-cli
+```
+
+Start the agent:
 
 ```sh
 docker compose pull
@@ -562,9 +568,9 @@ Import the configuration into the WireGuard app, connect, and open `http://10.13
 
 - The server container mounts `/var/lib/rift-site` **read-only** (the helper's `sites.json`, which the card lists) and `/var/lib/rift-site-queue` read-write. Nothing else of the host is visible, and the container cannot write to the site records or the proxy configuration.
 - An add or remove from a trusted connection (the same rule as every other change) validates the request in the panel first (agent name, domain of at most 253 characters, port 1-65535, proxy `traefik`, `caddy`, `nginx` or `npm`, or none) and writes one small JSON file into the queue: `{id, action: "add", agent, host, port, proxy?}` or `{id, action: "remove", host}`. At most 20 requests wait at a time.
-- On the host, the systemd units `rift-site-queue.path` and `rift-site-queue.service` (installed by `deploy/vps/install-cli`) run `rift-site process-queue` when a request appears. It checks every request again, trusting nothing from the container: only the actions `add` and `remove`, exactly their keys, a request id that matches the file name, the same name, domain, port and proxy rules, no links, at most 4 KiB. A request that fails any check is refused without running anything. A valid one goes through the same code as `sudo rift add site` and `sudo rift remove site`; no request text reaches a shell. The answer (`ok` and the helper's output or error) is written to `<id>.result.json`, the request file is deleted, and results older than a day are cleaned up. The panel polls for the answer for up to 30 seconds and shows it.
+- On the host, the systemd units `rift-site-queue.path` and `rift-site-queue.service` (installed by `deploy/install-cli`) run `rift-site process-queue` when a request appears. It checks every request again, trusting nothing from the container: only the actions `add` and `remove`, exactly their keys, a request id that matches the file name, the same name, domain, port and proxy rules, no links, at most 4 KiB. A request that fails any check is refused without running anything. A valid one goes through the same code as `sudo rift add site` and `sudo rift remove site`; no request text reaches a shell. The answer (`ok` and the helper's output or error) is written to `<id>.result.json`, the request file is deleted, and results older than a day are cleaned up. The panel polls for the answer for up to 30 seconds and shows it.
 
-If the host command is not installed, the card says that sites are managed on the host. If it is installed but the units are not active, a request ends with "The host service did not pick up the request; is `rift-site-queue.path` installed and active?". Run `sudo sh deploy/vps/install-cli` (also after `git pull`) and check `systemctl status rift-site-queue.path`. Run it before the first `docker compose up`: it creates `/var/lib/rift-site` and `/var/lib/rift-site-queue`. If Docker creates them first (Compose v2 does for a missing bind source) the panel works the same once the units exist. `sudo sh deploy/uninstall-host` removes the units and `--purge` also the queue directory.
+If the host command is not installed, the card says that sites are managed on the host. If it is installed but the units are not active, a request ends with "The host service did not pick up the request; is `rift-site-queue.path` installed and active?". Run `sudo sh deploy/install-cli` (also after `git pull`) and check `systemctl status rift-site-queue.path`. It creates `/var/lib/rift-site` and `/var/lib/rift-site-queue`. If Docker creates them first (Compose v2 does for a missing bind source) the panel works the same once the units exist. `sudo sh deploy/uninstall-host` removes the units and `--purge` also the queue directory.
 
 **Public mode** opens the port in the host firewall (`host_firewall = "auto"`); open it in any upstream firewall or cloud security group yourself. The panel speaks plain HTTP. In public mode the password and session cookie cross the network unencrypted, so prefer private mode, restrict `RIFT_WEBPANEL_ALLOW`, or put a TLS reverse proxy in front (the cookie is marked `Secure` when the proxy sends `X-Forwarded-Proto: https`). Public sessions are read-only, so a password read off the network alone allows no changes; it still shows your agents, ports and devices.
 
@@ -642,7 +648,7 @@ The backup is one `.tar.gz` with three parts: a small manifest, `server/` (every
 Agents, devices and sites keep working; only the address changes.
 
 1. On the old server: `sudo rift backup`. Copy the file to the new server over a channel you trust (`scp`). It holds every key.
-2. On the new server, install RIFT as in [Install the server](#install-the-server), with your `.env` (`RIFT_PUBLIC_ENDPOINT` may be a new name: RIFT issues a new enrollment certificate for it from the same CA, which agents already trust) and the same values for the pools and ports you changed (`RIFT_IPV4_POOL`, `RIFT_WG_PORT`, ...). Set `RIFT_PUBLIC_IPS` to the **new** addresses, run `docker compose up -d` and `sudo sh deploy/vps/install-cli`. For websites, have your reverse proxy running too.
+2. On the new server, install RIFT as in [Install the server](#install-the-server), with your `.env` (`RIFT_PUBLIC_ENDPOINT` may be a new name: RIFT issues a new enrollment certificate for it from the same CA, which agents already trust) and the same values for the pools and ports you changed (`RIFT_IPV4_POOL`, `RIFT_WG_PORT`, ...). Set `RIFT_PUBLIC_IPS` to the **new** addresses, run `docker compose up -d` and `sudo sh deploy/install-cli`. For websites, have your reverse proxy running too.
 3. Stop the old server's container (`docker compose down`) so two servers never use the same keys.
 4. Run `sudo rift restore rift-backup-2026-11-01.tar.gz` on the new server.
 5. Point DNS at the new server: the name in `RIFT_PUBLIC_ENDPOINT` and the names of your sites. If your agents connect to a raw IP address instead of a name, edit `RIFT_SERVER` in each agent's `.env` to the new address and run `docker compose up -d` there; the agent then dials that address with the WireGuard port it already knows. Nothing else changes on the agent.
@@ -671,7 +677,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | --- | --- |
 | `rift status` | Health of the server, agents, enrollment port, open invitations and refused forwards. |
 | `rift doctor` | Checks kernel tools, WireGuard, nftables and the host firewall. |
-| `rift logs [--lines N]` | Recent log entries of the running server (default 100). |
+| `rift logs [--lines N]` | Recent log entries of the running server or agent (default 100). |
 | `rift reload` | Re-reads `config.toml` and applies the current state again. |
 | `rift config validate` | Checks `config.toml` and the `.env` values; reports the first error. |
 
@@ -710,7 +716,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | `rift list sites` | All sites with their forward state (`ok`, `missing`, `refused`). |
 | `rift remove site DOMAIN` | Removes the site, its proxy configuration and its forward. |
 
-The web panel runs the same two commands through the host service (`rift-site-queue.path`, installed by `deploy/vps/install-cli`); see [Web panel](#web-panel).
+The web panel runs the same two commands through the host service (`rift-site-queue.path`, installed by `deploy/install-cli`); see [Web panel](#web-panel).
 
 | `rift proxy [traefik\|caddy\|nginx\|npm]` | Shows or sets the default proxy. |
 
@@ -831,7 +837,7 @@ docker compose up -d
 docker compose ps
 ```
 
-On the server, run `sudo sh deploy/vps/install-cli` again after `git pull` to update the installed CLI and site helper. Check logs, agent status and representative services after the update. Review configuration changes before replacing your local `config.toml` or `.env`.
+On each host, run `sudo sh deploy/install-cli` again after `git pull` to update the installed `rift` command (on the server, also the site helper). Check logs, agent status and representative services after the update. Review configuration changes before replacing your local `config.toml` or `.env`.
 
 The `rift-state` volume contains identities, keys, certificates and dynamic configuration. Protect and back up the state on **both** server and agent, and test restoration. On the server, `rift backup` and `rift restore` do this for you; see [Back up, move or rebuild](#back-up-move-or-rebuild). The agent's state volume is backed up with your usual volume tools. A normal `docker compose down` asks RIFT to remove its owned networking configuration; a subsequent `docker compose up -d` recreates it from the retained volume. A crash, forced kill or cleanup error can leave network state behind; inspect the logs and use the ownership-aware recovery procedure in [docs/deploy.md](docs/deploy.md#rollout-and-rollback). `docker compose down -v` and volume pruning can delete the state; agents and invitations cannot be recovered merely by restarting. Host-wide sysctl settings installed by `deploy/prepare-host` remain in place.
 

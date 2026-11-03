@@ -32,7 +32,7 @@ services:
       - rift-state:/var/lib/rift
       - ${RIFT_CONFIG:-./config.toml}:/etc/rift/config.toml:ro
       # Web panel sites: the host helper's records (read-only) and the request queue the
-      # host service answers. Created by deploy/vps/install-cli; Docker creates them empty
+      # host service answers. Created by deploy/install-cli; Docker creates them empty
       # otherwise, and the panel then says the host command is missing.
       - /var/lib/rift-site:/var/lib/rift-site:ro
       - /var/lib/rift-site-queue:/var/lib/rift-site-queue
