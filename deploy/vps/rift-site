@@ -1286,7 +1286,7 @@ def check_export_format(document):
 def parse_map(value):
     old, separator, new = value.partition("=")
     if not separator or not old or not new or "=" in new:
-        raise argparse.ArgumentTypeError("use OLD=NEW, for example core2=core")
+        raise argparse.ArgumentTypeError("use OLD=NEW, for example node2=node1")
     return old, new
 
 

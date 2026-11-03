@@ -95,7 +95,7 @@ function exitText(exit) {
   return `extra profile via ${exit.agent || "?"}${note}`;
 }
 
-// "main: exit via server · profiles: core, cabin (refused)" for the devices table.
+// "main: exit via server · profiles: node1, node2 (refused)" for the devices table.
 function exitSummary(peer) {
   const exits = peer.exits || [];
   const parts = [];
