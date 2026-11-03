@@ -89,7 +89,15 @@ RIFT_PUBLIC_IPS=203.0.113.10
 
 `rift.example.net` must resolve to the server endpoint. The example IP is a documentation placeholder: replace it with the actual address assigned to the server interface. `RIFT_PUBLIC_ENDPOINT` has no scheme or port and is also used as the enrollment certificate name. `RIFT_PUBLIC_IPS` may contain comma-separated addresses. Keep `COMPOSE_PROFILES=server`.
 
-Start and check the server:
+Install the host command (it reads `COMPOSE_PROFILES` from `.env`, so `.env` must exist first; run it before the first start):
+
+```sh
+sudo sh deploy/install-cli
+```
+
+This installs `/usr/local/bin/rift`, which runs `rift` inside the `rift-server` container, and replaces any existing file at that path. It requires Docker access (use `sudo rift ...` if your user cannot access Docker). Ensure `/usr/local/bin` is in your PATH, including sudo's PATH. The original `docker exec rift-server rift --config /etc/rift/config.toml ...` remains available. On the server the script also installs the site helper under `/usr/local/lib/rift`, which `sudo rift add site ...` and the other site commands run (they require Python 3 and administrator access). It creates `/var/lib/rift-site` and `/var/lib/rift-site-queue` (mounted into the server container) and enables the systemd path unit `rift-site-queue.path` that lets the web panel add and remove sites.
+
+Start the server:
 
 ```sh
 docker compose pull
@@ -97,13 +105,7 @@ docker compose up -d
 docker logs -f rift-server
 ```
 
-Wait for `RIFT server ready`, then leave the log view with Ctrl+C. Install the host command from the checkout (it reads `COMPOSE_PROFILES` from `.env`, so `.env` must exist first):
-
-```sh
-sudo sh deploy/install-cli
-```
-
-This installs `/usr/local/bin/rift`, which runs `rift` inside the `rift-server` container, and replaces any existing file at that path. It requires Docker access (use `sudo rift ...` if your user cannot access Docker). Ensure `/usr/local/bin` is in your PATH, including sudo's PATH. The original `docker exec rift-server rift --config /etc/rift/config.toml ...` remains available. On the server the script also installs the site helper under `/usr/local/lib/rift`, which `sudo rift add site ...` and the other site commands run (they require Python 3 and administrator access). It creates `/var/lib/rift-site` and `/var/lib/rift-site-queue` (mounted into the server container) and enables the systemd path unit `rift-site-queue.path` that lets the web panel add and remove sites.
+Wait for `RIFT server ready`, then leave the log view with Ctrl+C.
 
 Check the server with:
 
@@ -133,7 +135,9 @@ cp .env.agent.example .env
 chmod 600 .env
 ```
 
-Edit `.env`: keep `COMPOSE_PROFILES=agent` and replace the three invitation values with the exact output. `RIFT_SERVER` includes the enrollment port. Install the host command, as on the server, so `rift status`, `rift doctor` and `rift logs` work here (they run inside `rift-agent`):
+Edit `.env`: keep `COMPOSE_PROFILES=agent` and replace the three invitation values with the exact output. `RIFT_SERVER` includes the enrollment port.
+
+Install the host command, as on the server, so `rift status`, `rift doctor` and `rift logs` work here (they run inside `rift-agent`):
 
 ```sh
 sudo sh deploy/install-cli
@@ -146,6 +150,8 @@ docker compose pull
 docker compose up -d
 docker logs -f rift-agent
 ```
+
+Leave the log view with Ctrl+C once it shows no errors; the server confirms the enrollment below.
 
 On the **server**, verify that the agent becomes `active`:
 
