@@ -43,14 +43,23 @@ pub fn create_invite(
     ttl_seconds: u64,
 ) -> Result<String> {
     validate_name(name)?;
-    anyhow::ensure!(
-        !state
-            .snapshot()?
-            .agents
-            .iter()
-            .any(|agent| agent.name == name),
-        "agent name already exists"
-    );
+    // An invitation for an existing agent re-enrolls it: whoever uses it takes over the
+    // agent's key and keeps its addresses, forwards, grants and exits.
+    if let Some(agent) = state
+        .snapshot()?
+        .agents
+        .iter()
+        .find(|agent| agent.name == name)
+    {
+        anyhow::ensure!(
+            agent.status == AgentStatus::Active,
+            "agent {name} is {}; only an active agent can be invited again (enable it first, or wait for its enrollment)",
+            match agent.status {
+                AgentStatus::Pending => "still enrolling",
+                _ => "disabled",
+            }
+        );
+    }
     anyhow::ensure!(
         (60..=30 * 24 * 3600).contains(&ttl_seconds),
         "invitation TTL must be 60 seconds to 30 days"
@@ -344,6 +353,8 @@ pub async fn enroll_agent(config: &Config, identity: &mut AgentIdentity) -> Resu
     .await??
     {
         EnrollmentResponse::Welcome(w) => {
+            // A re-enrollment keeps the agent's existing ID on the server.
+            identity.id = w.agent_id.clone();
             identity.welcome = Some(w.clone());
             Ok(w)
         }

@@ -1016,6 +1016,9 @@ async fn show(
             response.data["token"].as_str().unwrap_or_default()
         );
         eprintln!("Copy these values into the agent's private .env file. This invitation is single-use and expires.");
+        if response.data["replaces"].as_bool() == Some(true) {
+            eprintln!("{} already exists: the install that uses this invitation takes over its key and keeps its addresses, forwards, grants and exits. The old install stops working then.", response.data["name"].as_str().unwrap_or_default());
+        }
         if response.data["enrollment"].as_str() == Some("auto") {
             eprintln!("The enrollment port is open until the agent is active or the invitation expires or is cancelled.");
         }

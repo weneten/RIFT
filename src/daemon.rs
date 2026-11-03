@@ -971,12 +971,13 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
                 cfg.enrollment != EnrollmentMode::Off,
                 "enrollment is off; set RIFT_ENROLLMENT=auto in the server .env and recreate the container"
             );
+            let replaces = s.state.snapshot()?.agents.iter().any(|a| a.name == name);
             let token = enrollment::create_invite(&cfg, &s.state, &name, ttl_seconds)?;
             sync_enrollment(s)
                 .await
                 .context("invitation created, but the enrollment port could not be opened")?;
             reconcile(s).await?;
-            serde_json::json!({"name":name,"token":token,"expires_at":now()+ttl_seconds as i64,"server":host_port(&cfg.public_endpoint,cfg.enrollment_bind.port()),"enrollment":cfg.enrollment})
+            serde_json::json!({"name":name,"token":token,"expires_at":now()+ttl_seconds as i64,"server":host_port(&cfg.public_endpoint,cfg.enrollment_bind.port()),"enrollment":cfg.enrollment,"replaces":replaces})
         }
         AdminRequest::CancelInvite { name } => {
             s.state.cancel_invite(&name)?;

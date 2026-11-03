@@ -384,12 +384,17 @@ rift enable agent node1
 rift remove agent node1
 rift remove invite node1
 
+# Reinstalled home server or lost agent volume: invite the same name again
+rift add agent node1
+
 # Inspect, disable, enable or remove a forward
 rift list forwards
 rift disable forward 1
 rift enable forward 1
 rift remove forward 1
 ```
+
+**Reinstalling an agent.** If a home server is reinstalled or its `rift-state` volume is lost, run `rift add agent NAME` again with its existing name (or "Re-invite" in the web panel) and start the new install with that invitation. The new install takes over the agent's key and keeps its ID, tunnel addresses, forwards, VPN grants, exits and sites, so VPN devices need no new profile. The old install stops working as soon as the invitation is used; until then nothing changes. Only an active agent can be invited again; enable a disabled one first.
 
 `rift rename agent OLD NEW` and `rift rotate agent NAME` are also available; `rift --help` lists every command. For translated forwards, `rift add ban AGENT FORWARD_ID ADDRESS --ttl 1h` blocks an original client address temporarily; `rift list bans` shows bans. Bans expire by TTL; there is no explicit remove command. Use `--json` for machine-readable administrative output and `rift --help` for the full CLI.
 

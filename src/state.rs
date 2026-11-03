@@ -159,6 +159,10 @@ impl StateStore {
         let tx = c.transaction()?;
         let generation = Self::read_snapshot(&tx)?.generation;
         tx.execute(
+            "DELETE FROM invites WHERE name=?1 AND (consumed=1 OR expires_at<?2)",
+            params![name, now()],
+        )?;
+        tx.execute(
             "INSERT INTO invites(name,token_hash,expires_at) VALUES(?1,?2,?3)",
             params![name, token_hash, expires_at],
         )
@@ -228,6 +232,49 @@ impl StateStore {
         }
         if invite_name != name {
             bail!("invitation is restricted to a different agent name")
+        }
+        // Re-enrollment of an existing agent: the agent keeps its ID, addresses and everything
+        // that refers to it; only key and attempt change. The new install learns the ID from
+        // the welcome. Retries of the same attempt return the same record.
+        if let Some(index) = s
+            .agents
+            .iter()
+            .position(|a| a.name == name && a.status != AgentStatus::Pending)
+        {
+            let existing = s.agents[index].clone();
+            if let Some(reserved) = reserved_agent {
+                if reserved != existing.id
+                    || reserved_attempt.as_deref() != Some(attempt)
+                    || reserved_key.as_deref() != Some(key)
+                    || deadline.unwrap_or_default() < now()
+                {
+                    bail!("invitation is reserved by another or expired attempt")
+                }
+                tx.commit()?;
+                return Ok(existing);
+            }
+            anyhow::ensure!(
+                existing.status == AgentStatus::Active,
+                "only an active agent can be enrolled again"
+            );
+            anyhow::ensure!(
+                !s.agents.iter().any(|a| a.public_key == key),
+                "this WireGuard key is already in use"
+            );
+            let stage_deadline = (now() + stage_seconds).min(expires);
+            let generation = s.generation + 1;
+            let agent = &mut s.agents[index];
+            agent.public_key = key.into();
+            agent.attempt_id = attempt.into();
+            agent.generation = generation;
+            agent.applied_generation = 0;
+            agent.last_error = None;
+            let record = agent.clone();
+            tx.execute("DELETE FROM rotations WHERE agent_id=?1", [&record.id])?;
+            tx.execute("UPDATE invites SET reserved_agent=?1,reserved_attempt=?2,reserved_key=?3,stage_deadline=?4 WHERE token_hash=?5", params![record.id,attempt,key,stage_deadline,token_hash])?;
+            Self::commit_snapshot(&tx, s, "enrollment-replace")?;
+            tx.commit()?;
+            return Ok(record);
         }
         if let Some(a) = s
             .agents
@@ -308,6 +355,11 @@ impl StateStore {
             bail!("activation identity or tunnel source mismatch")
         }
         if a.status == AgentStatus::Active {
+            // A re-enrolled agent was active all along; its invitation is used up now.
+            tx.execute(
+                "UPDATE invites SET consumed=1 WHERE reserved_agent=?1 AND reserved_attempt=?2",
+                params![id, attempt],
+            )?;
             tx.commit()?;
             return Ok(s);
         }
@@ -980,6 +1032,67 @@ mod tests {
         st.activate(&id, &attempt, "10.6.0.2".parse().unwrap())
             .unwrap();
         assert!(st.open_invites().unwrap().is_empty());
+    }
+    #[test]
+    fn an_active_agent_can_be_enrolled_again_and_keeps_its_identity() {
+        let d = tempdir().unwrap();
+        let st = StateStore::open(&d.path().join("state.db")).unwrap();
+        let pools = |st: &StateStore, token: &str, id: &str, attempt: &str, key: &str| {
+            st.reserve_enrollment(
+                &StateStore::invite_hash(token),
+                "node1",
+                id,
+                attempt,
+                key,
+                "10.6.0.0/24".parse().unwrap(),
+                "fd00:6::/64".parse().unwrap(),
+                "10.6.0.1".parse().unwrap(),
+                "fd00:6::1".parse().unwrap(),
+                120,
+            )
+        };
+        st.invite("node1", &StateStore::invite_hash("first"), now() + 600)
+            .unwrap();
+        let (id, attempt) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let first = pools(&st, "first", &id, &attempt, "old-key").unwrap();
+        st.activate(&id, &attempt, IpAddr::V4(first.tunnel_ipv4))
+            .unwrap();
+
+        // The reinstalled agent has a fresh identity; the invitation name may be reused.
+        st.invite("node1", &StateStore::invite_hash("second"), now() + 600)
+            .unwrap();
+        let (new_id, new_attempt) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let again = pools(&st, "second", &new_id, &new_attempt, "new-key").unwrap();
+        assert_eq!(again.id, id, "the server keeps the agent's ID");
+        assert_eq!(
+            (again.tunnel_ipv4, again.tunnel_ipv6),
+            (first.tunnel_ipv4, first.tunnel_ipv6)
+        );
+        assert_eq!(again.public_key, "new-key");
+        assert_eq!(again.status, AgentStatus::Active);
+        assert_eq!(st.snapshot().unwrap().agents.len(), 1);
+        // A retry of the same attempt gets the same answer; another attempt does not.
+        assert_eq!(
+            pools(&st, "second", &new_id, &new_attempt, "new-key")
+                .unwrap()
+                .id,
+            id
+        );
+        assert!(pools(&st, "second", &new_id, "other", "other-key").is_err());
+        assert_eq!(st.open_invites().unwrap().len(), 1);
+        st.activate(&id, &new_attempt, IpAddr::V4(first.tunnel_ipv4))
+            .unwrap();
+        assert!(
+            st.open_invites().unwrap().is_empty(),
+            "the invitation is used up"
+        );
+        assert!(pools(&st, "second", &new_id, &new_attempt, "new-key").is_err());
     }
     #[test]
     fn cancelling_invite_removes_its_pending_agent() {

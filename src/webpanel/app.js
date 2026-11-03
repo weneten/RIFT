@@ -237,12 +237,15 @@ function agentOptions(onlyActive) {
     .map((a) => [a.name, a.name]);
 }
 
-function inviteDialog() {
+// `existing` re-invites an active agent: the new install takes over its key and settings.
+function inviteDialog(existing) {
   const name = el("input", { required: true, pattern: "[A-Za-z0-9_\\-]{1,63}", placeholder: "node2" });
+  if (existing) Object.assign(name, { value: existing, readOnly: true });
   const ttl = select([["15m", "15 minutes"], ["30m", "30 minutes"], ["1h", "1 hour"], ["24h", "24 hours"]], "15m");
-  openModal("Invite agent", form([
+  openModal(existing ? `Invite ${existing} again` : "Invite agent", form([
     row("Agent name", name),
     row("Valid for", ttl),
+    existing ? el("p", { class: "notice" }, `For a reinstalled ${existing}: the install that uses this invitation takes over its key and keeps its addresses, forwards, grants and exits. The old install stops working then.`) : null,
     el("p", { class: "hint" }, "The enrollment port opens now and closes again when the agent is active, the invitation expires or is cancelled."),
   ], "Create invitation", async () => {
     const result = await act({ action: "agent_invite", name: name.value.trim(), ttl: ttl.value });
@@ -250,6 +253,7 @@ function inviteDialog() {
     const copyButton = button("Copy", (e) => copy(result.lines, e.currentTarget), "primary");
     openModal(`Invitation for ${result.name}`,
       el("p", { class: "hint" }, "Put these three lines into the agent's .env, then start it. The token is a secret and works once."),
+      result.replaces ? el("p", { class: "hint" }, `${result.name} keeps its addresses, forwards, grants and exits.`) : null,
       el("pre", { class: "pre" }, result.lines),
       el("div", { class: "form" }, el("div", { class: "buttons" }, copyButton, button("Done", closeModal))));
   }));
@@ -632,6 +636,7 @@ function render() {
           try { await act({ action: "agent_rename", name: a.id, new_name: next.trim() }); await load(); } catch (e) { showBanner(e.message); }
         }),
         actionButton("Rotate key", { action: "agent_rotate", name: a.id }, `Rotate the WireGuard key of ${a.name}? It happens on the agent's next sync.`),
+        a.status === "active" ? button("Re-invite", () => inviteDialog(a.name)) : null,
         a.status === "active"
           ? actionButton("Disable", { action: "agent_enable", name: a.id, enabled: false }, `Disable ${a.name}? Its forwards and VPN access stop until it is enabled again.`)
           : actionButton("Enable", { action: "agent_enable", name: a.id, enabled: true }),
@@ -830,7 +835,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("reload").addEventListener("click", async () => {
     try { await act({ action: "reload" }); await load(); } catch (e) { showBanner(`Reconcile failed: ${e.message}`); }
   });
-  $("add-agent").addEventListener("click", inviteDialog);
+  $("add-agent").addEventListener("click", () => inviteDialog());
   $("add-forward").addEventListener("click", forwardDialog);
   $("add-device").addEventListener("click", deviceDialog);
   $("modal-close").addEventListener("click", closeModal);
