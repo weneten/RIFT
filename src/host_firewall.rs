@@ -1,6 +1,8 @@
-//! UFW drops stay in force beside the RIFT table. An accept in `inet rift` does not
-//! override a drop in another filter base chain, so this module installs one owned jump
-//! into the UFW user chains. Grant checks remain in the RIFT table.
+//! Drops of another firewall stay in force beside the RIFT table: an accept in `inet rift`
+//! does not override a drop in another filter base chain. So this module installs one owned
+//! jump where that firewall decides: into the UFW user chains, or without UFW into each
+//! foreign input/forward base chain that drops (a drop policy, or a final reject as on Oracle
+//! Cloud images and Docker's forward policy). Grant checks remain in the RIFT table.
 
 use crate::model::{AgentVpnRule, Family, Forward};
 use anyhow::{ensure, Context, Result};
@@ -38,8 +40,13 @@ pub struct Observation {
     jumps: Vec<JumpRef>,
     pub forward_policy_drop: bool,
     pub input_policy_drop: bool,
-    /// Base chains (family, table, name) hooked at input or forward, with that hook.
+    /// Filter base chains (family, table, name) of other tables hooked at input or forward,
+    /// with that hook.
     hooked: Vec<(String, String, String, String)>,
+    /// Those of them that drop: by policy or by a final reject/drop without matches.
+    dropping: BTreeSet<(String, String, String)>,
+    /// Where the jumps go: `"ufw"`, `"nftables"` (other dropping chains) or `"none"`.
+    pub backend: &'static str,
     /// The tunnel interface is accepted on input / forwarded in / forwarded out by a rule of
     /// another table (for example `iptables -I INPUT -i rift0 -j ACCEPT`).
     pub input_open: bool,
@@ -125,6 +132,33 @@ pub fn observe_for(document: &Value, interface: &str) -> Result<Observation> {
             observe_base_rule(&mut obs, rule, interface);
         }
     }
+    let ufw = !obs.input.is_empty() || !obs.forward.is_empty();
+    if !ufw {
+        for (family, table, name, hook) in &obs.hooked {
+            if !obs
+                .dropping
+                .contains(&(family.clone(), table.clone(), name.clone()))
+            {
+                continue;
+            }
+            let chain = ChainRef {
+                family: family.clone(),
+                table: table.clone(),
+                name: name.clone(),
+            };
+            match hook.as_str() {
+                "input" => obs.input.push(chain),
+                _ => obs.forward.push(chain),
+            }
+        }
+    }
+    obs.backend = if ufw {
+        "ufw"
+    } else if obs.input.is_empty() && obs.forward.is_empty() {
+        "none"
+    } else {
+        "nftables"
+    };
     Ok(obs)
 }
 
@@ -160,6 +194,8 @@ fn observe_base_rule(obs: &mut Observation, rule: &Value, interface: &str) {
     };
     let plain = !has("match");
     if plain && (has("reject") || has("drop")) {
+        obs.dropping
+            .insert((reference.family, reference.table, reference.name));
         match hook.as_str() {
             "input" => obs.input_policy_drop = true,
             "forward" => obs.forward_policy_drop = true,
@@ -364,20 +400,30 @@ pub fn plan_agent(obs: &Observation, spec: &AgentSpec<'_>) -> Result<Plan> {
     Ok(plan)
 }
 
-/// Forwarding between an exit interface and the uplinks: out freely, back only for replies.
+/// Forwarding between an exit interface and the uplinks. Only replies may come back, but
+/// that is enforced in the RIFT table: these rules sit in tables that `iptables` also reads
+/// (UFW, `iptables-nft`), and a native `ct state` match makes such a table unreadable for it.
 fn exit_rules(interface: &str, uplinks: &[String]) -> Vec<String> {
     if uplinks.is_empty() {
         return vec![
-            format!("iifname \"{interface}\" oifname != \"{interface}\" accept comment \"rift:exit\""),
-            format!("iifname != \"{interface}\" oifname \"{interface}\" ct state established,related accept comment \"rift:exit\""),
+            format!(
+                "iifname \"{interface}\" oifname != \"{interface}\" accept comment \"rift:exit\""
+            ),
+            format!(
+                "iifname != \"{interface}\" oifname \"{interface}\" accept comment \"rift:exit\""
+            ),
         ];
     }
     uplinks
         .iter()
         .flat_map(|uplink| {
             [
-                format!("iifname \"{interface}\" oifname \"{uplink}\" accept comment \"rift:exit\""),
-                format!("iifname \"{uplink}\" oifname \"{interface}\" ct state established,related accept comment \"rift:exit\""),
+                format!(
+                    "iifname \"{interface}\" oifname \"{uplink}\" accept comment \"rift:exit\""
+                ),
+                format!(
+                    "iifname \"{uplink}\" oifname \"{interface}\" accept comment \"rift:exit\""
+                ),
             ]
         })
         .collect()
@@ -406,44 +452,25 @@ pub fn report(
     uplinks: &[String],
     public_ips_configured: bool,
 ) -> DoctorReport {
-    let backend = if obs.input.is_empty() && obs.forward.is_empty() {
-        "none"
-    } else {
-        "ufw"
-    };
-    let uplinks_missing = public_ips_configured && uplinks.is_empty() && !obs.forward.is_empty();
     let mut warnings = Vec::new();
-    if obs.forward_policy_drop
-        && obs.forward.is_empty()
-        && !(obs.forward_in_open && obs.forward_out_open)
-    {
+    let blocks = (obs.input_policy_drop && !obs.input_open)
+        || (obs.forward_policy_drop && !(obs.forward_in_open && obs.forward_out_open));
+    if mode == "off" && blocks {
         warnings.push(
-            "Another firewall (not UFW) drops forwarded packets, for example Docker or the final REJECT of Oracle Cloud images; RIFT cannot open it, so forwards and exits fail. Fix: sudo iptables -I FORWARD 1 -i rift0 -j ACCEPT && sudo iptables -I FORWARD 1 -o rift0 -j ACCEPT, then keep it with sudo netfilter-persistent save (or your firewall's own way)."
+            "host_firewall is off and another firewall drops tunnel, WireGuard or forwarded traffic; set host_firewall = \"auto\" or open it yourself."
                 .to_string(),
         );
     }
-    if obs.input_policy_drop && obs.input.is_empty() && !obs.input_open {
+    if mode == "auto" && public_ips_configured && uplinks.is_empty() && !obs.forward.is_empty() {
         warnings.push(
-            "Another firewall (not UFW) drops incoming packets, for example the final REJECT of Oracle Cloud images; agents, the web panel and enrollment over the tunnel are blocked. Fix: sudo iptables -I INPUT 1 -i rift0 -j ACCEPT, then keep it with sudo netfilter-persistent save (or your firewall's own way)."
-                .to_string(),
-        );
-    }
-    if mode == "off" && backend == "ufw" && (obs.input_policy_drop || obs.forward_policy_drop) {
-        warnings.push(
-            "host_firewall is off, so UFW can still drop tunnel control traffic and published forwards."
-                .to_string(),
-        );
-    }
-    if mode == "auto" && uplinks_missing {
-        warnings.push(
-            "No local interface owns a configured public IP, so UFW forwarding was not opened."
+            "No local interface owns a configured public IP, so the host firewall was opened only on the tunnel."
                 .to_string(),
         );
     }
     DoctorReport {
         status: json!({
             "mode": mode,
-            "backend": backend,
+            "backend": obs.backend,
             "uplinks": uplinks,
             "input_chains": obs.input.len(),
             "forward_chains": obs.forward.len(),
@@ -473,13 +500,30 @@ fn observe_chain(obs: &mut Observation, chain: &Value) {
     if chain.get("hook").is_some() {
         let policy = chain.get("policy").and_then(Value::as_str).unwrap_or("");
         let hook = chain.get("hook").and_then(Value::as_str).unwrap_or("");
-        if hook == "input" || hook == "forward" {
+        let filter = chain
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("filter")
+            == "filter";
+        let family_ok = matches!(reference.family.as_str(), "ip" | "ip6" | "inet");
+        if (hook == "input" || hook == "forward")
+            && filter
+            && family_ok
+            && reference.table != "rift"
+        {
             obs.hooked.push((
                 reference.family.clone(),
                 reference.table.clone(),
                 reference.name.clone(),
                 hook.to_string(),
             ));
+            if policy == "drop" {
+                obs.dropping.insert((
+                    reference.family.clone(),
+                    reference.table.clone(),
+                    reference.name.clone(),
+                ));
+            }
         }
         if policy == "drop" && hook == "forward" {
             obs.forward_policy_drop = true;
@@ -712,19 +756,87 @@ mod tests {
     }
 
     #[test]
-    fn a_final_reject_without_ufw_is_reported_with_the_command_to_fix_it() {
+    fn without_ufw_the_jumps_go_in_front_of_a_final_reject() {
         let obs = observe_for(&oracle_like(false, false), "rift0").unwrap();
-        let warnings = report("auto", &obs, &[], true).warnings;
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(warnings
-            .iter()
-            .any(|w| w.contains("sudo iptables -I INPUT 1 -i rift0 -j ACCEPT")));
-        assert!(warnings
-            .iter()
-            .any(|w| w.contains("sudo iptables -I FORWARD 1 -o rift0 -j ACCEPT")));
-        // Once rift0 is accepted ahead of the reject, nothing is left to warn about.
-        let obs = observe_for(&oracle_like(true, true), "rift0").unwrap();
-        assert!(report("auto", &obs, &[], true).warnings.is_empty());
+        assert_eq!(obs.backend, "nftables");
+        let uplinks = vec!["ens3".to_string()];
+        let plan = plan_server(&obs, &server_spec(&uplinks)).unwrap();
+        assert!(plan.create.contains("add chain ip filter rift-host-in"));
+        assert!(plan.create.contains("add chain ip filter rift-host-fwd"));
+        assert!(plan
+            .jumps
+            .contains("insert rule ip filter INPUT jump rift-host-in comment \"rift:jump\""));
+        assert!(plan
+            .jumps
+            .contains("insert rule ip filter FORWARD jump rift-host-fwd comment \"rift:jump\""));
+        assert!(plan
+            .fill
+            .contains("iifname \"ens3\" udp dport 51820 accept comment \"rift:wireguard\""));
+        assert!(report("auto", &obs, &uplinks, true).warnings.is_empty());
+        // With the firewall integration off, the block is reported instead.
+        assert_eq!(report("off", &obs, &uplinks, true).warnings.len(), 1);
+    }
+
+    #[test]
+    fn plans_use_only_matches_that_iptables_can_read() {
+        // UFW and iptables-nft read these tables back; a native conntrack match ("ct ...")
+        // makes the whole table unreadable for iptables.
+        let obs = observe_for(&oracle_like(false, false), "rift0").unwrap();
+        let uplinks = vec!["ens3".to_string()];
+        let mut spec = server_spec(&uplinks);
+        spec.vpn = true;
+        spec.exit = true;
+        spec.local_ingress = true;
+        spec.panel = Some(PanelSpec {
+            port: 8090,
+            public: true,
+        });
+        let server = plan_server(&obs, &spec).unwrap();
+        let agent = plan_agent(
+            &obs,
+            &AgentSpec {
+                interface: "rift0",
+                tunnel_v4: "10.88.0.2".parse().unwrap(),
+                tunnel_v6: "fd88:5249:4654::2".parse().unwrap(),
+                forwards: &[],
+                vpn: &[],
+                exit: Some(ExitSpec {
+                    interface: "rift-exit",
+                    uplinks: &uplinks,
+                }),
+            },
+        )
+        .unwrap();
+        for plan in [&server, &agent] {
+            let all = format!("{}{}{}", plan.create, plan.fill, plan.jumps);
+            assert!(!all.contains(" ct "), "{all}");
+        }
+        if let Ok(path) = std::env::var("RIFT_DUMP_PLAN") {
+            std::fs::write(
+                path,
+                format!("{}{}{}", server.create, server.fill, server.jumps),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn chains_that_do_not_drop_and_nat_chains_are_left_alone() {
+        let obs = observe(&json!({"nftables": [
+            {"chain": {"family": "ip", "table": "filter", "name": "INPUT", "type": "filter", "hook": "input", "policy": "accept"}},
+            {"chain": {"family": "ip", "table": "nat", "name": "INPUT", "type": "nat", "hook": "input", "policy": "drop"}},
+            {"chain": {"family": "inet", "table": "rift", "name": "input", "type": "filter", "hook": "input", "policy": "drop"}}
+        ]}))
+        .unwrap();
+        assert_eq!(obs.backend, "none");
+        assert!(obs.input.is_empty() && obs.forward.is_empty());
+    }
+
+    #[test]
+    fn ufw_wins_over_its_own_base_chains() {
+        let obs = observe(&ruleset()).unwrap();
+        assert_eq!(obs.backend, "ufw");
+        assert!(obs.input.iter().all(|c| c.name.starts_with("ufw")));
     }
 
     #[test]
@@ -893,9 +1005,9 @@ mod tests {
         assert!(plan
             .fill
             .contains("iifname \"rift0\" oifname \"eth0\" accept comment \"rift:exit\""));
-        assert!(plan.fill.contains(
-            "iifname \"eth0\" oifname \"rift0\" ct state established,related accept comment \"rift:exit\""
-        ));
+        assert!(plan
+            .fill
+            .contains("iifname \"eth0\" oifname \"rift0\" accept comment \"rift:exit\""));
         // Without a known uplink, any other interface will do.
         spec.uplinks = &[];
         let plan = plan_server(&obs, &spec).unwrap();
@@ -931,9 +1043,9 @@ mod tests {
         assert!(plan
             .fill
             .contains("iifname \"rift-exit\" oifname \"enp3s0\" accept comment \"rift:exit\""));
-        assert!(plan.fill.contains(
-            "iifname \"enp3s0\" oifname \"rift-exit\" ct state established,related accept comment \"rift:exit\""
-        ));
+        assert!(plan
+            .fill
+            .contains("iifname \"enp3s0\" oifname \"rift-exit\" accept comment \"rift:exit\""));
         let bad = vec!["eth0;drop".to_string()];
         assert!(plan_agent(
             &obs,
@@ -967,13 +1079,15 @@ mod tests {
     }
 
     #[test]
-    fn dropped_forward_without_ufw_is_reported() {
+    fn a_dropping_forward_chain_without_ufw_gets_the_jump() {
         let obs = observe(&json!({"nftables": [
             {"chain": {"family": "ip", "table": "filter", "name": "FORWARD", "hook": "forward", "policy": "drop"}}
         ]}))
         .unwrap();
         let report = report("auto", &obs, &[], false);
-        assert_eq!(report.status["backend"], "none");
-        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.status["backend"], "nftables");
+        assert!(report.warnings.is_empty());
+        assert_eq!(obs.forward.len(), 1);
+        assert!(obs.input.is_empty());
     }
 }

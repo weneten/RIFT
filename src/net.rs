@@ -699,12 +699,10 @@ impl Kernel {
             if host.warnings.is_empty() { OK } else { WARN },
             "Host firewall".into(),
             match (backend.as_str(), host.status["mode"].as_str()) {
-                ("ufw", Some("auto")) => "UFW; RIFT keeps its own rules in it".into(),
-                ("ufw", _) => "UFW, but host_firewall is off: open the ports yourself".into(),
-                _ if host.warnings.is_empty() => {
-                    "no UFW, and nothing found that blocks RIFT".into()
-                }
-                _ => "no UFW; another firewall blocks RIFT, see below".into(),
+                (_, Some("off")) => "host_firewall is off: RIFT leaves other firewalls alone".into(),
+                ("ufw", _) => "UFW; RIFT keeps its own rules in it".into(),
+                ("nftables", _) => "another firewall drops by default (for example the final REJECT of Oracle Cloud images or Docker); RIFT keeps its own rules in front of it".into(),
+                _ => "nothing found that blocks RIFT".into(),
             },
         );
         for warning in &host.warnings {
