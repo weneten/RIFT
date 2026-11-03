@@ -776,8 +776,8 @@ mod tests {
     fn world() -> StateSnapshot {
         StateSnapshot {
             agents: vec![
-                agent("core", AgentStatus::Active, 2),
-                agent("off", AgentStatus::Disabled, 3),
+                agent("node1", AgentStatus::Active, 2),
+                agent("node6", AgentStatus::Disabled, 3),
                 agent("new", AgentStatus::Pending, 4),
             ],
             ..Default::default()
@@ -806,7 +806,7 @@ mod tests {
         let mut snap = world();
         snap.forwards.push(Forward {
             id: 7,
-            agent_id: "id-core".into(),
+            agent_id: "id-node1".into(),
             listen_ip: ip("203.0.113.10"),
             listen_ports: "2222".parse().unwrap(),
             target_ports: "22".parse().unwrap(),
@@ -831,21 +831,21 @@ mod tests {
         });
         snap.vpn_grants.push(VpnGrant {
             peer: "phone".into(),
-            agent_id: "id-core".into(),
+            agent_id: "id-node1".into(),
             access: server(),
         });
         let out = export(&snap);
-        assert_eq!(out.agents, vec!["core", "off"]);
+        assert_eq!(out.agents, vec!["node1", "node6"]);
         assert_eq!(out.forwards.len(), 1);
-        assert_eq!(out.forwards[0].agent, "core");
-        assert_eq!(out.devices[0].grants[0].agent, "core");
+        assert_eq!(out.forwards[0].agent, "node1");
+        assert_eq!(out.devices[0].grants[0].agent, "node1");
         assert!(!out.devices[0].enabled && out.devices[0].panel);
         assert!(!out.devices[0].server_exit && out.devices[0].agent_exits.is_empty());
         let text = serde_json::to_string(&out).unwrap();
         for secret in [
             "SECRET-PUBLIC",
-            "id-core",
-            "key-core",
+            "id-node1",
+            "key-node1",
             "attempt",
             "10.14.0.2",
         ] {
@@ -858,7 +858,7 @@ mod tests {
     #[test]
     fn exits_survive_an_export_and_an_import_round_trip() {
         let mut snap = world();
-        snap.agents.push(agent("core2", AgentStatus::Active, 5));
+        snap.agents.push(agent("node2", AgentStatus::Active, 5));
         snap.vpn_peers.push(VpnPeer {
             name: "phone".into(),
             public_key: "k".into(),
@@ -867,19 +867,19 @@ mod tests {
             created_at: 1,
             panel: false,
             server_exit: true,
-            agent_exits: vec!["id-core".into(), "id-core2".into()],
+            agent_exits: vec!["id-node1".into(), "id-node2".into()],
             ipv6: std::net::Ipv6Addr::LOCALHOST,
         });
         let out = export(&snap);
         assert!(out.devices[0].server_exit);
-        assert_eq!(out.devices[0].agent_exits, ["core", "core2"]);
+        assert_eq!(out.devices[0].agent_exits, ["node1", "node2"]);
         let text = serde_json::to_string(&out).unwrap();
-        assert!(!text.contains("id-core"), "IDs stay out: {text}");
+        assert!(!text.contains("id-node1"), "IDs stay out: {text}");
         assert_eq!(Export::parse(text.as_bytes()).unwrap(), out);
 
         // Into an installation without the device: it is created with all three exits.
         let mut target = world();
-        target.agents.push(agent("core2", AgentStatus::Active, 5));
+        target.agents.push(agent("node2", AgentStatus::Active, 5));
         let planned = run(&out, &ImportOptions::default(), &target);
         let flags = planned
             .steps
@@ -898,15 +898,15 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(added, ["id-core", "id-core2"]);
+        assert_eq!(added, ["id-node1", "id-node2"]);
         assert!(planned.steps.iter().any(|s| {
             s.detail
                 .as_deref()
-                .is_some_and(|d| d.contains("rift vpn config qr phone core2"))
+                .is_some_and(|d| d.contains("rift vpn config qr phone node2"))
         }));
         // Mapped, filtered and missing agents.
         let options = ImportOptions {
-            map: vec![("core2".into(), "core".into())],
+            map: vec![("node2".into(), "node1".into())],
             ..Default::default()
         };
         let planned = run(&out, &options, &target);
@@ -915,9 +915,9 @@ mod tests {
             .iter()
             .filter(|s| matches!(s.op, Op::AgentExit { .. }))
             .count();
-        assert_eq!(added, 1, "both exits land on core, which is added once");
+        assert_eq!(added, 1, "both exits land on node1, which is added once");
         let options = ImportOptions {
-            skip_agents: vec!["core2".into()],
+            skip_agents: vec!["node2".into()],
             ..Default::default()
         };
         let planned = run(&out, &options, &target);
@@ -932,12 +932,12 @@ mod tests {
         assert!(planned
             .items
             .iter()
-            .any(|i| i.what == "1 entry for agent core2"));
+            .any(|i| i.what == "1 entry for agent node2"));
         let planned = run(&out, &ImportOptions::default(), &world());
         assert!(planned
             .items
             .iter()
-            .any(|i| i.what == "1 entry for agent core2" && i.status == Status::Skipped));
+            .any(|i| i.what == "1 entry for agent node2" && i.status == Status::Skipped));
         // Into one that has the device with the same exits: nothing to do for them.
         let mut same = target.clone();
         same.vpn_peers = snap.vpn_peers.clone();
@@ -948,12 +948,12 @@ mod tests {
         let only = file(
             vec![],
             vec![ExportDevice {
-                agent_exits: vec!["core2".into()],
+                agent_exits: vec!["node2".into()],
                 ..device("tablet", vec![])
             }],
         );
         let options = ImportOptions {
-            skip_agents: vec!["core2".into()],
+            skip_agents: vec!["node2".into()],
             ..Default::default()
         };
         let planned = run(&only, &options, &target);
@@ -988,12 +988,12 @@ mod tests {
     fn unknown_and_inactive_agents_are_skipped_with_a_way_forward() {
         let data = file(
             vec![
-                entry("core2", 80, 80),
-                entry("core2", 81, 81),
-                entry("core2", 82, 82),
-                entry("off", 90, 90),
+                entry("node2", 80, 80),
+                entry("node2", 81, 81),
+                entry("node2", 82, 82),
+                entry("node6", 90, 90),
                 entry("new", 91, 91),
-                entry("core", 2222, 22),
+                entry("node1", 2222, 22),
             ],
             vec![],
         );
@@ -1002,14 +1002,14 @@ mod tests {
         let missing = planned
             .items
             .iter()
-            .find(|i| i.what == "3 entries for agent core2")
+            .find(|i| i.what == "3 entries for agent node2")
             .expect("aggregated");
         let why = missing.detail.as_deref().unwrap();
-        assert!(why.contains("rift add agent core2") && why.contains("--map core2=NAME"));
+        assert!(why.contains("rift add agent node2") && why.contains("--map node2=NAME"));
         assert!(planned.items.iter().any(|i| i
             .detail
             .as_deref()
-            .is_some_and(|d| d.contains("rift enable agent off"))));
+            .is_some_and(|d| d.contains("rift enable agent node6"))));
         assert!(planned
             .items
             .iter()
@@ -1018,22 +1018,22 @@ mod tests {
 
     #[test]
     fn map_retargets_and_filters_see_the_mapped_name() {
-        let data = file(vec![entry("core2", 80, 80), entry("core", 81, 81)], vec![]);
+        let data = file(vec![entry("node2", 80, 80), entry("node1", 81, 81)], vec![]);
         let mapped = ImportOptions {
-            map: vec![("core2".into(), "core".into())],
+            map: vec![("node2".into(), "node1".into())],
             ..Default::default()
         };
         assert_eq!(run(&data, &mapped, &world()).steps.len(), 2);
         let only = ImportOptions {
-            agents: vec!["core".into()],
-            map: vec![("core2".into(), "off".into())],
+            agents: vec!["node1".into()],
+            map: vec![("node2".into(), "node6".into())],
             ..Default::default()
         };
         let planned = run(&data, &only, &world());
         assert_eq!(
             planned.steps.len(),
             1,
-            "core2 became off, which is not selected"
+            "node2 became node6, which is not selected"
         );
         assert!(planned.items[0]
             .detail
@@ -1041,27 +1041,27 @@ mod tests {
             .unwrap()
             .contains("--agent"));
         let skip = ImportOptions {
-            skip_agents: vec!["core".into()],
-            map: vec![("core2".into(), "core".into())],
+            skip_agents: vec!["node1".into()],
+            map: vec![("node2".into(), "node1".into())],
             ..Default::default()
         };
         assert_eq!(run(&data, &skip, &world()).steps.len(), 0);
         // The last mapping of an agent wins.
         let twice = ImportOptions {
-            map: vec![("a".into(), "b".into()), ("a".into(), "core".into())],
+            map: vec![("a".into(), "b".into()), ("a".into(), "node1".into())],
             ..Default::default()
         };
-        assert_eq!(twice.target("a"), "core");
+        assert_eq!(twice.target("a"), "node1");
         assert_eq!(twice.target("z"), "z");
     }
 
     #[test]
     fn identical_forwards_are_present_and_conflicts_fail_one_by_one() {
         let mut snap = world();
-        let mut old = entry("core", 2222, 22);
+        let mut old = entry("node1", 2222, 22);
         snap.forwards.push(Forward {
             id: 1,
-            agent_id: "id-core".into(),
+            agent_id: "id-node1".into(),
             listen_ip: old.listen_ip,
             listen_ports: old.listen_ports,
             target_ports: old.target_ports,
@@ -1074,9 +1074,14 @@ mod tests {
             purpose: Purpose::User,
         });
         old.enabled = true;
-        let clash = entry("core", 2222, 23);
+        let clash = entry("node1", 2222, 23);
         let data = file(
-            vec![old, clash, entry("core", 8080, 80), entry("core", 8080, 81)],
+            vec![
+                old,
+                clash,
+                entry("node1", 8080, 80),
+                entry("node1", 8080, 81),
+            ],
             vec![],
         );
         let planned = run(&data, &ImportOptions::default(), &snap);
@@ -1100,7 +1105,7 @@ mod tests {
         );
         // The file twice is the same as once.
         let twice = file(
-            vec![entry("core", 8080, 80), entry("core", 8080, 80)],
+            vec![entry("node1", 8080, 80), entry("node1", 8080, 80)],
             vec![],
         );
         let planned = run(&twice, &ImportOptions::default(), &world());
@@ -1128,10 +1133,10 @@ mod tests {
         assert_eq!(remap_listen_ip(ip("2001:db8::1"), &ips[..1]), None);
         assert_eq!(remap_listen_ip(ip("203.0.113.10"), &[]), None);
 
-        let mut v6 = entry("core", 443, 443);
+        let mut v6 = entry("node1", 443, 443);
         v6.listen_ip = ip("2001:db8::ff");
         v6.target_family = Family::V6;
-        let data = file(vec![entry("core", 80, 80), v6], vec![]);
+        let data = file(vec![entry("node1", 80, 80), v6], vec![]);
         let planned = plan(
             &data,
             &ImportOptions::default(),
@@ -1163,7 +1168,7 @@ mod tests {
     fn existing_forwards_move_unless_the_new_address_is_taken() {
         let forward = |id: u64, ip: &str, port: u16| Forward {
             id,
-            agent_id: "id-core".into(),
+            agent_id: "id-node1".into(),
             listen_ip: ip.parse().unwrap(),
             listen_ports: PortRange {
                 start: port,
@@ -1210,7 +1215,7 @@ mod tests {
 
     #[test]
     fn devices_are_created_with_flags_and_grants() {
-        let mut phone = device("phone", vec![("core", server()), ("core2", server())]);
+        let mut phone = device("phone", vec![("node1", server()), ("node2", server())]);
         phone.panel = true;
         phone.enabled = false;
         let data = file(vec![], vec![phone]);
@@ -1233,7 +1238,7 @@ mod tests {
             .unwrap()
             .contains("rift vpn config qr phone"));
         assert!(planned.steps[1].what.contains("disabled, panel access on"));
-        assert_eq!(count(&planned, Status::Skipped), 1, "core2 does not exist");
+        assert_eq!(count(&planned, Status::Skipped), 1, "node2 does not exist");
     }
 
     #[test]
@@ -1252,7 +1257,7 @@ mod tests {
         });
         snap.vpn_grants.push(VpnGrant {
             peer: "phone".into(),
-            agent_id: "id-core".into(),
+            agent_id: "id-node1".into(),
             access: server(),
         });
         let port = VpnAccess::Port {
@@ -1261,7 +1266,7 @@ mod tests {
         };
         let data = file(
             vec![],
-            vec![device("phone", vec![("core", server()), ("core", port)])],
+            vec![device("phone", vec![("node1", server()), ("node1", port)])],
         );
         let planned = run(&data, &ImportOptions::default(), &snap);
         assert_eq!(
@@ -1292,13 +1297,13 @@ mod tests {
         let data = file(
             vec![],
             vec![
-                device("only-core2", vec![("core2", server())]),
-                device("both", vec![("core2", server()), ("core", server())]),
+                device("only-node2", vec![("node2", server())]),
+                device("both", vec![("node2", server()), ("node1", server())]),
                 device("bare", vec![]),
             ],
         );
         let options = ImportOptions {
-            skip_agents: vec!["core2".into()],
+            skip_agents: vec!["node2".into()],
             ..Default::default()
         };
         let planned = run(&data, &options, &world());
@@ -1314,11 +1319,11 @@ mod tests {
         assert!(planned
             .items
             .iter()
-            .any(|i| i.what == "device only-core2" && i.status == Status::Skipped));
+            .any(|i| i.what == "device only-node2" && i.status == Status::Skipped));
         assert!(planned
             .items
             .iter()
-            .any(|i| i.what == "1 entry for agent core2"));
+            .any(|i| i.what == "1 entry for agent node2"));
     }
 
     #[test]
@@ -1337,7 +1342,7 @@ mod tests {
         let data = file(
             vec![],
             vec![
-                device("a", vec![(&net("core").0, net("core").1)]),
+                device("a", vec![(&net("node1").0, net("node1").1)]),
                 device("b", vec![(&net("home2").0, net("home2").1)]),
             ],
         );
@@ -1346,6 +1351,6 @@ mod tests {
         assert!(planned.items.iter().any(|i| i
             .detail
             .as_deref()
-            .is_some_and(|d| d.contains("behind agent core"))));
+            .is_some_and(|d| d.contains("behind agent node1"))));
     }
 }

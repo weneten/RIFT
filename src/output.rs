@@ -647,10 +647,10 @@ mod tests {
             {"id":5,"agent_id":"agent-uuid","protocol":"tcp","listen_ip":"2001:db8::1", "listen_ports":{"start":25001,"end":25003},"target_ports":{"start":5201,"end":5203},"target_family":"v6","ingress":"local","mode":"transparent","enabled":true},
             {"id":6,"agent_id":"unknown-uuid","protocol":"udp","listen_ip":"198.51.100.1", "listen_ports":{"start":80,"end":80},"target_ports":{"start":80,"end":80},"target_family":"v4","ingress":"public","mode":"transparent","enabled":false}
         ]);
-        let agents = json!([{"id":"agent-uuid","name":"core"}]);
+        let agents = json!([{"id":"agent-uuid","name":"node1"}]);
         let output = render(&AdminRequest::ForwardsList, &data, Some(&agents));
         for expected in [
-            "core",
+            "node1",
             "unknown-uuid",
             "[2001:db8::1]:25001-25003",
             "5201-5203",
@@ -669,15 +669,15 @@ mod tests {
     fn devices_show_their_exits_and_forwards_their_purpose() {
         let devices = json!([
             {"name":"iphone","ipv4":"10.14.0.2","enabled":true,"panel":false,"last_handshake":null,"grants":[],"exits":[{"via":"server"}]},
-            {"name":"ipad","ipv4":"10.14.0.3","enabled":true,"panel":true,"last_handshake":null,"grants":[{"agent":"core","access":"server","refused":null}],"exits":[{"via":"server"},{"via":"agent","agent":"core","state":"ok","reason":null},{"via":"agent","agent":"core2","state":"waiting","reason":"x"}]},
-            {"name":"mac","ipv4":"10.14.0.4","enabled":true,"panel":false,"last_handshake":null,"grants":[],"exits":[{"via":"agent","agent":"cabin","state":"refused","reason":"no"}]},
+            {"name":"ipad","ipv4":"10.14.0.3","enabled":true,"panel":true,"last_handshake":null,"grants":[{"agent":"node1","access":"server","refused":null}],"exits":[{"via":"server"},{"via":"agent","agent":"node1","state":"ok","reason":null},{"via":"agent","agent":"node2","state":"waiting","reason":"x"}]},
+            {"name":"mac","ipv4":"10.14.0.4","enabled":true,"panel":false,"last_handshake":null,"grants":[],"exits":[{"via":"agent","agent":"node5","state":"refused","reason":"no"}]},
             {"name":"tv","ipv4":"10.14.0.5","enabled":true,"panel":false,"last_handshake":null,"grants":[],"exits":[]}
         ]);
         let output = render(&AdminRequest::VpnPeerList, &devices, None);
         for expected in [
             "exit via server",
-            "web panel; core: server; exit via server; exit via core; exit via core2 (waiting for the agent)",
-            "exit via cabin (refused by agent)",
+            "web panel; node1: server; exit via server; exit via node1; exit via node2 (waiting for the agent)",
+            "exit via node5 (refused by agent)",
         ] {
             assert!(output.contains(expected), "missing {expected}: {output}");
         }
@@ -709,14 +709,14 @@ mod tests {
             server.contains("through this server") && server.contains("IPv6 traffic is dropped")
         );
         assert!(server.contains("Import the profile: rift vpn config qr iphone"));
-        assert!(!server.contains("config qr iphone core"));
+        assert!(!server.contains("config qr iphone node1"));
         let agent = add(
-            Exit::Agent("core".into()),
-            json!({"agent":"core","ipv6":true,"waiting":"agent core has not reported"}),
+            Exit::Agent("node1".into()),
+            json!({"agent":"node1","ipv6":true,"waiting":"agent node1 has not reported"}),
         );
-        assert!(agent.contains("through agent core") && agent.contains("Not ready yet"));
+        assert!(agent.contains("through agent node1") && agent.contains("Not ready yet"));
         assert!(agent.contains("main profile") && !agent.contains("dropped"));
-        assert!(agent.contains("Import the profile: rift vpn config qr iphone core"));
+        assert!(agent.contains("Import the profile: rift vpn config qr iphone node1"));
         let removed = |agent: Option<&str>| {
             render(
                 &AdminRequest::VpnExitClear {
@@ -730,8 +730,8 @@ mod tests {
         let server = removed(None);
         assert!(server.contains("no longer exits through this server"));
         assert!(server.contains("Import the main profile again: rift vpn config qr iphone"));
-        let agent = removed(Some("core"));
-        assert!(agent.contains("Delete the profile for core") && !agent.contains("config qr"));
+        let agent = removed(Some("node1"));
+        assert!(agent.contains("Delete the profile for node1") && !agent.contains("config qr"));
     }
     #[test]
     fn doctor_prints_a_checklist_and_a_verdict() {
@@ -751,19 +751,19 @@ mod tests {
     #[test]
     fn the_import_report_is_grouped_and_a_dry_run_says_so() {
         let data = json!({"dry_run": true, "items": [
-            {"status": "created", "what": "forward core 22/tcp on 1.2.3.4", "detail": null},
+            {"status": "created", "what": "forward node1 22/tcp on 1.2.3.4", "detail": null},
             {"status": "created", "what": "device phone", "detail": "new keys"},
             {"status": "present", "what": "device tv", "detail": null},
-            {"status": "skipped", "what": "3 entries for agent core2", "detail": "no such agent"},
-            {"status": "failed", "what": "forward core 80/tcp", "detail": "overlaps forward 1"},
+            {"status": "skipped", "what": "3 entries for agent node2", "detail": "no such agent"},
+            {"status": "failed", "what": "forward node1 80/tcp", "detail": "overlaps forward 1"},
         ]});
         let out = import_report(&data).unwrap();
         for expected in [
             "Dry run: nothing was changed.",
-            "Would create (2)\n  forward core 22/tcp on 1.2.3.4\n  device phone (new keys)",
+            "Would create (2)\n  forward node1 22/tcp on 1.2.3.4\n  device phone (new keys)",
             "Already present (1)\n  device tv",
-            "Skipped (1)\n  3 entries for agent core2: no such agent",
-            "Failed (1)\n  forward core 80/tcp: overlaps forward 1",
+            "Skipped (1)\n  3 entries for agent node2: no such agent",
+            "Failed (1)\n  forward node1 80/tcp: overlaps forward 1",
         ] {
             assert!(out.contains(expected), "missing {expected:?} in\n{out}");
         }
@@ -798,12 +798,12 @@ mod tests {
             ),
             "Forward 5 removed."
         );
-        let data = json!({"snapshot":{"generation":2,"forwards":[]},"fully_applied":false,"apply_error":"network failed","pending_forwards":[5],"agent_health":[{"name":"core","online":false,"configuration_ready":false}]});
+        let data = json!({"snapshot":{"generation":2,"forwards":[]},"fully_applied":false,"apply_error":"network failed","pending_forwards":[5],"agent_health":[{"name":"node1","online":false,"configuration_ready":false}]});
         let output = render(&AdminRequest::Status, &data, None);
         for expected in [
             "network failed",
             "Pending forward IDs: 5",
-            "core",
+            "node1",
             "offline",
             "pending",
         ] {

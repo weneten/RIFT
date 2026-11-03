@@ -1160,7 +1160,7 @@ mod tests {
                 .push(format!("{:?}", serde_json::to_value(&request)?));
             Ok(match request {
                 AdminRequest::Status => json!({
-                    "snapshot": {"generation": 7, "agents": [{"id": "a1", "name": "home", "status": "active", "tunnel_ipv4": "10.13.0.2"}],
+                    "snapshot": {"generation": 7, "agents": [{"id": "a1", "name": "node4", "status": "active", "tunnel_ipv4": "10.13.0.2"}],
                                  "forwards": [{"id": 3, "agent_id": "a1", "protocol": "tcp", "enabled": true}]},
                     "agent_health": [{"id": "a1", "online": true, "configuration_ready": true, "last_handshake": 100}],
                     "pending_forwards": [3], "fully_applied": false, "apply_error": null
@@ -1364,7 +1364,7 @@ mod tests {
         assert!(overview.starts_with("HTTP/1.1 200"), "{overview}");
         let body: Value = serde_json::from_str(overview.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body["agents"][0]["online"], true);
-        assert_eq!(body["forwards"][0]["agent"], "home");
+        assert_eq!(body["forwards"][0]["agent"], "node4");
         assert_eq!(body["forwards"][0]["pending"], true);
 
         let action = r#"{"action":"forward_enable","id":3,"enabled":false}"#;
@@ -1500,7 +1500,7 @@ mod tests {
         let session = exchange(&panel, "10.14.0.2", "GET /api/session HTTP/1.1\r\n\r\n").await;
         assert!(session.contains("\"can_write\":true"), "{session}");
         // The internet exits of a device are changes as well.
-        let exit = r#"{"action":"vpn_exit","peer":"laptop","exit":{"agent":"home"},"on":true}"#;
+        let exit = r#"{"action":"vpn_exit","peer":"laptop","exit":{"agent":"node4"},"on":true}"#;
         let refused = act(&panel, "203.0.113.7", &cookie, exit, "").await;
         assert!(
             refused.starts_with("HTTP/1.1 403") && refused.contains("read-only"),
@@ -1547,7 +1547,7 @@ mod tests {
             "{shown}"
         );
         // The profile of an agent exit is one as well.
-        let profile = r#"{"action":"vpn_config","name":"laptop","agent":"home"}"#;
+        let profile = r#"{"action":"vpn_config","name":"laptop","agent":"node4"}"#;
         assert!(act(&panel, "203.0.113.7", &cookie, profile, "")
             .await
             .starts_with("HTTP/1.1 403"));
@@ -1559,7 +1559,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .any(|c| c.contains("VpnConfig") && c.contains("home")));
+            .any(|c| c.contains("VpnConfig") && c.contains("node4")));
     }
 
     #[tokio::test]
@@ -1572,7 +1572,7 @@ mod tests {
         let cookie = logged_in(&panel).await;
         // Behind a reverse proxy the connection is read-only.
         const PROXIED: &str = "X-Forwarded-For: 203.0.113.7\r\n";
-        let add = r#"{"action":"site_add","agent":"home","host":"app.example.net","port":8080,"proxy":"caddy"}"#;
+        let add = r#"{"action":"site_add","agent":"node4","host":"app.example.net","port":8080,"proxy":"caddy"}"#;
         let remove = r#"{"action":"site_remove","host":"app.example.net"}"#;
         for body in [add, remove] {
             let refused = act(&panel, "127.0.0.1", &cookie, body, PROXIED).await;
@@ -1588,12 +1588,12 @@ mod tests {
         assert_eq!(crate::sites::pending(queue.path()).unwrap(), 2);
         // Bad parameters never reach the queue, and neither do unknown fields.
         for bad in [
-            r#"{"action":"site_add","agent":"home","host":"a b","port":80}"#,
+            r#"{"action":"site_add","agent":"node4","host":"a b","port":80}"#,
             r#"{"action":"site_add","agent":"x;id","host":"a.net","port":80}"#,
-            r#"{"action":"site_add","agent":"home","host":"a.net","port":0}"#,
-            r#"{"action":"site_add","agent":"home","host":"a.net","port":99999}"#,
-            r#"{"action":"site_add","agent":"home","host":"a.net","port":80,"proxy":"apache"}"#,
-            r#"{"action":"site_add","agent":"home","host":"a.net","port":80,"command":"id"}"#,
+            r#"{"action":"site_add","agent":"node4","host":"a.net","port":0}"#,
+            r#"{"action":"site_add","agent":"node4","host":"a.net","port":99999}"#,
+            r#"{"action":"site_add","agent":"node4","host":"a.net","port":80,"proxy":"apache"}"#,
+            r#"{"action":"site_add","agent":"node4","host":"a.net","port":80,"command":"id"}"#,
             r#"{"action":"site_remove","host":"../x"}"#,
         ] {
             let answer = act(&panel, "127.0.0.1", &cookie, bad, "").await;
@@ -1625,7 +1625,7 @@ mod tests {
         assert_eq!(overview["sites"]["available"], false);
         std::fs::write(
             sites.path().join("sites.json"),
-            r#"{"sites":{"app.example.net":{"agent":"home","target":80,"listen":20000,"proxy":"caddy","forward_id":3}}}"#,
+            r#"{"sites":{"app.example.net":{"agent":"node4","target":80,"listen":20000,"proxy":"caddy","forward_id":3}}}"#,
         )
         .unwrap();
         let overview = panel.overview(true).await.unwrap();
@@ -1655,7 +1655,7 @@ mod tests {
             &panel,
             "127.0.0.1",
             &cookie,
-            r#"{"action":"forward_add","agent":"home","specs":"53/both, 8080:80/tcp"}"#,
+            r#"{"action":"forward_add","agent":"node4","specs":"53/both, 8080:80/tcp"}"#,
             "",
         )
         .await;
@@ -1670,7 +1670,7 @@ mod tests {
             &panel,
             "127.0.0.1",
             &cookie,
-            r#"{"action":"forward_add","agent":"home","specs":"80"}"#,
+            r#"{"action":"forward_add","agent":"node4","specs":"80"}"#,
             "",
         )
         .await;
@@ -1692,7 +1692,7 @@ mod tests {
             &panel,
             "127.0.0.1",
             &cookie,
-            r#"{"action":"vpn_allow","peer":"phone","agent":"home","ports":"22/tcp 53/both","subnets":"192.168.178.0/24"}"#,
+            r#"{"action":"vpn_allow","peer":"phone","agent":"node4","ports":"22/tcp 53/both","subnets":"192.168.178.0/24"}"#,
             "",
         )
         .await;

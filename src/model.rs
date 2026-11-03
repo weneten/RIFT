@@ -617,7 +617,7 @@ mod tests {
         ]
     }
     fn build(spec: &str, ips: &[IpAddr], options: ForwardOptions) -> anyhow::Result<Vec<Forward>> {
-        build_forwards("home", &parse_forward_specs(&[spec.into()])?, ips, options)
+        build_forwards("node4", &parse_forward_specs(&[spec.into()])?, ips, options)
     }
 
     #[test]

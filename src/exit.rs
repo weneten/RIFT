@@ -191,7 +191,7 @@ mod tests {
     fn snapshot(agents: &[&str]) -> StateSnapshot {
         StateSnapshot {
             generation: 7,
-            agents: vec![agent("home")],
+            agents: vec![agent("node4")],
             vpn_peers: vec![device("phone", agents)],
             ..Default::default()
         }
@@ -206,7 +206,7 @@ mod tests {
     #[test]
     fn a_used_exit_gets_one_udp_forward_per_listen_address() {
         let ips = ips();
-        let mut snap = snapshot(&["home"]);
+        let mut snap = snapshot(&["node4"]);
         assert!(sync(&mut snap, &settings(&ips)));
         assert_eq!(snap.agents[0].exit_port, Some(51821));
         let forwards = exits(&snap);
@@ -225,7 +225,7 @@ mod tests {
         assert!(!sync(&mut snap, &settings(&ips)));
         assert_eq!(snap.forwards, before);
         // Without an IPv6 address on the server only the IPv4 listener exists.
-        let mut v4 = snapshot(&["home"]);
+        let mut v4 = snapshot(&["node4"]);
         sync(&mut v4, &settings(&ips[..1]));
         assert_eq!(exits(&v4).len(), 1);
     }
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn the_forward_goes_when_no_enabled_device_uses_the_exit_but_the_port_stays() {
         let ips = ips();
-        let mut snap = snapshot(&["home"]);
+        let mut snap = snapshot(&["node4"]);
         sync(&mut snap, &settings(&ips));
         snap.vpn_peers[0].enabled = false;
         assert!(sync(&mut snap, &settings(&ips)));
@@ -257,9 +257,9 @@ mod tests {
     #[test]
     fn a_forward_lives_while_one_enabled_device_lists_the_agent() {
         let ips = ips();
-        let mut snap = snapshot(&["home", "cabin"]);
-        snap.agents.push(agent("cabin"));
-        snap.vpn_peers.push(device("tablet", &["home"]));
+        let mut snap = snapshot(&["node4", "node5"]);
+        snap.agents.push(agent("node5"));
+        snap.vpn_peers.push(device("tablet", &["node4"]));
         snap.vpn_peers[1].ipv4 = Ipv4Addr::new(10, 14, 0, 3);
         let agents_with_forward = |snap: &StateSnapshot| {
             let mut ids: Vec<_> = exits(snap).iter().map(|f| f.agent_id.clone()).collect();
@@ -268,37 +268,37 @@ mod tests {
             ids
         };
         sync(&mut snap, &settings(&ips));
-        assert_eq!(agents_with_forward(&snap), ["cabin", "home"]);
+        assert_eq!(agents_with_forward(&snap), ["node4", "node5"]);
         assert_eq!(exits(&snap).len(), 4, "two listen addresses per agent");
-        // The phone leaves cabin: the tablet still keeps home.
-        snap.vpn_peers[0].agent_exits = vec!["home".into()];
+        // The phone leaves node5: the tablet still keeps node4.
+        snap.vpn_peers[0].agent_exits = vec!["node4".into()];
         sync(&mut snap, &settings(&ips));
-        assert_eq!(agents_with_forward(&snap), ["home"]);
-        // Disabling one of the two devices of home keeps its forward; both end it.
+        assert_eq!(agents_with_forward(&snap), ["node4"]);
+        // Disabling one of the two devices of node4 keeps its forward; both end it.
         snap.vpn_peers[1].enabled = false;
         sync(&mut snap, &settings(&ips));
-        assert_eq!(agents_with_forward(&snap), ["home"]);
+        assert_eq!(agents_with_forward(&snap), ["node4"]);
         snap.vpn_peers[0].agent_exits.clear();
         sync(&mut snap, &settings(&ips));
         assert!(exits(&snap).is_empty());
         // A disabled device listing an agent brings nothing back, an enabled one does.
         assert!(!sync(&mut snap, &settings(&ips)));
         snap.vpn_peers[1].enabled = true;
-        snap.vpn_peers[1].agent_exits = vec!["cabin".into(), "home".into()];
+        snap.vpn_peers[1].agent_exits = vec!["node5".into(), "node4".into()];
         sync(&mut snap, &settings(&ips));
-        assert_eq!(agents_with_forward(&snap), ["cabin", "home"]);
+        assert_eq!(agents_with_forward(&snap), ["node4", "node5"]);
     }
 
     #[test]
     fn ports_differ_per_agent_and_avoid_user_forwards_and_the_wireguard_port() {
         let ips = ips();
-        let mut snap = snapshot(&["home"]);
-        snap.agents.push(agent("cabin"));
-        snap.vpn_peers.push(device("tablet", &["cabin"]));
+        let mut snap = snapshot(&["node4"]);
+        snap.agents.push(agent("node5"));
+        snap.vpn_peers.push(device("tablet", &["node5"]));
         snap.vpn_peers[1].ipv4 = Ipv4Addr::new(10, 14, 0, 3);
         snap.forwards.push(Forward {
             id: 1,
-            agent_id: "home".into(),
+            agent_id: "node4".into(),
             listen_ip: ips[0],
             listen_ports: PortRange {
                 start: 51821,
@@ -321,7 +321,7 @@ mod tests {
             snap.agents.iter().find(|a| a.id == id).unwrap().exit_port
         };
         // 51821 belongs to a user forward; the two agents share the rest.
-        let mut ports = [port(&snap, "home"), port(&snap, "cabin")];
+        let mut ports = [port(&snap, "node4"), port(&snap, "node5")];
         ports.sort();
         assert_eq!(ports, [Some(51822), Some(51823)]);
         // A user forward that takes an assigned port moves the exit away from it.
@@ -330,16 +330,16 @@ mod tests {
             start: 51822,
             end: 51822,
         };
-        let before = port(&snap, "home");
+        let before = port(&snap, "node4");
         sync(&mut snap, &settings(&ips));
         // The agent whose port the user forward took moves to the freed one; the other stays.
-        let moved = [port(&snap, "home"), port(&snap, "cabin")];
+        let moved = [port(&snap, "node4"), port(&snap, "node5")];
         assert!(moved.contains(&Some(51821)) && !moved.contains(&Some(51822)));
         if before != Some(51822) {
-            assert_eq!(port(&snap, "home"), before);
+            assert_eq!(port(&snap, "node4"), before);
         }
         // Used up: no port, hence no forward for that agent.
-        let mut full = snapshot(&["home"]);
+        let mut full = snapshot(&["node4"]);
         let small = Settings {
             ports: 51820..=51820,
             ..settings(&ips)
@@ -352,7 +352,7 @@ mod tests {
     #[test]
     fn inactive_agents_have_no_exit_forward_and_managed_forwards_are_protected() {
         let ips = ips();
-        let mut snap = snapshot(&["home"]);
+        let mut snap = snapshot(&["node4"]);
         sync(&mut snap, &settings(&ips));
         let id = exits(&snap)[0].id;
         assert!(ensure_user_forward(&snap, id).is_err());
