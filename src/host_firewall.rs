@@ -926,7 +926,7 @@ mod tests {
         let obs = observe(&ruleset()).unwrap();
         let forward = Forward {
             id: 1,
-            agent_id: "core".into(),
+            agent_id: "node1".into(),
             listen_ip: "203.0.113.1".parse().unwrap(),
             listen_ports: "18080".parse().unwrap(),
             target_ports: "8000".parse().unwrap(),

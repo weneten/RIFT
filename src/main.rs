@@ -1056,20 +1056,20 @@ mod tests {
             vec!["rift", "enable", "device", "iphone"],
             vec!["rift", "disable", "device", "iphone"],
             vec!["rift", "remove", "device", "iphone"],
-            vec!["rift", "vpn", "allow", "iphone", "home", "server"],
+            vec!["rift", "vpn", "allow", "iphone", "node4", "server"],
             vec![
-                "rift", "vpn", "allow", "iphone", "home", "22/tcp", "53/both",
+                "rift", "vpn", "allow", "iphone", "node4", "22/tcp", "53/both",
             ],
             vec![
                 "rift",
                 "vpn",
                 "allow",
                 "iphone",
-                "home",
+                "node4",
                 "192.168.178.0/24",
                 "--snat",
             ],
-            vec!["rift", "vpn", "deny", "iphone", "home"],
+            vec!["rift", "vpn", "deny", "iphone", "node4"],
             vec!["rift", "vpn", "config", "export", "iphone"],
             vec!["rift", "vpn", "config", "qr", "iphone"],
             vec!["rift", "panel", "status"],
@@ -1086,9 +1086,10 @@ mod tests {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }
         // --snat only makes sense together with a network.
-        let snat =
-            Cli::try_parse_from(["rift", "vpn", "allow", "iphone", "home", "server", "--snat"])
-                .unwrap();
+        let snat = Cli::try_parse_from([
+            "rift", "vpn", "allow", "iphone", "node4", "server", "--snat",
+        ])
+        .unwrap();
         let Command::Vpn {
             command: Vpn::Allow(args),
         } = snat.command
@@ -1123,7 +1124,7 @@ mod tests {
             "vpn",
             "allow",
             "iphone",
-            "core",
+            "node1",
             "22/tcp",
             "53/both",
             "server",
@@ -1132,7 +1133,7 @@ mod tests {
         ])
         .unwrap()
         .unwrap();
-        assert_eq!(plan.agent.as_deref(), Some("core"));
+        assert_eq!(plan.agent.as_deref(), Some("node1"));
         assert_eq!(plan.exit, None);
         assert_eq!(
             plan.accesses,
@@ -1157,22 +1158,24 @@ mod tests {
             ]
         );
         // Without targets, deny withdraws everything on that agent.
-        let plan = vpn_plan(&["rift", "vpn", "deny", "iphone", "core"])
+        let plan = vpn_plan(&["rift", "vpn", "deny", "iphone", "node1"])
             .unwrap()
             .unwrap();
-        assert_eq!(plan.agent.as_deref(), Some("core"));
+        assert_eq!(plan.agent.as_deref(), Some("node1"));
         assert!(plan.accesses.is_empty() && plan.exit.is_none());
-        assert!(vpn_plan(&["rift", "vpn", "allow", "iphone", "core", "22"])
+        assert!(vpn_plan(&["rift", "vpn", "allow", "iphone", "node1", "22"])
             .unwrap()
             .is_err());
-        assert!(vpn_plan(&["rift", "vpn", "allow", "iphone", "core", "nas"])
-            .unwrap()
-            .is_err());
+        assert!(
+            vpn_plan(&["rift", "vpn", "allow", "iphone", "node1", "node3"])
+                .unwrap()
+                .is_err()
+        );
         // The agent is required and the old long options are gone.
         assert!(vpn_plan(&["rift", "vpn", "allow", "iphone"]).is_none());
-        assert!(vpn_plan(&["rift", "vpn", "allow", "iphone", "core", "--server"]).is_none());
+        assert!(vpn_plan(&["rift", "vpn", "allow", "iphone", "node1", "--server"]).is_none());
         assert!(
-            vpn_plan(&["rift", "vpn", "allow", "iphone", "--agent", "core", "server"]).is_none()
+            vpn_plan(&["rift", "vpn", "allow", "iphone", "--agent", "node1", "server"]).is_none()
         );
     }
     #[test]
@@ -1190,21 +1193,21 @@ mod tests {
             }
         );
         // After an agent: that agent, and it may come with grants.
-        let plan = vpn_plan(&["rift", "vpn", "allow", "iphone", "core", "exit"])
+        let plan = vpn_plan(&["rift", "vpn", "allow", "iphone", "node1", "exit"])
             .unwrap()
             .unwrap();
-        assert_eq!(plan.exit, Some(Exit::Agent("core".into())));
+        assert_eq!(plan.exit, Some(Exit::Agent("node1".into())));
         assert!(plan.accesses.is_empty());
         let requests =
-            vpn_requests(&["rift", "vpn", "allow", "iphone", "core", "22/tcp", "exit"]).unwrap();
+            vpn_requests(&["rift", "vpn", "allow", "iphone", "node1", "22/tcp", "exit"]).unwrap();
         assert_eq!(requests.len(), 2, "the grant, then the exit");
         assert!(matches!(
             &requests[0],
-            AdminRequest::VpnAllow { agent, .. } if agent == "core"
+            AdminRequest::VpnAllow { agent, .. } if agent == "node1"
         ));
         assert!(matches!(
             &requests[1],
-            AdminRequest::VpnExit { peer, exit: Exit::Agent(agent) } if peer == "iphone" && agent == "core"
+            AdminRequest::VpnExit { peer, exit: Exit::Agent(agent) } if peer == "iphone" && agent == "node1"
         ));
         let requests = vpn_requests(&["rift", "vpn", "allow", "iphone", "exit"]).unwrap();
         assert!(matches!(
@@ -1221,7 +1224,7 @@ mod tests {
                 .is_err()
         );
         // Allowing nothing is an error the command reports; the agent alone allows nothing.
-        assert!(vpn_requests(&["rift", "vpn", "allow", "iphone", "core"])
+        assert!(vpn_requests(&["rift", "vpn", "allow", "iphone", "node1"])
             .unwrap()
             .is_empty());
     }
@@ -1232,19 +1235,19 @@ mod tests {
             requests.as_slice(),
             [AdminRequest::VpnExitClear { agent: None, .. }]
         ));
-        let requests = vpn_requests(&["rift", "vpn", "deny", "iphone", "core", "exit"]).unwrap();
+        let requests = vpn_requests(&["rift", "vpn", "deny", "iphone", "node1", "exit"]).unwrap();
         assert!(matches!(
             requests.as_slice(),
-            [AdminRequest::VpnExitClear { agent: Some(a), .. }] if a == "core"
+            [AdminRequest::VpnExitClear { agent: Some(a), .. }] if a == "node1"
         ));
         // Without targets everything on the agent goes; with some, only those.
-        let requests = vpn_requests(&["rift", "vpn", "deny", "iphone", "core"]).unwrap();
+        let requests = vpn_requests(&["rift", "vpn", "deny", "iphone", "node1"]).unwrap();
         assert!(matches!(
             requests.as_slice(),
             [AdminRequest::VpnDeny { access: None, .. }]
         ));
         let requests =
-            vpn_requests(&["rift", "vpn", "deny", "iphone", "core", "22/tcp", "exit"]).unwrap();
+            vpn_requests(&["rift", "vpn", "deny", "iphone", "node1", "22/tcp", "exit"]).unwrap();
         assert_eq!(requests.len(), 2);
     }
     #[test]
@@ -1267,19 +1270,19 @@ mod tests {
             ["add Server"]
         );
         assert_eq!(
-            exits(&["rift", "vpn", "allow", "iphone", "core2", "exit"]),
-            [r#"add Agent("core2")"#]
+            exits(&["rift", "vpn", "allow", "iphone", "node2", "exit"]),
+            [r#"add Agent("node2")"#]
         );
         assert_eq!(
             exits(&["rift", "vpn", "deny", "iphone", "exit"]),
             ["remove None"]
         );
         assert_eq!(
-            exits(&["rift", "vpn", "deny", "iphone", "core2", "exit"]),
-            [r#"remove Some("core2")"#]
+            exits(&["rift", "vpn", "deny", "iphone", "node2", "exit"]),
+            [r#"remove Some("node2")"#]
         );
         assert_eq!(
-            exits(&["rift", "vpn", "deny", "iphone", "core2"]),
+            exits(&["rift", "vpn", "deny", "iphone", "node2"]),
             ["deny all"]
         );
         // The profiles: the main one, or that of an agent's exit.
@@ -1297,15 +1300,15 @@ mod tests {
             ("iphone".into(), None)
         );
         assert_eq!(
-            config(&["rift", "vpn", "config", "export", "iphone", "core"]),
-            ("iphone".into(), Some("core".into()))
+            config(&["rift", "vpn", "config", "export", "iphone", "node1"]),
+            ("iphone".into(), Some("node1".into()))
         );
         assert!(Cli::try_parse_from(["rift", "vpn", "config", "qr", "iphone", "a", "b"]).is_err());
     }
     #[test]
     fn vpn_targets_become_accesses() {
         let args = |extra: &[&str]| {
-            let mut argv = vec!["rift", "vpn", "allow", "iphone", "home"];
+            let mut argv = vec!["rift", "vpn", "allow", "iphone", "node4"];
             argv.extend(extra);
             vpn_plan(&argv).unwrap().map(|plan| plan.accesses)
         };
@@ -1325,8 +1328,8 @@ mod tests {
     fn doctor_reports_exits_and_what_each_agent_still_needs() {
         let status = serde_json::json!({"snapshot":{
             "agents":[
-                {"id":"a","name":"core","limits":{"exit":true},"exit":{"ipv6":false}},
-                {"id":"b","name":"cabin","limits":{"exit":false},"exit":null},
+                {"id":"a","name":"node1","limits":{"exit":true},"exit":{"ipv6":false}},
+                {"id":"b","name":"node5","limits":{"exit":false},"exit":null},
                 {"id":"c","name":"idle","limits":{"exit":false},"exit":null}],
             "vpn_peers":[
                 {"enabled":true,"server_exit":true,"agent_exits":["a"]},
@@ -1361,11 +1364,11 @@ mod tests {
         );
         assert!(text.contains("warn Server exit IPv6"), "{text}");
         assert!(
-            text.contains("ok Exit via agent core: ready; the agent host has no global IPv6"),
+            text.contains("ok Exit via agent node1: ready; the agent host has no global IPv6"),
             "{text}"
         );
         assert!(
-            text.contains("warn Exit via agent cabin: refuses the exit"),
+            text.contains("warn Exit via agent node5: refuses the exit"),
             "{text}"
         );
         assert!(
@@ -1445,12 +1448,12 @@ mod tests {
     #[test]
     fn documented_cli_parses() {
         for args in [
-            vec!["rift", "add", "forward", "nas", "2222:22/tcp"],
+            vec!["rift", "add", "forward", "node3", "2222:22/tcp"],
             vec![
                 "rift",
                 "add",
                 "forward",
-                "nas",
+                "node3",
                 "53/both",
                 "8080:80/tcp/all",
             ],
@@ -1458,7 +1461,7 @@ mod tests {
                 "rift",
                 "add",
                 "forward",
-                "nas",
+                "node3",
                 "8080/tcp",
                 "--listen-ip",
                 "203.0.113.10",
@@ -1473,7 +1476,7 @@ mod tests {
             "rift",
             "add",
             "forward",
-            "core",
+            "node1",
             "443/tcp",
             "--mode",
             "translate",
@@ -1546,7 +1549,7 @@ mod tests {
             "rift",
             "add",
             "forward",
-            "core",
+            "node1",
             "20000:8081/tcp",
             "--ingress",
             "local",
@@ -1567,15 +1570,15 @@ mod tests {
             vec!["rift", "list", "forwards"],
             vec!["rift", "list", "bans"],
             vec!["rift", "list", "devices"],
-            vec!["rift", "show", "agent", "core"],
-            vec!["rift", "add", "agent", "core"],
-            vec!["rift", "add", "agent", "core", "--ttl", "15m"],
-            vec!["rift", "remove", "invite", "core"],
-            vec!["rift", "remove", "agent", "core"],
-            vec!["rift", "disable", "agent", "core"],
-            vec!["rift", "enable", "agent", "core"],
-            vec!["rift", "rename", "agent", "core", "home"],
-            vec!["rift", "rotate", "agent", "core"],
+            vec!["rift", "show", "agent", "node1"],
+            vec!["rift", "add", "agent", "node1"],
+            vec!["rift", "add", "agent", "node1", "--ttl", "15m"],
+            vec!["rift", "remove", "invite", "node1"],
+            vec!["rift", "remove", "agent", "node1"],
+            vec!["rift", "disable", "agent", "node1"],
+            vec!["rift", "enable", "agent", "node1"],
+            vec!["rift", "rename", "agent", "node1", "node4"],
+            vec!["rift", "rotate", "agent", "node1"],
             vec!["rift", "remove", "forward", "3"],
             vec!["rift", "disable", "forward", "3"],
             vec!["rift", "enable", "forward", "3"],
@@ -1583,22 +1586,22 @@ mod tests {
                 "rift",
                 "add",
                 "ban",
-                "core",
+                "node1",
                 "3",
                 "203.0.113.9",
                 "--ttl",
                 "1h",
             ],
-            vec!["rift", "add", "ban", "core", "3", "203.0.113.9"],
+            vec!["rift", "add", "ban", "node1", "3", "203.0.113.9"],
             vec!["rift", "list", "sites"],
-            vec!["rift", "add", "site", "core", "app.example.org", "8080"],
+            vec!["rift", "add", "site", "node1", "app.example.org", "8080"],
             vec!["rift", "remove", "site", "app.example.org"],
             vec!["rift", "proxy"],
             vec!["rift", "proxy", "caddy"],
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }
-        let cli = Cli::try_parse_from(["rift", "add", "ban", "core", "3", "203.0.113.9"]).unwrap();
+        let cli = Cli::try_parse_from(["rift", "add", "ban", "node1", "3", "203.0.113.9"]).unwrap();
         let Command::Add {
             what:
                 AddWhat::Ban {
@@ -1613,7 +1616,7 @@ mod tests {
         };
         assert_eq!(
             (agent.as_str(), forward_id, ttl.as_str()),
-            ("core", 3, "1h")
+            ("node1", 3, "1h")
         );
         let cli = Cli::try_parse_from(["rift", "remove", "forward", "7"]).unwrap();
         assert!(matches!(
@@ -1657,13 +1660,13 @@ mod tests {
             "import",
             "f.json",
             "--agent",
-            "core",
+            "node1",
             "--agent",
-            "nas",
+            "node3",
             "--skip-agent",
-            "core2",
+            "node2",
             "--map",
-            "core2=core",
+            "node2=node1",
             "--map",
             "a=b",
             "--dry-run",
@@ -1672,14 +1675,14 @@ mod tests {
         let Command::Import(args) = cli.command else {
             panic!("import");
         };
-        assert_eq!(args.agents, ["core", "nas"]);
-        assert_eq!(args.skip_agents, ["core2"]);
+        assert_eq!(args.agents, ["node1", "node3"]);
+        assert_eq!(args.skip_agents, ["node2"]);
         assert_eq!(
             args.map,
-            [("core2".into(), "core".into()), ("a".into(), "b".into())]
+            [("node2".into(), "node1".into()), ("a".into(), "b".into())]
         );
         assert!(args.dry_run);
-        for bad in ["core2", "=core", "core2=", "a=b=c"] {
+        for bad in ["node2", "=node1", "node2=", "a=b=c"] {
             assert!(
                 Cli::try_parse_from(["rift", "import", "f.json", "--map", bad]).is_err(),
                 "{bad}"

@@ -2404,7 +2404,7 @@ mod tests {
     fn grant(name: &str, access: VpnAccess) -> VpnGrant {
         VpnGrant {
             peer: name.into(),
-            agent_id: "home".into(),
+            agent_id: "node4".into(),
             access,
         }
     }
@@ -2426,7 +2426,7 @@ mod tests {
     fn forwards_and_grants_outside_the_agent_limits_are_refused_and_left_out() {
         let forward = |id: u64, port: &str| Forward {
             id,
-            agent_id: "home".into(),
+            agent_id: "node4".into(),
             listen_ip: "203.0.113.10".parse().unwrap(),
             listen_ports: port.parse().unwrap(),
             target_ports: port.parse().unwrap(),
@@ -2439,8 +2439,8 @@ mod tests {
             purpose: Purpose::User,
         };
         let mut agent = AgentRecord {
-            id: "home".into(),
-            name: "core".into(),
+            id: "node4".into(),
+            name: "node1".into(),
             public_key: "k".into(),
             tunnel_ipv4: "10.13.0.2".parse().unwrap(),
             tunnel_ipv6: "fd88:5249:4654::2".parse().unwrap(),
@@ -2499,7 +2499,7 @@ mod tests {
         );
         let policy = policy_for(
             &limited,
-            "home",
+            "node4",
             "10.14.0.0/24".parse().unwrap(),
             "fd88:5249:4655::/64".parse().unwrap(),
         );
@@ -2517,8 +2517,8 @@ mod tests {
     #[test]
     fn an_agent_that_refuses_the_exit_loses_it_and_its_forward_until_it_allows_it() {
         let mut agent = AgentRecord {
-            id: "home".into(),
-            name: "core".into(),
+            id: "node4".into(),
+            name: "node1".into(),
             public_key: "k".into(),
             tunnel_ipv4: "10.13.0.2".parse().unwrap(),
             tunnel_ipv6: "fd88:5249:4654::2".parse().unwrap(),
@@ -2538,14 +2538,14 @@ mod tests {
             exit_port: Some(51821),
         };
         let mut device = peer("phone", true);
-        device.agent_exits = vec!["home".into()];
+        device.agent_exits = vec!["node4".into()];
         let ports = PortRange {
             start: 51821,
             end: 51821,
         };
         let exit_forward = Forward {
             id: 1,
-            agent_id: "home".into(),
+            agent_id: "node4".into(),
             listen_ip: "203.0.113.1".parse().unwrap(),
             listen_ports: ports,
             target_ports: ports,
@@ -2578,7 +2578,7 @@ mod tests {
             agent.limits = limits;
             let allowed = snap(&agent);
             assert_eq!(forward_state(&allowed, &allowed.forwards[0]).0, "enabled");
-            let policy = policy_for(&allowed, "home", pool, pool6);
+            let policy = policy_for(&allowed, "node4", pool, pool6);
             assert_eq!(
                 policy.forwards.len(),
                 1,
@@ -2598,13 +2598,13 @@ mod tests {
         let applied = without_refused(refused.clone());
         assert!(applied.forwards.is_empty());
         assert!(applied.vpn_peers[0].agent_exits.is_empty());
-        let policy = policy_for(&refused, "home", pool, pool6);
+        let policy = policy_for(&refused, "node4", pool, pool6);
         assert!(policy.exit.is_none() && policy.forwards.is_empty());
         let shown = exits_json(&refused, &refused.vpn_peers[0]);
         assert_eq!(shown[0]["state"], "refused");
-        assert_eq!(shown[0]["agent"], "core");
+        assert_eq!(shown[0]["agent"], "node1");
         // The stored choice survives, so allowing the exit later brings it back.
-        assert_eq!(refused.vpn_peers[0].agent_exits, ["home"]);
+        assert_eq!(refused.vpn_peers[0].agent_exits, ["node4"]);
     }
 
     #[test]

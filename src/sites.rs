@@ -249,9 +249,9 @@ mod tests {
 
     #[test]
     fn requests_are_validated_before_they_are_written() {
-        assert!(add("core", "app.example.net", 8080, Some("caddy")).is_ok());
-        assert!(add("core_1", "a", 1, None).is_ok());
-        assert!(add("core", "app.example.net", 65535, None).is_ok());
+        assert!(add("node1", "app.example.net", 8080, Some("caddy")).is_ok());
+        assert!(add("node1_1", "a", 1, None).is_ok());
+        assert!(add("node1", "app.example.net", 65535, None).is_ok());
         for agent in ["", "a b", "a;id", "../x", &"a".repeat(64)] {
             assert!(
                 add(agent, "app.example.net", 80, None).is_err(),
@@ -264,18 +264,18 @@ mod tests {
             "", "-a.net", "a-.net", "a..net", "a b.net", "a/b", "a;rm.net", "app.net.", "ä.net",
             &long, &too_long,
         ] {
-            assert!(add("core", host, 80, None).is_err(), "{host:?}");
+            assert!(add("node1", host, 80, None).is_err(), "{host:?}");
             assert!(remove(host).is_err(), "{host:?}");
         }
         for port in [0, 65536, 70000] {
             assert!(
-                add("core", "app.example.net", port, None).is_err(),
+                add("node1", "app.example.net", port, None).is_err(),
                 "{port}"
             );
         }
         for proxy in ["", "apache", "Traefik", "caddy "] {
             assert!(
-                add("core", "app.example.net", 80, Some(proxy)).is_err(),
+                add("node1", "app.example.net", 80, Some(proxy)).is_err(),
                 "{proxy:?}"
             );
         }
@@ -285,14 +285,14 @@ mod tests {
     #[test]
     fn a_request_file_holds_exactly_the_checked_parameters() {
         let dir = tempfile::tempdir().unwrap();
-        let request = add("core", "app.example.net", 8080, None).unwrap();
+        let request = add("node1", "app.example.net", 8080, None).unwrap();
         let id = enqueue(dir.path(), &request).unwrap();
         validate_id(&id).unwrap();
         let text = std::fs::read_to_string(dir.path().join(format!("{id}.json"))).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
             value,
-            json!({"id": id, "action": "add", "agent": "core", "host": "app.example.net", "port": 8080})
+            json!({"id": id, "action": "add", "agent": "node1", "host": "app.example.net", "port": 8080})
         );
         let request = remove("app.example.net").unwrap();
         let id = enqueue(dir.path(), &request).unwrap();
@@ -369,10 +369,10 @@ mod tests {
         std::fs::write(
             dir.path().join("sites.json"),
             json!({"proxy": "traefik", "sites": {
-                "b.example.net": {"agent": "core", "target": 9000, "listen": 20001, "proxy": "caddy", "forward_id": 2},
-                "a.example.net": {"agent": "core", "target": 8080, "listen": 20000, "proxy": "traefik", "forward_id": 1},
-                "c.example.net": {"agent": "core", "target": 80, "listen": 20002, "proxy": "nginx", "forward_id": 3},
-                "d.example.net": {"agent": "core", "target": 80, "listen": 20003, "proxy": "nginx", "forward_id": 4},
+                "b.example.net": {"agent": "node1", "target": 9000, "listen": 20001, "proxy": "caddy", "forward_id": 2},
+                "a.example.net": {"agent": "node1", "target": 8080, "listen": 20000, "proxy": "traefik", "forward_id": 1},
+                "c.example.net": {"agent": "node1", "target": 80, "listen": 20002, "proxy": "nginx", "forward_id": 3},
+                "d.example.net": {"agent": "node1", "target": 80, "listen": 20003, "proxy": "nginx", "forward_id": 4},
             }})
             .to_string(),
         )

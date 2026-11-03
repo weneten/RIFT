@@ -57,10 +57,10 @@ class RenderTests(unittest.TestCase):
     def test_missing_agent_says_enrollment_is_unfinished(self):
         self.assertIn(
             "has not finished enrollment",
-            rift_site.missing_agent_message("core", "rift: agent not found"),
+            rift_site.missing_agent_message("node1", "rift: agent not found"),
         )
         self.assertEqual(
-            rift_site.missing_agent_message("core", "connection refused"),
+            rift_site.missing_agent_message("node1", "connection refused"),
             "connection refused",
         )
 
@@ -318,16 +318,16 @@ class FileProviderTests(unittest.TestCase):
 
     def test_add_arguments_and_the_proxy_word(self):
         self.assertEqual(
-            rift_site.parse_add_args(["core", "a.example", "8081", "traefik"]),
-            (["core", "a.example", "8081"], "traefik"),
+            rift_site.parse_add_args(["node1", "a.example", "8081", "traefik"]),
+            (["node1", "a.example", "8081"], "traefik"),
         )
-        self.assertEqual(rift_site.parse_add_args(["core", "a.example", "8081"])[1], None)
+        self.assertEqual(rift_site.parse_add_args(["node1", "a.example", "8081"])[1], None)
         with self.assertRaises(rift_site.SiteError) as typo:
-            rift_site.parse_add_args(["core", "a.example", "8081", "traefic"])
+            rift_site.parse_add_args(["node1", "a.example", "8081", "traefic"])
         self.assertIn("unknown proxy traefic", str(typo.exception))
         for bad in (
-            ["core", "a.example", "8081", "--proxy", "traefik"],
-            ["core", "a.example"],
+            ["node1", "a.example", "8081", "--proxy", "traefik"],
+            ["node1", "a.example"],
             ["a", "b", "1", "npm", "x"],
         ):
             with self.assertRaises(rift_site.SiteError):
@@ -531,24 +531,24 @@ class ExportTests(unittest.TestCase):
     def test_sites_replace_the_forwards_they_made(self):
         core = {
             "format": 1,
-            "agents": ["core"],
+            "agents": ["node1"],
             "forwards": [
-                self.forward("core", 2222, 22),
-                self.forward("core", 20000, 8080, "local"),
-                self.forward("core", 20001, 9000, "local"),
+                self.forward("node1", 2222, 22),
+                self.forward("node1", 20000, 8080, "local"),
+                self.forward("node1", 20001, 9000, "local"),
             ],
             "devices": [
                 {
                     "name": "phone",
                     "enabled": True,
                     "panel": False,
-                    "grants": [{"agent": "core", "access": "server"}],
+                    "grants": [{"agent": "node1", "access": "server"}],
                 }
             ],
         }
         sites = {
             "app.example.org": {
-                "agent": "core",
+                "agent": "node1",
                 "target": 8080,
                 "listen": 20000,
                 "proxy": "caddy",
@@ -559,7 +559,7 @@ class ExportTests(unittest.TestCase):
         self.assertEqual([f["listen_ports"]["start"] for f in document["forwards"]], [2222, 20001])
         self.assertEqual(
             document["sites"],
-            [{"agent": "core", "host": "app.example.org", "port": 8080, "proxy": "caddy"}],
+            [{"agent": "node1", "host": "app.example.org", "port": 8080, "proxy": "caddy"}],
         )
         self.assertEqual(document["format"], 1)
         self.assertNotIn("forward_id", json.dumps(document))
@@ -577,7 +577,7 @@ class ExportTests(unittest.TestCase):
             rift_site.check_export_format([])
 
     def test_export_writes_the_file_and_names_it_by_date(self):
-        core = {"format": 1, "agents": ["core"], "forwards": [], "devices": []}
+        core = {"format": 1, "agents": ["node1"], "forwards": [], "devices": []}
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(rift_site, "site_state", return_value={"sites": {}}), \
                 mock.patch.object(rift_site, "rift", return_value=core) as call, \
@@ -596,52 +596,52 @@ class ImportTests(unittest.TestCase):
         base.update(extra)
         return base
 
-    def entry(self, host, agent="core", port=8080, proxy="caddy"):
+    def entry(self, host, agent="node1", port=8080, proxy="caddy"):
         return {"agent": agent, "host": host, "port": port, "proxy": proxy}
 
     def test_map_pairs_must_be_old_equals_new(self):
-        self.assertEqual(rift_site.parse_map("core2=core"), ("core2", "core"))
-        for bad in ("core2", "=core", "core2=", "a=b=c"):
+        self.assertEqual(rift_site.parse_map("node2=node1"), ("node2", "node1"))
+        for bad in ("node2", "=node1", "node2=", "a=b=c"):
             with self.assertRaises(Exception, msg=bad):
                 rift_site.parse_map(bad)
 
     def test_sites_follow_the_agent_filters_and_mapping(self):
-        agents = {"core": "active", "off": "disabled", "new": "pending"}
+        agents = {"node1": "active", "node6": "disabled", "new": "pending"}
         entries = [
-            self.entry("a.example.org", "core2"),
-            self.entry("b.example.org", "core"),
-            self.entry("c.example.org", "off"),
+            self.entry("a.example.org", "node2"),
+            self.entry("b.example.org", "node1"),
+            self.entry("c.example.org", "node6"),
             self.entry("d.example.org", "new"),
             self.entry("e.example.org", "gone"),
         ]
         plan = rift_site.plan_site_import(
-            entries, self.options(map=[("core2", "core")]), agents, {}, set()
+            entries, self.options(map=[("node2", "node1")]), agents, {}, set()
         )
         self.assertEqual(
             [p["status"] for p in plan], ["create", "create", "skipped", "skipped", "skipped"]
         )
-        self.assertEqual(plan[0]["agent"], "core")
-        self.assertIn("rift enable agent off", plan[2]["detail"])
+        self.assertEqual(plan[0]["agent"], "node1")
+        self.assertIn("rift enable agent node6", plan[2]["detail"])
         self.assertIn("still open", plan[3]["detail"])
         self.assertIn("rift add agent gone", plan[4]["detail"])
         self.assertIn("--map gone=NAME", plan[4]["detail"])
         only = rift_site.plan_site_import(
-            entries[:2], self.options(agents=["core"], map=[("core2", "off")]), agents, {}, set()
+            entries[:2], self.options(agents=["node1"], map=[("node2", "node6")]), agents, {}, set()
         )
         self.assertEqual([p["status"] for p in only], ["skipped", "create"])
         self.assertIn("--agent", only[0]["detail"])
         skip = rift_site.plan_site_import(
-            entries[:2], self.options(skip_agents=["core"]), agents, {}, set()
+            entries[:2], self.options(skip_agents=["node1"]), agents, {}, set()
         )
         self.assertEqual([p["status"] for p in skip], ["skipped", "skipped"])
         self.assertIn("--skip-agent", skip[1]["detail"])
 
     def test_existing_sites_are_present_or_a_conflict_but_never_changed(self):
-        agents = {"core": "active"}
+        agents = {"node1": "active"}
         sites = {
-            "same.example.org": {"agent": "core", "target": 8080, "proxy": "caddy", "listen": 20000, "forward_id": 1},
-            "other.example.org": {"agent": "core", "target": 9999, "proxy": "caddy", "listen": 20001, "forward_id": 2},
-            "lost.example.org": {"agent": "core", "target": 8080, "proxy": "caddy", "listen": 20002, "forward_id": 3},
+            "same.example.org": {"agent": "node1", "target": 8080, "proxy": "caddy", "listen": 20000, "forward_id": 1},
+            "other.example.org": {"agent": "node1", "target": 9999, "proxy": "caddy", "listen": 20001, "forward_id": 2},
+            "lost.example.org": {"agent": "node1", "target": 8080, "proxy": "caddy", "listen": 20002, "forward_id": 3},
         }
         entries = [self.entry(h) for h in sites]
         plan = rift_site.plan_site_import(
@@ -659,7 +659,7 @@ class ImportTests(unittest.TestCase):
         self.assertEqual([p["status"] for p in bad], ["failed", "failed"])
 
     def test_a_dry_run_creates_nothing_and_a_real_run_adds_each_site(self):
-        agents = {"core": "active"}
+        agents = {"node1": "active"}
         plan = rift_site.plan_site_import(
             [self.entry("a.example.org"), self.entry("b.example.org")],
             self.options(),
@@ -686,18 +686,18 @@ class ImportTests(unittest.TestCase):
 
     def test_the_report_is_grouped_like_the_server_report(self):
         items = [
-            {"status": "created", "what": "forward core 22/tcp on 1.2.3.4", "detail": None},
+            {"status": "created", "what": "forward node1 22/tcp on 1.2.3.4", "detail": None},
             {"status": "created", "what": "device phone", "detail": "new keys"},
             {"status": "present", "what": "device tv", "detail": None},
-            {"status": "skipped", "what": "3 entries for agent core2", "detail": "no such agent"},
+            {"status": "skipped", "what": "3 entries for agent node2", "detail": "no such agent"},
             {"status": "failed", "what": "site a.example.org", "detail": "no proxy"},
         ]
         text = rift_site.render_import_report(items, True)
         for expected in (
             "Dry run: nothing was changed.",
-            "Would create (2)\n  forward core 22/tcp on 1.2.3.4\n  device phone (new keys)",
+            "Would create (2)\n  forward node1 22/tcp on 1.2.3.4\n  device phone (new keys)",
             "Already present (1)\n  device tv",
-            "Skipped (1)\n  3 entries for agent core2: no such agent",
+            "Skipped (1)\n  3 entries for agent node2: no such agent",
             "Failed (1)\n  site a.example.org: no proxy",
         ):
             self.assertIn(expected, text)
@@ -713,12 +713,12 @@ class ImportTests(unittest.TestCase):
             with mock.patch.object(rift_site, "site_state", return_value={"sites": {}}), \
                     mock.patch.object(rift_site, "rift_with_input", return_value=report) as call:
                 rift_site.command_import(
-                    [str(export), "--agent", "core", "--skip-agent", "x", "--map", "a=b", "--dry-run"]
+                    [str(export), "--agent", "node1", "--skip-agent", "x", "--map", "a=b", "--dry-run"]
                 )
             args = call.call_args[0]
             self.assertEqual(
                 args[2:],
-                ("import", "-", "--agent", "core", "--skip-agent", "x", "--map", "a=b", "--dry-run"),
+                ("import", "-", "--agent", "node1", "--skip-agent", "x", "--map", "a=b", "--dry-run"),
             )
             self.assertEqual(json.loads(args[1])["format"], 1)
             export.write_text(json.dumps({"format": 7}))
@@ -922,7 +922,7 @@ class QueueTests(unittest.TestCase):
     def test_a_trailing_newline_is_not_a_valid_host_or_agent(self):
         self.assertFalse(rift_site.valid_host("a.example\n"))
         self.assertFalse(rift_site.valid_host("a.example\nserver {"))
-        self.assertFalse(rift_site.valid_agent("core\n"))
+        self.assertFalse(rift_site.valid_agent("node1\n"))
         self.assertTrue(rift_site.valid_host("a.example"))
 
     def setUp(self):
@@ -955,7 +955,7 @@ class QueueTests(unittest.TestCase):
         return count, a, r
 
     def good_add(self, **changes):
-        return {"action": "add", "agent": "core", "host": "app.example.net", "port": 8080, **changes}
+        return {"action": "add", "agent": "node1", "host": "app.example.net", "port": 8080, **changes}
 
     def test_an_add_runs_the_add_logic_and_answers(self):
         def add(agent, host, port, proxy):
@@ -965,7 +965,7 @@ class QueueTests(unittest.TestCase):
         name = self.request(self.good_add(proxy="caddy"))
         count, _, _ = self.process(add=mocked)
         self.assertEqual(count, 1)
-        mocked.assert_called_once_with("core", "app.example.net", 8080, "caddy")
+        mocked.assert_called_once_with("node1", "app.example.net", 8080, "caddy")
         self.assertEqual(
             self.result(name), {"id": name, "ok": True, "message": "https://app.example.net"}
         )
@@ -974,7 +974,7 @@ class QueueTests(unittest.TestCase):
     def test_the_proxy_is_optional(self):
         self.request(self.good_add())
         _, add, _ = self.process()
-        add.assert_called_once_with("core", "app.example.net", 8080, None)
+        add.assert_called_once_with("node1", "app.example.net", 8080, None)
 
     def test_a_remove_runs_the_remove_logic(self):
         name = self.request({"action": "remove", "host": "app.example.net"})
@@ -1026,7 +1026,7 @@ class QueueTests(unittest.TestCase):
             self.good_add(proxy=["caddy"]),
             self.good_add(command="id"),
             {"action": "add", "host": "a.net"},
-            {"action": "remove", "host": "a.net", "agent": "core"},
+            {"action": "remove", "host": "a.net", "agent": "node1"},
             {"action": "remove", "host": "a.net;id"},
             {"action": "remove"},
             {"action": "restore", "host": "a.net"},
