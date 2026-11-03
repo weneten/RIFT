@@ -78,6 +78,25 @@ function endpoint(ip, ports) {
   return String(ip).includes(":") ? `[${ip}]:${ports}` : `${ip}:${ports}`;
 }
 
+// Typical web ports of a TCP forward and the scheme they are opened with.
+const WEB_PORTS = {
+  80: "http", 443: "https", 8080: "http", 8000: "http", 8008: "http", 8081: "http",
+  8888: "http", 3000: "http", 5000: "http", 8090: "http", 8443: "https", 9443: "https",
+};
+
+// The URL to open a forward's public address at, or null when it is not a single web port.
+function forwardUrl(forward) {
+  const ports = forward.listen_ports;
+  const ip = String(forward.listen_ip || "");
+  if (forward.protocol !== "tcp" || !forward.enabled || !ports || ports.start !== ports.end) return null;
+  if (!ip || ip === "0.0.0.0" || ip === "::") return null;
+  const scheme = Object.prototype.hasOwnProperty.call(WEB_PORTS, ports.start) ? WEB_PORTS[ports.start] : null;
+  if (!scheme) return null;
+  const host = ip.includes(":") ? `[${ip}]` : ip;
+  const port = (ports.start === 80 || ports.start === 443) ? "" : `:${ports.start}`;
+  return `${scheme}://${host}${port}/`;
+}
+
 function access(a) {
   if (a === "server") return "host";
   if (a === "full") return "host, all protocols";
@@ -626,17 +645,21 @@ function render() {
       el("td", { class: "actions" }, actions));
   }), 6, invites.length ? "No agent has enrolled yet." : "No agents yet.");
 
+  // Forwards of a site are linked from the Sites table instead, so their Listen cell stays text.
+  const siteForwards = new Set(((data.sites || {}).sites || []).map((s) => s.forward_id).filter(Boolean));
   fill($("forwards"), forwards.map((f) => {
     const statePill = !f.enabled ? pill("disabled", "off")
       : f.refused ? Object.assign(pill("refused", "bad"), { title: f.refused })
       : f.pending ? pill("pending", "warn") : pill("active", "ok");
     const isExit = f.purpose === "exit";
     const mode = [isExit ? "exit" : null, f.mode, f.ingress === "local" ? "local" : null, f.target_family].filter(Boolean).join(" · ");
+    const listen = endpoint(f.listen_ip, range(f.listen_ports));
+    const url = siteForwards.has(f.id) ? null : forwardUrl(f);
     return el("tr", {},
       el("td", {}, f.id),
       el("td", {}, f.agent),
       el("td", {}, String(f.protocol || "").toUpperCase()),
-      el("td", {}, el("code", {}, endpoint(f.listen_ip, range(f.listen_ports)))),
+      el("td", {}, el("code", {}, url ? link(url, listen) : listen)),
       el("td", {}, range(f.target_ports)),
       el("td", { class: "muted" }, mode),
       el("td", {}, statePill),
