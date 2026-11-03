@@ -1389,6 +1389,61 @@ mod tests {
         assert!(none.0.is_empty(), "nothing to report without exits");
     }
     #[test]
+    fn readme_commands_parse() {
+        let docs = [
+            include_str!("../README.md"),
+            include_str!("../docs/deploy.md"),
+            include_str!("../docs/architecture.md"),
+            include_str!("../docs/verification.md"),
+        ];
+        let mut failed = Vec::new();
+        let mut checked = 0;
+        for doc in docs {
+            // Code-block lines and inline `rift ...` spans.
+            let inline = doc.split('`').skip(1).step_by(2);
+            for line in doc.lines().chain(inline) {
+                let line = line.split('#').next().unwrap_or("").trim();
+                let line = line.strip_prefix("sudo ").unwrap_or(line);
+                let Some(rest) = line.strip_prefix("rift ") else {
+                    continue;
+                };
+                let command = rest.split(['>', '|']).next().unwrap_or("").trim();
+                let words: Vec<&str> = std::iter::once("rift")
+                    .chain(command.split_whitespace())
+                    .collect();
+                if words.iter().any(|w| {
+                    w.contains("...")
+                        || w.starts_with('[')
+                        || w.contains('{')
+                        || (w.len() > 1 && w.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+                }) {
+                    continue;
+                }
+                checked += 1;
+                if let Err(error) = Cli::try_parse_from(&words) {
+                    // Prose may name a command without its arguments (`rift remove device`).
+                    use clap::error::ErrorKind::*;
+                    if !matches!(
+                        error.kind(),
+                        DisplayHelp
+                            | DisplayVersion
+                            | MissingRequiredArgument
+                            | MissingSubcommand
+                            | DisplayHelpOnMissingArgumentOrSubcommand
+                    ) {
+                        failed.push(format!("{}: {}", words.join(" "), error.kind()));
+                    }
+                }
+            }
+        }
+        assert!(checked > 50, "only {checked} documented commands found");
+        assert!(
+            failed.is_empty(),
+            "documented commands that do not parse:\n{}",
+            failed.join("\n")
+        );
+    }
+    #[test]
     fn documented_cli_parses() {
         for args in [
             vec!["rift", "add", "forward", "nas", "2222:22/tcp"],
