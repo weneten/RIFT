@@ -78,23 +78,18 @@ function endpoint(ip, ports) {
   return String(ip).includes(":") ? `[${ip}]:${ports}` : `${ip}:${ports}`;
 }
 
-// Typical web ports of a TCP forward and the scheme they are opened with.
-const WEB_PORTS = {
-  80: "http", 443: "https", 8080: "http", 8000: "http", 8008: "http", 8081: "http",
-  8888: "http", 3000: "http", 5000: "http", 8090: "http", 8443: "https", 9443: "https",
-};
+// Ports that are opened with https; every other TCP port is linked with http.
+const HTTPS_PORTS = new Set([443, 8443, 9443]);
 
-// The URL to open a forward's public address at, or null when it is not a single web port.
+// The URL to open a single-port TCP forward at, or null (UDP, port ranges, no address).
 function forwardUrl(forward) {
   const ports = forward.listen_ports;
   const ip = String(forward.listen_ip || "");
-  if (forward.protocol !== "tcp" || !forward.enabled || !ports || ports.start !== ports.end) return null;
-  // Behind a cloud NAT the listener has a private address that is useless from outside.
-  if (!ip || ip === "0.0.0.0" || ip === "::" || /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|f[cd])/i.test(ip)) return null;
-  const scheme = Object.prototype.hasOwnProperty.call(WEB_PORTS, ports.start) ? WEB_PORTS[ports.start] : null;
-  if (!scheme) return null;
+  if (forward.protocol !== "tcp" || !ports || ports.start !== ports.end) return null;
+  if (!ip || ip === "0.0.0.0" || ip === "::") return null;
+  const scheme = HTTPS_PORTS.has(ports.start) ? "https" : "http";
   const host = ip.includes(":") ? `[${ip}]` : ip;
-  const port = (ports.start === 80 || ports.start === 443) ? "" : `:${ports.start}`;
+  const port = (ports.start === 80 && scheme === "http") || (ports.start === 443 && scheme === "https") ? "" : `:${ports.start}`;
   return `${scheme}://${host}${port}/`;
 }
 
@@ -651,8 +646,6 @@ function render() {
       el("td", { class: "actions" }, actions));
   }), 6, invites.length ? "No agent has enrolled yet." : "No agents yet.");
 
-  // Forwards of a site are linked from the Sites table instead, so their Listen cell stays text.
-  const siteForwards = new Set(((data.sites || {}).sites || []).map((s) => s.forward_id).filter(Boolean));
   fill($("forwards"), forwards.map((f) => {
     const statePill = !f.enabled ? pill("disabled", "off")
       : f.refused ? Object.assign(pill("refused", "bad"), { title: f.refused })
@@ -660,7 +653,7 @@ function render() {
     const isExit = f.purpose === "exit";
     const mode = [isExit ? "exit" : null, f.mode, f.ingress === "local" ? "local" : null, f.target_family].filter(Boolean).join(" · ");
     const listen = endpoint(f.listen_ip, range(f.listen_ports));
-    const url = siteForwards.has(f.id) ? null : forwardUrl(f);
+    const url = forwardUrl(f);
     return el("tr", {},
       el("td", {}, f.id),
       el("td", {}, f.agent),
