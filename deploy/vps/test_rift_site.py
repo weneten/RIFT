@@ -71,6 +71,14 @@ class RenderTests(unittest.TestCase):
 
 
 class EdgeTests(unittest.TestCase):
+    def test_a_port_with_a_forward_suffix_is_explained(self):
+        for port in ("8081/tcp/both", "8081/tcp", "0", "70000", "abc"):
+            with mock.patch.object(rift_site, "load_state") as load:
+                with self.assertRaises(rift_site.SiteError) as caught:
+                    rift_site.command_add("node1", "app.example", port, None)
+            load.assert_not_called()
+            self.assertIn("PORT is the agent's port number, for example 8081", str(caught.exception))
+
     def setUp(self):
         self.traefik = [
             {

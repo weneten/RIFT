@@ -919,9 +919,12 @@ def command_purge():
 def command_add(agent, host, port, proxy):
     if not valid_agent(agent) or not valid_host(host):
         raise SiteError("agent or host is not a usable name")
+    if not re.fullmatch(r"[0-9]{1,5}", port) or not 1 <= int(port) <= 65535:
+        raise SiteError(
+            f"PORT is the agent's port number, for example 8081 (got {port!r}); "
+            "protocol suffixes like /tcp belong to `rift add forward`"
+        )
     target = int(port)
-    if not 1 <= target <= 65535:
-        raise SiteError("port must be in 1..65535")
     state = load_state()
     if state is None:
         state = default_state(read_server_public_ip())
