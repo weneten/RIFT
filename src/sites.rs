@@ -137,7 +137,7 @@ pub fn pending(queue: &Path) -> Result<usize> {
 pub fn enqueue(queue: &Path, request: &Request) -> Result<String> {
     ensure!(
         queue.is_dir(),
-        "sites are managed on the host; install the host command (sudo sh deploy/vps/install-cli) and recreate the server container"
+        "sites are managed on the host; install the host command (sudo sh deploy/install-cli) and recreate the server container"
     );
     if pending(queue)? >= MAX_PENDING {
         bail!("{MAX_PENDING} site requests are already waiting; the host service is not processing them (is rift-site-queue.path active?)");

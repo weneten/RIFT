@@ -1,12 +1,38 @@
 #!/bin/sh
-# Install the host-side server CLI and website helper, and the host service that carries
-# site requests from the web panel (see README: Web panel). Safe to run again.
+# Install the host command `rift` on this host. The role comes from the root .env (COMPOSE_PROFILES).
+# On the server (VPS) it also installs the website helper and the host service that carries site
+# requests from the web panel (see README: Web panel). Safe to run again.
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-install -d -m 755 /usr/local/bin /usr/local/lib/rift
-install -m 755 "$script_dir/rift-site" /usr/local/lib/rift/rift-site
+repo_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+
+role=
+if [ -f "$repo_dir/.env" ]; then
+    role=$(sed -n -E 's/^COMPOSE_PROFILES=(server|agent)([[:space:]]+#.*)?[[:space:]]*$/\1/p' "$repo_dir/.env" 2> /dev/null | tail -n 1 || true)
+fi
+case "$role" in
+    server | agent) ;;
+    *)
+        printf '%s\n' "rift: $repo_dir/.env is missing or has no COMPOSE_PROFILES=server or agent line." \
+            'Create it from the matching example first, then run this again:' \
+            '  VPS:         cp .env.server.example .env' \
+            '  home server: cp .env.agent.example .env' >&2
+        exit 1
+        ;;
+esac
+
+install -d -m 755 /usr/local/bin
 install -m 755 "$script_dir/rift" /usr/local/bin/rift
+
+if [ "$role" = agent ]; then
+    printf '%s\n' 'Installed /usr/local/bin/rift. On this agent, rift status, rift doctor and rift logs' \
+        'now run inside the rift-agent container.'
+    exit 0
+fi
+
+install -d -m 755 /usr/local/lib/rift
+install -m 755 "$script_dir/vps/rift-site" /usr/local/lib/rift/rift-site
 printf '%s\n' 'Installed /usr/local/bin/rift and /usr/local/lib/rift/rift-site.'
 
 # The server container reads the site records (read-only) and writes requests into the queue

@@ -22,7 +22,7 @@ services:
       - rift-state:/var/lib/rift
       - ./config.toml:/etc/rift/config.toml:ro
       # Web panel sites: the host helper's records (read-only) and the request queue the
-      # host service answers. Created by install-cli; Docker creates them empty otherwise.
+      # host service answers. Created by deploy/install-cli; Docker creates them empty otherwise.
       - /var/lib/rift-site:/var/lib/rift-site:ro
       - /var/lib/rift-site-queue:/var/lib/rift-site-queue
     environment:

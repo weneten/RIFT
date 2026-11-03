@@ -1,8 +1,42 @@
 #!/bin/sh
-# Host-side entry point for server administration.
+# Host-side entry point for RIFT. It runs `rift` in this host's RIFT container: rift-server on the
+# VPS, rift-agent on a home server. Only the server has the site commands and the helper-backed
+# admin commands, which read or write files on the host.
 set -eu
 
 site=/usr/local/lib/rift/rift-site
+
+# Status of a container (running, restarting, exited, ...); empty if it does not exist.
+state() {
+    docker inspect -f '{{.State.Status}}' "$1" 2> /dev/null || true
+}
+
+# Exits unless the named container is running.
+require_running() {
+    case "$(state "$1")" in
+        running) ;;
+        restarting)
+            echo "rift: the $1 container keeps restarting. Its last message:" >&2
+            docker logs --tail 1 "$1" 2>&1 | sed 's/^/  /' >&2
+            exit 1
+            ;;
+        *)
+            echo "rift: the $1 container is not running; start it with 'docker compose up -d' in the RIFT directory" >&2
+            exit 1
+            ;;
+    esac
+}
+
+if [ -z "$(state rift-server)" ]; then
+    if [ -z "$(state rift-agent)" ]; then
+        echo "rift: there is no rift-server or rift-agent container; start it with 'docker compose up -d' in the RIFT directory" >&2
+        exit 1
+    fi
+    require_running rift-agent
+    exec docker exec rift-agent rift --config /etc/rift/config.toml "$@"
+fi
+
+# Server only from here on.
 
 # Sites live on the host: the helper writes the proxy configuration.
 case "${1-} ${2-}" in
@@ -49,20 +83,5 @@ if [ "${1-}" = list ] && [ "${2-}" = forwards ] && [ "$#" -eq 2 ] && [ -x "$site
     "$site" forwards 2> /dev/null && exit 0
 fi
 
-case "$(docker inspect -f '{{.State.Status}}' rift-server 2> /dev/null || true)" in
-    running) ;;
-    restarting)
-        echo "rift: the rift-server container keeps restarting. Its last message:" >&2
-        docker logs --tail 1 rift-server 2>&1 | sed 's/^/  /' >&2
-        exit 1
-        ;;
-    "")
-        echo "rift: there is no rift-server container; start it with 'docker compose up -d' in the RIFT directory" >&2
-        exit 1
-        ;;
-    *)
-        echo "rift: the rift-server container is not running; start it with 'docker compose up -d' in the RIFT directory" >&2
-        exit 1
-        ;;
-esac
+require_running rift-server
 exec docker exec rift-server rift --config /etc/rift/config.toml $json "$@"

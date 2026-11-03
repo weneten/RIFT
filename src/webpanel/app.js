@@ -484,7 +484,7 @@ function grantsDialog(name, notes) {
 // ---------- sites (carried out by the host service, see the README) ----------
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const HOST_MISSING = "The host service did not pick up the request; is `rift-site-queue.path` installed and active? (sudo sh deploy/vps/install-cli)";
+const HOST_MISSING = "The host service did not pick up the request; is `rift-site-queue.path` installed and active? (sudo sh deploy/install-cli)";
 
 // Waits up to 30 seconds for the host's answer to a queued request and shows it.
 async function awaitSite(id, title) {
