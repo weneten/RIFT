@@ -1468,7 +1468,7 @@ def command_import(args):
         argv.append("--dry-run")
     report = rift_with_input(state, raw, *argv)
     items = list(report["items"])
-    entries = document.get("sites") or []
+    entries = document["sites"]
     if entries:
         agents = {a["name"]: a["status"] for a in rift(state, "list", "agents") or []}
         forwards = rift(state, "list", "forwards") or []

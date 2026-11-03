@@ -21,7 +21,6 @@ pub struct ExportForward {
     pub target_ports: PortRange,
     pub protocol: Protocol,
     pub mode: ForwardMode,
-    #[serde(default)]
     pub ingress: Ingress,
     pub target_family: Family,
     pub enabled: bool,
@@ -56,7 +55,6 @@ pub struct Export {
     pub agents: Vec<String>,
     pub forwards: Vec<ExportForward>,
     pub devices: Vec<ExportDevice>,
-    #[serde(default)]
     pub sites: Vec<ExportSite>,
 }
 impl Export {
@@ -979,7 +977,11 @@ mod tests {
         );
         assert!(Export::parse(b"{}").is_err());
         assert!(Export::parse(b"not json").is_err());
-        assert!(Export::parse(br#"{"format":2,"agents":[],"forwards":[],"devices":[]}"#).is_ok());
+        assert!(Export::parse(br#"{"format":2,"agents":[],"forwards":[],"devices":[]}"#).is_err());
+        assert!(Export::parse(
+            br#"{"format":2,"agents":[],"forwards":[],"devices":[],"sites":[]}"#
+        )
+        .is_ok());
     }
 
     #[test]

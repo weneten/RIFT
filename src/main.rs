@@ -1394,7 +1394,6 @@ mod tests {
             include_str!("../README.md"),
             include_str!("../docs/deploy.md"),
             include_str!("../docs/architecture.md"),
-            include_str!("../docs/verification.md"),
         ];
         let mut failed = Vec::new();
         let mut checked = 0;

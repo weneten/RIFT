@@ -11,7 +11,7 @@ Client ── TCP / UDP ──> RIFT server ── WireGuard ──> RIFT agent 
 
 The agent initiates the connection to the server. RIFT manages the tunnel, explicit forwarding grants and the necessary Linux networking rules. A separate reverse proxy can terminate HTTPS and route domain names to HTTP services through RIFT.
 
-> The examples use Linux Docker Engine with host networking. Host networking and `CAP_NET_ADMIN` let RIFT change the host's networking. Test the deployment and firewall interaction on a disposable system before production. Docker Desktop on Windows or macOS is useful for builds, but does not reproduce this Linux host-network datapath. See [verification status](docs/verification.md) for what has actually been tested.
+> The examples use Linux Docker Engine with host networking. Host networking and `CAP_NET_ADMIN` let RIFT change the host's networking. Test the deployment and firewall interaction on a disposable system before production. Docker Desktop on Windows or macOS is useful for builds, but does not reproduce this Linux host-network datapath.
 
 ## Contents
 
@@ -848,10 +848,9 @@ The state volume (CA, keys, agents, forwards) and the site records are kept so a
 
 ## Build and development
 
-The root Compose file pulls `weneten/rift:latest`. To build and use the local source instead, use `deploy/vps/compose.yml` on the server or `deploy/agent/compose.yml` on the agent, with the matching `.env` and configuration; inspect the rendered configuration before starting. To build an image directly:
+The root Compose file pulls `weneten/rift:latest`; that is the only deployment path. For development, the checks are:
 
 ```sh
-docker build -t rift:local .
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
@@ -863,4 +862,3 @@ The Linux network-namespace and Docker integration harnesses require disposable 
 
 - [Architecture and security boundaries](docs/architecture.md): packet paths, enrollment, translation, state and recovery.
 - [Deployment and verification](docs/deploy.md): preflight, firewall coexistence, rollout, rollback, integration tests and performance procedure.
-- [Recorded verification status](docs/verification.md): executed checks and outstanding release gates.
