@@ -307,15 +307,10 @@ pub fn plan_server(obs: &Observation, spec: &ServerSpec<'_>) -> Result<Plan> {
                 !spec.uplinks.is_empty(),
                 "local ingress needs a public uplink"
             );
-            let mut excluded: Vec<String> = spec
-                .uplinks
-                .iter()
-                .map(|name| format!("iifname != \"{name}\""))
-                .collect();
-            excluded.push(format!("iifname != \"{}\"", spec.interface));
+            // Uplink traffic to the tunnel is already accepted above, so one negated match is
+            // enough; iptables, which reads these tables too, keeps only one `-i` per rule.
             rules.push(format!(
-                "{} oifname \"{}\" accept comment \"rift:local\"",
-                excluded.join(" "),
+                "iifname != \"{0}\" oifname \"{0}\" accept comment \"rift:local\"",
                 spec.interface
             ));
         }
@@ -361,6 +356,16 @@ pub fn plan_agent(obs: &Observation, spec: &AgentSpec<'_>) -> Result<Plan> {
         }
         if chain.family == "ip" || chain.family == "inet" {
             for rule in spec.vpn {
+                // iptables has no protocol sets, so the server grant becomes one rule each.
+                if rule.access == crate::model::VpnAccess::Server {
+                    for protocol in ["tcp", "udp", "icmp"] {
+                        rules.push(format!(
+                            "iifname \"{}\" ip saddr {} ip daddr {} meta l4proto {protocol} accept comment \"rift:vpn\"",
+                            spec.interface, rule.source, spec.tunnel_v4
+                        ));
+                    }
+                    continue;
+                }
                 rules.push(format!(
                     "iifname \"{}\" {}accept comment \"rift:vpn\"",
                     spec.interface,
@@ -792,6 +797,10 @@ mod tests {
             public: true,
         });
         let server = plan_server(&obs, &spec).unwrap();
+        let vpn = [AgentVpnRule {
+            source: "10.14.0.2".parse().unwrap(),
+            access: crate::model::VpnAccess::Server,
+        }];
         let agent = plan_agent(
             &obs,
             &AgentSpec {
@@ -799,7 +808,7 @@ mod tests {
                 tunnel_v4: "10.88.0.2".parse().unwrap(),
                 tunnel_v6: "fd88:5249:4654::2".parse().unwrap(),
                 forwards: &[],
-                vpn: &[],
+                vpn: &vpn,
                 exit: Some(ExitSpec {
                     interface: "rift-exit",
                     uplinks: &uplinks,
@@ -809,14 +818,22 @@ mod tests {
         .unwrap();
         for plan in [&server, &agent] {
             let all = format!("{}{}{}", plan.create, plan.fill, plan.jumps);
-            assert!(!all.contains(" ct "), "{all}");
+            assert!(!all.contains(" ct ") && !all.contains('{'), "{all}");
+            for line in all.lines() {
+                assert!(line.matches("iifname").count() <= 1, "{line}");
+                assert!(line.matches("oifname").count() <= 1, "{line}");
+            }
         }
         if let Ok(path) = std::env::var("RIFT_DUMP_PLAN") {
-            std::fs::write(
-                path,
-                format!("{}{}{}", server.create, server.fill, server.jumps),
-            )
-            .unwrap();
+            let agent = agent
+                .fill
+                .replace("rift-host-in", "agent-in")
+                .replace("rift-host-fwd", "agent-fwd");
+            let dump = format!(
+                "{}{}{}add chain ip filter agent-in\nadd chain ip filter agent-fwd\n{agent}",
+                server.create, server.fill, server.jumps
+            );
+            std::fs::write(path, dump).unwrap();
         }
     }
 
@@ -910,9 +927,9 @@ mod tests {
         let mut spec = server_spec(&uplinks);
         spec.local_ingress = true;
         let plan = plan_server(&obs, &spec).unwrap();
-        assert!(plan.fill.contains(
-            "iifname != \"eth0\" iifname != \"rift0\" oifname \"rift0\" accept comment \"rift:local\""
-        ));
+        assert!(plan
+            .fill
+            .contains("iifname != \"rift0\" oifname \"rift0\" accept comment \"rift:local\""));
         assert!(plan
             .fill
             .contains("iifname \"eth0\" oifname \"rift0\" accept comment \"rift:forward\""));
@@ -991,7 +1008,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(plan.fill.contains("iifname \"rift0\" ip saddr 10.14.0.2 ip daddr 10.88.0.2 meta l4proto { tcp, udp, icmp } accept comment \"rift:vpn\""));
+        for protocol in ["tcp", "udp", "icmp"] {
+            assert!(plan.fill.contains(&format!("iifname \"rift0\" ip saddr 10.14.0.2 ip daddr 10.88.0.2 meta l4proto {protocol} accept comment \"rift:vpn\"")));
+        }
     }
 
     #[test]
