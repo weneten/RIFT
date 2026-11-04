@@ -167,6 +167,17 @@ enum Vpn {
     /// the exit through it. `rift vpn deny DEVICE exit` ends the exit through this server and
     /// `rift vpn deny DEVICE AGENT exit` only the one through that agent.
     Deny(VpnAccessArgs),
+    /// Use a DNS server at home on the go: `rift vpn dns DEVICE AGENT` makes the agent's
+    /// tunnel address the DNS server of the device's main profile (for example an AdGuard or
+    /// Pi-hole there) and allows port 53 on it. `rift vpn dns DEVICE default` goes back to no
+    /// DNS line, or `RIFT_VPN_DNS` with an exit through this server. Import the main profile
+    /// again afterwards.
+    Dns {
+        /// Device name.
+        peer: String,
+        /// The agent, or `default`.
+        agent: String,
+    },
     /// Export the WireGuard configuration of a device: its main profile, or with an agent
     /// name the profile of the exit through that agent.
     Config {
@@ -497,7 +508,7 @@ async fn run() -> Result<()> {
             Vpn::Allow(args) => {
                 let mut requests = vpn_allow_requests(&args)?.into_iter();
                 let first = requests.next().context(
-                    "choose what to allow, for example: 22/tcp, server, full, 192.168.178.0/24 or internet",
+                    "choose what to allow, for example: 22/tcp, server, full, 192.168.178.0/24 or exit",
                 )?;
                 more.extend(requests);
                 first
@@ -508,6 +519,10 @@ async fn run() -> Result<()> {
                 more.extend(requests);
                 first
             }
+            Vpn::Dns { peer, agent } => AdminRequest::VpnDns {
+                peer,
+                agent: (agent != "default").then_some(agent),
+            },
             Vpn::Config { .. } => unreachable!("handled above"),
         },
         Command::Status => AdminRequest::Status,
@@ -1393,6 +1408,20 @@ mod tests {
             &mut none,
         );
         assert!(none.0.is_empty(), "nothing to report without exits");
+    }
+    #[test]
+    fn vpn_dns_names_an_agent_or_the_default() {
+        let request = |argv: &[&str]| match Cli::try_parse_from(argv).unwrap().command {
+            Command::Vpn {
+                command: Vpn::Dns { peer, agent },
+            } => (peer, agent),
+            _ => panic!("not vpn dns"),
+        };
+        assert_eq!(
+            request(&["rift", "vpn", "dns", "iphone", "node1"]),
+            ("iphone".to_string(), "node1".to_string())
+        );
+        assert!(Cli::try_parse_from(["rift", "vpn", "dns", "iphone"]).is_err());
     }
     #[test]
     fn readme_commands_parse() {

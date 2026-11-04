@@ -136,6 +136,12 @@ pub enum AdminRequest {
         agent: String,
         access: Option<VpnAccess>,
     },
+    /// Makes the agent's tunnel address the DNS server of the device's main profile and allows
+    /// port 53 there; `None` returns to the default (no DNS line, or `RIFT_VPN_DNS` with an exit).
+    VpnDns {
+        peer: String,
+        agent: Option<String>,
+    },
     /// Adds an internet exit to a device: the VPS, or an extra profile that ends at the agent.
     VpnExit {
         peer: String,

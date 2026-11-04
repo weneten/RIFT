@@ -9,6 +9,7 @@ fn describe_rule(rule: &AgentVpnRule) -> String {
         VpnAccess::Full => "the host, all protocols".to_string(),
         VpnAccess::Port { protocol, ports } => format!("{ports}/{protocol}"),
         VpnAccess::Subnet { net, .. } => format!("subnet {net}"),
+        VpnAccess::Dns => "DNS (53/both)".to_string(),
     };
     format!("VPN grant for {} to {what}", rule.source)
 }

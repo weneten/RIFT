@@ -384,6 +384,7 @@ pub fn describe_access(access: &VpnAccess) -> String {
         VpnAccess::Subnet { net, snat } => {
             format!("{net}{}", if *snat { " (snat)" } else { "" })
         }
+        VpnAccess::Dns => "dns".into(),
     }
 }
 pub fn describe_forward(agent: &str, f: &Forward) -> String {

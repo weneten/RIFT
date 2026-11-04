@@ -604,6 +604,8 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
             }
             text
         }
+        AdminRequest::VpnDns { peer, agent: Some(agent) } => format!("{peer} now uses {agent} as its DNS server (port 53 on {agent} is allowed).\nImport the main profile again: rift vpn config qr {peer}"),
+        AdminRequest::VpnDns { peer, agent: None } => format!("{peer} uses the default DNS again.\nImport the main profile again: rift vpn config qr {peer}"),
         AdminRequest::VpnExit { peer, exit } => exit_added(peer, exit, data),
         AdminRequest::VpnExitClear { peer, agent } => exit_removed(peer, agent.as_deref()),
         AdminRequest::PanelStatus => panel_status(data),

@@ -59,7 +59,7 @@ pub fn exit_gateway(pool: Ipv4Net, pool6: Ipv6Net) -> (Ipv4Addr, Ipv6Addr) {
 pub struct Effective<'a> {
     pub peer: &'a VpnPeer,
     pub agent: &'a AgentRecord,
-    pub access: &'a VpnAccess,
+    pub access: VpnAccess,
 }
 
 /// nftables text for the places where VPN rules must sit ahead of the final drops.
@@ -72,6 +72,8 @@ pub struct Rules {
     pub nat: String,
 }
 
+/// The DNS grant is enforced as port 53 over UDP and TCP, so firewall rules and agents only
+/// ever see port grants.
 pub fn effective(snap: &StateSnapshot) -> Vec<Effective<'_>> {
     snap.vpn_grants
         .iter()
@@ -84,13 +86,37 @@ pub fn effective(snap: &StateSnapshot) -> Vec<Effective<'_>> {
                 .agents
                 .iter()
                 .find(|a| a.id == grant.agent_id && a.status == AgentStatus::Active)?;
-            Some(Effective {
+            Some((peer, agent, &grant.access))
+        })
+        .flat_map(|(peer, agent, access)| {
+            let accesses = match access {
+                VpnAccess::Dns => [Protocol::Udp, Protocol::Tcp]
+                    .map(|protocol| VpnAccess::Port {
+                        protocol,
+                        ports: PortRange { start: 53, end: 53 },
+                    })
+                    .to_vec(),
+                other => vec![other.clone()],
+            };
+            accesses.into_iter().map(move |access| Effective {
                 peer,
                 agent,
-                access: &grant.access,
+                access,
             })
         })
         .collect()
+}
+
+/// The agent whose tunnel address is the device's DNS server, when it has a DNS grant on an
+/// active agent.
+pub fn dns_agent<'a>(snap: &'a StateSnapshot, peer: &VpnPeer) -> Option<&'a AgentRecord> {
+    let grant = snap
+        .vpn_grants
+        .iter()
+        .find(|g| g.peer == peer.name && g.access == VpnAccess::Dns)?;
+    snap.agents
+        .iter()
+        .find(|a| a.id == grant.agent_id && a.status == AgentStatus::Active)
 }
 
 /// Networks the VPS must route to, and accept packets from, this agent.
@@ -99,7 +125,7 @@ pub fn agent_subnets(effective: &[Effective<'_>], agent_id: &str) -> BTreeSet<Ip
         .iter()
         .filter(|e| e.agent.id == agent_id)
         .filter_map(|e| match e.access {
-            VpnAccess::Subnet { net, .. } => Some(*net),
+            VpnAccess::Subnet { net, .. } => Some(net),
             _ => None,
         })
         .collect()
@@ -272,6 +298,8 @@ fn protocols(access: &VpnAccess) -> String {
             format!("meta l4proto {protocol} {protocol} dport {ports} ")
         }
         VpnAccess::Full | VpnAccess::Subnet { .. } => String::new(),
+        // Expanded to port grants before any rule is rendered.
+        VpnAccess::Dns => "meta l4proto { tcp, udp } th dport 53 ".into(),
     }
 }
 
@@ -306,8 +334,8 @@ pub fn server_rules(interface: &str, pools: Pools, ipv6_exit: bool, snap: &State
         rules.forward.push_str(&format!(
             "add rule inet rift forward iifname \"{interface}\" oifname \"{interface}\" {}accept\n\
              add rule inet rift forward iifname \"{interface}\" oifname \"{interface}\" ip saddr {} ip daddr {} ct state established,related accept\n",
-            flow_match(e.peer.ipv4, tunnel, e.access),
-            destination(tunnel, e.access),
+            flow_match(e.peer.ipv4, tunnel, &e.access),
+            destination(tunnel, &e.access),
             e.peer.ipv4,
         ));
     }
@@ -526,10 +554,14 @@ pub fn client_config(
         ));
     }
     let endpoint = host_port(p.host, p.wg_port);
+    let own_dns = dns_agent(snap, peer).map(|agent| format!("DNS = {}\n", agent.tunnel_ipv4));
     let (routes, dns) = if peer.server_exit {
         (
             "0.0.0.0/0, ::/0".to_string(),
-            dns_line(p.dns, p.server_ipv6)?,
+            match own_dns {
+                Some(line) => line,
+                None => dns_line(p.dns, p.server_ipv6)?,
+            },
         )
     } else {
         let mut routes = BTreeSet::new();
@@ -552,7 +584,7 @@ pub fn client_config(
         );
         (
             routes.into_iter().collect::<Vec<_>>().join(", "),
-            String::new(),
+            own_dns.unwrap_or_default(),
         )
     };
     Ok(format!(
@@ -799,6 +831,47 @@ mod tests {
         assert!(natted
             .nat
             .contains("ip saddr 10.14.0.2 ip daddr 192.168.178.0/24 masquerade"));
+    }
+
+    #[test]
+    fn a_dns_grant_sets_the_main_profiles_dns_and_opens_only_port_53() {
+        let mut snap = snapshot();
+        snap.vpn_grants = vec![grant("iphone", "node4", VpnAccess::Dns)];
+        // Split tunnel: the agent's address is routed and is the DNS server.
+        let text = config(&snap, "iphone", true).unwrap();
+        assert!(text.contains("DNS = 10.13.0.2\n"), "{text}");
+        assert!(text.contains("AllowedIPs = 10.13.0.2/32\n"), "{text}");
+        // With the exit through the VPS the agent replaces RIFT_VPN_DNS.
+        snap.vpn_peers[0].server_exit = true;
+        let text = config(&snap, "iphone", true).unwrap();
+        assert!(
+            text.contains("DNS = 10.13.0.2\n") && !text.contains("9.9.9.9"),
+            "{text}"
+        );
+        // The firewall and the agent see two port grants, never the DNS kind itself.
+        let rules = agent_rules(&snap, "node4");
+        let port53 = |protocol| VpnAccess::Port {
+            protocol,
+            ports: PortRange { start: 53, end: 53 },
+        };
+        assert_eq!(
+            rules.iter().map(|r| r.access.clone()).collect::<Vec<_>>(),
+            [port53(Protocol::Udp), port53(Protocol::Tcp)]
+        );
+        // An inactive agent gives no DNS line.
+        snap.agents[0].status = AgentStatus::Disabled;
+        snap.vpn_peers[0].server_exit = false;
+        snap.vpn_peers[0].panel = true;
+        let dns = dns();
+        let text = client_config(
+            &snap,
+            &snap.vpn_peers[0],
+            "k",
+            &params(&dns, Some(Ipv4Addr::new(10, 13, 0, 1)), true),
+            None,
+        )
+        .unwrap();
+        assert!(!text.contains("DNS"), "{text}");
     }
 
     #[test]

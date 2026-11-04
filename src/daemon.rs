@@ -964,8 +964,8 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
             let cfg = s.config.read().await.clone();
             validate_name(&name)?;
             anyhow::ensure!(
-                name != "exit",
-                "an agent cannot be called exit: `rift vpn allow DEVICE exit` would be ambiguous"
+                name != "exit" && name != "default",
+                "an agent cannot be called exit or default: `rift vpn allow DEVICE exit` and `rift vpn dns DEVICE default` would be ambiguous"
             );
             anyhow::ensure!(
                 cfg.enrollment != EnrollmentMode::Off,
@@ -1029,8 +1029,8 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
         AdminRequest::AgentRename { name, new_name } => {
             validate_name(&new_name)?;
             anyhow::ensure!(
-                new_name != "exit",
-                "an agent cannot be called exit: `rift vpn allow DEVICE exit` would be ambiguous"
+                new_name != "exit" && new_name != "default",
+                "an agent cannot be called exit or default: `rift vpn allow DEVICE exit` and `rift vpn dns DEVICE default` would be ambiguous"
             );
             let id = find_agent(&snap, &name)?.id.clone();
             s.state.mutate("agent-rename", |x| {
@@ -1596,6 +1596,47 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
             let warning = refused
                 .map(|why| format!("the grant was added, but agent {agent} will refuse it: {why}"));
             serde_json::json!({"peer":peer,"agent":agent,"access":access,"warning":warning})
+        }
+        AdminRequest::VpnDns { peer, agent } => {
+            find_peer(&peer)?;
+            let target = match &agent {
+                Some(agent) => {
+                    let target = find_agent(snap, agent)?;
+                    anyhow::ensure!(target.status == AgentStatus::Active, "agent must be active");
+                    Some(target.id.clone())
+                }
+                None => None,
+            };
+            s.state.mutate("vpn-dns", |x| {
+                x.vpn_grants
+                    .retain(|g| !(g.peer == peer && g.access == VpnAccess::Dns));
+                if let Some(agent_id) = &target {
+                    x.vpn_grants.push(VpnGrant {
+                        peer: peer.clone(),
+                        agent_id: agent_id.clone(),
+                        access: VpnAccess::Dns,
+                    });
+                }
+                Ok(())
+            })?;
+            reconcile(s).await?;
+            let refused = target.as_ref().and_then(|agent_id| {
+                grant_refusal(
+                    &s.state.snapshot().ok()?,
+                    &VpnGrant {
+                        peer: peer.clone(),
+                        agent_id: agent_id.clone(),
+                        access: VpnAccess::Dns,
+                    },
+                )
+            });
+            let warning = refused.map(|why| {
+                format!(
+                    "DNS is set, but agent {} will refuse it: {why}",
+                    agent.as_deref().unwrap_or_default()
+                )
+            });
+            serde_json::json!({"peer":peer,"agent":agent,"warning":warning})
         }
         AdminRequest::VpnDeny {
             peer,

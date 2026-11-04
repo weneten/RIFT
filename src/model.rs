@@ -209,6 +209,15 @@ impl AgentLimits {
                     self.port_list()
                 )
             }),
+            VpnAccess::Dns => [Protocol::Udp, Protocol::Tcp]
+                .into_iter()
+                .any(|protocol| !self.ports_allowed(protocol, PortRange { start: 53, end: 53 }))
+                .then(|| {
+                    format!(
+                        "the agent allows only ports {} (RIFT_AGENT_ALLOW_PORTS); add 53/both",
+                        self.port_list()
+                    )
+                }),
             VpnAccess::Port { protocol, ports } => {
                 (!self.ports_allowed(*protocol, *ports)).then(|| {
                     format!(
@@ -384,6 +393,9 @@ pub enum VpnAccess {
     /// An explicitly named network behind the agent. `snat` masquerades the peer's address
     /// on the agent, for LANs whose router has no route back to the VPN pool.
     Subnet { net: Ipv4Net, snat: bool },
+    /// DNS (port 53, UDP and TCP) on the agent's tunnel address, which the device's main
+    /// profile also uses as its DNS server. At most one per device.
+    Dns,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VpnGrant {

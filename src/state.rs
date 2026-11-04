@@ -680,6 +680,14 @@ fn validate_snapshot(s: &StateSnapshot) -> Result<()> {
         );
         crate::vpn::validate_access(&g.access)?;
         anyhow::ensure!(!s.vpn_grants[..i].contains(g), "duplicate VPN grant");
+        anyhow::ensure!(
+            g.access != VpnAccess::Dns
+                || !s.vpn_grants[..i]
+                    .iter()
+                    .any(|o| o.peer == g.peer && o.access == VpnAccess::Dns),
+            "device {} has more than one DNS server",
+            g.peer
+        );
         // One network behind two agents would make the VPS route ambiguous.
         if let VpnAccess::Subnet { net, .. } = &g.access {
             for other in &s.vpn_grants[..i] {
@@ -800,6 +808,11 @@ mod tests {
         let mut s = base.clone();
         s.vpn_peers[0].public_key = "k-a".into();
         assert!(validate_snapshot(&s).is_err(), "key shared with an agent");
+        let mut s = base.clone();
+        s.vpn_grants.push(grant("a", VpnAccess::Dns));
+        validate_snapshot(&s).unwrap();
+        s.vpn_grants.push(grant("b", VpnAccess::Dns));
+        assert!(validate_snapshot(&s).is_err(), "two DNS servers");
     }
     #[test]
     fn exits_are_validated_and_follow_their_agent() {

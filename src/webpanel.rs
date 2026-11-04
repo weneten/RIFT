@@ -593,6 +593,12 @@ enum Action {
         #[serde(default)]
         access: Option<VpnAccess>,
     },
+    /// The DNS server of the device's main profile: an agent, or `null` for the default.
+    VpnDns {
+        peer: String,
+        #[serde(default)]
+        agent: Option<String>,
+    },
     /// Adds (`on`) or removes one internet exit of the device: `"server"` or `{"agent": NAME}`.
     VpnExit {
         peer: String,
@@ -841,6 +847,9 @@ impl Action {
                         access,
                     })
                     .await?
+            }
+            Self::VpnDns { peer, agent } => {
+                panel.admin(AdminRequest::VpnDns { peer, agent }).await?
             }
             Self::VpnExit {
                 peer,
@@ -1516,6 +1525,17 @@ mod tests {
         assert!(act(&panel, "10.14.0.2", &cookie, off, "")
             .await
             .starts_with("HTTP/1.1 200"));
+        // So is the DNS server of a device.
+        let dns = r#"{"action":"vpn_dns","peer":"laptop","agent":"node4"}"#;
+        assert!(act(&panel, "203.0.113.7", &cookie, dns, "")
+            .await
+            .starts_with("HTTP/1.1 403"));
+        let default = r#"{"action":"vpn_dns","peer":"laptop","agent":null}"#;
+        for body in [dns, default] {
+            assert!(act(&panel, "127.0.0.1", &cookie, body, "")
+                .await
+                .starts_with("HTTP/1.1 200"));
+        }
         // Only a named exit parses, and the direction is required.
         let bad = r#"{"action":"vpn_exit","peer":"laptop","exit":"everywhere","on":true}"#;
         assert!(act(&panel, "127.0.0.1", &cookie, bad, "")
@@ -1534,6 +1554,11 @@ mod tests {
         assert_eq!(
             calls.iter().filter(|c| c.contains("VpnExitClear")).count(),
             1,
+            "{calls:?}"
+        );
+        assert_eq!(
+            calls.iter().filter(|c| c.contains("VpnDns")).count(),
+            2,
             "{calls:?}"
         );
         // Private keys count as a change.

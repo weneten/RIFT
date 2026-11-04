@@ -237,7 +237,7 @@ impl Kernel {
             })
             .collect();
         vpn_routes.extend(vpn_grants.iter().filter_map(|e| match e.access {
-            VpnAccess::Subnet { net, .. } => Some(IpNet::from(*net)),
+            VpnAccess::Subnet { net, .. } => Some(IpNet::from(net)),
             _ => None,
         }));
         let mut kept_routes = vpn_routes.clone();

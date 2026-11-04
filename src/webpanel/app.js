@@ -96,6 +96,7 @@ function forwardUrl(forward) {
 function access(a) {
   if (a === "server") return "host";
   if (a === "full") return "host, all protocols";
+  if (a === "dns") return "DNS server of the main profile (53/both)";
   if (a && a.port) return `port ${range(a.port.ports)}/${a.port.protocol}`;
   if (a && a.subnet) return `${a.subnet.net}${a.subnet.snat ? " (SNAT)" : ""}`;
   return JSON.stringify(a);
@@ -402,6 +403,25 @@ async function changeExit(name, exit, on) {
   return notes;
 }
 
+// The DNS server of a device's main profile: the default, or an agent (for example an
+// AdGuard at home), which also allows port 53 there.
+function dnsRow(name, peer, agents, refresh) {
+  const current = (peer.grants || []).find((g) => g.access === "dns");
+  const choice = select([["default", "Default (none, or RIFT_VPN_DNS with the exit above)"],
+    ...agents.map(([n]) => [n, `Agent ${n} (port 53 on its tunnel address)`])], current ? current.agent : "default");
+  choice.addEventListener("change", async () => {
+    choice.disabled = true;
+    try {
+      await act({ action: "vpn_dns", peer: name, agent: choice.value === "default" ? null : choice.value });
+      await refresh([`DNS of ${name} changed. Import the main profile again in the WireGuard app.`]);
+    } catch (e) {
+      choice.disabled = false;
+      showBanner(`DNS of ${name}: ${e.message}`);
+    }
+  });
+  return row("DNS server", choice);
+}
+
 function grantsDialog(name, notes) {
   const peer = (data.vpn_peers || []).find((p) => p.name === name);
   if (!peer) { closeModal(); return; }
@@ -485,7 +505,8 @@ function grantsDialog(name, notes) {
       el("h5", {}, "Main profile (panel and grants)"),
       toggle("Send all traffic through this server", exitOf(), "server",
         button("QR code / config", () => configDialog(name))),
-      el("p", { class: "hint" }, "The main profile is the only one that reaches the web panel and the grants above. Without this box it routes only what the grants name.")),
+      el("p", { class: "hint" }, "The main profile is the only one that reaches the web panel and the grants above. Without this box it routes only what the grants name."),
+      dnsRow(name, peer, agents, refresh)),
     el("div", { class: "exit-block" },
       el("h5", {}, "Extra profiles (one WireGuard entry each, all traffic through that home server)"),
       ...(profileNames.length ? profileNames.map((n) => {
