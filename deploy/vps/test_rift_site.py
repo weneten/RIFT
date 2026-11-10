@@ -254,6 +254,25 @@ class FileProviderTests(unittest.TestCase):
         self.assertIn("safe to delete", fresh)
         self.assertNotIn("safe to delete", rift_site.backup_notice(compose, backup, False))
 
+    def test_dns_check_says_whether_the_record_is_there(self):
+        state = {"container": "rift-server", "public_ip": "203.0.113.5"}
+
+        def lookup(answers):
+            def resolve(host, *a, **k):
+                if host not in answers:
+                    raise OSError("NXDOMAIN")
+                return [(2, 1, 6, "", (answers[host], 0))]
+            return resolve
+
+        with mock.patch.object(rift_site, "site_setting", lambda key, container="rift-server": "rift.example.net"):
+            with mock.patch.object(rift_site.socket, "getaddrinfo", lookup({"rift.example.net": "203.0.113.5", "ok.example.net": "203.0.113.5"})):
+                self.assertTrue(rift_site.dns_check("ok.example.net", state).endswith(": ok"))
+                missing = rift_site.dns_check("new.example.net", state)
+                self.assertTrue(missing.startswith("DNS: new.example.net -> 203.0.113.5"), missing)
+                self.assertIn("missing. Create this A record", missing)
+            with mock.patch.object(rift_site.socket, "getaddrinfo", lookup({"rift.example.net": "203.0.113.5", "old.example.net": "198.51.100.9"})):
+                self.assertIn("wrong, it resolves to 198.51.100.9", rift_site.dns_check("old.example.net", state))
+
     def test_dns_hint_prefers_the_public_endpoint_over_the_bind_address(self):
         state = {"container": "rift-server", "public_ip": "10.0.0.45"}
         original_setting, original_lookup = rift_site.site_setting, rift_site.socket.getaddrinfo

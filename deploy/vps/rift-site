@@ -829,6 +829,21 @@ def dns_hint(host, state):
     return f"DNS: {host} -> {state['public_ip']}"
 
 
+def dns_check(host, state):
+    """The DNS hint, checked against what the name resolves to now, so it says what to do."""
+    hint = dns_hint(host, state)
+    target = hint.split(" -> ", 1)[1].split(" ", 1)[0]
+    try:
+        found = sorted({info[4][0] for info in socket.getaddrinfo(host, None, socket.AF_INET)})
+    except OSError:
+        found = []
+    if target in found:
+        return f"{hint}: ok"
+    if not found:
+        return f"{hint}: missing. Create this A record at your DNS provider; the site and its certificate work once it resolves."
+    return f"{hint}: wrong, it resolves to {', '.join(found)}. Change the A record; the site and its certificate work once it points here."
+
+
 SERVER_ID_PATH = "/var/lib/rift/wireguard.pub"
 
 
@@ -990,7 +1005,7 @@ def command_add(agent, host, port, proxy):
         raise
     note = reload_proxy(state, chosen, host) or note
     print(f"https://{host}")
-    print(dns_hint(host, state))
+    print(dns_check(host, state))
     if note:
         print(note)
 
