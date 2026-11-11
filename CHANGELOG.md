@@ -4,6 +4,10 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ## [Unreleased]
 
+### Fixed
+
+- An agent checks that IPv4 and IPv6 forwarding are enabled before it enrolls. Before, a host without forwarding reserved the invitation and then stopped, and an agent without a persistent volume could not use that invitation again.
+
 ## [0.1.0]
 
 First pre-release. Not yet recommended for production; see the open release gates in [docs/deploy.md](docs/deploy.md#functional-test-matrix).

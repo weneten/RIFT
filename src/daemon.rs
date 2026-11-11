@@ -1888,6 +1888,9 @@ async fn run_agent_inner(
         let welcome = if let Some(w) = identity.welcome.clone() {
             w
         } else {
+            // Check local prerequisites first: enrollment reserves the invitation for this
+            // identity, and an agent without a persistent volume could not retry with it.
+            Kernel::new(config.clone()).preflight_forwarding().await?;
             let w = enrollment::enroll_agent(&config, &mut identity).await?;
             atomic_json(&id_path, &identity)?;
             w

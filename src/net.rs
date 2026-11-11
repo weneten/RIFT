@@ -1019,7 +1019,9 @@ impl Kernel {
         serde_json::from_str(&text).context("parse ip address JSON")
     }
 
-    async fn preflight_forwarding(&self) -> Result<()> {
+    /// Fails unless IPv4 and IPv6 forwarding are enabled. Agents run this before they
+    /// use up an invitation, so a missing sysctl does not burn the token.
+    pub async fn preflight_forwarding(&self) -> Result<()> {
         for path in [
             "/proc/sys/net/ipv4/ip_forward",
             "/proc/sys/net/ipv6/conf/all/forwarding",
