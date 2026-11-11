@@ -92,7 +92,8 @@ if [ "$purge" -eq 1 ] && command -v docker > /dev/null 2>&1; then
   for v in $(docker volume ls -q --filter name='rift-state' 2> /dev/null || true); do
     docker volume rm "$v" > /dev/null && echo "rift: removed volume $v"
   done
-  for img in rift:local weneten/rift:latest; do
+  # Every pulled tag: latest and any pinned RIFT_VERSION.
+  for img in rift:local $(docker image ls weneten/rift --format '{{.Repository}}:{{.Tag}}' 2> /dev/null || true); do
     if docker image inspect "$img" > /dev/null 2>&1; then
       docker image rm "$img" > /dev/null && echo "rift: removed image $img"
     fi

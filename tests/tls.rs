@@ -145,8 +145,19 @@ async fn test_frame_handler(
     Ok(())
 }
 
+/// Dual-stack so that `localhost` works whichever family it resolves to first. A host without
+/// IPv6 (some CI containers) falls back to IPv4 loopback; the TLS checks are the same there.
 fn dual_stack_listener() -> Result<TcpListener> {
-    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    let socket = match Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)) {
+        Ok(socket) => socket,
+        Err(error) if error.raw_os_error() == Some(libc::EAFNOSUPPORT) => {
+            eprintln!("no IPv6 on this host; testing over IPv4 loopback only");
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            listener.set_nonblocking(true)?;
+            return Ok(TcpListener::from_std(listener)?);
+        }
+        Err(error) => return Err(error.into()),
+    };
     socket.set_only_v6(false)?;
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;

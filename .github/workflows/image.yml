@@ -1,15 +1,18 @@
 name: Build and Push to Docker Hub
 
+# main publishes :latest. A tag vX.Y.Z publishes :X.Y.Z and leaves :latest alone.
 on:
   push:
     branches: [main]
+    tags: ['v*.*.*']
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# Per ref, so a release tag and a main push do not cancel each other.
 concurrency:
-  group: docker-hub-publish
+  group: docker-hub-publish-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,14 +27,27 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
       - name: Build and push amd64
+        env:
+          REPO: ${{ secrets.DOCKER_USERNAME }}/rift
         run: |
           set -eu
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+            crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+            if [ "$version" != "$crate" ]; then
+              echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $crate" >&2
+              exit 1
+            fi
+            tag="$version-amd64"
+          else
+            tag="amd64"
+          fi
           attempt=1
           while [ "$attempt" -le 3 ]; do
             if docker buildx build \
               --push \
               --platform linux/amd64 \
-              --tag ${{ secrets.DOCKER_USERNAME }}/rift:amd64 \
+              --tag "$REPO:$tag" \
               --cache-from type=gha,scope=rift-amd64 \
               --cache-to type=gha,scope=rift-amd64,mode=max \
               --provenance=true \
@@ -58,14 +74,27 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
       - name: Build and push arm64
+        env:
+          REPO: ${{ secrets.DOCKER_USERNAME }}/rift
         run: |
           set -eu
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+            crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+            if [ "$version" != "$crate" ]; then
+              echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $crate" >&2
+              exit 1
+            fi
+            tag="$version-arm64"
+          else
+            tag="arm64"
+          fi
           attempt=1
           while [ "$attempt" -le 3 ]; do
             if docker buildx build \
               --push \
               --platform linux/arm64 \
-              --tag ${{ secrets.DOCKER_USERNAME }}/rift:arm64 \
+              --tag "$REPO:$tag" \
               --cache-from type=gha,scope=rift-arm64 \
               --cache-to type=gha,scope=rift-arm64,mode=max \
               --provenance=true \
@@ -88,9 +117,20 @@ jobs:
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-      - name: Publish latest
+      - name: Publish multi-arch tag
+        env:
+          REPO: ${{ secrets.DOCKER_USERNAME }}/rift
         run: |
+          set -eu
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+            target="$version"
+            suffix="$version-"
+          else
+            target=latest
+            suffix=""
+          fi
           docker buildx imagetools create \
-            -t ${{ secrets.DOCKER_USERNAME }}/rift:latest \
-            ${{ secrets.DOCKER_USERNAME }}/rift:amd64 \
-            ${{ secrets.DOCKER_USERNAME }}/rift:arm64
+            -t "$REPO:$target" \
+            "$REPO:${suffix}amd64" \
+            "$REPO:${suffix}arm64"

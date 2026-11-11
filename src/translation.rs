@@ -328,9 +328,20 @@ mod tests {
             ..Default::default()
         }
     }
+    /// Loopback IPv6 is missing on some CI containers. Skip, loudly, rather than fail.
+    fn ipv6_loopback_available() -> bool {
+        if std::net::UdpSocket::bind("[::1]:0").is_ok() {
+            return true;
+        }
+        eprintln!("skipped: no IPv6 loopback on this host");
+        false
+    }
     #[tokio::test]
     async fn tcp_translation_v4_to_v6_carries_bytes_and_enforces_ban() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        if !ipv6_loopback_available() {
+            return;
+        }
         let backend = TcpListener::bind("[::1]:0").await.unwrap();
         let target = backend.local_addr().unwrap();
         let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -372,6 +383,9 @@ mod tests {
     }
     #[tokio::test]
     async fn udp_translation_v6_to_v4_roundtrip() {
+        if !ipv6_loopback_available() {
+            return;
+        }
         let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target = backend.local_addr().unwrap();
         let reserve = UdpSocket::bind("[::1]:0").await.unwrap();

@@ -11,6 +11,8 @@ Client ── TCP / UDP ──> RIFT server ── WireGuard ──> RIFT agent 
 
 The agent initiates the connection to the server. RIFT manages the tunnel, explicit forwarding grants and the necessary Linux networking rules. A separate reverse proxy can terminate HTTPS and route domain names to HTTP services through RIFT.
 
+> **Pre-release (0.x).** RIFT changes the host's firewall, routing and sysctls. Several release gates are still open, including cross-agent isolation, forwarding after a server restart and a real NAT cloud; see the [functional test matrix](docs/deploy.md#functional-test-matrix). Configuration and state formats may change between 0.x versions. Read the [changelog](CHANGELOG.md) before updating.
+
 > The examples use Linux Docker Engine with host networking. Host networking and `CAP_NET_ADMIN` let RIFT change the host's networking. Test the deployment and firewall interaction on a disposable system before production. Docker Desktop on Windows or macOS is useful for builds, but does not reproduce this Linux host-network datapath.
 
 ## Contents
@@ -33,6 +35,7 @@ The agent initiates the connection to the server. RIFT manages the tunnel, expli
 - [Operations and troubleshooting](#operations-and-troubleshooting)
 - [Build and development](#build-and-development)
 - [Further documentation](#further-documentation)
+- [License](#license)
 
 ## How it works
 
@@ -859,6 +862,19 @@ docker compose up -d
 docker compose ps
 ```
 
+`docker compose pull` fetches `weneten/rift:latest`, which follows the main branch. To stay on a release instead, check out its tag and set the same version in `.env` on the server and every agent:
+
+```sh
+git fetch --tags
+git checkout v0.1.0
+```
+
+```sh
+echo RIFT_VERSION=0.1.0 >> .env
+```
+
+Then run `docker compose pull` and `docker compose up -d`. Keep the checkout and `RIFT_VERSION` on the same release, because the `rift` command and the site helper come from the checkout. Releases and their changes are listed in [CHANGELOG.md](CHANGELOG.md).
+
 On each host, run `sudo sh deploy/install-cli` again after `git pull` to update the installed `rift` command (on the server, also the site helper). Check logs, agent status and representative services after the update. Review configuration changes before replacing your local `config.toml` or `.env`.
 
 The `rift-state` volume contains identities, keys, certificates and dynamic configuration. Protect and back up the state on **both** server and agent, and test restoration. On the server, `rift backup` and `rift restore` do this for you; see [Back up, move or rebuild](#back-up-move-or-rebuild). The agent's state volume is backed up with your usual volume tools. A normal `docker compose down` asks RIFT to remove its owned networking configuration; a subsequent `docker compose up -d` recreates it from the retained volume. A crash, forced kill or cleanup error can leave network state behind; inspect the logs and use the ownership-aware recovery procedure in [docs/deploy.md](docs/deploy.md#rollout-and-rollback). `docker compose down -v` and volume pruning can delete the state; agents and invitations cannot be recovered merely by restarting. Host-wide sysctl settings installed by `deploy/prepare-host` remain in place.
@@ -876,7 +892,7 @@ The state volume (CA, keys, agents, forwards) and the site records are kept so a
 
 ## Build and development
 
-The root Compose file pulls `weneten/rift:latest`; that is the only deployment path. For development, the checks are:
+The root Compose file pulls `weneten/rift:latest`, or `weneten/rift:$RIFT_VERSION` when that is set; the published image is the only deployment path. Pushing to `main` publishes `latest`; pushing a tag `vX.Y.Z` that matches the `Cargo.toml` version publishes `X.Y.Z` for `linux/amd64` and `linux/arm64`. For development, the checks are:
 
 ```sh
 cargo fmt --all -- --check
@@ -890,3 +906,7 @@ The Linux network-namespace and Docker integration harnesses require disposable 
 
 - [Architecture and security boundaries](docs/architecture.md): packet paths, enrollment, translation, state and recovery.
 - [Deployment and verification](docs/deploy.md): preflight, firewall coexistence, rollout, rollback, integration tests and performance procedure.
+
+## License
+
+RIFT is released under the [MIT License](LICENSE).
