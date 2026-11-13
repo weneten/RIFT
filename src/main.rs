@@ -160,7 +160,7 @@ enum Vpn {
     /// Use `exit` as a target to add an exit through that agent's connection
     /// (`rift vpn allow iphone node1 exit`), or alone to add the exit through this server
     /// (`rift vpn allow iphone exit`). A device can have both and several agent exits; each
-    /// is its own WireGuard profile (`rift vpn config qr iphone node1`), and the device
+    /// is its own WireGuard profile (`rift vpn config iphone node1`), and the device
     /// switches between them in the WireGuard app.
     Allow(VpnAccessArgs),
     /// Withdraw access again. Without a target, withdraws all of it on that agent, including
@@ -178,27 +178,17 @@ enum Vpn {
         /// The agent, or `default`.
         agent: String,
     },
-    /// Export the WireGuard configuration of a device: its main profile, or with an agent
-    /// name the profile of the exit through that agent.
+    /// Print the WireGuard configuration of a device as a QR code for the WireGuard app:
+    /// `rift vpn config DEVICE` for the main profile, `rift vpn config DEVICE AGENT` for the
+    /// exit through that agent. Both contain the device's private key.
     Config {
-        #[command(subcommand)]
-        command: VpnConfig,
-    },
-}
-#[derive(Subcommand)]
-enum VpnConfig {
-    /// Print the configuration, which contains the device's private key: `rift vpn config
-    /// export DEVICE` for the main profile, `... DEVICE AGENT` for the exit through an agent.
-    Export {
+        /// Device name.
         name: String,
         /// The agent whose exit profile to print.
         agent: Option<String>,
-    },
-    /// Print the configuration as a QR code for the WireGuard app.
-    Qr {
-        name: String,
-        /// The agent whose exit profile to print.
-        agent: Option<String>,
+        /// Print the configuration file instead of a QR code.
+        #[arg(long)]
+        export: bool,
     },
 }
 #[derive(Args)]
@@ -355,6 +345,11 @@ enum AddWhat {
         mode: Option<String>,
         #[arg(long, default_value = "public", value_parser = ["public", "local"])]
         ingress: String,
+        /// Only these client addresses or networks may connect, for example
+        /// `--allow-from 198.51.100.7,203.0.113.0/24`. Repeatable; IPv4 and IPv6 entries
+        /// apply to listeners of their family. Everyone else gets no answer, as on a closed port.
+        #[arg(long, value_name = "ADDRESS[,NETWORK...]")]
+        allow_from: Vec<String>,
     },
     /// Block an original client address for a translated forward.
     Ban {
@@ -373,6 +368,10 @@ enum AddWhat {
         port: u16,
         /// traefik, caddy, nginx or npm; default: the one `rift proxy` shows.
         proxy: Option<String>,
+        /// Only these client addresses or networks may open the site; the proxy answers
+        /// everyone else with 403. Running the command again with another list replaces it.
+        #[arg(long, value_name = "ADDRESS[,NETWORK...]")]
+        allow_from: Vec<String>,
     },
 }
 #[derive(Subcommand)]
@@ -468,13 +467,17 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         Command::Vpn {
-            command: Vpn::Config { command },
+            command:
+                Vpn::Config {
+                    name,
+                    agent,
+                    export,
+                },
         } => {
-            let (name, agent, qr) = match command {
-                VpnConfig::Export { name, agent } => (name, agent, false),
-                VpnConfig::Qr { name, agent } => (name, agent, true),
-            };
-            return vpn_config(&config, cli.json, name, agent, qr).await;
+            if let Some(form) = old_config_form(&name, agent.as_deref(), export) {
+                bail!("{form}");
+            }
+            return vpn_config(&config, cli.json, name, agent, !export).await;
         }
         Command::Panel {
             command: PanelCommand::Connect { name, export },
@@ -550,6 +553,7 @@ async fn run() -> Result<()> {
                 target_family,
                 mode,
                 ingress,
+                allow_from,
             } => {
                 let plans = parse_forward_specs(&specs)?;
                 let options = ForwardOptions {
@@ -574,6 +578,7 @@ async fn run() -> Result<()> {
                     } else {
                         Ingress::Public
                     },
+                    allow_from: parse_allow_from(&allow_from)?,
                 };
                 let forwards = build_forwards(&agent, &plans, &config.public_ips, options)?;
                 let mut requests = forwards.into_iter().map(AdminRequest::ForwardAdd);
@@ -973,7 +978,21 @@ async fn panel_connect(config: &Config, json: bool, name: String, export: bool) 
     }
     Ok(())
 }
-/// Prints the new secret as a QR code, like `vpn config qr`. Codes are never shown here: a
+/// The answer to the form before 0.2 (`rift vpn config qr|export DEVICE [AGENT]`): the QR code
+/// is the default now and `--export` prints the file, as in `rift panel connect`.
+fn old_config_form(name: &str, agent: Option<&str>, export: bool) -> Option<String> {
+    let flag = match name {
+        "qr" => "",
+        "export" => " --export",
+        _ => return None,
+    };
+    let rest = agent.map_or("DEVICE".to_string(), String::from);
+    let flag = if export { " --export" } else { flag };
+    Some(format!(
+        "`rift vpn config {name} ...` is now `rift vpn config {rest} [AGENT]{flag}`: the QR code is the default and --export prints the file"
+    ))
+}
+/// Prints the new secret as a QR code, like `vpn config`. Codes are never shown here: a
 /// code readable on the server would not be a second factor.
 async fn two_factor_setup(config: &Config, json: bool) -> Result<()> {
     let data = admin_ok(config, AdminRequest::PanelTwoFactorSetup).await?;
@@ -1088,8 +1107,9 @@ mod tests {
                 "--snat",
             ],
             vec!["rift", "vpn", "deny", "iphone", "node4"],
-            vec!["rift", "vpn", "config", "export", "iphone"],
-            vec!["rift", "vpn", "config", "qr", "iphone"],
+            vec!["rift", "vpn", "config", "iphone"],
+            vec!["rift", "vpn", "config", "iphone", "--export"],
+            vec!["rift", "vpn", "config", "iphone", "node1", "--export"],
             vec!["rift", "panel", "status"],
             vec!["rift", "panel", "password"],
             vec!["rift", "panel", "connect", "laptop"],
@@ -1304,24 +1324,37 @@ mod tests {
             ["deny all"]
         );
         // The profiles: the main one, or that of an agent's exit.
+        // QR code by default, the file with --export, as in `rift panel connect`.
         let config = |argv: &[&str]| match Cli::try_parse_from(argv).unwrap().command {
             Command::Vpn {
                 command:
                     Vpn::Config {
-                        command: VpnConfig::Export { name, agent } | VpnConfig::Qr { name, agent },
+                        name,
+                        agent,
+                        export,
                     },
-            } => (name, agent),
+            } => (name, agent, export),
             _ => unreachable!(),
         };
         assert_eq!(
-            config(&["rift", "vpn", "config", "qr", "iphone"]),
-            ("iphone".into(), None)
+            config(&["rift", "vpn", "config", "iphone"]),
+            ("iphone".into(), None, false)
         );
         assert_eq!(
-            config(&["rift", "vpn", "config", "export", "iphone", "node1"]),
-            ("iphone".into(), Some("node1".into()))
+            config(&["rift", "vpn", "config", "iphone", "node1", "--export"]),
+            ("iphone".into(), Some("node1".into()), true)
         );
-        assert!(Cli::try_parse_from(["rift", "vpn", "config", "qr", "iphone", "a", "b"]).is_err());
+        assert!(Cli::try_parse_from(["rift", "vpn", "config", "iphone", "a", "b"]).is_err());
+    }
+    #[test]
+    fn the_old_config_form_names_the_new_one() {
+        assert_eq!(old_config_form("iphone", None, false), None);
+        assert!(old_config_form("qr", Some("iphone"), false)
+            .unwrap()
+            .contains("rift vpn config iphone [AGENT]`"));
+        assert!(old_config_form("export", Some("iphone"), false)
+            .unwrap()
+            .contains("rift vpn config iphone [AGENT] --export`"));
     }
     #[test]
     fn vpn_targets_become_accesses() {

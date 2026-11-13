@@ -118,6 +118,7 @@ pub fn sync(snap: &mut StateSnapshot, settings: &Settings<'_>) -> bool {
             enabled: true,
             generation,
             purpose: Purpose::Exit,
+            allow_from: Vec::new(),
         });
         changed = true;
     }
@@ -315,6 +316,7 @@ mod tests {
             enabled: true,
             generation: 1,
             purpose: Purpose::User,
+            allow_from: Vec::new(),
         });
         sync(&mut snap, &settings(&ips));
         let port = |snap: &StateSnapshot, id: &str| {

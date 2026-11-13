@@ -24,6 +24,9 @@ pub struct ExportForward {
     pub ingress: Ingress,
     pub target_family: Family,
     pub enabled: bool,
+    /// Client addresses that may use the forward; empty means every client.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_from: Vec<ipnet::IpNet>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExportGrant {
@@ -48,6 +51,9 @@ pub struct ExportSite {
     pub host: String,
     pub port: u16,
     pub proxy: String,
+    /// Client addresses the proxy lets through; empty means every client.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_from: Vec<ipnet::IpNet>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Export {
@@ -109,6 +115,7 @@ pub fn export(snap: &StateSnapshot) -> Export {
                     ingress: f.ingress,
                     target_family: f.target_family,
                     enabled: f.enabled,
+                    allow_from: f.allow_from.clone(),
                 })
             })
             .collect(),
@@ -400,6 +407,10 @@ pub fn describe_forward(agent: &str, f: &Forward) -> String {
     if f.ingress == Ingress::Local {
         text.push_str(", local ingress");
     }
+    if !f.allow_from.is_empty() {
+        let from: Vec<String> = f.allow_from.iter().map(ToString::to_string).collect();
+        text.push_str(&format!(", from {}", from.join(" ")));
+    }
     if !f.enabled {
         text.push_str(", disabled");
     }
@@ -415,6 +426,7 @@ fn same_forward(a: &Forward, b: &Forward) -> bool {
         && a.mode == b.mode
         && a.ingress == b.ingress
         && a.target_family == b.target_family
+        && a.allow_from == b.allow_from
 }
 
 /// Decides what an import does: what it creates, what is there already, what it skips and
@@ -472,6 +484,7 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
             enabled: entry.enabled,
             generation: 0,
             purpose: Purpose::User,
+            allow_from: entry.allow_from.clone(),
         };
         let what = describe_forward(&agent, &forward);
         if let Err(error) = forward.validate() {
@@ -577,7 +590,7 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
                 op: Op::Device(device.name.clone()),
                 what: what.clone(),
                 detail: Some(format!(
-                    "new keys; re-import the device config: rift vpn config qr {}",
+                    "new keys; re-import the device config: rift vpn config {}",
                     device.name
                 )),
             });
@@ -693,7 +706,7 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
                 },
                 what,
                 detail: Some(format!(
-                    "import the extra profile: rift vpn config qr {} {agent}",
+                    "import the extra profile: rift vpn config {} {agent}",
                     device.name
                 )),
             });
@@ -747,6 +760,7 @@ mod tests {
             ingress: Ingress::Public,
             target_family: Family::V4,
             enabled: true,
+            allow_from: Vec::new(),
         }
     }
     fn device(name: &str, grants: Vec<(&str, VpnAccess)>) -> ExportDevice {
@@ -818,6 +832,7 @@ mod tests {
             enabled: true,
             generation: 5,
             purpose: Purpose::User,
+            allow_from: Vec::new(),
         });
         snap.vpn_peers.push(VpnPeer {
             name: "phone".into(),
@@ -903,7 +918,7 @@ mod tests {
         assert!(planned.steps.iter().any(|s| {
             s.detail
                 .as_deref()
-                .is_some_and(|d| d.contains("rift vpn config qr phone node2"))
+                .is_some_and(|d| d.contains("rift vpn config phone node2"))
         }));
         // Mapped, filtered and missing agents.
         let options = ImportOptions {
@@ -1073,6 +1088,7 @@ mod tests {
             enabled: false,
             generation: 1,
             purpose: Purpose::User,
+            allow_from: Vec::new(),
         });
         old.enabled = true;
         let clash = entry("node1", 2222, 23);
@@ -1186,6 +1202,7 @@ mod tests {
             enabled: true,
             generation: 1,
             purpose: Purpose::User,
+            allow_from: Vec::new(),
         };
         let ips = [ip("198.51.100.5"), ip("2001:db8::5")];
         let forwards = vec![
@@ -1237,7 +1254,7 @@ mod tests {
             .detail
             .as_deref()
             .unwrap()
-            .contains("rift vpn config qr phone"));
+            .contains("rift vpn config phone"));
         assert!(planned.steps[1].what.contains("disabled, panel access on"));
         assert_eq!(count(&planned, Status::Skipped), 1, "node2 does not exist");
     }

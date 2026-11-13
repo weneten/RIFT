@@ -24,9 +24,15 @@ impl Drop for Runtime {
         self.task.abort();
     }
 }
+/// Who may use a translated forward: its bans, and its allowed sources if it has any.
+#[derive(Default)]
+struct Gate {
+    bans: Vec<Ban>,
+    allow_from: HashMap<u64, Vec<ipnet::IpNet>>,
+}
 pub struct TranslationManager {
     runtimes: HashMap<(u64, u16), Runtime>,
-    bans: Arc<RwLock<Vec<Ban>>>,
+    bans: Arc<RwLock<Gate>>,
     permits: Arc<Semaphore>,
 }
 impl Default for TranslationManager {
@@ -38,12 +44,20 @@ impl TranslationManager {
     pub fn new() -> Self {
         Self {
             runtimes: HashMap::new(),
-            bans: Arc::new(RwLock::new(vec![])),
+            bans: Arc::new(RwLock::new(Gate::default())),
             permits: Arc::new(Semaphore::new(1024)),
         }
     }
     pub async fn reconcile(&mut self, snapshot: &StateSnapshot) -> Result<()> {
-        *self.bans.write().await = snapshot.bans.clone();
+        *self.bans.write().await = Gate {
+            bans: snapshot.bans.clone(),
+            allow_from: snapshot
+                .forwards
+                .iter()
+                .filter(|f| !f.allow_from.is_empty())
+                .map(|f| (f.id, f.allow_from.clone()))
+                .collect(),
+        };
         let mut desired = HashMap::new();
         for f in snapshot
             .forwards
@@ -131,18 +145,25 @@ fn bind_udp(addr: SocketAddr) -> Result<UdpSocket> {
     socket.bind(&addr.into())?;
     Ok(UdpSocket::from_std(socket.into())?)
 }
-async fn banned(bans: &RwLock<Vec<Ban>>, id: u64, ip: IpAddr) -> bool {
+/// Whether the client may not use forward `id`: it is banned, or not among the allowed sources.
+async fn banned(gate: &RwLock<Gate>, id: u64, ip: IpAddr) -> bool {
     let time = now();
-    bans.read()
-        .await
-        .iter()
-        .any(|b| b.forward_id == id && b.ip == ip && b.expires_at > time)
+    let gate = gate.read().await;
+    let outside = gate
+        .allow_from
+        .get(&id)
+        .is_some_and(|nets| !nets.iter().any(|net| net.contains(&ip)));
+    outside
+        || gate
+            .bans
+            .iter()
+            .any(|b| b.forward_id == id && b.ip == ip && b.expires_at > time)
 }
 async fn tcp_loop(
     listener: TcpListener,
     target: SocketAddr,
     id: u64,
-    bans: Arc<RwLock<Vec<Ban>>>,
+    bans: Arc<RwLock<Gate>>,
     permits: Arc<Semaphore>,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -181,7 +202,7 @@ async fn udp_loop(
     listener: Arc<UdpSocket>,
     target: SocketAddr,
     id: u64,
-    bans: Arc<RwLock<Vec<Ban>>>,
+    bans: Arc<RwLock<Gate>>,
     permits: Arc<Semaphore>,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -251,24 +272,38 @@ mod tests {
     #[tokio::test]
     async fn expired_and_other_forward_bans_do_not_apply() {
         let ip = "192.0.2.1".parse().unwrap();
-        let bans = RwLock::new(vec![
-            Ban {
-                id: 1,
-                agent_id: "a".into(),
-                forward_id: 7,
-                ip,
-                expires_at: now() - 1,
-            },
-            Ban {
-                id: 2,
-                agent_id: "b".into(),
-                forward_id: 8,
-                ip,
-                expires_at: now() + 60,
-            },
-        ]);
+        let bans = RwLock::new(Gate {
+            bans: vec![
+                Ban {
+                    id: 1,
+                    agent_id: "a".into(),
+                    forward_id: 7,
+                    ip,
+                    expires_at: now() - 1,
+                },
+                Ban {
+                    id: 2,
+                    agent_id: "b".into(),
+                    forward_id: 8,
+                    ip,
+                    expires_at: now() + 60,
+                },
+            ],
+            allow_from: HashMap::new(),
+        });
         assert!(!banned(&bans, 7, ip).await);
         assert!(banned(&bans, 8, ip).await);
+    }
+    #[tokio::test]
+    async fn only_allowed_sources_pass_a_restricted_forward() {
+        let gate = RwLock::new(Gate {
+            bans: vec![],
+            allow_from: HashMap::from([(7, vec!["198.51.100.0/24".parse().unwrap()])]),
+        });
+        assert!(!banned(&gate, 7, "198.51.100.9".parse().unwrap()).await);
+        assert!(banned(&gate, 7, "203.0.113.1".parse().unwrap()).await);
+        // Forwards without a list stay open to everyone.
+        assert!(!banned(&gate, 8, "203.0.113.1".parse().unwrap()).await);
     }
     fn snapshot(listen: SocketAddr, target: SocketAddr, protocol: Protocol) -> StateSnapshot {
         StateSnapshot {
@@ -323,6 +358,7 @@ mod tests {
                 enabled: true,
                 generation: 1,
                 purpose: Purpose::User,
+                allow_from: Vec::new(),
             }],
             bans: vec![],
             ..Default::default()

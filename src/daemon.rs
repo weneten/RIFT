@@ -1478,6 +1478,12 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
     let data = match r {
         AdminRequest::VpnPeerAdd { name } => {
             validate_name(&name)?;
+            // `rift vpn config qr|export ...` was the form before 0.2 and is answered with the
+            // new one, so a device of that name could not be printed.
+            anyhow::ensure!(
+                name != "qr" && name != "export",
+                "the device names qr and export are reserved"
+            );
             cfg.check_vpn_pool()?;
             anyhow::ensure!(
                 !snap.vpn_peers.iter().any(|p| p.name == name),
@@ -1514,7 +1520,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
             };
             reconcile(s).await?;
             let peer = added.vpn_peers.iter().find(|p| p.name == name);
-            serde_json::json!({"name":name,"ipv4":peer.map(|p| p.ipv4),"ipv6":peer.map(|p| p.ipv6),"public_key":public,"next":"grant access with `rift vpn allow`, then `rift vpn config export`"})
+            serde_json::json!({"name":name,"ipv4":peer.map(|p| p.ipv4),"ipv6":peer.map(|p| p.ipv6),"public_key":public,"next":"grant access with `rift vpn allow`, then `rift vpn config`"})
         }
         AdminRequest::VpnPeerList => {
             let stats = s.kernel.lock().await.stats().await.unwrap_or_default();
@@ -2482,6 +2488,7 @@ mod tests {
             enabled: true,
             generation: 2,
             purpose: Purpose::User,
+            allow_from: Vec::new(),
         };
         let mut agent = AgentRecord {
             id: "node4".into(),
@@ -2601,6 +2608,7 @@ mod tests {
             enabled: true,
             generation: 2,
             purpose: Purpose::Exit,
+            allow_from: Vec::new(),
         };
         let snap = |agent: &AgentRecord| StateSnapshot {
             generation: 2,

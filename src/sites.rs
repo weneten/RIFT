@@ -35,6 +35,9 @@ pub enum Request {
         port: u16,
         #[serde(skip_serializing_if = "Option::is_none")]
         proxy: Option<String>,
+        /// Client addresses or networks the proxy lets through; empty means everyone.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        allow_from: Vec<String>,
     },
     Remove {
         id: String,
@@ -77,7 +80,13 @@ fn new_id() -> String {
 }
 
 /// A validated request to publish `host` through `agent`'s `port`.
-pub fn add(agent: &str, host: &str, port: u32, proxy: Option<&str>) -> Result<Request> {
+pub fn add(
+    agent: &str,
+    host: &str,
+    port: u32,
+    proxy: Option<&str>,
+    allow_from: &[ipnet::IpNet],
+) -> Result<Request> {
     validate_name(agent)?;
     validate_host(host)?;
     let port = u16::try_from(port)
@@ -96,6 +105,7 @@ pub fn add(agent: &str, host: &str, port: u32, proxy: Option<&str>) -> Result<Re
         host: host.into(),
         port,
         proxy: proxy.map(String::from),
+        allow_from: allow_from.iter().map(ToString::to_string).collect(),
     })
 }
 
@@ -234,6 +244,7 @@ pub fn overview(sites: &Path, queue: &Path, forwards: &[Value]) -> Value {
                 "listen": site["listen"],
                 "proxy": site["proxy"],
                 "forward_id": site["forward_id"],
+                "allow_from": site.get("allow_from").cloned().unwrap_or_else(|| json!([])),
                 "forward": state,
                 "reason": reason,
             })
@@ -249,12 +260,12 @@ mod tests {
 
     #[test]
     fn requests_are_validated_before_they_are_written() {
-        assert!(add("node1", "app.example.net", 8080, Some("caddy")).is_ok());
-        assert!(add("node1_1", "a", 1, None).is_ok());
-        assert!(add("node1", "app.example.net", 65535, None).is_ok());
+        assert!(add("node1", "app.example.net", 8080, Some("caddy"), &[]).is_ok());
+        assert!(add("node1_1", "a", 1, None, &[]).is_ok());
+        assert!(add("node1", "app.example.net", 65535, None, &[]).is_ok());
         for agent in ["", "a b", "a;id", "../x", &"a".repeat(64)] {
             assert!(
-                add(agent, "app.example.net", 80, None).is_err(),
+                add(agent, "app.example.net", 80, None, &[]).is_err(),
                 "{agent:?}"
             );
         }
@@ -264,18 +275,18 @@ mod tests {
             "", "-a.net", "a-.net", "a..net", "a b.net", "a/b", "a;rm.net", "app.net.", "ä.net",
             &long, &too_long,
         ] {
-            assert!(add("node1", host, 80, None).is_err(), "{host:?}");
+            assert!(add("node1", host, 80, None, &[]).is_err(), "{host:?}");
             assert!(remove(host).is_err(), "{host:?}");
         }
         for port in [0, 65536, 70000] {
             assert!(
-                add("node1", "app.example.net", port, None).is_err(),
+                add("node1", "app.example.net", port, None, &[]).is_err(),
                 "{port}"
             );
         }
         for proxy in ["", "apache", "Traefik", "caddy "] {
             assert!(
-                add("node1", "app.example.net", 80, Some(proxy)).is_err(),
+                add("node1", "app.example.net", 80, Some(proxy), &[]).is_err(),
                 "{proxy:?}"
             );
         }
@@ -283,9 +294,20 @@ mod tests {
     }
 
     #[test]
+    fn allowed_sources_travel_with_the_request() {
+        let nets = crate::model::parse_allow_from(&["203.0.113.7, 198.51.100.0/24"]).unwrap();
+        let request = add("node1", "app.example.net", 8080, None, &nets).unwrap();
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value["allow_from"],
+            json!(["203.0.113.7/32", "198.51.100.0/24"])
+        );
+    }
+
+    #[test]
     fn a_request_file_holds_exactly_the_checked_parameters() {
         let dir = tempfile::tempdir().unwrap();
-        let request = add("node1", "app.example.net", 8080, None).unwrap();
+        let request = add("node1", "app.example.net", 8080, None, &[]).unwrap();
         let id = enqueue(dir.path(), &request).unwrap();
         validate_id(&id).unwrap();
         let text = std::fs::read_to_string(dir.path().join(format!("{id}.json"))).unwrap();

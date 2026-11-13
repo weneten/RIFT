@@ -1,5 +1,5 @@
 use anyhow::{bail, Context};
-use ipnet::Ipv4Net;
+use ipnet::{IpNet, Ipv4Net};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -307,6 +307,10 @@ pub struct Forward {
     pub enabled: bool,
     pub generation: u64,
     pub purpose: Purpose,
+    /// Client addresses or networks that may use the forward, all of the listener's family.
+    /// Empty means every client.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_from: Vec<IpNet>,
 }
 impl Forward {
     pub fn target_ip(&self, agent: &AgentRecord) -> IpAddr {
@@ -343,6 +347,25 @@ impl Forward {
             self.ingress != Ingress::Local || self.mode == ForwardMode::Transparent,
             "local ingress applies only to transparent forwards"
         );
+        anyhow::ensure!(
+            self.allow_from.is_empty() || self.ingress == Ingress::Public,
+            "--allow-from applies to public forwards only; a local forward is reached through the proxy on the server"
+        );
+        anyhow::ensure!(
+            self.allow_from.len() <= MAX_ALLOW_FROM,
+            "--allow-from takes at most {MAX_ALLOW_FROM} addresses or networks"
+        );
+        for net in &self.allow_from {
+            anyhow::ensure!(
+                Family::of(net.addr()) == Family::of(self.listen_ip),
+                "allowed source {net} does not match the address family of listener {}",
+                self.listen_ip
+            );
+            anyhow::ensure!(
+                *net == net.trunc(),
+                "allowed source {net} has host bits set"
+            );
+        }
         Ok(())
     }
 }
@@ -539,7 +562,7 @@ pub fn parse_forward_specs(specs: &[String]) -> anyhow::Result<Vec<ForwardPlan>>
 }
 
 /// Choices of one `add forward` that apply to all its forwards. `None` means automatic.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ForwardOptions {
     /// An explicit server address instead of `/v4`, `/v6` or `/all`.
     pub listen_ip: Option<IpAddr>,
@@ -548,6 +571,42 @@ pub struct ForwardOptions {
     pub mode: Option<ForwardMode>,
     pub target_family: Option<Family>,
     pub ingress: Ingress,
+    /// Client addresses that may connect; each forward keeps those of its listener's family.
+    pub allow_from: Vec<IpNet>,
+}
+
+/// The most sources one forward or site may name.
+pub const MAX_ALLOW_FROM: usize = 64;
+
+/// Parses `--allow-from` values: addresses or networks, separated by commas or spaces, for
+/// example `198.51.100.7, 203.0.113.0/24, 2001:db8::/48`. A bare address means that one host.
+/// Host bits are cleared and duplicates removed.
+pub fn parse_allow_from<S: AsRef<str>>(values: &[S]) -> anyhow::Result<Vec<IpNet>> {
+    let mut out: Vec<IpNet> = Vec::new();
+    for value in values {
+        for word in value
+            .as_ref()
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|w| !w.is_empty())
+        {
+            let net = match word.parse::<IpNet>() {
+                Ok(net) => net.trunc(),
+                Err(_) => IpNet::from(word.parse::<IpAddr>().with_context(|| {
+                    format!(
+                        "{word:?} is not an address or network like 203.0.113.7 or 198.51.100.0/24"
+                    )
+                })?),
+            };
+            if !out.contains(&net) {
+                out.push(net);
+            }
+        }
+    }
+    anyhow::ensure!(
+        out.len() <= MAX_ALLOW_FROM,
+        "--allow-from takes at most {MAX_ALLOW_FROM} addresses or networks"
+    );
+    Ok(out)
 }
 
 /// The forwards one `add forward` creates, validated, with IDs still to be assigned.
@@ -604,7 +663,19 @@ pub fn build_forwards(
                 enabled: true,
                 generation: 0,
                 purpose: Purpose::User,
+                allow_from: options
+                    .allow_from
+                    .iter()
+                    .copied()
+                    .filter(|net| Family::of(net.addr()) == own)
+                    .collect(),
             };
+            anyhow::ensure!(
+                options.allow_from.is_empty() || !forward.allow_from.is_empty(),
+                "--allow-from names no {} source for the listener {listen_ip}; add one or choose {}",
+                match own { Family::V4 => "IPv4", Family::V6 => "IPv6" },
+                match own { Family::V4 => "/v6", Family::V6 => "/v4" },
+            );
             forward.validate()?;
             out.push(forward);
         }
@@ -680,7 +751,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            build("80/tcp", &ips(), explicit).unwrap()[0].listen_ip,
+            build("80/tcp", &ips(), explicit.clone()).unwrap()[0].listen_ip,
             ips()[1]
         );
         assert!(build("80/tcp/v4", &ips(), explicit).is_err());
@@ -692,12 +763,62 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            build("80/tcp", &ips(), form).unwrap()[0].listen_ip,
+            build("80/tcp", &ips(), form.clone()).unwrap()[0].listen_ip,
             ips()[1]
         );
         assert_eq!(
             build("80/tcp/v4", &ips(), form).unwrap()[0].listen_ip,
             ips()[0]
+        );
+    }
+
+    #[test]
+    fn allowed_sources_split_by_family_and_are_checked() {
+        let nets = parse_allow_from(&["203.0.113.7, 198.51.100.9/24", "2001:db8::/48 203.0.113.7"])
+            .unwrap();
+        assert_eq!(
+            nets,
+            vec![
+                "203.0.113.7/32".parse::<IpNet>().unwrap(),
+                "198.51.100.0/24".parse().unwrap(),
+                "2001:db8::/48".parse().unwrap(),
+            ],
+            "host bits cleared, duplicates dropped, order kept"
+        );
+        assert!(parse_allow_from(&["example.net"]).is_err());
+        assert!(parse_allow_from(&["10.0.0.0/33"]).is_err());
+        let many: Vec<String> = (0..=MAX_ALLOW_FROM)
+            .map(|i| format!("10.0.{i}.0/24"))
+            .collect();
+        assert!(parse_allow_from(&many).is_err());
+
+        let options = ForwardOptions {
+            allow_from: nets.clone(),
+            ..Default::default()
+        };
+        let all = build("22/tcp/all", &ips(), options.clone()).unwrap();
+        assert_eq!(all[0].allow_from, nets[..2]);
+        assert_eq!(all[1].allow_from, nets[2..]);
+        // A listener whose family the list does not name would be open to no one.
+        let only_v4 = ForwardOptions {
+            allow_from: nets[..2].to_vec(),
+            ..Default::default()
+        };
+        let error = build("22/tcp/all", &ips(), only_v4.clone()).unwrap_err();
+        assert!(error.to_string().contains("no IPv6 source"), "{error}");
+        // A local forward is reached through the proxy, whose address is the source.
+        let local = ForwardOptions {
+            ingress: Ingress::Local,
+            ..only_v4
+        };
+        assert!(build("22/tcp", &ips(), local).is_err());
+        let mut forward = build("22/tcp", &ips(), Default::default())
+            .unwrap()
+            .remove(0);
+        forward.allow_from = vec!["2001:db8::/48".parse().unwrap()];
+        assert!(
+            forward.validate().is_err(),
+            "family must match the listener"
         );
     }
 }

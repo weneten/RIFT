@@ -1995,6 +1995,21 @@ fn ingress_clause(tunnel: &str, forward: &Forward, uplinks: &[String]) -> Result
     Ok(clause)
 }
 
+/// Limits a forward to its allowed client addresses. Packets from anyone else are neither
+/// marked nor translated, so they reach no agent; the final drops of the RIFT table and the
+/// host's input rules apply to them as to any closed port.
+fn source_clause(forward: &Forward) -> String {
+    if forward.allow_from.is_empty() {
+        return String::new();
+    }
+    let family = match Family::of(forward.listen_ip) {
+        Family::V4 => "ip",
+        Family::V6 => "ip6",
+    };
+    let nets: Vec<String> = forward.allow_from.iter().map(ToString::to_string).collect();
+    format!("{family} saddr {{ {} }} ", nets.join(", "))
+}
+
 const NAT_CHAIN: &str = "add chain inet rift postrouting_nat { type nat hook postrouting priority srcnat; policy accept; }\n";
 
 // Keep meta l4proto before conntrack port comparisons in both renderers.
@@ -2040,12 +2055,13 @@ fn render_server_rules(
             let proto = f.protocol.to_string();
             let target = nft_nat_target(f.target_ip(agent), target_port);
             let iif = ingress_clause(interface, f, uplinks)?;
+            let from = source_clause(f);
             out.push_str(&format!(
-                "add rule inet rift prerouting_mark {iif} {addr_family} daddr {addr} {proto} dport {listen_port} ct direction original ct mark set (ct mark & {:#x}) | {:#x}\n",
+                "add rule inet rift prerouting_mark {iif} {from}{addr_family} daddr {addr} {proto} dport {listen_port} ct direction original ct mark set (ct mark & {:#x}) | {:#x}\n",
                 !mask, mark
             ));
             out.push_str(&format!(
-                "add rule inet rift prerouting_nat {iif} {addr_family} daddr {addr} {proto} dport {listen_port} dnat {target_family} to {target}\n"
+                "add rule inet rift prerouting_nat {iif} {from}{addr_family} daddr {addr} {proto} dport {listen_port} dnat {target_family} to {target}\n"
             ));
             // A missing MSS option must not skip the separate grant accept.
             if f.protocol == Protocol::Tcp {
@@ -3133,6 +3149,7 @@ mod tests {
             enabled: true,
             generation: 1,
             purpose: crate::model::Purpose::User,
+            allow_from: Vec::new(),
         }
     }
     #[test]
@@ -3462,6 +3479,58 @@ mod tests {
         assert!(!plain.contains("masquerade") && !plain.contains("postrouting"));
         assert!(render(&[net(true)]).contains("postrouting_nat iifname \"rift0\" oifname != \"rift0\" ip saddr 10.14.0.2 ip daddr 192.168.178.0/24 masquerade"));
         assert!(!render(&[]).contains("10.14.0.2"));
+    }
+    #[test]
+    fn allowed_sources_limit_mark_and_dnat_only() {
+        let a = agent();
+        let agents = BTreeMap::from([(a.id.clone(), &a)]);
+        let mut f = forward(ForwardMode::Transparent);
+        f.listen_ports = PortRange { start: 80, end: 80 };
+        f.target_ports = PortRange {
+            start: 8080,
+            end: 8080,
+        };
+        f.allow_from = vec![
+            "198.51.100.0/24".parse().unwrap(),
+            "203.0.113.7/32".parse().unwrap(),
+        ];
+        let rendered = render_server_rules(
+            "rift0",
+            0x52490000,
+            0xffff0000,
+            8444,
+            Ipv4Addr::new(10, 88, 0, 1),
+            "fd88:5249:4654::1".parse().unwrap(),
+            &[&f],
+            &agents,
+            &[],
+            &vpn::Rules::default(),
+        )
+        .unwrap();
+        let from = "ip saddr { 198.51.100.0/24, 203.0.113.7/32 }";
+        assert!(rendered.contains(&format!(
+            "prerouting_nat iifname != \"rift0\" {from} ip daddr 203.0.113.1 tcp dport 80 dnat ip to 10.88.0.2:8080"
+        )));
+        assert!(rendered.contains(&format!(
+            "prerouting_mark iifname != \"rift0\" {from} ip daddr 203.0.113.1 tcp dport 80 ct direction original"
+        )));
+        // Without DNAT nothing else matches: the forward rules need `ct status dnat`.
+        assert_eq!(rendered.matches("saddr {").count(), 2);
+        f.allow_from.clear();
+        let open = render_server_rules(
+            "rift0",
+            0x52490000,
+            0xffff0000,
+            8444,
+            Ipv4Addr::new(10, 88, 0, 1),
+            "fd88:5249:4654::1".parse().unwrap(),
+            &[&f],
+            &agents,
+            &[],
+            &vpn::Rules::default(),
+        )
+        .unwrap();
+        assert!(!open.contains("saddr {"));
     }
     #[test]
     fn local_ingress_excludes_the_public_uplink_on_dnat_and_the_original_forward() {
