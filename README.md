@@ -258,6 +258,18 @@ rift status
 
 A grant may remain pending while the agent applies it. Test from a separate client after it is active; a successful command alone does not prove firewall or application reachability.
 
+### Limit a forward to known clients
+
+`--allow-from` lets only the named client addresses or networks through; everyone else gets no answer, as on a closed port:
+
+```sh
+rift add forward node1 2222:22/tcp --allow-from 198.51.100.7,203.0.113.0/24
+```
+
+Separate entries with commas or repeat the option. A bare address means that one host. IPv4 entries apply to IPv4 listeners and IPv6 entries to IPv6 listeners, so `/all` needs at least one of each. `rift list forwards` shows the list in the FROM column (`any` without one). The server enforces it before the packet enters the tunnel: transparent forwards are not redirected for other sources, translated forwards drop their connections. To change the list, remove the forward and add it again.
+
+The source is the address the server sees. A client behind NAT or a mobile network has no fixed address, and a VPN device connects with its public address, not its VPN address, because device profiles are split-tunnel. For your own devices use a [VPN grant](#private-vpn-access) instead: `rift vpn allow DEVICE AGENT 22/tcp` reaches the service at the agent's tunnel address without any public port. `--allow-from` does not apply to `--ingress local`; for sites use `rift add site ... --allow-from`.
+
 ### IPv4-to-IPv6 and IPv6-to-IPv4
 
 Translation bridges different listener and target families. It must be requested explicitly. For example, an IPv4 listener forwarding to the agent's IPv6 tunnel address:
@@ -357,6 +369,14 @@ RIFT_LETSENCRYPT_EMAIL=admin@example.net
 
 The helper reads these values from the running server container, which Compose fills from `.env`; they are visible to root through `docker inspect`. They also work as environment variables of the site command or in `/etc/rift/site.env`. With `RIFT_REQUEST_CERTIFICATE=false` the proxy host is created without TLS and you request a certificate in the NPM UI. `rift remove site` deletes the proxy host again, and its certificate too when that was issued for this domain alone and no other host, redirection, 404 host or stream uses it; shared and wildcard certificates are kept.
 
+To let only known clients open a site, add `--allow-from` with addresses or networks; the proxy answers everyone else with 403:
+
+```sh
+sudo rift add site node1 app.example.net 8081 traefik --allow-from 198.51.100.7,2001:db8:1::/48
+```
+
+Running `rift add site` again for the same domain replaces the list; without `--allow-from` the site is open to everyone again. Traefik gets an `ipAllowList` middleware (`ipWhiteList` when its image tag says version 2), Caddy a `remote_ip` matcher, Nginx `allow`/`deny` inside `location /` (the certbot challenge stays reachable) and Nginx Proxy Manager the same lines in the host's advanced configuration. The proxy checks the address it sees: behind a CDN or another proxy that is the CDN's address, and with Docker's userland proxy (for example IPv6 to a container) it can be Docker's gateway. Check from an allowed and a refused client after adding. `rift list sites` shows the list in the FROM column.
+
 To remove a site and its forward:
 
 ```sh
@@ -430,8 +450,8 @@ Everything is denied until you allow it. A device reaches only what a grant name
 ```sh
 rift add device iphone                       # key pair + address from the VPN pool
 rift vpn allow iphone node1 server           # the home server itself
-rift vpn config qr iphone                    # scan in the WireGuard app
-rift vpn config export iphone > iphone.conf  # or export a file (contains the private key)
+rift vpn config iphone                       # QR code: scan it in the WireGuard app
+rift vpn config iphone --export > iphone.conf  # or export a file (contains the private key)
 ```
 
 `rift vpn allow DEVICE AGENT TARGET...` takes one or more targets, for example `rift vpn allow iphone node1 22/tcp 53/both`:
@@ -458,7 +478,7 @@ The agent host itself answers on its LAN address too, as long as that address li
 
 ```sh
 rift vpn dns iphone node1        # node1's tunnel address becomes the DNS server
-rift vpn config qr iphone        # import the main profile again
+rift vpn config iphone           # import the main profile again
 rift vpn dns iphone default      # back to the default
 ```
 
@@ -472,19 +492,19 @@ A device can also send **all** its internet traffic through RIFT, like a commerc
 
 | Profile | Where the traffic leaves | Add with | Import with |
 | --- | --- | --- | --- |
-| main profile | Without an exit, only what the device's grants and the panel name. With the server exit, the VPS's connection; websites see the VPS's address. | `rift vpn allow DEVICE exit` (the server exit) | `rift vpn config qr DEVICE` |
-| one per agent | That agent's connection, for example your home line; websites see your home address. | `rift vpn allow DEVICE AGENT exit` | `rift vpn config qr DEVICE AGENT` |
+| main profile | Without an exit, only what the device's grants and the panel name. With the server exit, the VPS's connection; websites see the VPS's address. | `rift vpn allow DEVICE exit` (the server exit) | `rift vpn config DEVICE` |
+| one per agent | That agent's connection, for example your home line; websites see your home address. | `rift vpn allow DEVICE AGENT exit` | `rift vpn config DEVICE AGENT` |
 
 ```sh
 rift add device iphone
 rift vpn allow iphone exit        # main profile: exit through the VPS
 rift vpn allow iphone node1 exit  # extra profile: exit through the agent node1
 rift vpn allow iphone node2 exit  # and another one through node2
-rift vpn config qr iphone         # scan the main profile in the WireGuard app
-rift vpn config qr iphone node1   # scan the profile for node1
+rift vpn config iphone            # scan the main profile in the WireGuard app
+rift vpn config iphone node1      # scan the profile for node1
 ```
 
-`exit` may sit beside other targets: `rift vpn allow iphone node1 22/tcp exit` grants port 22 on `node1` and adds the exit through `node1`. Exits add up: allowing another one keeps the others. Remove one at a time: `rift vpn deny iphone exit` ends the server exit, `rift vpn deny iphone node1 exit` only the one through `node1`, and `rift vpn deny iphone node1` withdraws every grant on `node1` together with that exit. After a change RIFT names the profile to import again, for example `Import the profile: rift vpn config qr iphone node1`. `rift list devices` shows the exits in the ACCESS column (`exit via server; exit via node1; exit via node2`, each with `(refused by agent)` or `(waiting for the agent)` when it does not work yet). The agent names `exit` and `default` are reserved.
+`exit` may sit beside other targets: `rift vpn allow iphone node1 22/tcp exit` grants port 22 on `node1` and adds the exit through `node1`. Exits add up: allowing another one keeps the others. Remove one at a time: `rift vpn deny iphone exit` ends the server exit, `rift vpn deny iphone node1 exit` only the one through `node1`, and `rift vpn deny iphone node1` withdraws every grant on `node1` together with that exit. After a change RIFT names the profile to import again, for example `Import the profile: rift vpn config iphone node1`. `rift list devices` shows the exits in the ACCESS column (`exit via server; exit via node1; exit via node2`, each with `(refused by agent)` or `(waiting for the agent)` when it does not work yet). The agent names `exit` and `default` are reserved.
 
 **One device, several profiles.** Every profile of a device uses the same key pair and the same addresses; only one of them is active on the phone at a time, so you switch between them in the WireGuard app. The main profile reaches the web panel and the grants as usual, and with the server exit it also carries all internet traffic. A profile for an agent ends at that agent instead, so the panel and the grants on the VPS are **not** reachable while it is active: switch back to the main profile for those. The web panel offers the same in a device's Access dialog: a "Main profile" block with the box "Send all traffic through this server", an "Extra profiles" block with one switch per agent, a QR code or configuration button per profile, and a note after each change saying which profile to import again or delete in the WireGuard app. The devices table shows them apart, for example `main: exit via server · profiles: node1`.
 
@@ -513,7 +533,7 @@ phone ── WireGuard A (end to end) ──────────────
 - The server assigns each agent that is in use one UDP port from `exit_port_min`..`exit_port_max` (default 51821 to 51899, never the WireGuard port) and publishes it like a normal transparent UDP forward on the server's first IPv4 address (and first IPv6 address, if `RIFT_PUBLIC_IPS` has one). **Open that UDP port in your cloud firewall**, as for any forward. The forward belongs to RIFT: it shows in `rift list forwards` with purpose `exit`, `rift remove forward` and `rift disable forward` refuse it, and it disappears when no enabled device uses that exit. The agent accepts it without an entry in `RIFT_AGENT_ALLOW_PORTS`: `RIFT_AGENT_ALLOW_EXIT` implies that one port.
 - The traffic between the phone and the agent is encrypted end to end with the device key (the same key the server holds for the device) and the agent's exit key. The VPS relays only ciphertext. A hostile VPS could still add a device of its own to the agent's exit, which is why the agent's owner must opt in.
 - The agent masquerades the traffic towards its internet connection. It **blocks private and local destinations** (RFC 1918, `100.64.0.0/10`, `169.254.0.0/16`, loopback, multicast, `fc00::/7`, `fe80::/10`, and with them every RIFT pool) unless they lie inside `RIFT_AGENT_ALLOW_SUBNETS`, and devices on this interface reach nothing on the agent host itself. Your home network is therefore closed to the device unless you list it.
-- The configuration is a profile of its own (`rift vpn config qr DEVICE AGENT`): `MTU` is the server's `mtu` minus 80 (1300 by default) because of the second tunnel, and the endpoint is `RIFT_PUBLIC_ENDPOINT` with the exit port. The profile reaches neither the web panel nor the grants of the device. Panel and grants work in the main profile only, so switch profiles in the WireGuard app to use them.
+- The configuration is a profile of its own (`rift vpn config DEVICE AGENT`): `MTU` is the server's `mtu` minus 80 (1300 by default) because of the second tunnel, and the endpoint is `RIFT_PUBLIC_ENDPOINT` with the exit port. The profile reaches neither the web panel nor the grants of the device. Panel and grants work in the main profile only, so switch profiles in the WireGuard app to use them.
 - Traffic crosses the VPS twice (phone to VPS to home, and back), so the VPS's bandwidth and the home upload speed both limit you. If the agent has not reported its exit key yet, `rift vpn config` says why there is no configuration yet.
 - On the agent, `rift doctor` shows whether the exit is offered and whether the host has a global IPv6 address; on the server it counts the exit devices and names what an agent still lacks. If a host firewall drops forwarding on the agent (UFW, Docker), RIFT adds `rift:exit` forwarding rules for `rift-exit` and the default-route interfaces. `rift-exit`, its key and its rules disappear when the exit is no longer used or the agent stops offering it.
 
@@ -592,7 +612,7 @@ Import the configuration into the WireGuard app, connect, and open `http://10.13
 
 - The server container mounts `/var/lib/rift-site` **read-only** (the helper's `sites.json`, which the card lists) and `/var/lib/rift-site-queue` read-write. Nothing else of the host is visible, and the container cannot write to the site records or the proxy configuration.
 - An add or remove from a trusted connection (the same rule as every other change) validates the request in the panel first (agent name, domain of at most 253 characters, port 1-65535, proxy `traefik`, `caddy`, `nginx` or `npm`, or none) and writes one small JSON file into the queue: `{id, action: "add", agent, host, port, proxy?}` or `{id, action: "remove", host}`. At most 20 requests wait at a time.
-- On the host, the systemd units `rift-site-queue.path` and `rift-site-queue.service` (installed by `deploy/install-cli`) run `rift-site process-queue` when a request appears. It checks every request again, trusting nothing from the container: only the actions `add` and `remove`, exactly their keys, a request id that matches the file name, the same name, domain, port and proxy rules, no links, at most 4 KiB. A request that fails any check is refused without running anything. A valid one goes through the same code as `sudo rift add site` and `sudo rift remove site`; no request text reaches a shell. The answer (`ok` and the helper's output or error) is written to `<id>.result.json`, the request file is deleted, and results older than a day are cleaned up. The panel polls for the answer for up to 30 seconds and shows it.
+- On the host, the systemd units `rift-site-queue.path` and `rift-site-queue.service` (installed by `deploy/install-cli`) run `rift-site process-queue` when a request appears. It checks every request again, trusting nothing from the container: only the actions `add` and `remove`, exactly their keys, a request id that matches the file name, the same name, domain, port and proxy rules, an optional `allow_from` list of addresses or networks, no links, at most 4 KiB. A request that fails any check is refused without running anything. A valid one goes through the same code as `sudo rift add site` and `sudo rift remove site`; no request text reaches a shell. The answer (`ok` and the helper's output or error) is written to `<id>.result.json`, the request file is deleted, and results older than a day are cleaned up. The panel polls for the answer for up to 30 seconds and shows it.
 
 If the host command is not installed, the card says that sites are managed on the host. If it is installed but the units are not active, a request ends with "The host service did not pick up the request; is `rift-site-queue.path` installed and active?". Run `sudo sh deploy/install-cli` (also after `git pull`) and check `systemctl status rift-site-queue.path`. It creates `/var/lib/rift-site` and `/var/lib/rift-site-queue`. If Docker creates them first (Compose v2 does for a missing bind source) the panel works the same once the units exist. `sudo sh deploy/uninstall-host` removes the units and `--purge` also the queue directory.
 
@@ -641,7 +661,7 @@ The report groups what happened:
 ```text
 Created (3)
   forward node1 2222:22/tcp on 203.0.113.10 (the server has no address 198.51.100.7; used 203.0.113.10)
-  device phone (new keys; re-import the device config: rift vpn config qr phone)
+  device phone (new keys; re-import the device config: rift vpn config phone)
   site app.example.org (agent node1, port 8080, caddy) (DNS: app.example.org -> 203.0.113.10)
 
 Already present (1)
@@ -689,7 +709,7 @@ For a fresh start that keeps your settings, not your keys:
 2. Reinstall the server as in [Install the server](#install-the-server).
 3. For every agent: `rift add agent NAME` on the server, and the three `.env` lines on the agent. The agent needs a clean state volume (`docker compose down -v` there), because it was enrolled with the old server. Wait until `rift list agents` shows it as active.
 4. `rift import rift-export-2026-11-01.json --dry-run`, read the report, then run it again without `--dry-run`. Use `--map OLD=NEW` for agents that now have another name and `--skip-agent NAME` for ones you do not bring back.
-5. Import the configuration of every VPN device again (`rift vpn config qr NAME`): the devices have new keys.
+5. Import the configuration of every VPN device again (`rift vpn config NAME`): the devices have new keys.
 
 ## Command reference
 
@@ -726,6 +746,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | … `--mode translate` | Bridges IPv6 clients to an IPv4-only service (the service then sees the server, not the client). |
 | … `--ingress local` | Only for a reverse proxy on the server; not reachable from the Internet. |
 | … `--listen-ip ADDRESS` | A specific server address, only needed with several addresses of the same IP version. |
+| … `--allow-from ADDRESS[,NETWORK...]` | Only these clients reach the forward; see [Limit a forward to known clients](#limit-a-forward-to-known-clients). |
 | `rift list forwards` | All forwards with ID, purpose (`user`, or `exit` for the managed forward of an [internet exit](#use-rift-as-a-vpn-exit)) and state (`enabled`, `disabled`, `pending`, `refused`); on the server with a SITE column. |
 | `rift remove forward ID` | Deletes a forward. Refuses an `exit` forward. |
 | `rift disable forward ID` / `rift enable forward ID` | Switches a forward off and on again. |
@@ -736,7 +757,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 
 | Command | What it does |
 | --- | --- |
-| `rift add site AGENT DOMAIN PORT [traefik\|caddy\|nginx\|npm]` | Publishes `https://DOMAIN` through your reverse proxy to `PORT` on the agent. Without a proxy word the default is used. |
+| `rift add site AGENT DOMAIN PORT [traefik\|caddy\|nginx\|npm] [--allow-from ADDRESS[,NETWORK...]]` | Publishes `https://DOMAIN` through your reverse proxy to `PORT` on the agent. Without a proxy word the default is used. With `--allow-from` the proxy answers other clients with 403. |
 | `rift list sites` | All sites with their forward state (`ok`, `missing`, `refused`). |
 | `rift remove site DOMAIN` | Removes the site, its proxy configuration and its forward. |
 
@@ -755,7 +776,7 @@ The web panel runs the same two commands through the host service (`rift-site-qu
 | `rift vpn deny DEVICE AGENT [TARGET...]` | Withdraws access; without a target everything on that agent, including the exit through it. |
 | `rift vpn deny DEVICE exit` / `rift vpn deny DEVICE AGENT exit` | Ends the exit through the server / through that agent; the device's other exits stay. |
 | `rift vpn dns DEVICE AGENT` / `rift vpn dns DEVICE default` | Makes the agent's tunnel address the DNS server of the device's main profile and allows port 53 there / goes back to the default. |
-| `rift vpn config qr DEVICE [AGENT]` / `rift vpn config export DEVICE [AGENT]` | WireGuard configuration as a QR code or file (contains the private key): the main profile, or with `AGENT` the profile of the exit through that agent. |
+| `rift vpn config DEVICE [AGENT] [--export]` | WireGuard configuration as a QR code, or with `--export` as a file (both contain the private key): the main profile, or with `AGENT` the profile of the exit through that agent. Same form as `rift panel connect NAME [--export]`. |
 | `rift disable device NAME` / `rift enable device NAME` | Cuts a device off and lets it back in; key and grants stay. |
 | `rift remove device NAME` | Deletes the device, its key and its grants. |
 

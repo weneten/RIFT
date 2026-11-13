@@ -96,6 +96,7 @@ fn forwards(data: &Value, names: &HashMap<String, String>) -> String {
                 range(&f["target_ports"]),
                 field(f, "target_family"),
                 field(f, "ingress"),
+                allowed_sources(&f["allow_from"]),
                 field(f, "mode"),
                 match f["purpose"].as_str() {
                     Some("exit") => "exit".into(),
@@ -111,12 +112,24 @@ fn forwards(data: &Value, names: &HashMap<String, String>) -> String {
         .collect();
     table(
         &[
-            "ID", "AGENT", "PROTO", "LISTEN", "TARGET", "FAMILY", "INGRESS", "MODE", "PURPOSE",
-            "STATE",
+            "ID", "AGENT", "PROTO", "LISTEN", "TARGET", "FAMILY", "INGRESS", "FROM", "MODE",
+            "PURPOSE", "STATE",
         ],
         rows,
         "No forwards configured.",
     )
+}
+
+/// The clients a forward accepts: `any`, or its allowed addresses and networks.
+fn allowed_sources(value: &Value) -> String {
+    match value.as_array() {
+        Some(nets) if !nets.is_empty() => nets
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(","),
+        _ => "any".into(),
+    }
 }
 
 fn agents(data: &Value) -> String {
@@ -435,7 +448,7 @@ fn exit_added(peer: &str, exit: &Exit, data: &Value) -> String {
             if data["ipv6"].as_bool() == Some(false) {
                 lines.push("This server has no IPv6 address in RIFT_PUBLIC_IPS: the device's IPv6 traffic is dropped, not leaked.".into());
             }
-            format!("rift vpn config qr {peer}")
+            format!("rift vpn config {peer}")
         }
         Exit::Agent(agent) => {
             let agent = data["agent"].as_str().unwrap_or(agent);
@@ -449,7 +462,7 @@ fn exit_added(peer: &str, exit: &Exit, data: &Value) -> String {
                 lines.push("The agent host has no global IPv6 address: the device's IPv6 traffic is dropped, not leaked.".into());
             }
             lines.push("That profile reaches neither the web panel nor other RIFT grants; switch to the main profile for those.".into());
-            format!("rift vpn config qr {peer} {agent}")
+            format!("rift vpn config {peer} {agent}")
         }
     };
     lines.push(format!("Import the profile: {profile}"));
@@ -460,7 +473,7 @@ fn exit_added(peer: &str, exit: &Exit, data: &Value) -> String {
 fn exit_removed(peer: &str, agent: Option<&str>) -> String {
     match agent {
         None => format!(
-            "{peer} no longer exits through this server.\nImport the main profile again: rift vpn config qr {peer}"
+            "{peer} no longer exits through this server.\nImport the main profile again: rift vpn config {peer}"
         ),
         Some(agent) => format!(
             "{peer} no longer exits through agent {agent}.\nDelete the profile for {agent} in the WireGuard app; it does not work any more."
@@ -592,7 +605,7 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
             let rows = data.as_array().into_iter().flatten().map(|b| vec![field(b, "id"), field(b, "forward_id"), field(b, "ip"), field(b, "expires_at")]).collect();
             table(&["ID", "FORWARD", "ADDRESS", "EXPIRES (UNIX)"], rows, "No active bans.")
         },
-        AdminRequest::VpnPeerAdd { name } => format!("VPN device {name} registered with addresses {} and {}.\nNext: rift vpn allow {name} AGENT 22/tcp (or server), then rift vpn config qr {name}\nFor an internet exit, which is a profile of its own: rift vpn allow {name} exit (this server) or rift vpn allow {name} AGENT exit, then rift vpn config qr {name} [AGENT]", field(data, "ipv4"), field(data, "ipv6")),
+        AdminRequest::VpnPeerAdd { name } => format!("VPN device {name} registered with addresses {} and {}.\nNext: rift vpn allow {name} AGENT 22/tcp (or server), then rift vpn config {name}\nFor an internet exit, which is a profile of its own: rift vpn allow {name} exit (this server) or rift vpn allow {name} AGENT exit, then rift vpn config {name} [AGENT]", field(data, "ipv4"), field(data, "ipv6")),
         AdminRequest::VpnPeerList => vpn_peers(data),
         AdminRequest::VpnPeerEnable { name, enabled } => format!("VPN device {name} {}.", if *enabled { "enabled" } else { "disabled; it can no longer connect" }),
         AdminRequest::VpnPeerRevoke { name } => format!("VPN device {name} revoked. Its key and grants are gone."),
@@ -604,8 +617,8 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
             }
             text
         }
-        AdminRequest::VpnDns { peer, agent: Some(agent) } => format!("{peer} now uses {agent} as its DNS server (port 53 on {agent} is allowed).\nImport the main profile again: rift vpn config qr {peer}"),
-        AdminRequest::VpnDns { peer, agent: None } => format!("{peer} uses the default DNS again.\nImport the main profile again: rift vpn config qr {peer}"),
+        AdminRequest::VpnDns { peer, agent: Some(agent) } => format!("{peer} now uses {agent} as its DNS server (port 53 on {agent} is allowed).\nImport the main profile again: rift vpn config {peer}"),
+        AdminRequest::VpnDns { peer, agent: None } => format!("{peer} uses the default DNS again.\nImport the main profile again: rift vpn config {peer}"),
         AdminRequest::VpnExit { peer, exit } => exit_added(peer, exit, data),
         AdminRequest::VpnExitClear { peer, agent } => exit_removed(peer, agent.as_deref()),
         AdminRequest::PanelStatus => panel_status(data),
@@ -625,7 +638,7 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
         AdminRequest::PanelTwoFactorReset => "Two-factor panel login is off. The secret is deleted and all panel sessions have ended.".into(),
         AdminRequest::PanelAllow { name, allowed: true } => {
             let url = data["urls"].as_array().and_then(|u| u.get(1)).map(|u| field(u, "url")).unwrap_or_default();
-            format!("{name} may now open the web panel at {url}.\nIf the device was set up before, re-import its configuration: rift vpn config qr {name}")
+            format!("{name} may now open the web panel at {url}.\nIf the device was set up before, re-import its configuration: rift vpn config {name}")
         }
         AdminRequest::PanelAllow { name, allowed: false } => format!("{name} can no longer open the web panel."),
         AdminRequest::Reload => "Configuration reconciled.".into(),
@@ -710,15 +723,15 @@ mod tests {
         assert!(
             server.contains("through this server") && server.contains("IPv6 traffic is dropped")
         );
-        assert!(server.contains("Import the profile: rift vpn config qr iphone"));
-        assert!(!server.contains("config qr iphone node1"));
+        assert!(server.contains("Import the profile: rift vpn config iphone"));
+        assert!(!server.contains("config iphone node1"));
         let agent = add(
             Exit::Agent("node1".into()),
             json!({"agent":"node1","ipv6":true,"waiting":"agent node1 has not reported"}),
         );
         assert!(agent.contains("through agent node1") && agent.contains("Not ready yet"));
         assert!(agent.contains("main profile") && !agent.contains("dropped"));
-        assert!(agent.contains("Import the profile: rift vpn config qr iphone node1"));
+        assert!(agent.contains("Import the profile: rift vpn config iphone node1"));
         let removed = |agent: Option<&str>| {
             render(
                 &AdminRequest::VpnExitClear {
@@ -731,9 +744,9 @@ mod tests {
         };
         let server = removed(None);
         assert!(server.contains("no longer exits through this server"));
-        assert!(server.contains("Import the main profile again: rift vpn config qr iphone"));
+        assert!(server.contains("Import the main profile again: rift vpn config iphone"));
         let agent = removed(Some("node1"));
-        assert!(agent.contains("Delete the profile for node1") && !agent.contains("config qr"));
+        assert!(agent.contains("Delete the profile for node1") && !agent.contains("vpn config"));
     }
     #[test]
     fn doctor_prints_a_checklist_and_a_verdict() {

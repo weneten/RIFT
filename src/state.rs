@@ -1288,6 +1288,7 @@ mod tests {
             enabled: true,
             generation: 1,
             purpose: Purpose::User,
+            allow_from: Vec::new(),
         };
         st.mutate("forward-add", |s| {
             s.forwards.push(f.clone());

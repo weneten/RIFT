@@ -81,6 +81,7 @@ mod tests {
             enabled: true,
             generation,
             purpose: crate::model::Purpose::User,
+            allow_from: Vec::new(),
         }
     }
     fn rule(access: VpnAccess) -> AgentVpnRule {

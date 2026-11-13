@@ -268,15 +268,18 @@ function forwardDialog() {
   const on = select([["v4", "IPv4"], ...(hasV6 ? [["v6", "IPv6"], ["all", "IPv4 and IPv6"]] : [])], "v4");
   const mode = select([["", "automatic"], ["transparent", "transparent (client IP visible)"], ["translate", "translate (IPv4 ↔ IPv6)"]], "");
   const ingress = select([["public", "public"], ["local", "local (for a proxy on this server)"]], "public");
+  const allowFrom = el("input", { placeholder: "everyone, or 203.0.113.7 198.51.100.0/24" });
   openModal("Add forwards", form([
     row("Agent", agent),
     row("Ports", specs),
     el("p", { class: "hint" }, "LISTEN[:TARGET]/tcp, /udp or /both, several separated by spaces. The target defaults to the listen port. A port may end in /v4, /v6 or /all to override the server address below."),
     el("div", { class: "row inline" }, row("Server address", on), row("Mode", mode)),
     row("Ingress", ingress),
+    row("Only from", allowFrom),
+    el("p", { class: "hint" }, "Leave empty for every client. Otherwise only these addresses or networks reach the service; everyone else sees a closed port. Not for local ingress."),
     el("p", { class: "hint" }, "Automatic is transparent: the service sees the client's address and must listen on the same IP version on the agent (0.0.0.0, or :: for IPv6). Translate bridges IPv6 clients to an IPv4-only service, but the service then sees the server instead of the client. Open the public ports in your cloud firewall as well."),
   ], "Add", async () => {
-    const body = { action: "forward_add", agent: agent.value, specs: specs.value, on: on.value, ingress: ingress.value };
+    const body = { action: "forward_add", agent: agent.value, specs: specs.value, on: on.value, ingress: ingress.value, allow_from: allowFrom.value };
     if (mode.value) body.mode = mode.value;
     const result = await act(body);
     closeModal();
@@ -566,15 +569,19 @@ function siteDialog() {
   const host = el("input", { required: true, placeholder: "app.example.net", maxlength: 253 });
   const port = el("input", { required: true, type: "number", min: 1, max: 65535, placeholder: "8080" });
   const proxy = select([["", "default"], ["traefik", "Traefik"], ["caddy", "Caddy"], ["nginx", "Nginx"], ["npm", "Nginx Proxy Manager"]], "");
+  const allowFrom = el("input", { placeholder: "everyone, or 203.0.113.7 198.51.100.0/24" });
   openModal("Add site", form([
     row("Agent", agent),
     row("Domain", host),
     row("Target port on the agent", port),
     row("Proxy", proxy),
+    row("Only from", allowFrom),
+    el("p", { class: "hint" }, "Leave empty for every client. Otherwise the proxy answers everyone but these addresses or networks with 403."),
     el("p", { class: "hint" }, "The server's host service publishes https://DOMAIN through your reverse proxy to this port. The domain must already point at this server."),
   ], "Add site", async () => {
     const body = { action: "site_add", agent: agent.value, host: host.value.trim(), port: Number(port.value) };
     if (proxy.value) body.proxy = proxy.value;
+    if (allowFrom.value.trim()) body.allow_from = allowFrom.value;
     const queued = await act(body);
     await awaitSite(queued.id, `Adding ${body.host}`);
   }));
@@ -672,7 +679,8 @@ function render() {
       : f.refused ? Object.assign(pill("refused", "bad"), { title: f.refused })
       : f.pending ? pill("pending", "warn") : pill("active", "ok");
     const isExit = f.purpose === "exit";
-    const mode = [isExit ? "exit" : null, f.mode, f.ingress === "local" ? "local" : null, f.target_family].filter(Boolean).join(" · ");
+    const only = (f.allow_from || []).length ? `only ${f.allow_from.join(", ")}` : null;
+    const mode = [isExit ? "exit" : null, f.mode, f.ingress === "local" ? "local" : null, f.target_family, only].filter(Boolean).join(" · ");
     const listen = endpoint(f.listen_ip, range(f.listen_ports));
     const url = forwardUrl(f);
     return el("tr", {},
@@ -732,7 +740,8 @@ function render() {
       el("td", {}, link(`https://${site.host}`, site.host)),
       el("td", {}, site.agent),
       el("td", {}, site.target),
-      el("td", {}, site.proxy),
+      el("td", {}, site.proxy, (site.allow_from || []).length
+        ? el("span", { class: "muted small" }, ` · only ${site.allow_from.join(", ")}`) : null),
       el("td", {}, statePill, site.forward_id ? el("span", { class: "muted small" }, ` #${site.forward_id}`) : null),
       el("td", { class: "actions" }, btns(button("Remove", async () => {
         if (!window.confirm(`Remove the site ${site.host} and its forward?`)) return;

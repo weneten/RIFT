@@ -545,6 +545,9 @@ enum Action {
         mode: Option<ForwardMode>,
         #[serde(default)]
         ingress: Ingress,
+        /// Allowed client addresses or networks, separated by commas or spaces; empty for all.
+        #[serde(default)]
+        allow_from: String,
     },
     ForwardEnable {
         id: u64,
@@ -624,6 +627,9 @@ enum Action {
         port: u32,
         #[serde(default)]
         proxy: Option<String>,
+        /// Allowed client addresses or networks, separated by commas or spaces; empty for all.
+        #[serde(default)]
+        allow_from: String,
     },
     SiteRemove {
         host: String,
@@ -715,6 +721,7 @@ impl Action {
                 on,
                 mode,
                 ingress,
+                allow_from,
             } => {
                 let specs = words(&specs);
                 ensure!(
@@ -725,6 +732,7 @@ impl Action {
                     on,
                     mode,
                     ingress,
+                    allow_from: parse_allow_from(&[allow_from])?,
                     ..Default::default()
                 };
                 let forwards = build_forwards(
@@ -885,8 +893,11 @@ impl Action {
                 host,
                 port,
                 proxy,
+                allow_from,
             } => {
-                let request = crate::sites::add(&agent, &host, port, proxy.as_deref())?;
+                let allow_from = parse_allow_from(&[allow_from])?;
+                let request =
+                    crate::sites::add(&agent, &host, port, proxy.as_deref(), &allow_from)?;
                 json!({"id": crate::sites::enqueue(&panel.queue_dir, &request)?})
             }
             Self::SiteRemove { host } => {
@@ -962,6 +973,7 @@ fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> Value {
                 "mode": f["mode"],
                 "purpose": f["purpose"],
                 "ingress": f["ingress"],
+                "allow_from": f.get("allow_from").cloned().unwrap_or_else(|| json!([])),
                 "enabled": f["enabled"],
                 "pending": pending.contains(&f["id"]),
                 "refused": refused.iter().find(|r| r["id"] == f["id"]).map(|r| r["reason"].clone()),

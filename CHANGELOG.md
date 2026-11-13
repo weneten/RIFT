@@ -4,6 +4,15 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ## [Unreleased]
 
+### Added
+
+- `rift add forward ... --allow-from ADDRESS[,NETWORK...]`: only the named clients reach the forward; the server neither redirects nor relays anyone else. Shown in the FROM column of `rift list forwards`, in the web panel, and carried by `rift export` / `rift import`.
+- `rift add site ... --allow-from ADDRESS[,NETWORK...]`: the reverse proxy answers other clients with 403 (Traefik `ipAllowList`/`ipWhiteList`, Caddy `remote_ip`, Nginx and Nginx Proxy Manager `allow`/`deny`). Also in the web panel's site dialog, the site queue and export files.
+
+### Changed
+
+- `rift vpn config DEVICE [AGENT]` prints the QR code; `--export` prints the configuration file. This is the form of `rift panel connect NAME [--export]`. The old `rift vpn config qr|export ...` answers with the new form. The device names `qr` and `export` are reserved.
+
 ## [0.1.0]
 
 First pre-release. Not yet recommended for production; see the open release gates in [docs/deploy.md](docs/deploy.md#functional-test-matrix).

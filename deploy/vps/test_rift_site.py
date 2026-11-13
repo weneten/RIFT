@@ -37,6 +37,45 @@ class RenderTests(unittest.TestCase):
         self.assertIn("server_name app.makl.xyz;", nginx)
         self.assertIn("proxy_pass http://181.214.231.165:20000;", nginx)
 
+    def test_allowed_sources_reach_every_proxy(self):
+        nets = ["203.0.113.7/32", "2001:db8::/48"]
+        url = "http://203.0.113.10:20000"
+        v3 = rift_site.render_traefik("app.example.net", url, "le", "web", "websecure", nets)
+        self.assertEqual(v3.count("- rift-app-example-net-allow\n"), 2, "both routers")
+        self.assertIn("ipAllowList:", v3)
+        self.assertIn('- "2001:db8::/48"', v3)
+        v2 = rift_site.render_traefik("app.example.net", url, "le", "web", "websecure", nets, 2)
+        self.assertIn("ipWhiteList:", v2)
+        self.assertNotIn("middlewares", rift_site.render_traefik("a.net", url, "le", "web", "websecure"))
+        self.assertEqual(
+            rift_site.render_caddy("app.example.net", url, nets),
+            "app.example.net {\n"
+            "    @rift_denied not remote_ip 203.0.113.7/32 2001:db8::/48\n"
+            "    respond @rift_denied 403\n"
+            "    reverse_proxy 203.0.113.10:20000\n}\n",
+        )
+        nginx = rift_site.render_nginx("app.example.net", url, nets)
+        location = nginx.index("location / {")
+        self.assertGreater(nginx.index("allow 203.0.113.7/32;"), location)
+        self.assertLess(nginx.index("allow 2001:db8::/48;"), nginx.index("deny all;"))
+        self.assertNotIn("deny", rift_site.render_nginx("a.net", url))
+        payload = rift_site.npm_host_payload("a.net", "203.0.113.10", 20000, 0, nets)
+        self.assertEqual(
+            payload["advanced_config"], "allow 203.0.113.7/32;\nallow 2001:db8::/48;\ndeny all;\n"
+        )
+        self.assertEqual(rift_site.npm_host_payload("a.net", "203.0.113.10", 20000, 0)["advanced_config"], "")
+
+    def test_traefik_major_version_comes_from_the_image_tag(self):
+        def doc(image):
+            return [{"Config": {"Image": image}}]
+
+        self.assertEqual(rift_site.traefik_major(doc("traefik:v2.11")), 2)
+        self.assertEqual(rift_site.traefik_major(doc("docker.io/library/traefik:2.10.7")), 2)
+        self.assertEqual(rift_site.traefik_major(doc("traefik:v3.1")), 3)
+        self.assertEqual(rift_site.traefik_major(doc("traefik:latest")), 3)
+        self.assertEqual(rift_site.traefik_major(doc("traefik")), 3)
+        self.assertEqual(rift_site.traefik_major(doc("registry:5000/traefik:v2.9")), 2)
+
     def test_public_ip_comes_from_env_before_toml(self):
         toml = 'public_ips = ["203.0.113.10"]\n'
         self.assertEqual(rift_site.resolve_public_ip(toml, "198.51.100.10"), "198.51.100.10")
@@ -335,18 +374,29 @@ class FileProviderTests(unittest.TestCase):
         self.assertEqual(rows[0][-1], "SITE")
         self.assertEqual(
             rows[1],
-            ("1", "heim", "TCP", "10.0.0.207:20000", "8091", "v4", "local", "transparent", "user",
-             "enabled", "beszel.example.net (traefik)"),
+            ("1", "heim", "TCP", "10.0.0.207:20000", "8091", "v4", "local", "any", "transparent",
+             "user", "enabled", "beszel.example.net (traefik)"),
         )
         self.assertEqual(rows[2][3], "[2001:db8::1]:1337-1339")
-        self.assertEqual(rows[2][8:], ("user", "disabled", ""))
+        self.assertEqual(rows[2][9:], ("user", "disabled", ""))
         # The managed forward of an internet exit says so.
-        self.assertEqual(rows[3][8:], ("exit", "enabled", ""))
+        self.assertEqual(rows[3][9:], ("exit", "enabled", ""))
+        forwards[1]["allow_from"] = ["2001:db8:1::/48", "2001:db8:2::7/128"]
+        rows = rift_site.forward_rows(forwards, agents, sites)
+        self.assertEqual(rows[2][7], "2001:db8:1::/48,2001:db8:2::7/128")
 
     def test_add_arguments_and_the_proxy_word(self):
         self.assertEqual(
             rift_site.parse_add_args(["node1", "a.example", "8081", "traefik"]),
-            (["node1", "a.example", "8081"], "traefik"),
+            (["node1", "a.example", "8081"], "traefik", []),
+        )
+        self.assertEqual(
+            rift_site.parse_add_args(
+                ["node1", "a.example", "8081", "--allow-from", "203.0.113.7,198.51.100.9/24",
+                 "caddy", "--allow-from=2001:db8::/48"]
+            ),
+            (["node1", "a.example", "8081"], "caddy",
+             ["203.0.113.7/32", "198.51.100.0/24", "2001:db8::/48"]),
         )
         self.assertEqual(rift_site.parse_add_args(["node1", "a.example", "8081"])[1], None)
         with self.assertRaises(rift_site.SiteError) as typo:
@@ -356,6 +406,9 @@ class FileProviderTests(unittest.TestCase):
             ["node1", "a.example", "8081", "--proxy", "traefik"],
             ["node1", "a.example"],
             ["a", "b", "1", "npm", "x"],
+            ["node1", "a.example", "8081", "--allow-from"],
+            ["node1", "a.example", "8081", "--allow-from", "example.net"],
+            ["node1", "a.example", "8081", "--allow-from", ","],
         ):
             with self.assertRaises(rift_site.SiteError):
                 rift_site.parse_add_args(bad)
@@ -699,7 +752,7 @@ class ImportTests(unittest.TestCase):
             add.assert_not_called()
         self.assertEqual([i["status"] for i in items], ["created", "created"])
 
-        def fake_add(agent, host, port, proxy):
+        def fake_add(agent, host, port, proxy, allow_from):
             if host == "b.example.org":
                 raise rift_site.SiteError("caddy is not listening on port 443")
             print("https://" + host)
@@ -985,14 +1038,14 @@ class QueueTests(unittest.TestCase):
         return {"action": "add", "agent": "node1", "host": "app.example.net", "port": 8080, **changes}
 
     def test_an_add_runs_the_add_logic_and_answers(self):
-        def add(agent, host, port, proxy):
+        def add(agent, host, port, proxy, allow_from):
             print(f"https://{host}")
 
         mocked = mock.Mock(side_effect=add)
         name = self.request(self.good_add(proxy="caddy"))
         count, _, _ = self.process(add=mocked)
         self.assertEqual(count, 1)
-        mocked.assert_called_once_with("node1", "app.example.net", 8080, "caddy")
+        mocked.assert_called_once_with("node1", "app.example.net", 8080, "caddy", [])
         self.assertEqual(
             self.result(name), {"id": name, "ok": True, "message": "https://app.example.net"}
         )
@@ -1001,7 +1054,19 @@ class QueueTests(unittest.TestCase):
     def test_the_proxy_is_optional(self):
         self.request(self.good_add())
         _, add, _ = self.process()
-        add.assert_called_once_with("node1", "app.example.net", 8080, None)
+        add.assert_called_once_with("node1", "app.example.net", 8080, None, [])
+
+    def test_allowed_sources_are_checked_and_passed_on(self):
+        self.request(self.good_add(allow_from=["203.0.113.7", "198.51.100.0/24"]))
+        _, add, _ = self.process()
+        add.assert_called_once_with(
+            "node1", "app.example.net", 8080, None, ["203.0.113.7/32", "198.51.100.0/24"]
+        )
+        for bad in ("203.0.113.7", ["example.net"], [7], ["1.2.3.4; deny"]):
+            name = self.request(self.good_add(allow_from=bad))
+            _, add, _ = self.process()
+            add.assert_not_called()
+            self.assertFalse(self.result(name)["ok"])
 
     def test_a_remove_runs_the_remove_logic(self):
         name = self.request({"action": "remove", "host": "app.example.net"})
@@ -1029,7 +1094,7 @@ class QueueTests(unittest.TestCase):
 
     def test_requests_run_oldest_first(self):
         order = []
-        add = mock.Mock(side_effect=lambda agent, host, port, proxy: order.append(host))
+        add = mock.Mock(side_effect=lambda agent, host, port, proxy, allow_from: order.append(host))
         for host in ("c.example.net", "a.example.net", "b.example.net"):
             self.request(self.good_add(host=host))
         self.process(add=add)

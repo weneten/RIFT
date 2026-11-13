@@ -954,6 +954,7 @@ mod tests {
             enabled: true,
             generation: 1,
             purpose: crate::model::Purpose::User,
+            allow_from: Vec::new(),
         };
         let plan = plan_agent(
             &obs,
