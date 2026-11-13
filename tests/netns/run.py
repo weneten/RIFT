@@ -527,6 +527,66 @@ got=s.recv(128).decode(); print(got); assert got==sys.argv[1],(got,sys.argv[1])
     print("PASS foreign Fail2ban-style INPUT/FORWARD rules block one client, preserve RIFT/control/other-client traffic, and removal restores access")
 
 
+def allow_from_test(server_cfg):
+    """--allow-from: only the named sources reach a forward, for each mode and family."""
+    env = {"RIFT_PUBLIC_ENDPOINT": SERVER_HOST,
+           "RIFT_PUBLIC_IPS": f"{PUBLIC_V4},{PUBLIC_V4_NEW},{PUBLIC_V6}"}
+    allowed4, refused4 = "198.18.0.11", "198.18.0.10"
+    allowed6, refused6 = CLIENT_ALT_PUBLIC_V6, CLIENT_PUBLIC_V6
+    cases = [
+        # (spec, listen ip, family, proto, extra options, allowed list)
+        ("18120:19080/tcp", PUBLIC_V4, "4", "tcp", [], f"{allowed4},192.0.2.0/24"),
+        ("18121:19081/udp", PUBLIC_V4, "4", "udp", [], allowed4),
+        ("18122:19080/tcp", PUBLIC_V6, "6", "tcp", [], f"{allowed6}/128"),
+        ("18123:19080/tcp", PUBLIC_V4, "4", "tcp",
+         ["--mode", "translate", "--target-family", "v6"], allowed4),
+    ]
+    created = []
+    for spec, listen_ip, _, _, extra, allow in cases:
+        forward = json.loads(cli(VPS, server_cfg, "add", "forward", "agent2", spec,
+                                 "--listen-ip", listen_ip, *extra, "--allow-from", allow,
+                                 env=env).stdout)
+        assert forward["allow_from"], f"forward {spec} was stored without its sources: {forward}"
+        created.append(forward["id"])
+    # A list without an address of the listener's family would open the port to no one.
+    mismatch = ns(VPS, str(BIN), "--config", str(server_cfg), "--json", "add", "forward",
+                  "agent2", "18124/tcp", "--listen-ip", PUBLIC_V4, "--allow-from", allowed6,
+                  check=False, env={**os.environ, **env})
+    assert mismatch.returncode != 0, "a forward with only IPv6 sources on an IPv4 listener was accepted"
+    wait_policy(server_cfg, 3)
+    listed = {f["id"]: f for f in json.loads(cli(VPS, server_cfg, "list", "forwards").stdout)}
+    assert listed[created[0]]["allow_from"] == [f"{allowed4}/32", "192.0.2.0/24"], listed[created[0]]
+    nat = ns(VPS, "nft", "list", "chain", "inet", "rift", "prerouting_nat").stdout
+    assert f"ip saddr {{ {allowed4}, 192.0.2.0/24 }}" in nat or f"ip saddr {{ 192.0.2.0/24, {allowed4} }}" in nat, nat
+
+    translated = r'''import socket,sys
+s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(3)
+s.bind((sys.argv[1],0)); s.connect(("198.18.0.1",18123)); s.sendall(b"allow-from")
+got=s.recv(128).decode(); print(got); assert got.startswith("fd88:5249:4654::1"),got
+'''
+    for spec, listen_ip, fam, proto, extra, _ in cases:
+        port = spec.split(":")[0]
+        allowed, refused = (allowed4, refused4) if fam == "4" else (allowed6, refused6)
+        if extra:
+            assert ns(CLIENT_ALT, "python3", "-c", translated, allowed).stdout.strip() \
+                .startswith("fd88:5249:4654::1"), "allowed client lost the translated forward"
+            blocked = ns(CLIENT, "python3", "-c", translated, refused, check=False)
+        else:
+            seen = ns(CLIENT_ALT, "python3", "-c", _client_probe(), fam, proto, allowed,
+                      listen_ip, port).returncode
+            assert seen == 0, f"allowed client {allowed} did not reach {spec}"
+            blocked = ns(CLIENT, "python3", "-c", _client_probe(), fam, proto, refused,
+                         listen_ip, port, check=False)
+        assert blocked.returncode != 0, f"client {refused} reached {spec} outside --allow-from"
+    # The unrestricted forwards of the same agent still answer the refused client.
+    assert ns(CLIENT, "python3", "-c", _client_probe(), "4", "tcp", refused4,
+              PUBLIC_V4, "18084").returncode == 0, "--allow-from leaked onto another forward"
+    for forward_id in created:
+        cli(VPS, server_cfg, "remove", "forward", str(forward_id))
+    wait_policy(server_cfg, 3)
+    print("PASS --allow-from lets only the listed sources reach transparent IPv4/IPv6 TCP/UDP and translated forwards")
+
+
 def _client_probe():
     return r'''import socket,sys
 fam=socket.AF_INET6 if sys.argv[1]=="6" else socket.AF_INET
@@ -744,6 +804,7 @@ def main():
         fail2ban_coexistence_test(server_cfg, ports)
         agent_local_ban_test(server_cfg)
         translation_ban_test(server_cfg)
+        allow_from_test(server_cfg)
         check_routes_and_foreign(prior, baselines)
         check_normal_traffic()
         migrate_endpoint_ip(server_cfg)
