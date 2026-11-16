@@ -906,6 +906,27 @@ def kill_during_startup(namespace, cfg, command, env, label):
     assert process.poll() is not None, f"{label} survived SIGKILL"
 
 
+def interrupt_server_starts(cfg, env):
+    """Kills the server again and again a little later in its start, until at least one kill
+    landed after it had begun to apply its state (it logged that the enrollment endpoint is
+    open) and before it reported ready. A fixed poll can miss that window: the whole start
+    takes well under a second."""
+    mid_apply = 0
+    for attempt in range(60):
+        label = f"server-interrupted-{attempt}"
+        process = daemon(VPS, cfg, ["server"], env, label=label)
+        time.sleep(attempt * 0.01)
+        stop_process(process, signal.SIGKILL)
+        assert process.poll() is not None, f"{label} survived SIGKILL"
+        log = (WORK / f"{label}.log").read_text(encoding="utf-8", errors="replace")
+        if "enrollment endpoint" in log and "RIFT server ready" not in log:
+            mid_apply += 1
+            if mid_apply >= 3:
+                break
+    assert mid_apply, "no kill landed between the start of apply and 'RIFT server ready'"
+    print(f"PASS server killed {mid_apply} time(s) in the middle of applying its state")
+
+
 def expired_invitation_test(server_cfg, token, created_at):
     """An invitation whose TTL has passed is refused and creates no agent."""
     remaining = created_at + 62 - time.monotonic()
@@ -1148,7 +1169,7 @@ def main():
         # Interrupt both daemons while they start (after they began to change the network),
         # then start them again: the second start must take over the half-applied state.
         agent1_env = {"RIFT_SERVER": f"{SERVER_HOST}:8443", "RIFT_AGENT_NAME": "agent1"}
-        kill_during_startup(VPS, server_cfg, ["server"], server_env, "server-interrupted")
+        interrupt_server_starts(server_cfg, server_env)
         server_proc = daemon(VPS, server_cfg, ["server"], server_env, label="server-after-interrupt")
         wait_until(lambda: cli(VPS, server_cfg, "status", env=server_env).returncode == 0,
                    "server after an interrupted start", timeout=35)
