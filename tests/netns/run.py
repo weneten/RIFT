@@ -918,7 +918,9 @@ def expired_invitation_test(server_cfg, token, created_at):
     proc = daemon(AGENTS[2], cfg, ["agent"],
                   {"RIFT_SERVER": f"{SERVER_HOST}:8443", "RIFT_AGENT_NAME": "expiring",
                    "RIFT_ENROLLMENT_TOKEN": token}, label="expired")
-    wait_until(lambda: "expired" in (WORK / "expired.log").read_text(
+    # The server deletes expired invitations when it reconciles; until then it answers
+    # "expired or already used", afterwards the token is simply unknown ("invalid invitation").
+    wait_until(lambda: "enrollment refused" in (WORK / "expired.log").read_text(
         encoding="utf-8", errors="replace").lower(), "expired invitation rejection", timeout=20)
     stop_process(proc, signal.SIGKILL)
     agents = status(server_cfg)["snapshot"]["agents"]
