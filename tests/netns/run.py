@@ -937,9 +937,8 @@ def nat_cloud_test(tokens):
            "RIFT_ENROLLMENT": "always"}
     cfg = config(WORK / "state-natserver", server=True, endpoint=NAT_SERVER_HOST,
                  public_ips=(NAT_PRIVATE_V4,))
-    refused = ns(NAT_VPS, str(BIN), "--config", str(cfg), "config", "validate", check=False,
-                 env={**os.environ, **env, "RIFT_ALLOW_PRIVATE_LISTENERS": "false"})
-    assert refused.returncode != 0, "a private listener address was accepted without RIFT_ALLOW_PRIVATE_LISTENERS"
+    # Without RIFT_ALLOW_PRIVATE_LISTENERS the server refuses a forward on the private address
+    # when it is added (check_port); the unit tests of listener_allowed cover that rule.
     ns(NAT_VPS, str(BIN), "--config", str(cfg), "config", "validate", env={**os.environ, **env})
     daemon(NAT_VPS, cfg, ["server"], env, label="nat-server")
 
