@@ -11,6 +11,7 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ### Changed
 
+- `deploy/prepare-host` works in LXC containers (for example on Proxmox VE): it recognises the container, checks WireGuard without a network namespace where it may not create one, and says to load the module on the host when it is missing. It also says when the kernel has no IPv6. The README has a section on running RIFT in a Proxmox LXC container.
 - `rift vpn config DEVICE [AGENT]` prints the QR code; `--export` prints the configuration file. This is the form of `rift panel connect NAME [--export]`. The old `rift vpn config qr|export ...` answers with the new form. The device names `qr` and `export` are reserved.
 - `rift list bans` shows the expiry as a UTC date and time instead of Unix seconds (`--json` is unchanged).
 - `rift vpn deny` no longer accepts `--snat`, which had no effect there.

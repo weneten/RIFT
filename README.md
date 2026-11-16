@@ -22,6 +22,7 @@ The agent initiates the connection to the server. RIFT manages the tunnel, expli
 - [Install the server](#install-the-server)
 - [Connect an agent](#connect-an-agent)
 - [Harden the agent](#harden-the-agent)
+- [Run in an LXC container (Proxmox VE)](#run-in-an-lxc-container-proxmox-ve)
 - [Supported protocols](#supported-protocols)
 - [Publish services](#publish-services)
 - [Publish websites with HTTPS](#publish-websites-with-https)
@@ -183,6 +184,35 @@ The agent reports its limits to the server with every sync, so the server knows 
 - `rift list forwards` shows such a forward as `refused`, `rift status` names the reason, and `rift list devices` marks refused grants. The server does not publish a refused forward, so no public port opens without a service behind it; other forwards are unaffected. Once you allow the port on the agent, the forward becomes active on the next sync.
 
 The agent still enforces its lists itself, whatever the server sends; the server's view only serves the warnings.
+
+## Run in an LXC container (Proxmox VE)
+
+The server and the agent can also run in an LXC container, for example on Proxmox VE, with Docker inside the container. RIFT then changes only the container's own network, not the host's. This setup follows from how LXC shares the host kernel and has not yet been verified on a real Proxmox host; try it on a spare container first.
+
+On the **Proxmox host**, load the WireGuard module (a container cannot load kernel modules) and keep it loaded after a reboot:
+
+```sh
+modprobe wireguard
+echo wireguard > /etc/modules-load.d/wireguard.conf
+```
+
+Create a Debian 12 container with the features Docker needs, `nesting=1` and `keyctl=1` (Options > Features in the web interface, or `--features nesting=1,keyctl=1` with `pct create` / `pct set`). An unprivileged container is enough. Inside it, install Docker and Git, then follow [Install the server](#install-the-server) or [Connect an agent](#connect-an-agent) as on any host:
+
+```sh
+apt update && apt install -y curl git ca-certificates
+curl -fsSL https://get.docker.com | sh
+git clone https://github.com/weneten/RIFT.git
+cd RIFT
+sh deploy/prepare-host
+```
+
+`deploy/prepare-host` recognises the container. It sets the forwarding sysctls of the container's own network namespace, checks WireGuard without creating a network namespace where an unprivileged container may not, and says what to do on the host when the module is missing or Docker lacks the container features. `rift doctor` in the container then shows the usual checks.
+
+Points specific to LXC:
+
+- **Agent:** a forward reaches services in the same container (for example Docker containers next to RIFT), not services in other containers or VMs; see [How it works](#how-it-works). Other guests on your LAN are reachable only privately, through VPN network grants and `RIFT_AGENT_ALLOW_SUBNETS`.
+- **Server:** the public address must be assigned to the container's interface (for example a bridge with its own public IP). If the Proxmox host forwards the ports to a private container address instead, set it up as behind a cloud NAT: `RIFT_ALLOW_PRIVATE_LISTENERS=true` and the container's private address in `RIFT_PUBLIC_IPS`.
+- Open UDP 51820 and TCP 8443 (and your forward ports) in the Proxmox firewall as well, if it is enabled for the container.
 
 ## Supported protocols
 

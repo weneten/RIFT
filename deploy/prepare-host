@@ -2,11 +2,33 @@
 # One host step before the container starts. RIFT does not change these
 # host-wide sysctls itself: a write from the container is often read-only and
 # does not survive reboot. Safe to run again.
+#
+# Also works inside an LXC container (for example on Proxmox VE): there the
+# sysctls belong to the container's own network namespace, and the WireGuard
+# kernel module has to be loaded on the LXC host.
 set -eu
 if [ "$(id -u)" -ne 0 ]; then
   echo "rift: run as root: sudo sh deploy/prepare-host" >&2
   exit 1
 fi
+
+# The container technology this runs in (lxc, docker, ...), empty on a VM or bare metal.
+container_type() {
+  if command -v systemd-detect-virt > /dev/null 2>&1; then
+    kind=$(systemd-detect-virt --container 2> /dev/null || true)
+    if [ -n "$kind" ] && [ "$kind" != none ]; then
+      echo "$kind"
+      return
+    fi
+  fi
+  if [ -r /run/systemd/container ]; then
+    head -n 1 /run/systemd/container
+    return
+  fi
+  tr '\0' '\n' < /proc/1/environ 2> /dev/null | sed -n 's/^container=//p' | head -n 1
+}
+container=$(container_type)
+
 conf=/etc/sysctl.d/99-rift.conf
 umask 022
 cat > "$conf" << 'EOF'
@@ -16,19 +38,73 @@ net.ipv6.conf.all.forwarding = 1
 net.ipv4.conf.default.rp_filter = 2
 EOF
 write_sysctl() {
-  printf '%s\n' "$2" > "/proc/sys/$(printf '%s' "$1" | tr . /)"
+  path="/proc/sys/$(printf '%s' "$1" | tr . /)"
+  if [ ! -e "$path" ]; then
+    echo "rift: $1 does not exist: this kernel has no IPv6 (disabled with ipv6.disable=1?). RIFT needs IPv6 support in the kernel, even without IPv6 connectivity." >&2
+    exit 1
+  fi
+  if ! printf '%s\n' "$2" 2> /dev/null > "$path"; then
+    echo "rift: cannot set $1 = $2 (/proc/sys is read-only here)." >&2
+    if [ -n "$container" ]; then
+      echo "rift: this is a $container container; it needs a writable /proc/sys/net (LXC's default proc:mixed allows it)." >&2
+    fi
+    exit 1
+  fi
 }
 write_sysctl net.ipv4.ip_forward 1
 write_sysctl net.ipv6.conf.all.forwarding 1
 write_sysctl net.ipv4.conf.default.rp_filter 2
-ns=rift-preflight-$$
-ip netns add "$ns"
-trap 'ip netns del "$ns" 2>/dev/null || true' EXIT
-if ! ip -n "$ns" link add rift-probe type wireguard; then
-  modprobe wireguard 2>/dev/null || true
-  if ! ip -n "$ns" link add rift-probe type wireguard; then
-    echo "rift: this kernel cannot create a WireGuard interface" >&2
-    exit 1
+
+# Can this kernel create a WireGuard interface here?
+wireguard_link() {
+  # $1: an optional network namespace. A fresh namespace keeps the probe away from this
+  # host's interfaces.
+  if [ -n "$1" ]; then
+    ip -n "$1" link add rift-probe type wireguard 2> /dev/null
+  else
+    probe=riftp$$
+    ip link add "$probe" type wireguard 2> /dev/null && ip link del "$probe"
   fi
+}
+probe_wireguard() {
+  ns=rift-preflight-$$
+  if ip netns add "$ns" 2> /dev/null; then
+    trap 'ip netns del "$ns" 2>/dev/null || true' EXIT
+  else
+    # An unprivileged LXC container may not create network namespaces; probe with a
+    # uniquely named interface in this namespace instead, deleted right away.
+    ns=
+  fi
+  wireguard_link "$ns" && return 0
+  # The module may just not be loaded yet. A container cannot load it.
+  if [ -z "$container" ]; then
+    modprobe wireguard 2> /dev/null || true
+    wireguard_link "$ns" && return 0
+  fi
+  return 1
+}
+if ! probe_wireguard; then
+  if [ -n "$container" ]; then
+    echo "rift: this $container container cannot create a WireGuard interface." >&2
+    echo "rift: a container uses the kernel of its host, and only the host can load the module." >&2
+    echo "rift: on the host (for example the Proxmox VE node) run:" >&2
+    echo "rift:   modprobe wireguard" >&2
+    echo "rift:   echo wireguard > /etc/modules-load.d/wireguard.conf" >&2
+    echo "rift: then run this script again here." >&2
+  else
+    echo "rift: this kernel cannot create a WireGuard interface" >&2
+  fi
+  exit 1
 fi
 echo "rift: forwarding sysctls installed in $conf"
+
+if [ "$container" = lxc ]; then
+  echo "rift: running in an LXC container; WireGuard works here."
+  if ! command -v docker > /dev/null 2>&1; then
+    echo "rift: Docker is not installed yet. In LXC it needs the container features nesting=1 and keyctl=1" \
+      "(Proxmox: Options > Features, or pct set ID --features nesting=1,keyctl=1)."
+  elif ! docker info > /dev/null 2>&1; then
+    echo "rift: Docker does not answer. In LXC it needs the container features nesting=1 and keyctl=1" \
+      "(Proxmox: Options > Features, or pct set ID --features nesting=1,keyctl=1), then restart the container." >&2
+  fi
+fi

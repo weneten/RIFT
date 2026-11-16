@@ -1197,7 +1197,11 @@ impl Kernel {
                 if !interface_exists(name).await.unwrap_or(true) {
                     remove_owner_file(&marker_path).await.ok();
                 }
-                return Err(e).context("create WireGuard interface");
+                return Err(e).context(
+                    "create WireGuard interface: the kernel cannot create one here. In an LXC \
+                     container (for example on Proxmox VE) the host must load the module: run \
+                     `modprobe wireguard` there and add it to /etc/modules-load.d/",
+                );
             }
             let token = owner
                 .as_deref()
