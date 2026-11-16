@@ -1024,6 +1024,14 @@ def plaintext_secret_scan(server_cfg, tokens):
             if len(needle) >= 32:
                 keys[path] = needle
     assert any(p.name == "wireguard.key" for p in keys), "no WireGuard key was found to scan for"
+    # tls-bundle.json is by design the durable source of the generated CA and server keys
+    # (src/tls_material.rs); the PEM files are copies of it. It must be private like a key
+    # file and is the one other file allowed to hold them.
+    containers = set()
+    for directory in state_dirs:
+        for path in directory.rglob("tls-bundle.json"):
+            assert path.stat().st_mode & 0o077 == 0, f"{path} is readable by group or others"
+            containers.add(path)
     needles = {f"token of {name}": token for name, token in tokens.items()}
     for path, needle in keys.items():
         needles[f"key {path.relative_to(WORK)}"] = needle
@@ -1045,7 +1053,7 @@ def plaintext_secret_scan(server_cfg, tokens):
         outputs[log.name] = log.read_text(encoding="utf-8", errors="replace")
     for directory in state_dirs:
         for path in directory.rglob("*"):
-            if path.is_file() and path not in keys:
+            if path.is_file() and path not in keys and path not in containers:
                 outputs[str(path.relative_to(WORK))] = path.read_bytes().decode("latin-1")
     for where, text in outputs.items():
         for what, needle in needles.items():
