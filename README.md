@@ -11,7 +11,7 @@ Client ── TCP / UDP ──> RIFT server ── WireGuard ──> RIFT agent 
 
 The agent initiates the connection to the server. RIFT manages the tunnel, explicit forwarding grants and the necessary Linux networking rules. A separate reverse proxy can terminate HTTPS and route domain names to HTTP services through RIFT.
 
-> **Pre-release (0.x).** RIFT changes the host's firewall, routing and sysctls. Several release gates are still open, including cross-agent isolation, forwarding after a server restart and a real NAT cloud; see the [functional test matrix](docs/deploy.md#functional-test-matrix). Configuration and state formats may change between 0.x versions. Read the [changelog](CHANGELOG.md) before updating.
+> **Pre-release (0.x).** RIFT changes the host's firewall, routing and sysctls. The namespace test suite covers agent isolation, forwarding after a server crash or an interrupted start, a simulated 1:1 cloud NAT, expired invitations and a scan for plain-text secrets; a deployment on a real NAT cloud, host reboots and performance are still open. See the [functional test matrix](docs/deploy.md#functional-test-matrix). Configuration and state formats may change between 0.x versions. Read the [changelog](CHANGELOG.md) before updating.
 
 > The examples use Linux Docker Engine with host networking. Host networking and `CAP_NET_ADMIN` let RIFT change the host's networking. Test the deployment and firewall interaction on a disposable system before production. Docker Desktop on Windows or macOS is useful for builds, but does not reproduce this Linux host-network datapath.
 
@@ -56,7 +56,7 @@ On both machines:
 
 On the server:
 
-- A DNS name or IP address reachable by the agent for enrollment and WireGuard. The public address used in forwards must actually be assigned to a server network interface; a DNS name is not valid for `RIFT_PUBLIC_IPS`. A network that only supplies an externally NATed address without assigning it to the server interface (typical for Oracle Cloud, AWS and Google Cloud) needs `RIFT_ALLOW_PRIVATE_LISTENERS=true` and the private interface address in `RIFT_PUBLIC_IPS`; see the configuration table below. That setup follows from the code and unit tests but has not been verified on a real NAT cloud.
+- A DNS name or IP address reachable by the agent for enrollment and WireGuard. The public address used in forwards must actually be assigned to a server network interface; a DNS name is not valid for `RIFT_PUBLIC_IPS`. A network that only supplies an externally NATed address without assigning it to the server interface (typical for Oracle Cloud, AWS and Google Cloud) needs `RIFT_ALLOW_PRIVATE_LISTENERS=true` and the private interface address in `RIFT_PUBLIC_IPS`; see the configuration table below. The namespace test suite runs this setup behind a simulated 1:1 NAT (enrollment, WireGuard and TCP/UDP forwards with the client's own address); it has not yet been verified on a real cloud provider.
 - Allow incoming UDP **51820** for WireGuard and TCP **8443** for enrollment, plus each public TCP or UDP service port you choose. Adjust upstream firewall/security-group rules as well as the host firewall. By default the server only listens on 8443 while an invitation is open (see [Connect an agent](#connect-an-agent)). TCP **8444** is tunnel control and must not be exposed publicly.
 - For a website, a DNS record for its domain and an existing supported reverse proxy listening on TCP 443. Certificate issuance may also require TCP 80.
 
@@ -337,7 +337,9 @@ Replace `203.0.113.10` in the Caddyfile with the same actual interface address u
 
 ### Using the site commands
 
-### Prepare the website and proxy
+The host commands `rift add site`, `rift remove site` and `rift list sites` set up the forward and the proxy configuration for you. Prepare the application and the proxy first, then add the site.
+
+#### Prepare the website and proxy
 
 1. Start the HTTP application on the agent, for example on port `8081`, listening on its tunnel address or on `0.0.0.0`. If it runs in Docker, publish the port on the agent host. Confirm the application itself works before adding RIFT.
 2. Create an A or AAAA DNS record for `app.example.net` pointing to the server's reachable address. Replace all example names with your own.
@@ -346,7 +348,7 @@ Replace `203.0.113.10` in the Caddyfile with the same actual interface address u
 
 The helper assumes particular proxy layouts: Traefik uses a watched file provider, entrypoints `web` and `websecure`, and certificate resolver `myresolver`; Caddy and Nginx must load the generated site directories (`/etc/caddy/rift-sites` and `/etc/nginx/rift-sites`). Adapt your proxy configuration to those paths and reload commands. The helper stores its settings and site records in `/var/lib/rift-site/sites.json`. It uses the first IPv4 address in `RIFT_PUBLIC_IPS` for the proxy's local hop; clients can still reach the site over IPv6 when the proxy listens on IPv6 and the domain has an AAAA record. Inspect the helper and back up proxy configuration before using it on an existing installation.
 
-### Add a site
+#### Add a site
 
 On the **server**, from the checkout, choose the proxy that already owns port 443:
 
@@ -427,11 +429,12 @@ rift remove forward 1
 
 `rift rename agent OLD NEW` and `rift rotate agent NAME` are also available; `rift --help` lists every command. For translated forwards, `rift add ban AGENT FORWARD_ID ADDRESS --ttl 1h` blocks an original client address temporarily; `rift list bans` shows bans. Bans expire by TTL; there is no explicit remove command. Use `--json` for machine-readable administrative output and `rift --help` for the full CLI.
 
-Forwards are shown as a compact table, including the ID used for removal, agent, listener, target port, ingress and state. Agent names are resolved when available; an ID is shown if they cannot be retrieved. For example:
+Forwards are shown as a compact table: the ID used for removal, agent, listener, target port, ingress, allowed sources (FROM), mode, purpose and state. Agent names are resolved when available; an ID is shown if they cannot be retrieved. On the server, the installed `rift` adds a SITE column for forwards that `rift add site` manages. For example:
 
 ```text
-ID  AGENT  PROTO  LISTEN                  TARGET  FAMILY  INGRESS  MODE         STATE
-5   node1  TCP    203.0.113.10:25001     5201    v4      local    transparent  enabled
+ID  AGENT  PROTO  LISTEN              TARGET  FAMILY  INGRESS  FROM  MODE         PURPOSE  STATE    SITE
+1   node1  TCP    203.0.113.10:2222   22      v4      public   any   transparent  user     enabled
+5   node1  TCP    203.0.113.10:20000  8081    v4      local    any   transparent  user     enabled  app.example.net (caddy)
 ```
 
 Normal commands print concise status and confirmations. Use `rift --json status`, `rift --json list forwards`, or `rift --json doctor` for complete machine-readable data. The `--json` format is also used by the site helper and integration tools.
@@ -463,7 +466,7 @@ rift vpn config iphone --export > iphone.conf  # or export a file (contains the 
 | `full` | Every IP protocol to the agent host. Still not its LAN. |
 | `192.168.178.0/24` | An explicitly named private network behind the agent; add `--snat` if the LAN router has no route back (see below). |
 
-Manage devices with `rift list devices`, `rift disable device NAME` / `rift enable device NAME` (reversible) and `rift remove device NAME` (deletes the device, its key and its grants). `rift vpn deny NAME AGENT [TARGET...]` withdraws grants; without selectors it withdraws everything on that agent. Revocation and denial close the path on the server in the same reconcile pass; the agent follows on its next sync.
+Manage devices with `rift list devices`, `rift disable device NAME` / `rift enable device NAME` (reversible) and `rift remove device NAME` (deletes the device, its key and its grants). `rift vpn deny NAME AGENT [TARGET...]` withdraws grants; without selectors it withdraws everything on that agent. A network grant made with `--snat` is withdrawn without repeating `--snat`. Revocation and denial close the path on the server in the same reconcile pass; the agent follows on its next sync.
 
 Main profiles are split-tunnel unless the device has the server [internet exit](#use-rift-as-a-vpn-exit): `AllowedIPs` lists only the granted addresses. Every device has an IPv4 and an IPv6 address; grants use IPv4 only. Exported files and QR codes contain the device's private key, which stays in a mode-0600 file under the state volume and is never logged.
 
@@ -632,7 +635,7 @@ RIFT has two ways to save a server. Pick by what you want to keep.
 | Devices | Get new keys; import their configuration again. | Unchanged. |
 | Use it to | Rebuild from scratch, copy settings to another server, keep a readable record. | Move to another VPS or recover from a lost disk without touching agents or devices. |
 
-All four commands run on the server and read or write files in your current directory. `rift restore` needs `sudo`.
+All four commands run on the server and read or write files in your current directory. `rift restore` needs `sudo`. The others need only Docker access; the examples run `rift backup` with `sudo` so that the archive, which holds every key, belongs to root.
 
 ### Export and import settings
 
@@ -713,7 +716,7 @@ For a fresh start that keeps your settings, not your keys:
 
 ## Command reference
 
-All commands run on the **server** unless noted. `rift COMMAND --help` shows the details of each. `--json` before the command gives machine-readable output, for example `rift --json list forwards`.
+All commands run on the **server** unless noted. `rift COMMAND --help` shows the details of each, including the host commands (sites, `proxy`, `export`, `import`, `backup`, `restore`). `--json` before the command gives machine-readable output, for example `rift --json list forwards`.
 
 **Overview**
 
@@ -743,7 +746,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | Command | What it does |
 | --- | --- |
 | `rift add forward AGENT SPEC...` | Publishes ports. `SPEC` is `LISTEN[:TARGET]/tcp`, `/udp` or `/both`, optionally ending in `/v4` (default), `/v6` or `/all`. Example: `rift add forward node1 2222:22/tcp 53/both 8080:80/tcp/all`. |
-| … `--mode translate` | Bridges IPv6 clients to an IPv4-only service (the service then sees the server, not the client). |
+| … `--mode translate` | Bridges IPv4 and IPv6: an IPv6 listener (`/v6`) to an IPv4-only service, or with `--target-family v6` an IPv4 listener to the agent's IPv6 address. The service then sees the server, not the client; see [IPv4-to-IPv6 and IPv6-to-IPv4](#ipv4-to-ipv6-and-ipv6-to-ipv4). |
 | … `--ingress local` | Only for a reverse proxy on the server; not reachable from the Internet. |
 | … `--listen-ip ADDRESS` | A specific server address, only needed with several addresses of the same IP version. |
 | … `--allow-from ADDRESS[,NETWORK...]` | Only these clients reach the forward; see [Limit a forward to known clients](#limit-a-forward-to-known-clients). |
@@ -751,7 +754,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | `rift remove forward ID` | Deletes a forward. Refuses an `exit` forward. |
 | `rift disable forward ID` / `rift enable forward ID` | Switches a forward off and on again. |
 | `rift add ban AGENT FORWARD_ID IP [--ttl 1h]` | Blocks a client address on a translated forward for a while. |
-| `rift list bans` | Active bans. |
+| `rift list bans` | Active bans with their expiry time (UTC). |
 
 **Websites (host commands, run with `sudo` on the server)**
 
@@ -760,10 +763,9 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | `rift add site AGENT DOMAIN PORT [traefik\|caddy\|nginx\|npm] [--allow-from ADDRESS[,NETWORK...]]` | Publishes `https://DOMAIN` through your reverse proxy to `PORT` on the agent. Without a proxy word the default is used. With `--allow-from` the proxy answers other clients with 403. |
 | `rift list sites` | All sites with their forward state (`ok`, `missing`, `refused`). |
 | `rift remove site DOMAIN` | Removes the site, its proxy configuration and its forward. |
-
-The web panel runs the same two commands through the host service (`rift-site-queue.path`, installed by `deploy/install-cli`); see [Web panel](#web-panel).
-
 | `rift proxy [traefik\|caddy\|nginx\|npm]` | Shows or sets the default proxy. |
+
+The web panel runs `add site` and `remove site` through the host service (`rift-site-queue.path`, installed by `deploy/install-cli`); see [Web panel](#web-panel).
 
 **VPN devices (phones, laptops)**
 
@@ -801,8 +803,8 @@ The web panel runs the same two commands through the host service (`rift-site-qu
 | … `--dry-run` | Shows what would happen and changes nothing. |
 | … `--agent NAME` / `--skip-agent NAME` | Imports only, or leaves out, the entries of an agent. Repeatable. |
 | … `--map OLD=NEW` | Puts the entries of agent OLD on agent NEW. Repeatable. |
-| `rift backup [FILE]` | Saves the whole state, **including every key**, as a private `.tar.gz`. Default file `rift-backup-DATE.tar.gz`. |
-| `sudo rift restore FILE [--yes]` | Replaces all state on this server with a backup, restarts it and re-creates the proxy configuration of the sites. |
+| `sudo rift backup [FILE]` | Saves the whole state, **including every key**, as a private `.tar.gz` (mode 0600). Default file `rift-backup-DATE.tar.gz`. |
+| `sudo rift restore FILE [--yes] [--no-safety-backup]` | Replaces all state on this server with a backup, restarts it and re-creates the proxy configuration of the sites. First saves the current state as `rift-before-restore-DATE-TIME.tar.gz` unless `--no-safety-backup` is given. |
 
 **Run by Docker Compose, not by hand:** `rift server` (the server) and `rift agent` (an agent).
 
@@ -931,3 +933,12 @@ The Linux network-namespace and Docker integration harnesses require disposable 
 ## License
 
 RIFT is released under the [MIT License](LICENSE).
+
+The `rift` binary contains third-party Rust crates under permissive licenses (MIT, Apache-2.0, ISC, BSD-3-Clause, Unicode-3.0); their full license texts are in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). The Docker image also contains unmodified Debian packages, some of them under the GPL (for example iproute2, iptables, nftables and wireguard-tools), which RIFT runs as separate programs. [NOTICE](NOTICE) lists them and says where their licenses and sources are; inside the image all of these files are in `/usr/share/doc/rift/`.
+
+After changing dependencies, regenerate the third-party list (CI checks that it is current and that every license is on the list in `about.toml`):
+
+```sh
+cargo install cargo-about@0.9.3 --locked --features cli
+cargo about generate --locked --fail about.hbs -o THIRD_PARTY_LICENSES.md
+```

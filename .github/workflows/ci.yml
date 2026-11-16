@@ -41,6 +41,17 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y iproute2 wireguard-tools nftables openssh-client openssl curl
       - run: sudo env RIFT_DOCKER_PUBLISHED_VM=1 bash tests/docker/published-port-e2e.sh
 
+  licenses:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-about@0.9.3 --locked --features cli
+      # Fails on a dependency whose license is not in about.toml, and when
+      # THIRD_PARTY_LICENSES.md no longer matches Cargo.lock.
+      - run: cargo about generate --locked --fail about.hbs -o THIRD_PARTY_LICENSES.md
+      - run: git diff --exit-code THIRD_PARTY_LICENSES.md
+
   site-helper:
     runs-on: ubuntu-24.04
     steps:

@@ -12,6 +12,14 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 ### Changed
 
 - `rift vpn config DEVICE [AGENT]` prints the QR code; `--export` prints the configuration file. This is the form of `rift panel connect NAME [--export]`. The old `rift vpn config qr|export ...` answers with the new form. The device names `qr` and `export` are reserved.
+- `rift list bans` shows the expiry as a UTC date and time instead of Unix seconds (`--json` is unchanged).
+- `rift vpn deny` no longer accepts `--snat`, which had no effect there.
+- `rift add site --help`, `rift proxy --help` and the help of the other host commands show the full help text instead of a short usage error. `rift restore --help` lists `--no-safety-backup`.
+- The Docker image contains the licenses of RIFT, of the Rust crates in the binary (`THIRD_PARTY_LICENSES.md`) and a list of its Debian packages with their source versions, under `/usr/share/doc/rift/`; see `NOTICE`.
+
+### Tests
+
+- The namespace suite (`tests/netns/run.py`) also checks agent isolation, forwarding after a server crash, daemons killed in the middle of their start, a server behind a simulated 1:1 cloud NAT, an expired invitation and that no token or private key appears in logs, command output or state files. Unit tests check expired invitations and that the invitation secret is not stored.
 
 ### Fixed
 

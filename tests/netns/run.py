@@ -28,7 +28,13 @@ BR_AGENT = f"rba{PID}"
 BR_BACKEND = f"rbb{PID}"
 WORK = None
 PROCS = []
-NETNS = [VPS, ROUTER, CLIENT, CLIENT_ALT, BACKEND, *AGENTS]
+# A second server behind a 1:1 cloud NAT (Oracle Cloud, AWS, GCP style): only a private
+# address is on its interface, a gateway namespace maps a public address onto it.
+NAT_VPS = f"rnv{PID}"
+NAT_GW = f"rng{PID}"
+NAT_AGENT = f"rna{PID}"
+BR_NAT = f"rbn{PID}"
+NETNS = [VPS, ROUTER, CLIENT, CLIENT_ALT, BACKEND, *AGENTS, NAT_VPS, NAT_GW, NAT_AGENT]
 PUBLIC_V4 = "198.18.0.1"
 PUBLIC_V4_NEW = "198.18.0.2"
 PUBLIC_V6 = "2001:db8:42:5249::1"
@@ -36,6 +42,9 @@ CLIENT_PUBLIC_V6 = "2001:db8:42:5249::10"
 CLIENT_ALT_PUBLIC_V6 = "2001:db8:42:5249::11"
 WG_PUBLIC_NAT = "198.18.0.254"
 SERVER_HOST = "rift-vps.test"
+NAT_PUBLIC_V4 = "198.18.0.50"
+NAT_PRIVATE_V4 = "10.99.0.2"
+NAT_SERVER_HOST = "rift-nat.test"
 MARK = "0x52490000"
 
 
@@ -78,7 +87,8 @@ def attach(nsname, hostif, nsif, bridge):
     ns(nsname, "ip", "link", "set", link_name, "up")
 
 
-def config(state_dir, *, server=False):
+def config(state_dir, *, server=False, endpoint=SERVER_HOST,
+           public_ips=(PUBLIC_V4, PUBLIC_V4_NEW, PUBLIC_V6)):
     values = [
         f'state_dir = "{state_dir}"', 'interface = "rift0"',
         'wg_port = 51820', 'control_port = 8444',
@@ -88,8 +98,8 @@ def config(state_dir, *, server=False):
         'poll_seconds = 2',
     ]
     if server:
-        values += [f'public_endpoint = "{SERVER_HOST}"',
-                   f'public_ips = ["{PUBLIC_V4}", "{PUBLIC_V4_NEW}", "{PUBLIC_V6}"]',
+        values += [f'public_endpoint = "{endpoint}"',
+                   "public_ips = [" + ", ".join(f'"{ip}"' for ip in public_ips) + "]",
                    'enrollment_bind = "0.0.0.0:8443"',
                    'enrollment = "always"']
     return write(WORK / f"{pathlib.Path(state_dir).name}.toml", "\n".join(values) + "\n")
@@ -157,6 +167,7 @@ def cleanup():
     run(["ip", "link", "del", BR_PUBLIC], check=False)
     run(["ip", "link", "del", BR_AGENT], check=False)
     run(["ip", "link", "del", BR_BACKEND], check=False)
+    run(["ip", "link", "del", BR_NAT], check=False)
     for name in NETNS:
         run(["ip", "netns", "del", name], check=False)
         shutil.rmtree(f"/etc/netns/{name}", ignore_errors=True)
@@ -182,6 +193,12 @@ def create_topology():
         attach(name, f"ha{i}{PID}", f"na{i}{PID}", BR_AGENT)
     attach(AGENTS[2], f"hab{PID}", f"nab{PID}", BR_BACKEND)
     attach(BACKEND, f"hbk{PID}", f"nbk{PID}", BR_BACKEND)
+    run(["ip", "link", "add", BR_NAT, "type", "bridge"])
+    run(["ip", "link", "set", BR_NAT, "up"])
+    attach(NAT_GW, f"hgp{PID}", f"ngp{PID}", BR_PUBLIC)
+    attach(NAT_GW, f"hgn{PID}", f"ngn{PID}", BR_NAT)
+    attach(NAT_VPS, f"hnv{PID}", f"nnv{PID}", BR_NAT)
+    attach(NAT_AGENT, f"hna{PID}", f"nna{PID}", BR_AGENT)
 
     ns(VPS, "ip", "addr", "add", f"{PUBLIC_V4}/24", "dev", "eth0")
     ns(VPS, "ip", "addr", "add", f"{PUBLIC_V4_NEW}/24", "dev", "eth0")
@@ -210,6 +227,7 @@ def create_topology():
     ns(BACKEND, "ip", "route", "add", "198.18.0.0/24", "via", "10.77.0.1")
     ns(ROUTER, "sysctl", "-qw", "net.ipv4.ip_forward=1")
     ns(ROUTER, "sysctl", "-qw", "net.ipv6.conf.all.forwarding=1")
+    create_nat_cloud_topology()
     ns(VPS, "sysctl", "-qw", "net.ipv4.ip_forward=1")
     ns(VPS, "sysctl", "-qw", "net.ipv6.conf.all.forwarding=1")
     ns(CLIENT, "sysctl", "-qw", "net.ipv4.ip_forward=1")
@@ -225,6 +243,29 @@ def create_topology():
           "nft 'add chain inet rift_test_filter forward { type filter hook forward priority filter; policy accept; }'")
 
 
+def create_nat_cloud_topology():
+    """The public address lives only on the gateway, which translates it 1:1 to the server's
+    private address, as a cloud provider's NAT does. Client addresses are not translated."""
+    ns(NAT_GW, "ip", "addr", "add", f"{NAT_PUBLIC_V4}/24", "dev", "eth0")
+    ns(NAT_GW, "ip", "addr", "add", "10.99.0.1/24", "dev", "eth1")
+    ns(NAT_GW, "sysctl", "-qw", "net.ipv4.ip_forward=1")
+    sh_ns(NAT_GW, "nft add table ip cloud_nat; "
+          "nft 'add chain ip cloud_nat prerouting { type nat hook prerouting priority dstnat; policy accept; }'; "
+          "nft 'add chain ip cloud_nat postrouting { type nat hook postrouting priority srcnat; policy accept; }'; "
+          f"nft add rule ip cloud_nat prerouting iifname eth0 ip daddr {NAT_PUBLIC_V4} dnat to {NAT_PRIVATE_V4}; "
+          f"nft add rule ip cloud_nat postrouting oifname eth0 ip saddr {NAT_PRIVATE_V4} snat to {NAT_PUBLIC_V4}")
+    ns(NAT_VPS, "ip", "addr", "add", f"{NAT_PRIVATE_V4}/24", "dev", "eth0")
+    ns(NAT_VPS, "ip", "route", "add", "default", "via", "10.99.0.1")
+    ns(NAT_VPS, "sysctl", "-qw", "net.ipv4.ip_forward=1")
+    ns(NAT_VPS, "sysctl", "-qw", "net.ipv6.conf.all.forwarding=1")
+    ns(NAT_AGENT, "ip", "addr", "add", "172.31.0.9/24", "dev", "eth0")
+    ns(NAT_AGENT, "ip", "route", "add", "default", "via", "172.31.0.1")
+    ns(NAT_AGENT, "sysctl", "-qw", "net.ipv4.ip_forward=1")
+    ns(NAT_AGENT, "sysctl", "-qw", "net.ipv6.conf.all.forwarding=1")
+    write(pathlib.Path(f"/etc/netns/{NAT_AGENT}") / "hosts",
+          f"127.0.0.1 localhost\n{NAT_PUBLIC_V4} {NAT_SERVER_HOST}\n", 0o644)
+
+
 def install_foreign_state():
     sh_ns(VPS, "nft add table inet rift_preserve; "
           "nft 'add chain inet rift_preserve input { type filter hook input priority 0; policy accept; }'; "
@@ -238,17 +279,20 @@ ECHO = r'''#!/usr/bin/env python3
 import socket,sys
 family=socket.AF_INET6 if sys.argv[1] == "6" else socket.AF_INET
 kind=socket.SOCK_DGRAM if sys.argv[2] == "udp" else socket.SOCK_STREAM
+# Without a fifth argument the reply is the client address the service saw; with one it is
+# that fixed text, which names the agent that answered.
+tag=sys.argv[5] if len(sys.argv) > 5 else None
 s=socket.socket(family,kind); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
 s.bind((sys.argv[3],int(sys.argv[4])))
 if kind == socket.SOCK_STREAM:
  s.listen(32)
  while True:
   c,a=s.accept()
-  try: c.sendall(a[0].encode())
+  try: c.sendall((tag or a[0]).encode())
   finally: c.close()
 else:
  while True:
-  data,a=s.recvfrom(4096); s.sendto(a[0].encode(),a)
+  data,a=s.recvfrom(4096); s.sendto((tag or a[0]).encode(),a)
 '''
 
 
@@ -741,6 +785,253 @@ def disable_remove_test(server_cfg):
     print("PASS disabled and removed agents no longer receive IPv4/IPv6 forwards")
 
 
+def agent_isolation_test(server_cfg):
+    """Each forward reaches only its own agent, and agents cannot reach each other."""
+    env = {"RIFT_PUBLIC_ENDPOINT": SERVER_HOST,
+           "RIFT_PUBLIC_IPS": f"{PUBLIC_V4},{PUBLIC_V4_NEW},{PUBLIC_V6}"}
+    echo_file = write(WORK / "echo.py", ECHO, 0o755)
+    records = {r["name"]: r for r in status(server_cfg)["snapshot"]["agents"]}
+    names = ["agent1", "agent2", "agent3"]
+    # Every agent answers on the same target port with its own name.
+    for namespace, name in zip(AGENTS, names):
+        for fam, address in (("4", records[name]["tunnel_ipv4"]), ("6", records[name]["tunnel_ipv6"])):
+            for proto in ("tcp", "udp"):
+                start_echo_process(namespace, echo_file, [fam, proto, address, "19083", name],
+                                   f"identity-{name}-{fam}-{proto}")
+                wait_echo_ready(namespace, fam, proto, address, 19083)
+    ports = {}
+    for idx, name in enumerate(names):
+        for fam, listen_ip in (("4", PUBLIC_V4), ("6", PUBLIC_V6)):
+            for proto in ("tcp", "udp"):
+                port = 18140 + idx * 4 + (0 if fam == "4" else 2) + (0 if proto == "tcp" else 1)
+                cli(VPS, server_cfg, "add", "forward", name, f"{port}:19083/{proto}",
+                    "--listen-ip", listen_ip, env=env)
+                ports[(name, fam, proto)] = (listen_ip, port)
+    wait_policy(server_cfg, 3)
+    identity = r"""import socket,sys
+fam=socket.AF_INET6 if sys.argv[1]=="6" else socket.AF_INET
+s=socket.socket(fam,socket.SOCK_DGRAM if sys.argv[2]=="udp" else socket.SOCK_STREAM); s.settimeout(4)
+s.connect((sys.argv[3],int(sys.argv[4]))); s.sendall(b"who")
+print(s.recv(64).decode())
+"""
+    for (name, fam, proto), (listen_ip, port) in ports.items():
+        answer = ns(CLIENT, "python3", "-c", identity, fam, proto, listen_ip, str(port)).stdout.strip()
+        assert answer == name, f"forward {listen_ip}:{port}/{proto} of {name} was answered by {answer!r}"
+    print("PASS every agent's forwards reach only that agent (IPv4/IPv6, TCP/UDP)")
+
+    # The server's WireGuard peers: each agent may send only from its own tunnel addresses,
+    # so one agent cannot pose as another inside the tunnel.
+    dump = ns(VPS, "wg", "show", "rift0", "allowed-ips").stdout
+    allowed = {}
+    for line in dump.splitlines():
+        key, _, rest = line.partition("\t")
+        allowed[key] = set(rest.split())
+    for name in names:
+        record = records[name]
+        own = {f"{record['tunnel_ipv4']}/32", f"{record['tunnel_ipv6']}/128"}
+        mine = [ips for ips in allowed.values() if own & ips]
+        assert len(mine) == 1, f"{name}'s tunnel addresses belong to {len(mine)} WireGuard peers: {dump}"
+        others = set().union(*(
+            {f"{records[o]['tunnel_ipv4']}/32", f"{records[o]['tunnel_ipv6']}/128"}
+            for o in names if o != name))
+        assert not (mine[0] & others), f"{name}'s peer also carries another agent's address: {dump}"
+
+    # Agent to agent through the server: no answer on any family or transport. Each probe
+    # gets a host route into the tunnel first, as a compromised agent would add, so the
+    # packets really reach the server and it is the server that must drop them.
+    probe = r"""import socket,sys
+fam=socket.AF_INET6 if ":" in sys.argv[1] else socket.AF_INET
+s=socket.socket(fam,socket.SOCK_DGRAM if sys.argv[3]=="udp" else socket.SOCK_STREAM); s.settimeout(2)
+try:
+    s.connect((sys.argv[1],int(sys.argv[2]))); s.sendall(b"cross"); data=s.recv(64)
+    print("answered:"+data.decode()); sys.exit(0)
+except OSError as error:
+    print(f"no answer: {error}"); sys.exit(3)
+"""
+    for source_ns, source in zip(AGENTS, names):
+        for target in names:
+            if target == source:
+                continue
+            for address in (records[target]["tunnel_ipv4"], records[target]["tunnel_ipv6"]):
+                family, prefix = ("-6", "128") if ":" in address else ("-4", "32")
+                ns(source_ns, "ip", family, "route", "replace", f"{address}/{prefix}", "dev", "rift0")
+                try:
+                    for proto in ("tcp", "udp"):
+                        result = ns(source_ns, "python3", "-c", probe, address, "19083", proto,
+                                    check=False)
+                        assert result.returncode == 3, \
+                            f"{source} reached {target} at {address}/{proto} through the tunnel: {result.stdout}"
+                finally:
+                    ns(source_ns, "ip", family, "route", "del", f"{address}/{prefix}", "dev", "rift0",
+                       check=False)
+    print("PASS agents cannot reach each other's tunnel addresses through the server")
+
+
+def wait_forwarding_after_restart(server_cfg, names, ports, what):
+    def online():
+        health = {agent["name"]: agent for agent in status(server_cfg)["agent_health"]}
+        return all(health.get(name, {}).get("online") for name in names)
+    wait_until(online, f"agents to handshake after {what}", timeout=75)
+
+    def restored():
+        traffic_test(names, ports)
+        return True
+    wait_until(restored, f"forwarded traffic to recover after {what}", timeout=75)
+
+
+def assert_single_owner_rules(namespace):
+    """A crash and a restart must not leave a second copy of RIFT's policy rules."""
+    for family in ("-4", "-6"):
+        rules = [line for line in ns(namespace, "ip", family, "rule", "show").stdout.splitlines()
+                 if line.startswith(("11000:", "11001:"))]
+        assert len(rules) == len(set(rules)), f"duplicate RIFT policy rules in {namespace}: {rules}"
+    tables = ns(namespace, "nft", "list", "tables").stdout.split("\n")
+    assert tables.count("table inet rift") <= 1, f"duplicate RIFT nftables table in {namespace}"
+
+
+def kill_during_startup(namespace, cfg, command, env, label):
+    """Starts a daemon and kills it as soon as it has begun to change the network (its
+    WireGuard interface exists), i.e. before it has finished applying its state."""
+    process = daemon(namespace, cfg, command, env, label=label)
+    def started_changing():
+        if process.poll() is not None:
+            raise RuntimeError(f"{label} exited before it was interrupted")
+        return ns(namespace, "ip", "link", "show", "rift0", check=False, timeout=5).returncode == 0
+    deadline = time.monotonic() + 35
+    while not started_changing():
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"{label} never created rift0")
+        time.sleep(0.05)
+    stop_process(process, signal.SIGKILL)
+    assert process.poll() is not None, f"{label} survived SIGKILL"
+
+
+def expired_invitation_test(server_cfg, token, created_at):
+    """An invitation whose TTL has passed is refused and creates no agent."""
+    remaining = created_at + 62 - time.monotonic()
+    if remaining > 0:
+        time.sleep(remaining)
+    invites = status(server_cfg)["invites"]
+    assert not any(invite["name"] == "expiring" for invite in invites), \
+        f"rift status still lists an expired invitation: {invites}"
+    cfg = config(WORK / "state-expired", server=False)
+    proc = daemon(AGENTS[2], cfg, ["agent"],
+                  {"RIFT_SERVER": f"{SERVER_HOST}:8443", "RIFT_AGENT_NAME": "expiring",
+                   "RIFT_ENROLLMENT_TOKEN": token}, label="expired")
+    wait_until(lambda: "expired" in (WORK / "expired.log").read_text(
+        encoding="utf-8", errors="replace").lower(), "expired invitation rejection", timeout=20)
+    stop_process(proc, signal.SIGKILL)
+    agents = status(server_cfg)["snapshot"]["agents"]
+    assert not any(a["name"] == "expiring" for a in agents), "an expired invitation enrolled an agent"
+    print("PASS an invitation is refused once its TTL has passed and creates no agent")
+
+
+def nat_cloud_test(tokens):
+    """A server that has only a private address behind a 1:1 NAT, as on Oracle Cloud, AWS or
+    Google Cloud, set up as the README says: RIFT_ALLOW_PRIVATE_LISTENERS=true, the private
+    interface address in RIFT_PUBLIC_IPS and the public DNS name in RIFT_PUBLIC_ENDPOINT."""
+    env = {"RIFT_PUBLIC_ENDPOINT": NAT_SERVER_HOST, "RIFT_PUBLIC_IPS": NAT_PRIVATE_V4,
+           "RIFT_ALLOW_PRIVATE_LISTENERS": "true", "RIFT_ENROLLMENT_BIND": "0.0.0.0:8443",
+           "RIFT_ENROLLMENT": "always"}
+    cfg = config(WORK / "state-natserver", server=True, endpoint=NAT_SERVER_HOST,
+                 public_ips=(NAT_PRIVATE_V4,))
+    refused = ns(NAT_VPS, str(BIN), "--config", str(cfg), "config", "validate", check=False,
+                 env={**os.environ, **env, "RIFT_ALLOW_PRIVATE_LISTENERS": "false"})
+    assert refused.returncode != 0, "a private listener address was accepted without RIFT_ALLOW_PRIVATE_LISTENERS"
+    ns(NAT_VPS, str(BIN), "--config", str(cfg), "config", "validate", env={**os.environ, **env})
+    daemon(NAT_VPS, cfg, ["server"], env, label="nat-server")
+
+    def nat_status():
+        return json.loads(cli(NAT_VPS, cfg, "status", env=env).stdout)
+    wait_until(lambda: cli(NAT_VPS, cfg, "status", env=env).returncode == 0,
+               "NAT server admin socket", timeout=35)
+    token = json.loads(cli(NAT_VPS, cfg, "add", "agent", "natagent", "--ttl", "15m", env=env).stdout)["token"]
+    tokens["natagent"] = token
+    agent_cfg = config(WORK / "state-natagent", server=False)
+    daemon(NAT_AGENT, agent_cfg, ["agent"], {"RIFT_SERVER": f"{NAT_SERVER_HOST}:8443",
+                                             "RIFT_AGENT_NAME": "natagent",
+                                             "RIFT_ENROLLMENT_TOKEN": token}, label="nat-agent")
+
+    def active():
+        agents = nat_status()["snapshot"]["agents"]
+        return next((a for a in agents if a["name"] == "natagent" and a["status"] == "active"), None)
+    record = wait_until(active, "the agent behind the cloud NAT to become active")
+    endpoint = ns(NAT_AGENT, "wg", "show", "rift0", "endpoints").stdout
+    assert f"{NAT_PUBLIC_V4}:51820" in endpoint, f"agent does not dial the public NAT address: {endpoint}"
+
+    echo_file = write(WORK / "echo.py", ECHO, 0o755)
+    for proto, port in (("tcp", 19080), ("udp", 19081)):
+        start_echo_process(NAT_AGENT, echo_file, ["4", proto, record["tunnel_ipv4"], str(port)],
+                           f"echo-natagent-{proto}")
+        wait_echo_ready(NAT_AGENT, "4", proto, record["tunnel_ipv4"], port)
+    for spec in ("18200:19080/tcp", "18201:19081/udp"):
+        created = cli(NAT_VPS, cfg, "add", "forward", "natagent", spec, env=env).stdout
+        assert NAT_PRIVATE_V4 in created, f"forward {spec} does not listen on the private address: {created}"
+
+    def applied():
+        current = nat_status()
+        snap = current["snapshot"]
+        return (current.get("fully_applied") is True and not current.get("pending_forwards")
+                and current.get("apply_error") is None
+                and all(a["applied_generation"] >= snap["generation"] for a in snap["agents"]))
+    wait_until(applied, "the NAT server's agent to apply its forwards")
+
+    def reachable():
+        for proto, port in (("tcp", "18200"), ("udp", "18201")):
+            ns(CLIENT, "python3", "-c", _client_probe(), "4", proto, "198.18.0.10",
+               NAT_PUBLIC_V4, port)
+        return True
+    wait_until(reachable, "forwards on the public NAT address", timeout=30)
+    print("PASS a server behind a 1:1 cloud NAT enrolls an agent and forwards TCP/UDP "
+          "on the public address with the client's own source address")
+
+
+def plaintext_secret_scan(server_cfg, tokens):
+    """No invitation token or private key appears in a log, in normal command output or in
+    any state file other than the key's own mode-0600 file."""
+    state_dirs = sorted(p for p in WORK.iterdir() if p.is_dir() and p.name.startswith("state-"))
+    keys = {}
+    for directory in state_dirs:
+        for path in directory.rglob("*.key"):
+            assert path.stat().st_mode & 0o077 == 0, f"{path} is readable by group or others"
+            text = path.read_text(encoding="utf-8", errors="replace")
+            lines = [line.strip() for line in text.splitlines()
+                     if line.strip() and not line.startswith("-----")]
+            # A single long line of the key is enough to recognise a copy of it.
+            needle = max(lines, key=len) if lines else ""
+            if len(needle) >= 32:
+                keys[path] = needle
+    assert any(p.name == "wireguard.key" for p in keys), "no WireGuard key was found to scan for"
+    needles = {f"token of {name}": token for name, token in tokens.items()}
+    for path, needle in keys.items():
+        needles[f"key {path.relative_to(WORK)}"] = needle
+    # Bare secrets inside tokens, in case a token is decoded and its parts logged.
+    for name, token in tokens.items():
+        try:
+            bundle = json.loads(base64.urlsafe_b64decode(token[3:] + "=="))
+            needles[f"secret of {name}"] = bundle["secret"]
+        except (ValueError, KeyError):
+            pass
+
+    outputs = {}
+    for args in (["status"], ["list", "agents"], ["list", "forwards"], ["list", "devices"],
+                 ["show", "agent", "agent1"], ["logs", "--lines", "2000"], ["doctor"],
+                 ["export", "-"]):
+        result = ns(VPS, str(BIN), "--config", str(server_cfg), "--json", *args, check=False)
+        outputs[f"rift {' '.join(args)}"] = result.stdout + result.stderr
+    for log in WORK.glob("*.log"):
+        outputs[log.name] = log.read_text(encoding="utf-8", errors="replace")
+    for directory in state_dirs:
+        for path in directory.rglob("*"):
+            if path.is_file() and path not in keys:
+                outputs[str(path.relative_to(WORK))] = path.read_bytes().decode("latin-1")
+    for where, text in outputs.items():
+        for what, needle in needles.items():
+            assert needle not in text, f"{what} appears in plain text in {where}"
+    print(f"PASS no token or private key in {len(outputs)} logs, outputs and state files; "
+          f"{len(keys)} key files are mode 0600")
+
+
 def main():
     global WORK
     if sys.platform != "linux" or os.geteuid() != 0:
@@ -780,6 +1071,10 @@ def main():
         server_proc = daemon(VPS, server_cfg, ["server"], server_env)
         wait_until(lambda: cli(VPS, server_cfg, "status", env=server_env).returncode == 0,
                    "RIFT server admin socket", timeout=35)
+        # Created now and used at the end, once its one-minute TTL has passed.
+        expiring_token = json.loads(cli(VPS, server_cfg, "add", "agent", "expiring", "--ttl", "1m",
+                                        env=server_env).stdout)["token"]
+        expiring_created = time.monotonic()
         for secret in (WORK / "state-server" / "tls-server.key",
                        WORK / "state-server" / "tls-ca.key"):
             assert secret.exists() and secret.stat().st_mode & 0o077 == 0, \
@@ -801,6 +1096,7 @@ def main():
         ports = add_forwards(server_cfg, ["agent1", "agent2", "agent3"])
         wait_policy(server_cfg, 3)
         traffic_test(["agent1", "agent2", "agent3"], ports)
+        agent_isolation_test(server_cfg)
         fail2ban_coexistence_test(server_cfg, ports)
         agent_local_ban_test(server_cfg)
         translation_ban_test(server_cfg)
@@ -813,16 +1109,22 @@ def main():
         migrate_nat_port(server_cfg)
         disable_remove_test(server_cfg)
         replay_and_wrong_ca(server_cfg, tokens["agent1"])
+        tokens["expiring"] = expiring_token
+        expired_invitation_test(server_cfg, expiring_token, expiring_created)
 
         # Hard-crash and restart the server with its persistent state. The
         # unrelated nftables table and foreign policy rule must survive.
         stop_process(server_proc, signal.SIGKILL)
-        server_proc = daemon(VPS, server_cfg, ["server"], server_env)
+        # A label of its own keeps the first server log for the secret scan at the end.
+        server_proc = daemon(VPS, server_cfg, ["server"], server_env, label="server-after-crash")
         wait_until(lambda: cli(VPS, server_cfg, "status", env=server_env).returncode == 0,
                    "RIFT server to restart from saved state", timeout=35)
         assert ns(VPS, "nft", "list", "table", "inet", "rift_preserve").stdout == prior[0]
         assert ns(VPS, "ip", "rule", "show").stdout == prior[1], "foreign policy rules changed after restart"
         print("PASS crash/restart preserves existing firewall objects and policy rules")
+        wait_forwarding_after_restart(server_cfg, ["agent1", "agent2"], ports, "a server crash")
+        assert_single_owner_rules(VPS)
+        print("PASS forwarding works again after the server was killed and restarted")
 
         # Orderly shutdown removes RIFT state without touching unrelated rules;
         # persistent identities and grants restore service after both restart.
@@ -842,24 +1144,30 @@ def main():
         assert ns(VPS, "ip", "rule", "show").stdout == prior[1]
         expect_tcp_unreachable(ports[("agent1", PUBLIC_V4, "tcp")], PUBLIC_V4)
         check_normal_traffic()
-        server_proc = daemon(VPS, server_cfg, ["server"], server_env)
+        # Interrupt both daemons while they start (after they began to change the network),
+        # then start them again: the second start must take over the half-applied state.
+        agent1_env = {"RIFT_SERVER": f"{SERVER_HOST}:8443", "RIFT_AGENT_NAME": "agent1"}
+        kill_during_startup(VPS, server_cfg, ["server"], server_env, "server-interrupted")
+        server_proc = daemon(VPS, server_cfg, ["server"], server_env, label="server-after-interrupt")
         wait_until(lambda: cli(VPS, server_cfg, "status", env=server_env).returncode == 0,
-                   "server after orderly restart", timeout=35)
-        daemon(AGENTS[0], agent_cfgs[0], ["agent"], {"RIFT_SERVER": f"{SERVER_HOST}:8443",
-               "RIFT_AGENT_NAME": "agent1"})
+                   "server after an interrupted start", timeout=35)
+        kill_during_startup(AGENTS[0], agent_cfgs[0], ["agent"], agent1_env, "agent1-interrupted")
+        daemon(AGENTS[0], agent_cfgs[0], ["agent"], agent1_env, label="agent1-after-interrupt")
         wait_agents(server_cfg, 2)
         wait_policy(server_cfg, 2)
         # Agent records and applied generations persist across the restart;
         # they do not prove that the new WireGuard interface has handshakes.
-        def restarted_agents_online():
-            health = {agent["name"]: agent for agent in status(server_cfg)["agent_health"]}
-            return all(health.get(name, {}).get("online") for name in ("agent1", "agent2"))
-        wait_until(restarted_agents_online, "both agents to handshake after server restart", timeout=75)
-        def restored_traffic():
-            traffic_test(["agent1", "agent2"], ports)
-            return True
-        wait_until(restored_traffic, "forwarded traffic to recover after restart", timeout=75)
-        print("PASS orderly stop cleans networking and restart restores forwarding")
+        wait_forwarding_after_restart(server_cfg, ["agent1", "agent2"], ports,
+                                      "an interrupted start")
+        for name in (VPS, AGENTS[0]):
+            assert_single_owner_rules(name)
+        assert ns(VPS, "nft", "list", "table", "inet", "rift_preserve").stdout == prior[0]
+        assert ns(VPS, "ip", "rule", "show").stdout == prior[1]
+        check_normal_traffic()
+        print("PASS orderly stop cleans networking; a start interrupted mid-apply recovers on "
+              "the next start and restores forwarding")
+        nat_cloud_test(tokens)
+        plaintext_secret_scan(server_cfg, tokens)
         print("PASS namespace integration suite completed; no performance numbers were collected")
     except Exception:
         # Preserve diagnostics in the job log before cleanup removes the scratch directory.

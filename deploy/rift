@@ -38,19 +38,28 @@ fi
 
 # Server only from here on.
 
-# Sites live on the host: the helper writes the proxy configuration.
-case "${1-} ${2-}" in
-    "add site" | "remove site")
-        cmd=$1
-        shift 2
-        exec "$site" "$cmd" "$@"
-        ;;
-    "list sites")
-        exec "$site" list
-        ;;
+# `--help` and `-h` are answered by the container's own help text, which describes the host
+# commands too.
+help=
+case " $* " in
+    *" --help "* | *" -h "*) help=1 ;;
 esac
+
+# Sites live on the host: the helper writes the proxy configuration.
+if [ -z "$help" ]; then
+    case "${1-} ${2-}" in
+        "add site" | "remove site")
+            cmd=$1
+            shift 2
+            exec "$site" "$cmd" "$@"
+            ;;
+        "list sites")
+            exec "$site" list
+            ;;
+    esac
+fi
 # Commands that read or write files in the current directory run on the host; the container
-# only produces and consumes streams. `--help` is answered by the container's own help text.
+# only produces and consumes streams.
 json=
 if [ "${1-}" = --json ]; then
     case "${2-}" in
@@ -60,21 +69,18 @@ if [ "${1-}" = --json ]; then
             ;;
     esac
 fi
-case "${1-}" in
-    export | import | backup | restore)
-        case " $* " in
-            *" --help "* | *" -h "*) ;;
-            *)
-                cmd=$1
-                shift
-                exec "$site" "$cmd" $json "$@"
-                ;;
-        esac
-        ;;
-esac
-if [ "${1-}" = proxy ]; then
-    shift
-    exec "$site" proxy "$@"
+if [ -z "$help" ]; then
+    case "${1-}" in
+        export | import | backup | restore)
+            cmd=$1
+            shift
+            exec "$site" "$cmd" $json "$@"
+            ;;
+        proxy)
+            shift
+            exec "$site" proxy "$@"
+            ;;
+    esac
 fi
 
 if [ "${1-}" = list ] && [ "${2-}" = forwards ] && [ "$#" -eq 2 ] && [ -x "$site" ]; then

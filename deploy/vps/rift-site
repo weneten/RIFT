@@ -2027,7 +2027,7 @@ def usage():
         "       rift export [FILE]\n"
         "       rift import FILE [--agent NAME]... [--skip-agent NAME]... [--map OLD=NEW]... [--dry-run]\n"
         "       rift backup [FILE]\n"
-        "       rift restore FILE [--yes]"
+        "       rift restore FILE [--yes] [--no-safety-backup]"
     )
 
 

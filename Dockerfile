@@ -14,6 +14,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && install -d -m 0700 /var/lib/rift /etc/rift
 COPY --from=build /src/target/release/rift /usr/local/bin/rift
+# Licenses of RIFT and of everything it ships with; see NOTICE.
+COPY LICENSE NOTICE THIRD_PARTY_LICENSES.md /usr/share/doc/rift/
+RUN dpkg-query -W -f='${binary:Package} ${Version} source: ${source:Package} ${source:Version}\n' \
+      > /usr/share/doc/rift/debian-packages.txt
 USER 0:0
 WORKDIR /
 HEALTHCHECK --interval=30s --timeout=20s --start-period=90s --retries=3 \

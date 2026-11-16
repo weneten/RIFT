@@ -1,0 +1,38 @@
+RIFT - Rust Internet Forwarding Tunnel
+Copyright (c) 2026 weneten and RIFT contributors
+
+RIFT is released under the MIT License; see LICENSE. This file lists the
+third-party components that are distributed together with RIFT and where
+their licenses and sources are. None of them changes RIFT's own license.
+
+
+1. Rust crates compiled into the `rift` binary
+
+The binary contains the Rust crates listed with their full license texts in
+THIRD_PARTY_LICENSES.md (in the Docker image: /usr/share/doc/rift/). They are
+licensed under the MIT, Apache-2.0, ISC, BSD-3-Clause and Unicode-3.0
+licenses, all of which permit use in an MIT-licensed program.
+
+The crate libsqlite3-sys embeds the SQLite library, which its authors have
+dedicated to the public domain (https://sqlite.org/copyright.html).
+
+
+2. Debian packages in the Docker image
+
+The Docker image (weneten/rift) is built on the official debian:bookworm-slim
+image and adds the unmodified Debian packages ca-certificates, iproute2,
+iptables, nftables and wireguard-tools together with their dependencies.
+The `rift` binary is dynamically linked against the GNU C Library (glibc,
+LGPL-2.1-or-later) from that base image.
+
+These packages keep their own licenses. Several of them, among them iproute2,
+iptables, nftables and wireguard-tools, are licensed under the GNU General
+Public License version 2. RIFT runs these tools as separate programs and does
+not link against them.
+
+- License texts: /usr/share/doc/<package>/copyright inside the image.
+- Exact package and source versions: /usr/share/doc/rift/debian-packages.txt
+  inside the image (written when the image is built).
+- Corresponding source code: every listed source version is available from
+  the Debian archive, for example with `apt-get source <package>=<version>`
+  or from https://snapshot.debian.org/.

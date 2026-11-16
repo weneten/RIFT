@@ -84,4 +84,4 @@ Cross-family translation is an opt-in TCP/UDP forwarder in the same binary. Its 
 
 ## Evidence boundary
 
-Unit tests, real loopback TLS tests, and IPv4/IPv6 translation tests can run on a developer machine. They do not prove transparent kernel forwarding, Fail2ban, Docker publication or production SSH continuity. The Linux namespace and Docker integration suites exercise those paths on disposable privileged runners. SFTP, Traefik, full host reboots, staging firewall combinations and iperf3 measurements remain explicit release gates until their real results are recorded.
+Unit tests, real loopback TLS tests, and IPv4/IPv6 translation tests can run on a developer machine. They do not prove transparent kernel forwarding, Fail2ban, Docker publication or production SSH continuity. The Linux namespace and Docker integration suites exercise those paths on disposable privileged runners. SFTP, Traefik, full host reboots, staging firewall combinations, a real cloud NAT (the namespace suite simulates one) and iperf3 measurements remain explicit release gates until their real results are recorded.

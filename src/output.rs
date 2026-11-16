@@ -15,6 +15,20 @@ fn field(value: &Value, name: &str) -> String {
     text(&value[name])
 }
 
+/// A ban's expiry (Unix seconds) as a UTC date and time, for example `2026-11-16 10:00:00`.
+fn ban_expiry(value: &Value) -> String {
+    match value.as_i64().and_then(|t| u64::try_from(t).ok()) {
+        Some(seconds) => {
+            let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+            humantime::format_rfc3339_seconds(at)
+                .to_string()
+                .trim_end_matches('Z')
+                .replacen('T', " ", 1)
+        }
+        None => text(value),
+    }
+}
+
 fn table(headers: &[&str], rows: Vec<Vec<String>>, empty: &str) -> String {
     if rows.is_empty() {
         return empty.into();
@@ -602,8 +616,8 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
         AdminRequest::CancelInvite { name } => format!("Invitation for {name} cancelled."),
         AdminRequest::Ban { ip, forward_id, .. } => format!("Address {ip} banned for forward {forward_id}."),
         AdminRequest::BansList => {
-            let rows = data.as_array().into_iter().flatten().map(|b| vec![field(b, "id"), field(b, "forward_id"), field(b, "ip"), field(b, "expires_at")]).collect();
-            table(&["ID", "FORWARD", "ADDRESS", "EXPIRES (UNIX)"], rows, "No active bans.")
+            let rows = data.as_array().into_iter().flatten().map(|b| vec![field(b, "id"), field(b, "forward_id"), field(b, "ip"), ban_expiry(&b["expires_at"])]).collect();
+            table(&["ID", "FORWARD", "ADDRESS", "EXPIRES (UTC)"], rows, "No active bans.")
         },
         AdminRequest::VpnPeerAdd { name } => format!("VPN device {name} registered with addresses {} and {}.\nNext: rift vpn allow {name} AGENT 22/tcp (or server), then rift vpn config {name}\nFor an internet exit, which is a profile of its own: rift vpn allow {name} exit (this server) or rift vpn allow {name} AGENT exit, then rift vpn config {name} [AGENT]", field(data, "ipv4"), field(data, "ipv6")),
         AdminRequest::VpnPeerList => vpn_peers(data),
@@ -655,6 +669,14 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn bans_show_their_expiry_as_utc_time() {
+        let data = json!([{"id":1,"forward_id":4,"ip":"198.51.100.7","expires_at":1_794_823_200}]);
+        let output = render(&AdminRequest::BansList, &data, None);
+        assert!(output.contains("EXPIRES (UTC)"), "{output}");
+        assert!(output.contains("2026-11-16 10:00:00"), "{output}");
+    }
 
     #[test]
     fn forwards_show_names_ranges_ipv6_and_fallback_ids() {

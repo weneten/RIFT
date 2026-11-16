@@ -473,4 +473,93 @@ mod tests {
         assert_eq!(wireguard_endpoint(stored, Some("host:notaport")), stored);
         assert_eq!(wireguard_endpoint(stored, Some("")), stored);
     }
+
+    const TEST_CA: &str = "-----BEGIN CERTIFICATE-----\ntest-ca\n-----END CERTIFICATE-----\n";
+
+    fn enrollment_fixture() -> (tempfile::TempDir, Config, StateStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("tls-ca.crt");
+        std::fs::write(&ca, TEST_CA).unwrap();
+        let config = Config {
+            state_dir: dir.path().to_path_buf(),
+            public_endpoint: "rift.example.net".into(),
+            tls_ca: Some(ca),
+            ..Config::default()
+        };
+        let state = StateStore::open(&dir.path().join("state.db")).unwrap();
+        (dir, config, state)
+    }
+
+    fn request(token: &str, name: &str) -> EnrollmentRequest {
+        EnrollmentRequest {
+            version: protocol::VERSION,
+            token: token.into(),
+            name: name.into(),
+            identity_id: uuid::Uuid::new_v4().to_string(),
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            public_key: base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+        }
+    }
+
+    #[test]
+    fn an_expired_invitation_is_refused_and_creates_no_agent() {
+        let (_dir, config, state) = enrollment_fixture();
+        // An invitation exactly as `create_invite` builds it, stored with an expiry one second
+        // in the past, as if its TTL had just run out.
+        let secret = "s".repeat(43);
+        let bundle = InviteBundle {
+            version: 1,
+            secret: secret.clone(),
+            ca_pem: TEST_CA.into(),
+        };
+        let token = format!(
+            "{TOKEN_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&bundle).unwrap())
+        );
+        state
+            .invite("late", &StateStore::invite_hash(&secret), now() - 1)
+            .unwrap();
+        let error = enroll(&request(&token, "late"), &state, &config, "server-key")
+            .expect_err("an expired invitation was accepted");
+        assert!(
+            error.to_string().contains("expired"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !state
+                .snapshot()
+                .unwrap()
+                .agents
+                .iter()
+                .any(|a| a.name == "late"),
+            "an expired invitation created an agent"
+        );
+        // The same steps with an invitation that is still valid succeed, so the refusal above
+        // comes from the expiry and not from the fixture.
+        let fresh = create_invite(&config, &state, "early", 60).unwrap();
+        let welcome = enroll(&request(&fresh, "early"), &state, &config, "server-key").unwrap();
+        assert_eq!(welcome.name, "early");
+    }
+
+    #[test]
+    fn the_invitation_secret_is_never_stored_in_plain_text() {
+        let (dir, config, state) = enrollment_fixture();
+        let token = create_invite(&config, &state, "node1", 600).unwrap();
+        let secret = parse_invite(&token).unwrap().secret;
+        enroll(&request(&token, "node1"), &state, &config, "server-key").unwrap();
+        drop(state);
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            let bytes = std::fs::read(&path).unwrap();
+            for needle in [&secret, &token] {
+                assert!(
+                    !bytes
+                        .windows(needle.len())
+                        .any(|window| window == needle.as_bytes()),
+                    "{} holds the invitation secret in plain text",
+                    path.display()
+                );
+            }
+        }
+    }
 }

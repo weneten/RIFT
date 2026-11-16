@@ -125,6 +125,10 @@ enum Command {
         /// Do not ask for confirmation.
         #[arg(long)]
         yes: bool,
+        /// Do not save the current state as rift-before-restore-DATE-TIME.tar.gz first, for
+        /// example when the server cannot start.
+        #[arg(long)]
+        no_safety_backup: bool,
     },
 }
 #[derive(Args)]
@@ -162,7 +166,7 @@ enum Vpn {
     /// (`rift vpn allow iphone exit`). A device can have both and several agent exits; each
     /// is its own WireGuard profile (`rift vpn config iphone node1`), and the device
     /// switches between them in the WireGuard app.
-    Allow(VpnAccessArgs),
+    Allow(VpnAllowArgs),
     /// Withdraw access again. Without a target, withdraws all of it on that agent, including
     /// the exit through it. `rift vpn deny DEVICE exit` ends the exit through this server and
     /// `rift vpn deny DEVICE AGENT exit` only the one through that agent.
@@ -195,14 +199,30 @@ enum Vpn {
 struct VpnAccessArgs {
     /// Device name.
     peer: String,
-    /// The agent, then what to allow: PORT/tcp, PORT/udp or PORT/both (ranges like
+    /// The agent, then the targets: PORT/tcp, PORT/udp or PORT/both (ranges like
     /// 8000-8010/tcp), `server`, `full`, a network behind the agent such as 192.168.178.0/24,
     /// or `exit`. Several are allowed. Just `exit` means the exit through this server.
     #[arg(value_name = "AGENT TARGET", required = true, num_args = 1..)]
     rest: Vec<String>,
+    /// Set only by `vpn allow`; `vpn deny` matches a grant whatever its NAT setting.
+    #[arg(skip)]
+    snat: bool,
+}
+#[derive(Args)]
+struct VpnAllowArgs {
+    #[command(flatten)]
+    access: VpnAccessArgs,
     /// Masquerade the device's address on the agent, for LANs without a route to the VPN pool.
     #[arg(long)]
     snat: bool,
+}
+impl VpnAllowArgs {
+    fn into_access(self) -> VpnAccessArgs {
+        VpnAccessArgs {
+            snat: self.snat,
+            ..self.access
+        }
+    }
 }
 /// What a `vpn allow` or `vpn deny` command names.
 #[derive(Debug, PartialEq, Eq)]
@@ -509,7 +529,7 @@ async fn run() -> Result<()> {
         },
         Command::Vpn { command } => match command {
             Vpn::Allow(args) => {
-                let mut requests = vpn_allow_requests(&args)?.into_iter();
+                let mut requests = vpn_allow_requests(&args.into_access())?.into_iter();
                 let first = requests.next().context(
                     "choose what to allow, for example: 22/tcp, server, full, 192.168.178.0/24 or exit",
                 )?;
@@ -1134,12 +1154,17 @@ mod tests {
         else {
             unreachable!()
         };
-        assert!(args.plan().is_err());
+        assert!(args.into_access().plan().is_err());
+        // `vpn deny` has no --snat: a grant is withdrawn whatever its NAT setting.
+        assert!(Cli::try_parse_from(["rift", "vpn", "deny", "iphone", "node4", "--snat"]).is_err());
     }
     fn vpn_plan(argv: &[&str]) -> Option<Result<VpnPlan>> {
         match Cli::try_parse_from(argv).map(|c| c.command) {
             Ok(Command::Vpn {
-                command: Vpn::Allow(args) | Vpn::Deny(args),
+                command: Vpn::Allow(args),
+            }) => Some(args.into_access().plan()),
+            Ok(Command::Vpn {
+                command: Vpn::Deny(args),
             }) => Some(args.plan()),
             _ => None,
         }
@@ -1148,7 +1173,7 @@ mod tests {
         match Cli::try_parse_from(argv).unwrap().command {
             Command::Vpn {
                 command: Vpn::Allow(args),
-            } => vpn_allow_requests(&args),
+            } => vpn_allow_requests(&args.into_access()),
             Command::Vpn {
                 command: Vpn::Deny(args),
             } => vpn_deny_requests(&args),
