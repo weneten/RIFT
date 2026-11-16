@@ -24,6 +24,7 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ### Fixed
 
+- A server or agent killed between creating its WireGuard interface and tagging it as its own could not start again until the interface was deleted by hand ("ip link JSON did not return the interface alias"). The next start now tags the interface, but only while RIFT's ownership marker is still pending and the interface is untouched (no key, no peers). Found by the new interrupted-start test.
 - An agent checks that IPv4 and IPv6 forwarding are enabled before it enrolls. Before, a host without forwarding reserved the invitation and then stopped, and an agent without a persistent volume could not use that invitation again.
 
 ## [0.1.0]

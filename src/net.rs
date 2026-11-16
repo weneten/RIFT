@@ -1162,6 +1162,8 @@ impl Kernel {
             }
         }
         if exists {
+            self.adopt_untagged_pending_interface(name, owner.as_deref())
+                .await?;
             let saved = owner.as_deref().context("WireGuard interface already exists but has no persistent RIFT ownership marker; refusing to take it over")?;
             ensure!(
                 saved.starts_with(&format!("{OWNER_VERSION}\ninterface\n")),
@@ -1244,6 +1246,51 @@ impl Kernel {
             .await
             .context("bring WireGuard interface up")?;
         Ok(())
+    }
+
+    /// RIFT writes its `pending` ownership marker, creates the interface and only then tags it
+    /// with the marker's alias. A crash between the last two steps leaves an untagged
+    /// interface that every later start refused. Such an interface is tagged now, but only
+    /// while the marker is still `pending`, the interface has no alias at all and it is an
+    /// untouched WireGuard interface (no private key, no peers): anything else may belong to
+    /// someone else and is still refused below.
+    async fn adopt_untagged_pending_interface(
+        &self,
+        name: &str,
+        owner: Option<&str>,
+    ) -> Result<()> {
+        let Some(saved) = owner else {
+            return Ok(());
+        };
+        if !saved.starts_with(&format!("{OWNER_VERSION}\ninterface\npending\n")) {
+            return Ok(());
+        }
+        match interface_alias(name).await {
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("did not return the interface alias") => {}
+            _ => return Ok(()),
+        }
+        let token = saved
+            .lines()
+            .nth(3)
+            .context("interface ownership marker has no alias token")?;
+        let key = run_output("wg", ["show", name, "private-key"])
+            .await
+            .context("existing interface is not a WireGuard interface")?;
+        let peers = run_output("wg", ["show", name, "peers"]).await?;
+        ensure!(
+            untouched_wireguard(&key, &peers),
+            "WireGuard interface {name} has no RIFT alias but is already configured; refusing to take it over"
+        );
+        tracing::warn!(
+            interface = name,
+            "tagging the WireGuard interface an interrupted start created before it could tag it"
+        );
+        run_ok("ip", ["link", "set", "dev", name, "alias", token])
+            .await
+            .context("tag RIFT-owned WireGuard interface")
     }
 
     async fn set_listen_port_if_needed(&self) -> Result<()> {
@@ -2899,6 +2946,10 @@ fn rift_interface_alias(alias: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
 }
+/// A WireGuard interface as `ip link add` leaves it: `wg show` reports no private key and no peers.
+fn untouched_wireguard(private_key: &str, peers: &str) -> bool {
+    private_key.trim() == "(none)" && peers.trim().is_empty()
+}
 async fn interface_alias(interface: &str) -> Result<String> {
     let output = run_output("ip", ["-j", "link", "show", "dev", interface]).await?;
     let value: Value = serde_json::from_str(&output).context("parse ip link JSON")?;
@@ -3674,6 +3725,9 @@ mod tests {
             "rift:dfc1f76d-be1c-4475-96d9-75036e592ed7"
         ));
         assert!(!rift_interface_alias(""));
+        assert!(untouched_wireguard("(none)\n", ""));
+        assert!(!untouched_wireguard("aGVsbG8=\n", ""));
+        assert!(!untouched_wireguard("(none)", "cGVlcg==\n"));
         assert!(!rift_interface_alias("rift:"));
         assert!(!rift_interface_alias("wg0"));
         assert!(!rift_interface_alias("rift:not a token"));
