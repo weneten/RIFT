@@ -1391,6 +1391,7 @@ async fn import_admin(
                     }
                 }
                 Op::Device(_) => cfg.check_vpn_pool()?,
+                Op::AgentNames(_) => {}
                 Op::Flags { name, .. } | Op::AgentExit { name, .. } => {
                     anyhow::ensure!(
                         !lost_devices.contains(name),
@@ -1512,11 +1513,18 @@ async fn import_admin(
                     enabled,
                     panel,
                     server_exit,
+                    names_off,
                 } => {
                     for p in x.vpn_peers.iter_mut().filter(|p| &p.name == name) {
                         p.enabled = enabled.unwrap_or(p.enabled);
                         p.panel = panel.unwrap_or(p.panel);
                         p.server_exit = server_exit.unwrap_or(p.server_exit);
+                        p.names_off = names_off.unwrap_or(p.names_off);
+                    }
+                }
+                Op::AgentNames(id) => {
+                    for a in x.agents.iter_mut().filter(|a| &a.id == id) {
+                        a.names = true;
                     }
                 }
                 Op::AgentExit { name, agent_id } => {

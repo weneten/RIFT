@@ -6,6 +6,8 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ### Added
 
+- `rift export` and `rift import` carry the names: the agents with names on (`named_agents`) and devices that turned them off (`names_off`). Older export files without them are read as before.
+
 - Names: lookups that RIFT passes to a device's own DNS server (`rift vpn dns`) carry the device's VPN address as EDNS Client Subnet, so a Pi-hole with ECS evaluation shows the real device instead of the server. Public resolvers (`RIFT_VPN_DNS`) never get it.
 
 - Agents of the previous release keep working with an updated server: the server accepts every protocol from `MIN_PEER_VERSION` to its own and shapes each agent's policy for its protocol. Agents report their RIFT version with every sync; `rift list agents` has a VERSION column, the web panel shows it, and `rift status` names agents older than the server. Update the server first.

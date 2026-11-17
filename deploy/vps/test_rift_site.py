@@ -671,6 +671,15 @@ class ExportTests(unittest.TestCase):
             self.assertTrue((Path(tmp) / "mine.json").exists())
 
 
+class ExportFieldTests(unittest.TestCase):
+    def test_fields_of_the_server_pass_through_the_export(self):
+        core = {"format": 2, "agents": ["PP"], "named_agents": ["PP"], "forwards": [],
+                "devices": [{"name": "tablet", "names_off": True, "grants": []}]}
+        document = rift_site.export_document(core, {})
+        self.assertEqual(document["named_agents"], ["PP"])
+        self.assertTrue(document["devices"][0]["names_off"])
+
+
 class ImportTests(unittest.TestCase):
     def options(self, **extra):
         base = {"agents": [], "skip_agents": [], "map": [], "dry_run": False}

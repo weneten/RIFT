@@ -43,6 +43,9 @@ pub struct ExportDevice {
     pub server_exit: bool,
     /// Names of the agents that each end an extra profile.
     pub agent_exits: Vec<String>,
+    /// The device does not use RIFT's names (`rift vpn names device NAME off`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub names_off: bool,
 }
 /// Added by the host helper; the server process knows nothing about sites.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,6 +62,9 @@ pub struct ExportSite {
 pub struct Export {
     pub format: u32,
     pub agents: Vec<String>,
+    /// Agents with names on (`NAME.internal`). Older export files have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub named_agents: Vec<String>,
     pub forwards: Vec<ExportForward>,
     pub devices: Vec<ExportDevice>,
     pub sites: Vec<ExportSite>,
@@ -102,6 +108,12 @@ pub fn export(snap: &StateSnapshot) -> Export {
             .filter(|a| a.status != AgentStatus::Pending)
             .map(|a| a.name.clone())
             .collect(),
+        named_agents: snap
+            .agents
+            .iter()
+            .filter(|a| a.status != AgentStatus::Pending && a.names)
+            .map(|a| a.name.clone())
+            .collect(),
         forwards: forwards
             .into_iter()
             .filter_map(|f| {
@@ -139,6 +151,7 @@ pub fn export(snap: &StateSnapshot) -> Export {
                     .collect(),
                 server_exit: p.server_exit,
                 agent_exits: p.agent_exits.iter().filter_map(|id| name(id)).collect(),
+                names_off: p.names_off,
             })
             .collect(),
         sites: Vec::new(),
@@ -294,7 +307,10 @@ pub enum Op {
         enabled: Option<bool>,
         panel: Option<bool>,
         server_exit: Option<bool>,
+        names_off: Option<bool>,
     },
+    /// Turns on the names (`NAME.internal`) of this agent (by ID).
+    AgentNames(String),
     Grant(VpnGrant),
     /// Adds the exit profile through this agent (by ID) to the device.
     AgentExit {
@@ -563,16 +579,18 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
             continue;
         }
         let existing = ctx.snap.vpn_peers.iter().find(|p| p.name == device.name);
-        let (enabled, panel, server_exit) = match existing {
+        let (enabled, panel, server_exit, names_off) = match existing {
             Some(p) => (
                 (p.enabled != device.enabled).then_some(device.enabled),
                 (p.panel != device.panel).then_some(device.panel),
                 (p.server_exit != device.server_exit).then_some(device.server_exit),
+                (p.names_off != device.names_off).then_some(device.names_off),
             ),
             None => (
                 (!device.enabled).then_some(false),
                 device.panel.then_some(true),
                 device.server_exit.then_some(true),
+                device.names_off.then_some(true),
             ),
         };
         let panel = if panel == Some(true) && !ctx.panel_enabled {
@@ -595,7 +613,7 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
                 )),
             });
         }
-        if enabled.is_some() || panel.is_some() || server_exit.is_some() {
+        if enabled.is_some() || panel.is_some() || server_exit.is_some() || names_off.is_some() {
             let mut changes = Vec::new();
             if let Some(on) = enabled {
                 changes.push(if on { "enabled" } else { "disabled" });
@@ -614,12 +632,16 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
                     "exit via this server off"
                 });
             }
+            if let Some(off) = names_off {
+                changes.push(if off { "names off" } else { "names on" });
+            }
             plan.steps.push(Step {
                 op: Op::Flags {
                     name: device.name.clone(),
                     enabled,
                     panel,
                     server_exit,
+                    names_off,
                 },
                 what: format!("{what}: {}", changes.join(", ")),
                 detail: None,
@@ -712,6 +734,33 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
             });
         }
     }
+    for entry in &data.named_agents {
+        let (agent_id, agent) = match resolve(options, ctx, entry) {
+            Resolved::Agent { id, name } => (id, name),
+            Resolved::Filtered { name, why } | Resolved::Unavailable { name, why } => {
+                skips.add(&name, &why);
+                continue;
+            }
+        };
+        let what = format!("names of agent {agent}");
+        let Some(label) = vpn::dns_label(&agent) else {
+            plan.items.push(Item::new(
+                Status::Failed,
+                what,
+                Some("the name is not usable as a DNS name; rename the agent".into()),
+            ));
+            continue;
+        };
+        if ctx.snap.agents.iter().any(|a| a.id == agent_id && a.names) {
+            plan.items.push(Item::new(Status::Present, what, None));
+            continue;
+        }
+        plan.steps.push(Step {
+            op: Op::AgentNames(agent_id),
+            what,
+            detail: Some(format!("{label}.{}", vpn::NAMES_SUFFIX)),
+        });
+    }
     plan.items.extend(skips.items());
     plan
 }
@@ -768,6 +817,7 @@ mod tests {
     }
     fn device(name: &str, grants: Vec<(&str, VpnAccess)>) -> ExportDevice {
         ExportDevice {
+            names_off: false,
             name: name.into(),
             enabled: true,
             panel: false,
@@ -784,6 +834,7 @@ mod tests {
     }
     fn file(forwards: Vec<ExportForward>, devices: Vec<ExportDevice>) -> Export {
         Export {
+            named_agents: Vec::new(),
             format: FORMAT,
             agents: vec![],
             forwards,
@@ -873,6 +924,57 @@ mod tests {
         }
         let again = Export::parse(text.as_bytes()).unwrap();
         assert_eq!(again, out);
+    }
+
+    #[test]
+    fn names_survive_an_export_and_an_import_round_trip() {
+        let mut snap = world();
+        snap.agents[0].names = true;
+        snap.vpn_peers.push(VpnPeer {
+            names_off: true,
+            name: "tablet".into(),
+            public_key: "k".into(),
+            ipv4: Ipv4Addr::new(10, 14, 0, 3),
+            enabled: true,
+            created_at: 1,
+            panel: false,
+            server_exit: false,
+            agent_exits: Vec::new(),
+            ipv6: std::net::Ipv6Addr::LOCALHOST,
+        });
+        let out = export(&snap);
+        assert_eq!(out.named_agents, ["node1"]);
+        assert!(out.devices[0].names_off);
+        let text = serde_json::to_string(&out).unwrap();
+        assert_eq!(Export::parse(text.as_bytes()).unwrap(), out);
+
+        // Into an installation where node1 has names off and the device does not exist.
+        let planned = run(&out, &ImportOptions::default(), &world());
+        assert!(planned
+            .steps
+            .iter()
+            .any(|s| matches!(&s.op, Op::AgentNames(id) if id == "id-node1")));
+        assert!(planned.steps.iter().any(|s| matches!(
+            &s.op,
+            Op::Flags {
+                names_off: Some(true),
+                ..
+            }
+        )));
+        // Where node1 already has names on: reported as present.
+        let planned = run(&out, &ImportOptions::default(), &snap);
+        assert!(!planned
+            .steps
+            .iter()
+            .any(|s| matches!(&s.op, Op::AgentNames(_))));
+        assert!(planned
+            .items
+            .iter()
+            .any(|i| i.status == Status::Present && i.what.contains("names of agent node1")));
+        // An export file from before names has neither field.
+        let old = br#"{"format":2,"agents":["node1"],"forwards":[],"devices":[{"name":"p","enabled":true,"panel":false,"grants":[],"server_exit":false,"agent_exits":[]}],"sites":[]}"#;
+        let parsed = Export::parse(old).unwrap();
+        assert!(parsed.named_agents.is_empty() && !parsed.devices[0].names_off);
     }
 
     #[test]
@@ -1249,6 +1351,7 @@ mod tests {
             .map(|s| match &s.op {
                 Op::Device(_) => "device",
                 Op::Flags { .. } => "flags",
+                Op::AgentNames(_) => "names",
                 Op::Grant(_) => "grant",
                 Op::Forward(_) => "forward",
                 Op::AgentExit { .. } => "exit",
