@@ -1,0 +1,35 @@
+name: Release
+
+# A tag vX.Y.Z creates the GitHub release with the notes of that version from CHANGELOG.md.
+# The image for the same tag is built by image.yml. Nothing runs until a tag is pushed.
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check the version and take its notes from CHANGELOG.md
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ "$version" != "$crate" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $crate" >&2
+            exit 1
+          fi
+          sh deploy/release-notes "$version" > notes.md
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          flag=
+          case "$version" in 0.*) flag=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" --title "RIFT $version" --notes-file notes.md $flag

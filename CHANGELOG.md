@@ -6,6 +6,8 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ### Added
 
+- Release preparation: a tag `vX.Y.Z` now also creates the GitHub release with that version's notes from this file (`.github/workflows/release.yml`, `deploy/release-notes`); `docs/release.md` lists the steps.
+
 - `deploy/field-check` collects the evidence for the release gates that need real hosts (cloud NAT, reboot, firewalls, Proxmox LXC, throughput) into a report without secrets; `--before-reboot`/`--after-reboot` check that RIFT comes back alone, `--perf` guides an iperf3 run through a temporary forward. See docs/deploy.md.
 
 - `SECURITY.md`: how to report a vulnerability privately (GitHub private vulnerability reporting), supported versions and scope.

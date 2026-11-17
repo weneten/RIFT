@@ -1011,7 +1011,8 @@ The Linux network-namespace and Docker integration harnesses require disposable 
 ## Further documentation
 
 - [Architecture and security boundaries](docs/architecture.md): packet paths, enrollment, translation, state and recovery.
-- [Deployment and verification](docs/deploy.md): preflight, firewall coexistence, rollout, rollback, integration tests and performance procedure.
+- [Deployment and verification](docs/deploy.md): preflight, firewall coexistence, rollout, rollback, integration tests, field checks and performance procedure.
+- [Releasing RIFT](docs/release.md): notes, version, compatibility and tag.
 
 ## Security
 
