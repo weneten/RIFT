@@ -527,6 +527,16 @@ enum Action {
         name: String,
         enabled: bool,
     },
+    /// `NAME.internal` for devices with a grant on the agent.
+    AgentNames {
+        name: String,
+        on: bool,
+    },
+    /// Whether a device uses RIFT's names.
+    VpnPeerNames {
+        name: String,
+        on: bool,
+    },
     AgentRename {
         name: String,
         new_name: String,
@@ -706,6 +716,12 @@ impl Action {
                 panel.admin(AdminRequest::CancelInvite { name }).await?
             }
             Self::AgentRemove { name } => panel.admin(AdminRequest::AgentRemove { name }).await?,
+            Self::AgentNames { name, on } => {
+                panel.admin(AdminRequest::AgentNames { name, on }).await?
+            }
+            Self::VpnPeerNames { name, on } => {
+                panel.admin(AdminRequest::VpnPeerNames { name, on }).await?
+            }
             Self::AgentEnable {
                 name,
                 enabled: true,
@@ -951,6 +967,8 @@ fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> Value {
                 "status": a["status"],
                 "tunnel_ipv4": a["tunnel_ipv4"],
                 "tunnel_ipv6": a["tunnel_ipv6"],
+                "names": a["names"].as_bool().unwrap_or(false),
+                "dns_name": a["name"].as_str().and_then(crate::vpn::dns_label).map(|l| format!("{l}.{}", crate::vpn::NAMES_SUFFIX)),
                 "online": h.map(|h| h["online"].clone()).unwrap_or(Value::Bool(false)),
                 "configuration_ready": h.map(|h| h["configuration_ready"].clone()).unwrap_or(Value::Bool(false)),
                 "last_handshake": h.map(|h| h["last_handshake"].clone()).unwrap_or(Value::Null),
@@ -1302,6 +1320,7 @@ mod tests {
     fn nft_rules_name_only_granted_devices_and_the_allow_list() {
         let mut cfg = config(PanelAccess::Private, "10.13.0.5, fd00::/64");
         let peer = |name: &str, last: u8, enabled: bool, panel: bool| VpnPeer {
+            names_off: false,
             name: name.into(),
             public_key: format!("k-{name}"),
             ipv4: std::net::Ipv4Addr::new(10, 14, 0, last),

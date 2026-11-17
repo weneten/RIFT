@@ -309,6 +309,7 @@ mod tests {
         StateSnapshot {
             generation: 1,
             agents: vec![AgentRecord {
+                names: false,
                 id: "a".into(),
                 name: "a".into(),
                 public_key: "test".into(),

@@ -153,23 +153,61 @@ fn allowed_sources(value: &Value) -> String {
     }
 }
 
+/// The message after names were turned on or off, with the devices whose main profile changed.
+fn names_changed(what: &str, data: &Value) -> String {
+    let devices: Vec<&str> = data["reimport"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if devices.is_empty() {
+        format!("{what}\nNo device needs a new configuration.")
+    } else {
+        let commands: Vec<String> = devices
+            .iter()
+            .map(|d| format!("rift vpn config {d}"))
+            .collect();
+        format!(
+            "{what}\nThe main profile of {} changed (its DNS server); import it again: {}",
+            devices.join(", "),
+            commands.join(", ")
+        )
+    }
+}
+
 fn agents(data: &Value) -> String {
     let rows = data
         .as_array()
         .into_iter()
         .flatten()
         .map(|a| {
+            let dns = match (
+                a["names"].as_bool(),
+                a["name"].as_str().and_then(rift::vpn::dns_label),
+            ) {
+                (Some(true), Some(label)) => format!("{label}.{}", rift::vpn::NAMES_SUFFIX),
+                _ => "-".into(),
+            };
             vec![
                 field(a, "name"),
                 field(a, "status"),
                 field(a, "tunnel_ipv4"),
+                dns,
                 field(a, "tunnel_ipv6"),
                 field(a, "id"),
             ]
         })
         .collect();
     table(
-        &["NAME", "STATE", "TUNNEL IPv4", "TUNNEL IPv6", "ID"],
+        &[
+            "NAME",
+            "STATE",
+            "TUNNEL IPv4",
+            "DNS NAME",
+            "TUNNEL IPv6",
+            "ID",
+        ],
         rows,
         "No agents configured.",
     )
@@ -536,6 +574,19 @@ fn vpn_peers(data: &Value) -> String {
                 grants.insert(0, "web panel".into());
             }
             grants.extend(vpn_exits(&p["exits"]));
+            if p["names_off"].as_bool() == Some(true) {
+                grants.push("names off".into());
+            } else {
+                let names: Vec<&str> = p["names"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
+                if !names.is_empty() {
+                    grants.push(format!("names: {}", names.join(", ")));
+                }
+            }
             vec![
                 field(p, "name"),
                 field(p, "ipv4"),
@@ -619,6 +670,22 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
         AdminRequest::AgentRemove { name } => format!("Agent {name} removed."),
         AdminRequest::AgentDisable { name } => format!("Agent {name} disabled."),
         AdminRequest::AgentEnable { name } => format!("Agent {name} enabled."),
+        AdminRequest::AgentNames { name, on } => names_changed(
+            &if *on {
+                format!("Devices with a grant on {name} now reach it as {}.", field(data, "dns_name"))
+            } else {
+                format!("{} no longer resolves.", field(data, "dns_name"))
+            },
+            data,
+        ),
+        AdminRequest::VpnPeerNames { name, on } => names_changed(
+            &if *on {
+                format!("{name} uses RIFT's names for the agents it reaches that have them on.")
+            } else {
+                format!("{name} no longer uses RIFT's names; it reaches agents by address.")
+            },
+            data,
+        ),
         AdminRequest::AgentRename { name, new_name } => format!("Agent {name} renamed to {new_name}."),
         AdminRequest::AgentRotate { name } => format!("Key rotation requested for {name}. It will occur on the next control sync.\nRotation ID: {}", field(data, "rotation_id")),
         AdminRequest::CancelInvite { name } => format!("Invitation for {name} cancelled."),

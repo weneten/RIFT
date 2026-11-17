@@ -293,10 +293,13 @@ impl Kernel {
             ipv6_exit,
             snapshot,
         );
-        // Panel access sits ahead of the rule that keeps VPN peers off the VPS.
+        // Panel access and RIFT's names sit ahead of the rule that keeps VPN peers off the VPS.
         vpn_rules
             .input
             .insert_str(0, &crate::webpanel::input_rules(&self.config, snapshot));
+        let names = crate::names::server_rules(&self.config, snapshot);
+        vpn_rules.input.insert_str(0, &names.input);
+        vpn_rules.prerouting.push_str(&names.prerouting);
         let rules = render_server_rules(
             self.interface(),
             self.config.mark,
@@ -2085,6 +2088,7 @@ fn render_server_rules(
     if !vpn.nat.is_empty() {
         out.push_str(NAT_CHAIN);
     }
+    out.push_str(&vpn.prerouting);
     // VPN peers must never reach the control port, whatever their source address claims.
     out.push_str(&vpn.input);
     out.push_str(&format!(
@@ -3170,6 +3174,7 @@ mod tests {
 
     fn agent() -> AgentRecord {
         AgentRecord {
+            names: false,
             id: "a1".into(),
             name: "agent".into(),
             public_key: "pub".into(),
@@ -3252,6 +3257,7 @@ mod tests {
         let snap = StateSnapshot {
             agents: vec![a.clone()],
             vpn_peers: vec![VpnPeer {
+                names_off: false,
                 name: "iphone".into(),
                 public_key: "k".into(),
                 ipv4: Ipv4Addr::new(10, 14, 0, 2),
@@ -3337,6 +3343,7 @@ mod tests {
         let snap = StateSnapshot {
             agents: vec![a.clone()],
             vpn_peers: vec![VpnPeer {
+                names_off: false,
                 name: "iphone".into(),
                 public_key: "k".into(),
                 ipv4: Ipv4Addr::new(10, 14, 0, 2),

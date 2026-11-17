@@ -316,6 +316,7 @@ impl StateStore {
         let t = now();
         let stage_deadline = (t + stage_seconds).min(expires);
         let record = AgentRecord {
+            names: false,
             id: id.into(),
             name: name.into(),
             public_key: key.into(),
@@ -745,6 +746,7 @@ mod tests {
     #[test]
     fn vpn_state_is_validated() {
         let agent = |id: &str, n: u8| AgentRecord {
+            names: false,
             id: id.into(),
             name: id.into(),
             public_key: format!("k-{id}"),
@@ -766,6 +768,7 @@ mod tests {
             snat: false,
         };
         let peer = VpnPeer {
+            names_off: false,
             name: "iphone".into(),
             public_key: "k-iphone".into(),
             ipv4: Ipv4Addr::new(10, 14, 0, 2),
@@ -818,6 +821,7 @@ mod tests {
     fn exits_are_validated_and_follow_their_agent() {
         let store = StateStore::open(&tempdir().unwrap().path().join("s.db")).unwrap();
         let agent = |id: &str, n: u8, port: Option<u16>| AgentRecord {
+            names: false,
             id: id.into(),
             name: id.into(),
             public_key: format!("k-{id}"),
@@ -835,6 +839,7 @@ mod tests {
             exit_port: port,
         };
         let device = |name: &str, n: u8, agent_exits: Vec<String>| VpnPeer {
+            names_off: false,
             name: name.into(),
             public_key: format!("k-{name}"),
             ipv4: Ipv4Addr::new(10, 14, 0, n),
@@ -1369,6 +1374,7 @@ mod tests {
         store
             .mutate("fixture", |state| {
                 state.agents.push(AgentRecord {
+                    names: false,
                     id: "a".into(),
                     name: "a".into(),
                     public_key: "key".into(),

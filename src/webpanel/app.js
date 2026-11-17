@@ -303,6 +303,24 @@ function banDialog(forward) {
   }));
 }
 
+// Turns names on or off (an agent's or a device's) and says which devices must import their
+// main profile again, because their DNS server changed.
+async function namesChange(body) {
+  try {
+    const result = await act(body);
+    await load();
+    const devices = result.reimport || [];
+    const lines = [body.action === "agent_names"
+      ? (body.on ? `Devices with a grant now reach it as ${result.dns_name}.` : `${result.dns_name} no longer resolves.`)
+      : (body.on ? `${body.name} uses RIFT's names.` : `${body.name} no longer uses RIFT's names.`)];
+    lines.push(devices.length
+      ? `The main profile of ${devices.join(", ")} changed (its DNS server): import it again on the device (Config button).`
+      : "No device needs a new configuration.");
+    openModal("Names", el("div", { class: "notice", role: "status" }, ...lines.map((t) => el("p", {}, t))),
+      el("div", { class: "form" }, el("div", { class: "buttons" }, button("Done", closeModal, "primary"))));
+  } catch (e) { showBanner(e.message); }
+}
+
 // Like `rift vpn connect`: the device (created if it does not exist), the ports it may reach
 // on one agent, panel access if wanted, then its QR code with the addresses to open.
 function deviceDialog() {
@@ -569,6 +587,13 @@ function grantsDialog(name, notes) {
             : x.state === "waiting" ? el("span", { class: "muted small" }, " waiting for the agent") : null) : null);
       }) : [el("p", { class: "muted" }, "No active agent yet.")]),
       el("p", { class: "hint" }, "Each extra profile is its own WireGuard entry with the same keys and addresses as the main one; switch between them in the WireGuard app. An agent must allow it with RIFT_AGENT_ALLOW_EXIT=true.")));
+  const namesBox = el("input", { type: "checkbox", checked: !peer.names_off });
+  namesBox.addEventListener("change", () => namesChange({ action: "vpn_peer_names", name, on: namesBox.checked }));
+  content.push(el("hr", { class: "sep" }), el("h4", {}, "Names"),
+    check("Use RIFT's names (NAME.internal) for agents that have them on", namesBox),
+    el("p", { class: "hint" }, (peer.names || []).length
+      ? `Resolves: ${peer.names.join(", ")}. While the tunnel is on, every lookup of the device goes through this server.`
+      : "No agent this device reaches has names on. Turn them on per agent in the Agents card."));
   content.push(el("div", { class: "form" }, el("div", { class: "buttons" }, button("Done", closeModal, "primary"))));
   openModal(`Access of ${name}`, ...content);
 }
@@ -709,6 +734,7 @@ function render() {
         }),
         actionButton("Rotate key", { action: "agent_rotate", name: a.id }, `Rotate the WireGuard key of ${a.name}? It happens on the agent's next sync.`),
         a.status === "active" ? button("Re-invite", () => inviteDialog(a.name)) : null,
+        a.dns_name ? button(a.names ? "Names off" : "Names on", () => namesChange({ action: "agent_names", name: a.id, on: !a.names })) : null,
         a.status === "active"
           ? actionButton("Disable", { action: "agent_enable", name: a.id, enabled: false }, `Disable ${a.name}? Its forwards and VPN access stop until it is enabled again.`)
           : actionButton("Enable", { action: "agent_enable", name: a.id, enabled: true }),
@@ -719,9 +745,10 @@ function render() {
       el("td", {}, connection),
       el("td", {}, statePill, a.last_error ? el("span", { class: "muted small", title: a.last_error }, " ⚠") : null),
       el("td", {}, el("code", {}, a.tunnel_ipv4 || "-")),
+      el("td", {}, a.names && a.dns_name ? el("code", {}, a.dns_name) : el("span", { class: "muted" }, "off")),
       el("td", {}, a.status === "active" ? ago(a.last_handshake, now) : "-"),
       el("td", { class: "actions" }, actions));
-  }), 6, invites.length ? "No agent has enrolled yet." : "No agents yet.");
+  }), 7, invites.length ? "No agent has enrolled yet." : "No agents yet.");
 
   fill($("forwards"), forwards.map((f) => {
     const statePill = !f.enabled ? pill("disabled", "off")

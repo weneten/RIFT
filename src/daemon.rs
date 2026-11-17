@@ -164,6 +164,10 @@ pub async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
             tracing::warn!("the web panel is public over plain HTTP; its password crosses the network unencrypted unless a TLS proxy is in front of it");
         }
     }
+    tasks.push(tokio::spawn(crate::names::serve(
+        config.clone(),
+        server.state.clone(),
+    )));
     tracing::info!("RIFT server ready; config={}", config_path.display());
     let poll = Duration::from_secs(config.poll_seconds);
     #[cfg(unix)]
@@ -596,9 +600,9 @@ async fn handle_control(mut stream: TcpStream, source: IpAddr, s: Arc<Server>) -
             if previous != applied_generation || changed_report {
                 reconcile(&s).await?;
             }
-            let (pool, pool6) = {
+            let (pool, pool6, server4) = {
                 let config = s.config.read().await;
-                (config.vpn_pool, config.vpn_pool6)
+                (config.vpn_pool, config.vpn_pool6, config.server_ipv4)
             };
             if let Some((rotation_id, _, committed)) = s.state.rotation(&agent.id)? {
                 if !committed {
@@ -609,10 +613,17 @@ async fn handle_control(mut stream: TcpStream, source: IpAddr, s: Arc<Server>) -
                         &agent.id,
                         pool,
                         pool6,
+                        server4,
                     ))
                 }
             } else {
-                ControlResponse::Policy(policy_for(&s.state.snapshot()?, &agent.id, pool, pool6))
+                ControlResponse::Policy(policy_for(
+                    &s.state.snapshot()?,
+                    &agent.id,
+                    pool,
+                    pool6,
+                    server4,
+                ))
             }
         }
         ControlRequest::Ban {
@@ -767,13 +778,41 @@ fn inapplicable(snap: &StateSnapshot, public_ips: &[IpAddr]) -> Vec<serde_json::
         })
         .collect()
 }
+/// The devices that use RIFT's names, so a change can say whose profile changed.
+fn names_users(snap: &StateSnapshot) -> Vec<String> {
+    snap.vpn_peers
+        .iter()
+        .filter(|p| crate::vpn::uses_names(snap, p))
+        .map(|p| p.name.clone())
+        .collect()
+}
+/// Devices that started or stopped using names: their main profile has a new DNS line.
+fn changed_users(before: &[String], after: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = before
+        .iter()
+        .filter(|n| !after.contains(n))
+        .chain(after.iter().filter(|n| !before.contains(n)))
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
 fn policy_for(
     snapshot: &StateSnapshot,
     id: &str,
     vpn_pool: ipnet::Ipv4Net,
     vpn_pool6: ipnet::Ipv6Net,
+    server_ipv4: std::net::Ipv4Addr,
 ) -> AgentPolicy {
     let snapshot = &without_refused(snapshot.clone());
+    let mut vpn = crate::vpn::agent_rules(snapshot, id);
+    // The server asks this agent's DNS server for devices that use RIFT's names.
+    if crate::names::upstream_agents(snapshot)
+        .iter()
+        .any(|a| a == id)
+    {
+        vpn.push(crate::names::upstream_rule(server_ipv4));
+    }
     AgentPolicy {
         generation: snapshot.generation,
         forwards: snapshot
@@ -783,7 +822,7 @@ fn policy_for(
             .cloned()
             .collect(),
         vpn_pool: Some(vpn_pool),
-        vpn: crate::vpn::agent_rules(snapshot, id),
+        vpn,
         exit: crate::vpn::agent_exit_policy(snapshot, id, vpn_pool, vpn_pool6),
     }
 }
@@ -1383,6 +1422,7 @@ async fn import_admin(
                     let ipv4 = crate::vpn::allocate(cfg.vpn_pool, &x.vpn_peers)?;
                     let ipv6 = crate::vpn::allocate6(cfg.vpn_pool6, &x.vpn_peers)?;
                     x.vpn_peers.push(VpnPeer {
+                        names_off: false,
                         name: name.clone(),
                         public_key: public,
                         ipv4,
@@ -1499,6 +1539,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                 let ipv4 = crate::vpn::allocate(cfg.vpn_pool, &x.vpn_peers)?;
                 let ipv6 = crate::vpn::allocate6(cfg.vpn_pool6, &x.vpn_peers)?;
                 x.vpn_peers.push(VpnPeer {
+                    names_off: false,
                     name: name.clone(),
                     public_key: public.clone(),
                     ipv4,
@@ -1530,9 +1571,42 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                     let agent = snap.agents.iter().find(|a| a.id == g.agent_id).map(|a| a.name.clone());
                     serde_json::json!({"agent":agent,"access":g.access,"refused":grant_refusal(snap, g)})
                 }).collect();
-                serde_json::json!({"name":p.name,"ipv4":p.ipv4,"ipv6":p.ipv6,"enabled":p.enabled,"panel":p.panel,"public_key":p.public_key,"last_handshake":handshake,"grants":grants,"exits":exits_json(snap, p)})
+                let names: Vec<String> = crate::vpn::named_agents(snap, p).iter().filter_map(|a| crate::vpn::dns_label(&a.name)).map(|l| format!("{l}.{}", crate::vpn::NAMES_SUFFIX)).collect();
+                serde_json::json!({"name":p.name,"ipv4":p.ipv4,"ipv6":p.ipv6,"enabled":p.enabled,"panel":p.panel,"public_key":p.public_key,"last_handshake":handshake,"grants":grants,"exits":exits_json(snap, p),"names":names,"names_off":p.names_off})
             }).collect();
             serde_json::Value::Array(rows)
+        }
+        AdminRequest::AgentNames { name, on } => {
+            let agent = find_agent(snap, &name)?;
+            let id = agent.id.clone();
+            let label = crate::vpn::dns_label(&agent.name).ok_or_else(|| {
+                anyhow!("{name} is not usable as a DNS name; rename the agent to letters, digits and - (rift rename agent)")
+            })?;
+            let before = names_users(snap);
+            s.state.mutate("agent-names", |x| {
+                x.agents
+                    .iter_mut()
+                    .filter(|a| a.id == id)
+                    .for_each(|a| a.names = on);
+                Ok(())
+            })?;
+            reconcile(s).await?;
+            let after = names_users(&s.state.snapshot()?);
+            serde_json::json!({"name":name,"on":on,"dns_name":format!("{label}.{}", crate::vpn::NAMES_SUFFIX),"reimport":changed_users(&before, &after)})
+        }
+        AdminRequest::VpnPeerNames { name, on } => {
+            find_peer(&name)?;
+            let before = names_users(snap);
+            s.state.mutate("vpn-peer-names", |x| {
+                x.vpn_peers
+                    .iter_mut()
+                    .filter(|p| p.name == name)
+                    .for_each(|p| p.names_off = !on);
+                Ok(())
+            })?;
+            reconcile(s).await?;
+            let after = names_users(&s.state.snapshot()?);
+            serde_json::json!({"name":name,"on":on,"reimport":changed_users(&before, &after)})
         }
         AdminRequest::VpnPeerEnable { name, enabled } => {
             find_peer(&name)?;
@@ -1698,6 +1772,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                     wg_port: cfg.wg_port,
                     mtu: cfg.mtu,
                     panel: cfg.webpanel.then_some(cfg.server_ipv4),
+                    server_ipv4: cfg.server_ipv4,
                     dns: &cfg.vpn_dns,
                     server_ipv6: cfg.public_ips.iter().any(IpAddr::is_ipv6),
                 },
@@ -2434,6 +2509,7 @@ mod tests {
 
     fn peer(name: &str, enabled: bool) -> VpnPeer {
         VpnPeer {
+            names_off: false,
             name: name.into(),
             public_key: format!("key-{name}"),
             ipv4: "10.14.0.2".parse().unwrap(),
@@ -2484,6 +2560,7 @@ mod tests {
             allow_from: Vec::new(),
         };
         let mut agent = AgentRecord {
+            names: false,
             id: "node4".into(),
             name: "node1".into(),
             public_key: "k".into(),
@@ -2547,6 +2624,7 @@ mod tests {
             "node4",
             "10.14.0.0/24".parse().unwrap(),
             "fd88:5249:4655::/64".parse().unwrap(),
+            "10.13.0.1".parse().unwrap(),
         );
         assert_eq!(policy.forwards.len(), 1);
         assert_eq!(
@@ -2562,6 +2640,7 @@ mod tests {
     #[test]
     fn an_agent_that_refuses_the_exit_loses_it_and_its_forward_until_it_allows_it() {
         let mut agent = AgentRecord {
+            names: false,
             id: "node4".into(),
             name: "node1".into(),
             public_key: "k".into(),
@@ -2624,7 +2703,7 @@ mod tests {
             agent.limits = limits;
             let allowed = snap(&agent);
             assert_eq!(forward_state(&allowed, &allowed.forwards[0]).0, "enabled");
-            let policy = policy_for(&allowed, "node4", pool, pool6);
+            let policy = policy_for(&allowed, "node4", pool, pool6, "10.13.0.1".parse().unwrap());
             assert_eq!(
                 policy.forwards.len(),
                 1,
@@ -2644,7 +2723,7 @@ mod tests {
         let applied = without_refused(refused.clone());
         assert!(applied.forwards.is_empty());
         assert!(applied.vpn_peers[0].agent_exits.is_empty());
-        let policy = policy_for(&refused, "node4", pool, pool6);
+        let policy = policy_for(&refused, "node4", pool, pool6, "10.13.0.1".parse().unwrap());
         assert!(policy.exit.is_none() && policy.forwards.is_empty());
         let shown = exits_json(&refused, &refused.vpn_peers[0]);
         assert_eq!(shown[0]["state"], "refused");

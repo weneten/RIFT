@@ -726,6 +726,7 @@ mod tests {
     }
     fn agent(name: &str, status: AgentStatus, n: u8) -> AgentRecord {
         AgentRecord {
+            names: false,
             id: format!("id-{name}"),
             name: name.into(),
             public_key: format!("key-{name}"),
@@ -835,6 +836,7 @@ mod tests {
             allow_from: Vec::new(),
         });
         snap.vpn_peers.push(VpnPeer {
+            names_off: false,
             name: "phone".into(),
             public_key: "SECRET-PUBLIC".into(),
             ipv4: Ipv4Addr::new(10, 14, 0, 2),
@@ -876,6 +878,7 @@ mod tests {
         let mut snap = world();
         snap.agents.push(agent("node2", AgentStatus::Active, 5));
         snap.vpn_peers.push(VpnPeer {
+            names_off: false,
             name: "phone".into(),
             public_key: "k".into(),
             ipv4: Ipv4Addr::new(10, 14, 0, 2),
@@ -1263,6 +1266,7 @@ mod tests {
     fn existing_devices_only_get_what_is_missing() {
         let mut snap = world();
         snap.vpn_peers.push(VpnPeer {
+            names_off: false,
             name: "phone".into(),
             public_key: "k".into(),
             ipv4: Ipv4Addr::new(10, 14, 0, 2),

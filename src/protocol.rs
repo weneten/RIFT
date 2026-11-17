@@ -87,6 +87,16 @@ pub enum AdminRequest {
     AgentEnable {
         name: String,
     },
+    /// `NAME.internal` for devices with a grant on the agent.
+    AgentNames {
+        name: String,
+        on: bool,
+    },
+    /// Whether this device uses RIFT's names when an agent it reaches has them on.
+    VpnPeerNames {
+        name: String,
+        on: bool,
+    },
     AgentRename {
         name: String,
         new_name: String,

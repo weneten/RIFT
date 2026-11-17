@@ -146,6 +146,7 @@ mod tests {
 
     fn agent(id: &str) -> AgentRecord {
         AgentRecord {
+            names: false,
             id: id.into(),
             name: id.into(),
             public_key: format!("k-{id}"),
@@ -165,6 +166,7 @@ mod tests {
     }
     fn device(name: &str, agents: &[&str]) -> VpnPeer {
         VpnPeer {
+            names_off: false,
             name: name.into(),
             public_key: format!("k-{name}"),
             ipv4: Ipv4Addr::new(10, 14, 0, 2),

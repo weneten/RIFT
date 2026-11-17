@@ -7,6 +7,7 @@ pub mod enrollment;
 pub mod exit;
 pub(crate) mod host_firewall;
 pub mod model;
+pub mod names;
 pub mod net;
 pub mod portable;
 pub mod protocol;

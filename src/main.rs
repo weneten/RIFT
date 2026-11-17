@@ -182,6 +182,14 @@ enum Vpn {
         /// The agent, or `default`.
         agent: String,
     },
+    /// Names for VPN devices: `rift vpn names agent NAME on` makes `NAME.internal` resolve to
+    /// the agent for every device with a grant on it; `rift vpn names device NAME off` keeps a
+    /// device out. A device that uses names has RIFT as its DNS server and must import its
+    /// main profile again when that starts or stops.
+    Names {
+        #[command(subcommand)]
+        what: NamesWhat,
+    },
     /// The short way to give a phone or laptop access: `rift vpn connect DEVICE AGENT TARGET...`
     /// creates the device if it does not exist yet, allows the targets (as `vpn allow`) and
     /// prints its WireGuard configuration as a QR code, with the addresses to open. For
@@ -205,6 +213,21 @@ enum Vpn {
         /// Print the configuration file instead of a QR code.
         #[arg(long)]
         export: bool,
+    },
+}
+#[derive(Subcommand)]
+enum NamesWhat {
+    /// `rift vpn names agent NAME on|off`: NAME.internal for devices with a grant on it.
+    Agent {
+        name: String,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// `rift vpn names device NAME on|off`: whether this device uses the names (default on).
+    Device {
+        name: String,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
     },
 }
 #[derive(Args)]
@@ -556,6 +579,18 @@ async fn run() -> Result<()> {
                 more.extend(requests);
                 first
             }
+            Vpn::Names {
+                what: NamesWhat::Agent { name, state },
+            } => AdminRequest::AgentNames {
+                name,
+                on: state == "on",
+            },
+            Vpn::Names {
+                what: NamesWhat::Device { name, state },
+            } => AdminRequest::VpnPeerNames {
+                name,
+                on: state == "on",
+            },
             Vpn::Dns { peer, agent } => AdminRequest::VpnDns {
                 peer,
                 agent: (agent != "default").then_some(agent),
@@ -1862,6 +1897,8 @@ mod tests {
             vec!["rift", "enable", "forward", "3"],
             vec!["rift", "add", "ban", "3", "203.0.113.9", "--ttl", "1h"],
             vec!["rift", "add", "ban", "3", "203.0.113.9"],
+            vec!["rift", "vpn", "names", "agent", "PP", "on"],
+            vec!["rift", "vpn", "names", "device", "handy", "off"],
             vec!["rift", "list", "sites"],
             vec!["rift", "add", "site", "node1", "app.example.org", "8080"],
             vec!["rift", "remove", "site", "app.example.org"],
@@ -1880,6 +1917,7 @@ mod tests {
             panic!("add ban");
         };
         assert_eq!((forward_id, ttl.as_str()), (3, "1h"));
+        assert!(Cli::try_parse_from(["rift", "vpn", "names", "agent", "PP", "maybe"]).is_err());
         // The agent is no longer named: the forward ID says which one it is.
         assert!(Cli::try_parse_from(["rift", "add", "ban", "node1", "3", "203.0.113.9"]).is_err());
         let cli = Cli::try_parse_from(["rift", "remove", "forward", "7"]).unwrap();

@@ -273,6 +273,10 @@ pub struct AgentRecord {
     /// The UDP port the server assigned to this agent's exit. Kept once assigned, so the
     /// configurations of devices stay valid while the exit is switched off and on.
     pub exit_port: Option<u16>,
+    /// VPN devices with a grant on this agent resolve `NAME.internal` to its tunnel address
+    /// (`rift vpn names agent NAME on`).
+    #[serde(default)]
+    pub names: bool,
 }
 /// What an agent that offers an internet exit tells the server with every sync.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -393,6 +397,10 @@ pub struct VpnPeer {
     pub server_exit: bool,
     /// Agents (by ID) that each end an extra profile with the same keys and addresses.
     pub agent_exits: Vec<String>,
+    /// This device does not use RIFT's names even when an agent it reaches has them on
+    /// (`rift vpn names device NAME off`).
+    #[serde(default)]
+    pub names_off: bool,
 }
 /// One internet exit of a device in requests: the VPS or the agent that the name gives.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

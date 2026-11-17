@@ -70,6 +70,8 @@ pub struct Rules {
     /// Rules for the `postrouting_nat` chain, which the renderer adds when this is not
     /// empty. Empty unless a grant asks for SNAT or an internet exit masquerades.
     pub nat: String,
+    /// Rules for the server's `prerouting_nat` chain: RIFT's names (port 53 to the DNS port).
+    pub prerouting: String,
 }
 
 /// The DNS grant is enforced as port 53 over UDP and TCP, so firewall rules and agents only
@@ -105,6 +107,50 @@ pub fn effective(snap: &StateSnapshot) -> Vec<Effective<'_>> {
             })
         })
         .collect()
+}
+
+/// The suffix of the names RIFT gives agents: `NAME.internal`. ICANN reserved `.internal`
+/// for private networks in 2024, so it never clashes with a public name.
+pub const NAMES_SUFFIX: &str = "internal";
+
+/// The DNS label of an agent: its name in lower case with `_` as `-`, or `None` when that is
+/// not a valid label (it then has no name).
+pub fn dns_label(agent: &str) -> Option<String> {
+    let label = agent.to_ascii_lowercase().replace('_', "-");
+    (!label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+    .then_some(label)
+}
+
+/// The agents whose names this device resolves: active, names on, and the device has a grant
+/// on them. Empty when the device turned names off or is disabled.
+pub fn named_agents<'a>(snap: &'a StateSnapshot, peer: &VpnPeer) -> Vec<&'a AgentRecord> {
+    if peer.names_off || !peer.enabled {
+        return Vec::new();
+    }
+    let mut out: Vec<&AgentRecord> = Vec::new();
+    for grant in snap.vpn_grants.iter().filter(|g| g.peer == peer.name) {
+        if let Some(agent) = snap
+            .agents
+            .iter()
+            .find(|a| a.id == grant.agent_id && a.names && a.status == AgentStatus::Active)
+        {
+            if !out.iter().any(|a| a.id == agent.id) {
+                out.push(agent);
+            }
+        }
+    }
+    out
+}
+
+/// Whether RIFT is this device's DNS server: it resolves at least one agent's name.
+pub fn uses_names(snap: &StateSnapshot, peer: &VpnPeer) -> bool {
+    !named_agents(snap, peer).is_empty()
 }
 
 /// The agent whose tunnel address is the device's DNS server, when it has a DNS grant on an
@@ -443,6 +489,7 @@ impl Rules {
         self.input.push_str(&other.input);
         self.forward.push_str(&other.forward);
         self.nat.push_str(&other.nat);
+        self.prerouting.push_str(&other.prerouting);
     }
 }
 
@@ -479,6 +526,8 @@ pub struct ClientParams<'a> {
     pub mtu: u16,
     /// The VPS's tunnel address when the web panel is on, for devices that may open it.
     pub panel: Option<Ipv4Addr>,
+    /// The VPS's tunnel address: the DNS server of devices that use RIFT's names.
+    pub server_ipv4: Ipv4Addr,
     /// `RIFT_VPN_DNS`.
     pub dns: &'a [IpAddr],
     /// Whether the VPS can carry IPv6 for devices that exit through it.
@@ -554,7 +603,14 @@ pub fn client_config(
         ));
     }
     let endpoint = host_port(p.host, p.wg_port);
-    let own_dns = dns_agent(snap, peer).map(|agent| format!("DNS = {}\n", agent.tunnel_ipv4));
+    // With names, RIFT on the VPS answers every lookup of the device: it resolves the agents'
+    // names and passes everything else on (to the device's own DNS agent or RIFT_VPN_DNS).
+    let names = uses_names(snap, peer);
+    let own_dns = if names {
+        Some(format!("DNS = {}\n", p.server_ipv4))
+    } else {
+        dns_agent(snap, peer).map(|agent| format!("DNS = {}\n", agent.tunnel_ipv4))
+    };
     let (routes, dns) = if peer.server_exit {
         (
             "0.0.0.0/0, ::/0".to_string(),
@@ -567,6 +623,9 @@ pub fn client_config(
         let mut routes = BTreeSet::new();
         if let Some(server) = p.panel.filter(|_| peer.panel) {
             routes.insert(format!("{server}/32"));
+        }
+        if names {
+            routes.insert(format!("{}/32", p.server_ipv4));
         }
         for grant in snap.vpn_grants.iter().filter(|g| g.peer == peer.name) {
             let Some(agent) = snap.agents.iter().find(|a| a.id == grant.agent_id) else {
@@ -636,6 +695,7 @@ mod tests {
 
     fn agent(id: &str, last: u8) -> AgentRecord {
         AgentRecord {
+            names: false,
             id: id.into(),
             name: id.into(),
             public_key: format!("key-{id}"),
@@ -655,6 +715,7 @@ mod tests {
     }
     fn peer(name: &str, last: u8, enabled: bool) -> VpnPeer {
         VpnPeer {
+            names_off: false,
             name: name.into(),
             public_key: format!("key-{name}"),
             ipv4: Ipv4Addr::new(10, 14, 0, last),
@@ -710,6 +771,7 @@ mod tests {
             wg_port: 51820,
             mtu: 1380,
             panel,
+            server_ipv4: Ipv4Addr::new(10, 13, 0, 1),
             dns,
             server_ipv6,
         }
@@ -718,6 +780,27 @@ mod tests {
         let dns = dns();
         let peer = snap.vpn_peers.iter().find(|p| p.name == name).unwrap();
         client_config(snap, peer, "SECRET", &params(&dns, None, server_ipv6), None)
+    }
+    #[test]
+    fn names_make_the_server_the_dns_server_of_the_main_profile() {
+        let mut snap = snapshot();
+        let plain = config(&snap, "iphone", false).unwrap();
+        assert!(!plain.contains("DNS ="), "{plain}");
+        snap.agents[0].names = true;
+        let named = config(&snap, "iphone", false).unwrap();
+        assert!(named.contains("DNS = 10.13.0.1\n"), "{named}");
+        assert!(
+            named.contains("AllowedIPs = 10.13.0.1/32, 10.13.0.2/32\n"),
+            "the DNS server is routed into the tunnel: {named}"
+        );
+        // The device can opt out, and then nothing changes for it.
+        snap.vpn_peers[0].names_off = true;
+        assert_eq!(config(&snap, "iphone", false).unwrap(), plain);
+        // With the exit through the VPS the server is the DNS server too, instead of RIFT_VPN_DNS.
+        snap.vpn_peers[0].names_off = false;
+        snap.vpn_peers[0].server_exit = true;
+        let exit = config(&snap, "iphone", false).unwrap();
+        assert!(exit.contains("DNS = 10.13.0.1\n"), "{exit}");
     }
     fn agent_config(
         snap: &StateSnapshot,
