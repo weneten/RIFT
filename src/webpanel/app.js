@@ -301,25 +301,54 @@ function banDialog(forward) {
   }));
 }
 
+// Like `rift vpn connect`: the device (created if it does not exist), the ports it may reach
+// on one agent, panel access if wanted, then its QR code with the addresses to open.
 function deviceDialog() {
-  const name = el("input", { required: true, pattern: "[A-Za-z0-9_\\-]{1,63}", placeholder: "phone" });
+  const peers = data.vpn_peers || [];
+  const list = el("datalist", { id: "device-names" }, ...peers.map((p) => el("option", { value: p.name })));
+  const name = el("input", { required: true, pattern: "[A-Za-z0-9_\\-]{1,63}", placeholder: "phone", list: "device-names" });
+  const agents = agentOptions(true);
+  const agent = select([["", "none"], ...agents], agents.length ? agents[0][0] : "");
+  const ports = el("input", { placeholder: "3000/tcp 8080/tcp" });
   const panel = el("input", { type: "checkbox" });
-  openModal("Add VPN device", form([
-    row("Device name", name),
+  openModal("Connect a VPN device", form([
+    list,
+    row("Device name (new or existing)", name),
+    el("div", { class: "row inline" }, row("Agent", agent), row("Ports on the agent", ports)),
     check("May open this panel", panel),
-    el("p", { class: "hint" }, "A new device reaches nothing until you grant it access."),
-  ], "Create", async () => {
-    const created = name.value.trim();
-    await act({ action: "vpn_peer_add", name: created, panel: panel.checked });
+    el("p", { class: "hint" }, "Only what you name here is reachable: no public port is opened. Leave the ports empty to create the device without access. More access and internet exits: the device's Access button."),
+  ], "Connect", async () => {
+    const device = name.value.trim();
+    const wanted = ports.value.trim();
+    if (wanted && !agent.value) throw new Error("Choose the agent the ports are on.");
+    const existed = peers.some((p) => p.name === device);
+    if (!existed) await act({ action: "vpn_peer_add", name: device, panel: panel.checked });
+    else if (panel.checked) await act({ action: "panel_allow", name: device, allowed: true });
+    const notes = [];
+    if (wanted) {
+      const result = await act({ action: "vpn_allow", peer: device, agent: agent.value, ports: wanted });
+      notes.push(...(result.warnings || []));
+      const host = (data.agents || []).find((a) => a.name === agent.value);
+      const ip = host && host.tunnel_ipv4;
+      if (ip) {
+        for (const spec of wanted.split(/[\s,]+/).filter(Boolean)) {
+          const [port, proto] = spec.split("/");
+          notes.push(proto === "tcp" && /^\d+$/.test(port)
+            ? `Once connected: ${ip}:${port}/tcp, a web page there at http://${ip}:${port}`
+            : `Once connected: ${ip}:${spec}`);
+        }
+      }
+    }
+    if (existed) notes.push(`${device} already existed: import this configuration again on the device.`);
     await load();
-    if (panel.checked) await configDialog(created);
-    else grantsDialog(created);
+    if (wanted || panel.checked) await configDialog(device, undefined, notes);
+    else grantsDialog(device);
   }));
 }
 
 // The profiles of a device: the main one, then one per agent exit. Each is its own
 // WireGuard configuration; the device uses the same keys and addresses in all of them.
-async function configDialog(name, agent) {
+async function configDialog(name, agent, notes) {
   const peer = (data.vpn_peers || []).find((p) => p.name === name);
   const agentExits = ((peer && peer.exits) || []).filter((x) => x.via === "agent" && x.agent).map((x) => x.agent);
   if (agent && !agentExits.includes(agent)) agent = undefined;
@@ -336,9 +365,10 @@ async function configDialog(name, agent) {
   const content = [];
   if (agentExits.length) {
     const choice = select([["", "Main profile"], ...agentExits.map((n) => [n, `Extra profile via ${n}`])], agent || "");
-    choice.addEventListener("change", () => configDialog(name, choice.value || undefined));
+    choice.addEventListener("change", () => configDialog(name, choice.value || undefined, notes));
     content.push(row("Profile", choice));
   }
+  if (notes && notes.length) content.push(el("div", { class: "notice", role: "status" }, ...notes.map((t) => el("p", {}, t))));
   openModal(`WireGuard configuration: ${name}`,
     ...content,
     el("p", { class: "warn-text" }, "Contains the device's private key. Do not share or store it carelessly."),

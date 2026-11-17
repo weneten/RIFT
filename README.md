@@ -478,7 +478,17 @@ phone ── WireGuard ──> RIFT server ── existing tunnel ──> RIFT a
                        (VPN peer 10.14.0.x)                             └─> optional LAN
 ```
 
-Everything is denied until you allow it. A device reaches only what a grant names, and devices cannot reach each other or the server itself. Run on the **server**:
+Everything is denied until you allow it. A device reaches only what a grant names, and devices cannot reach each other or the server itself.
+
+**The short way.** One command on the **server** creates the device if it does not exist yet, allows what you name and prints the QR code for the WireGuard app, followed by the addresses to open:
+
+```sh
+rift vpn connect iphone node1 3000/tcp
+```
+
+Scan the code, switch the tunnel on and open the address it names, for example `http://10.13.0.2:3000` (node1's tunnel address). No public port is opened: only devices with a grant reach the service. To add another service later, run the command again with its port and scan the new code; `--export > iphone.conf` prints the file instead. In the web panel, "Connect device" in the VPN devices card does the same.
+
+The same in single steps:
 
 ```sh
 rift add device iphone                       # key pair + address from the VPN pool
@@ -585,7 +595,7 @@ Pools, DNS and ports in the configuration: see the [Configuration](#configuratio
 
 ## Web panel
 
-The server can serve a web panel with what the CLI does: agents and invitations, forwards and bans, VPN devices with their grants, internet exit and WireGuard configuration (as QR code or file), panel access, sites, reconcile, the recent log and diagnostics. Only printing the panel password stays in the CLI. The panel is **off** by default. Enable it in the server `.env` and recreate the container:
+The server can serve a web panel with what the CLI does: agents and invitations, forwards and bans, VPN devices with their grants, internet exit and WireGuard configuration (as QR code or file; "Connect device" creates a device, grants ports on an agent and shows its QR code in one step), panel access, sites, reconcile, the recent log and diagnostics. Only printing the panel password stays in the CLI. The panel is **off** by default. Enable it in the server `.env` and recreate the container:
 
 ```dotenv
 RIFT_WEBPANEL=true
@@ -801,6 +811,7 @@ The web panel runs `add site` and `remove site` through the host service (`rift-
 
 | Command | What it does |
 | --- | --- |
+| `rift vpn connect DEVICE AGENT TARGET... [--snat] [--export]` | Creates the device if needed, grants the targets (as `vpn allow`) and prints its configuration as a QR code with the addresses to open. Example: `rift vpn connect phone node1 3000/tcp`. |
 | `rift add device NAME` | Registers a device with a key and an address. It reaches nothing yet. |
 | `rift list devices` | All devices with state, last handshake and access, including the exits (`exit via server; exit via node1; exit via node2`). |
 | `rift vpn allow DEVICE AGENT TARGET... [--snat]` | Grants access. `TARGET` is `22/tcp` (port or range), `server` (the agent host), `full` (all protocols to the host), a network such as `192.168.178.30/32` (`--snat` for networks whose router has no route back), or `exit`: adds an internet exit through that agent, as an extra profile of the device. |

@@ -6,6 +6,8 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ### Added
 
+- `rift vpn connect DEVICE AGENT TARGET... [--export]`: creates the device if it does not exist, grants the targets like `rift vpn allow` and prints the QR code with the addresses to open, for example `rift vpn connect phone node1 3000/tcp`. The web panel's "Add device" dialog is now "Connect device" and does the same. A target that is not valid fails before a device is created.
+
 - `rift add forward ... --allow-from ADDRESS[,NETWORK...]`: only the named clients reach the forward; the server neither redirects nor relays anyone else. Shown in the FROM column of `rift list forwards`, in the web panel, and carried by `rift export` / `rift import`.
 - `rift add site ... --allow-from ADDRESS[,NETWORK...]`: the reverse proxy answers other clients with 403 (Traefik `ipAllowList`/`ipWhiteList`, Caddy `remote_ip`, Nginx and Nginx Proxy Manager `allow`/`deny`). Also in the web panel's site dialog, the site queue and export files.
 

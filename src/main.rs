@@ -182,6 +182,18 @@ enum Vpn {
         /// The agent, or `default`.
         agent: String,
     },
+    /// The short way to give a phone or laptop access: `rift vpn connect DEVICE AGENT TARGET...`
+    /// creates the device if it does not exist yet, allows the targets (as `vpn allow`) and
+    /// prints its WireGuard configuration as a QR code, with the addresses to open. For
+    /// example `rift vpn connect phone node1 3000/tcp`. Run it again with more targets to add
+    /// them; then scan the new code.
+    Connect {
+        #[command(flatten)]
+        access: VpnAllowArgs,
+        /// Print the configuration file instead of a QR code.
+        #[arg(long)]
+        export: bool,
+    },
     /// Print the WireGuard configuration of a device as a QR code for the WireGuard app:
     /// `rift vpn config DEVICE` for the main profile, `rift vpn config DEVICE AGENT` for the
     /// exit through that agent. Both contain the device's private key.
@@ -487,6 +499,9 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         Command::Vpn {
+            command: Vpn::Connect { access, export },
+        } => return vpn_connect(&config, cli.json, access.into_access(), export).await,
+        Command::Vpn {
             command:
                 Vpn::Config {
                     name,
@@ -546,7 +561,7 @@ async fn run() -> Result<()> {
                 peer,
                 agent: (agent != "default").then_some(agent),
             },
-            Vpn::Config { .. } => unreachable!("handled above"),
+            Vpn::Config { .. } | Vpn::Connect { .. } => unreachable!("handled above"),
         },
         Command::Status => AdminRequest::Status,
         Command::Reload => AdminRequest::Reload,
@@ -961,6 +976,112 @@ async fn admin_ok(config: &Config, request: AdminRequest) -> Result<serde_json::
     }
     Ok(response.data)
 }
+/// `rift vpn connect`: the device (created if missing), its grants and its configuration in
+/// one step, then where to reach what was allowed.
+async fn vpn_connect(config: &Config, json: bool, args: VpnAccessArgs, export: bool) -> Result<()> {
+    // Checked before anything is created, so a mistyped target creates no device.
+    let plan = args.plan()?;
+    let requests = vpn_allow_requests(&args)?;
+    anyhow::ensure!(
+        !requests.is_empty(),
+        "choose what to allow, for example: 3000/tcp, server, full, 192.168.178.0/24 or exit"
+    );
+    let name = args.peer.clone();
+    let peers = admin_ok(config, AdminRequest::VpnPeerList).await?;
+    let exists = peers
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|p| p["name"].as_str() == Some(name.as_str()));
+    if !exists {
+        admin_ok(config, AdminRequest::VpnPeerAdd { name: name.clone() }).await?;
+    }
+    let mut warnings = Vec::new();
+    for request in requests {
+        let data = admin_ok(config, request)
+            .await
+            .context("the device and earlier grants of this command were already applied")?;
+        if let Some(warning) = data["warning"].as_str() {
+            warnings.push(warning.to_string());
+        }
+    }
+    let tunnel = match &plan.agent {
+        Some(agent) => admin_ok(config, AdminRequest::AgentsList)
+            .await?
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|a| a["name"].as_str() == Some(agent.as_str()))
+            .and_then(|a| a["tunnel_ipv4"].as_str().map(String::from)),
+        None => None,
+    };
+    let reach = tunnel
+        .as_deref()
+        .map(|ip| reach_lines(ip, &plan.accesses))
+        .unwrap_or_default();
+    // Only an exit through the agent asked for: that profile is the one to import.
+    let profile = match &plan.exit {
+        Some(Exit::Agent(agent)) if plan.accesses.is_empty() => Some(agent.clone()),
+        _ => None,
+    };
+    if json {
+        let data = admin_ok(
+            config,
+            AdminRequest::VpnConfig {
+                name: name.clone(),
+                agent: profile,
+            },
+        )
+        .await?;
+        println!(
+            "{}",
+            serde_json::json!({"device": name, "created": !exists, "warnings": warnings, "reach": reach, "config": data})
+        );
+        return Ok(());
+    }
+    if !exists {
+        eprintln!("VPN device {name} created.");
+    }
+    for warning in &warnings {
+        eprintln!("Warning: {warning}");
+    }
+    vpn_config(config, false, name.clone(), profile.clone(), !export).await?;
+    if exists {
+        eprintln!("{name} already existed: import this configuration again on the device so it routes the new access.");
+    }
+    if !reach.is_empty() {
+        eprintln!("Once the device is connected:");
+        for line in &reach {
+            eprintln!("  {line}");
+        }
+    }
+    if let (Some(Exit::Agent(agent)), None) = (&plan.exit, &profile) {
+        eprintln!(
+            "The exit through {agent} is a profile of its own: rift vpn config {name} {agent}"
+        );
+    }
+    Ok(())
+}
+/// Where a device reaches what a grant allows, for the message after `rift vpn connect`.
+fn reach_lines(tunnel_ipv4: &str, accesses: &[VpnAccess]) -> Vec<String> {
+    accesses
+        .iter()
+        .map(|access| match access {
+            VpnAccess::Port { protocol, ports }
+                if *protocol == Protocol::Tcp && ports.start == ports.end =>
+            {
+                format!(
+                    "{tunnel_ipv4}:{ports}/tcp (a web page there: http://{tunnel_ipv4}:{ports})"
+                )
+            }
+            VpnAccess::Port { protocol, ports } => format!("{tunnel_ipv4}:{ports}/{protocol}"),
+            VpnAccess::Server => format!("{tunnel_ipv4} (TCP, UDP and ping)"),
+            VpnAccess::Full => format!("{tunnel_ipv4} (all protocols)"),
+            VpnAccess::Subnet { net, .. } => format!("the network {net}"),
+            VpnAccess::Dns => format!("DNS at {tunnel_ipv4}"),
+        })
+        .collect()
+}
 /// The short way onto the panel: one device, panel access, and its configuration.
 async fn panel_connect(config: &Config, json: bool, name: String, export: bool) -> Result<()> {
     let status = admin_ok(config, AdminRequest::PanelStatus).await?;
@@ -1180,6 +1301,39 @@ mod tests {
             _ => unreachable!(),
         }
     }
+    #[test]
+    fn vpn_connect_takes_the_allow_arguments_and_names_the_addresses() {
+        let cli = Cli::try_parse_from([
+            "rift", "vpn", "connect", "phone", "pp", "3000/tcp", "53/udp", "--export",
+        ])
+        .unwrap();
+        let Command::Vpn {
+            command: Vpn::Connect { access, export },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert!(export);
+        let access = access.into_access();
+        let plan = access.plan().unwrap();
+        assert_eq!(plan.agent.as_deref(), Some("pp"));
+        let reach = reach_lines("10.13.0.2", &plan.accesses);
+        assert!(
+            reach.iter().any(|l| l.contains("http://10.13.0.2:3000")),
+            "{reach:?}"
+        );
+        assert!(reach.iter().any(|l| l == "10.13.0.2:53/udp"), "{reach:?}");
+        // A target that is not one fails before anything is created.
+        let bad = Cli::try_parse_from(["rift", "vpn", "connect", "phone", "pp", "web"]).unwrap();
+        let Command::Vpn {
+            command: Vpn::Connect { access, .. },
+        } = bad.command
+        else {
+            unreachable!()
+        };
+        assert!(access.into_access().plan().is_err());
+    }
+
     #[test]
     fn vpn_short_form_names_device_agent_and_targets() {
         let plan = vpn_plan(&[
