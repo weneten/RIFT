@@ -1071,14 +1071,19 @@ def plaintext_secret_scan(server_cfg, tokens):
 # ---------- a VPN device: grants, re-import notes and names ----------
 
 DNS_RESPONDER = r"""import socket,sys
-# A home DNS server (AdGuard stand-in): every A question gets 192.0.2.53.
+# A home DNS server (Pi-hole stand-in). Every A question gets the client address from the
+# EDNS Client Subnet option RIFT adds, so the test sees which device RIFT named; without the
+# option it answers 192.0.2.53.
 s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind((sys.argv[1],53))
+ECS=bytes([0,8,0,8,0,1,32,0])
 while True:
-    q,a=s.recvfrom(512)
+    q,a=s.recvfrom(1024)
     end=12
     while q[end]: end+=q[end]+1
     end+=5
-    s.sendto(q[:2]+bytes([0x81,0x80,0,1,0,1,0,0,0,0])+q[12:end]+bytes([0xc0,0x0c,0,1,0,1,0,0,0,60,0,4,192,0,2,53]),a)
+    at=q.find(ECS,end)
+    addr=q[at+8:at+12] if at>=0 else bytes([192,0,2,53])
+    s.sendto(q[:2]+bytes([0x81,0x80,0,1,0,1,0,0,0,0])+q[12:end]+bytes([0xc0,0x0c,0,1,0,1,0,0,0,60,0,4])+addr,a)
 """
 
 DNS_QUERY = r"""import socket,sys
@@ -1186,9 +1191,11 @@ def vpn_device_test(server_cfg):
     assert home["reimport"] == ["phone"], home
     config = json.loads(cli(VPS, server_cfg, "vpn", "config", "phone", "--export").stdout)["config"]
     assert device_apply(config, me) == "10.13.0.1", config
-    assert wait_until(lambda: ask("example.com") == ["0", "192.0.2.53"],
-                      "example.com through RIFT to the home DNS server", timeout=40)
-    print("PASS names: NAME.internal only for agents with names and a grant, other names relayed to the device's DNS agent")
+    # The home DNS server answers with the device address RIFT passed on (EDNS Client Subnet),
+    # so a Pi-hole shows the device instead of the server.
+    assert wait_until(lambda: ask("example.com") == ["0", me],
+                      "example.com through RIFT to the home DNS server, naming the device", timeout=40)
+    print("PASS names: NAME.internal only for agents with names and a grant, other names relayed to the device's DNS agent with the device's address")
 
     # The device opts out: its configuration changes, and the server no longer answers it.
     off = json.loads(cli(VPS, server_cfg, "vpn", "names", "device", "phone", "off").stdout)

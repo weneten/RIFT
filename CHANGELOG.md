@@ -6,6 +6,8 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ### Added
 
+- Names: lookups that RIFT passes to a device's own DNS server (`rift vpn dns`) carry the device's VPN address as EDNS Client Subnet, so a Pi-hole with ECS evaluation shows the real device instead of the server. Public resolvers (`RIFT_VPN_DNS`) never get it.
+
 - Agents of the previous release keep working with an updated server: the server accepts every protocol from `MIN_PEER_VERSION` to its own and shapes each agent's policy for its protocol. Agents report their RIFT version with every sync; `rift list agents` has a VERSION column, the web panel shows it, and `rift status` names agents older than the server. Update the server first.
 
 - Stored state is migrated on update instead of refused. `state.db` has a format number; RIFT copies an older database to `state-before-vN-TIME.db` (mode 0600) in the state volume and migrates it in one transaction. A database from a newer RIFT is refused with a clear message instead of the old advice to delete the volume. RIFT 0.1 state is read as format 1. An agent's `identity.json` has a format number too, and an agent drops a cached policy it cannot read; the server sends it again.

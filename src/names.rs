@@ -220,6 +220,133 @@ fn decide(query: &[u8], snap: &StateSnapshot, peer: &VpnPeer) -> Reply {
     }
 }
 
+const TYPE_OPT: u16 = 41;
+const OPTION_ECS: u16 = 8;
+/// The UDP payload size RIFT announces in an OPT record it adds (the common safe value).
+const EDNS_PAYLOAD: u16 = 1232;
+
+fn count(packet: &[u8], at: usize) -> Option<usize> {
+    Some(u16::from_be_bytes([*packet.get(at)?, *packet.get(at + 1)?]) as usize)
+}
+
+/// The offset after the name that starts at `pos` (labels or a compression pointer).
+fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
+    for _ in 0..128 {
+        let len = *packet.get(pos)?;
+        match len {
+            0 => return Some(pos + 1),
+            l if l & 0xc0 == 0xc0 => {
+                packet.get(pos + 1)?;
+                return Some(pos + 2);
+            }
+            l if l & 0xc0 == 0 => pos += 1 + l as usize,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The resource records of a message: (start, offset of the type field, offset after its
+/// data) for every record, and the section each one is in (0 answer, 1 authority, 2
+/// additional). `None` when the message is malformed.
+fn records(packet: &[u8]) -> Option<Vec<(usize, usize, usize, u8)>> {
+    let qd = count(packet, 4)?;
+    let counts = [count(packet, 6)?, count(packet, 8)?, count(packet, 10)?];
+    let mut pos = 12;
+    for _ in 0..qd {
+        pos = skip_name(packet, pos)? + 4;
+    }
+    let mut out = Vec::new();
+    for (section, n) in counts.iter().enumerate() {
+        for _ in 0..*n {
+            let start = pos;
+            let typ = skip_name(packet, pos)?;
+            let rdlen = count(packet, typ + 8)?;
+            pos = typ + 10 + rdlen;
+            if pos > packet.len() {
+                return None;
+            }
+            out.push((start, typ, pos, section as u8));
+        }
+    }
+    (pos == packet.len()).then_some(out)
+}
+
+/// `query` with an EDNS Client Subnet option that names the device (`ip`/32), so the device's
+/// DNS server can show and filter per device (Pi-hole reads it). A client's own ECS option is
+/// replaced; without an OPT record one is added, and the bool says so, to take it out of the
+/// answer again. A query that cannot be parsed goes out unchanged.
+fn with_client_subnet(query: &[u8], ip: Ipv4Addr) -> (Vec<u8>, bool) {
+    let mut ecs = Vec::with_capacity(12);
+    ecs.extend_from_slice(&OPTION_ECS.to_be_bytes());
+    ecs.extend_from_slice(&8u16.to_be_bytes());
+    ecs.extend_from_slice(&1u16.to_be_bytes()); // family: IPv4
+    ecs.extend_from_slice(&[32, 0]); // source prefix /32, scope 0
+    ecs.extend_from_slice(&ip.octets());
+    let Some(list) = records(query) else {
+        return (query.to_vec(), false);
+    };
+    let opt = list.iter().find(|(_, typ, _, section)| {
+        *section == 2 && count(query, *typ) == Some(TYPE_OPT as usize)
+    });
+    match opt {
+        Some(&(_, typ, end, _)) => {
+            let data = typ + 10;
+            let mut options = Vec::new();
+            let mut pos = data;
+            while pos + 4 <= end {
+                let code = count(query, pos).unwrap_or(0) as u16;
+                let len = count(query, pos + 2).unwrap_or(0);
+                if pos + 4 + len > end {
+                    return (query.to_vec(), false);
+                }
+                if code != OPTION_ECS {
+                    options.extend_from_slice(&query[pos..pos + 4 + len]);
+                }
+                pos += 4 + len;
+            }
+            options.extend_from_slice(&ecs);
+            let Ok(rdlen) = u16::try_from(options.len()) else {
+                return (query.to_vec(), false);
+            };
+            let mut out = query[..typ + 8].to_vec();
+            out.extend_from_slice(&rdlen.to_be_bytes());
+            out.extend_from_slice(&options);
+            out.extend_from_slice(&query[end..]);
+            (out, false)
+        }
+        None => {
+            let mut out = query.to_vec();
+            let ar = count(query, 10).unwrap_or(0) as u16 + 1;
+            out[10..12].copy_from_slice(&ar.to_be_bytes());
+            out.push(0); // the root name
+            out.extend_from_slice(&TYPE_OPT.to_be_bytes());
+            out.extend_from_slice(&EDNS_PAYLOAD.to_be_bytes());
+            out.extend_from_slice(&[0, 0, 0, 0]);
+            out.extend_from_slice(&(ecs.len() as u16).to_be_bytes());
+            out.extend_from_slice(&ecs);
+            (out, true)
+        }
+    }
+}
+
+/// `answer` without its OPT record: for a device that sent no EDNS, which RIFT added.
+fn without_opt(answer: &[u8]) -> Vec<u8> {
+    let Some(list) = records(answer) else {
+        return answer.to_vec();
+    };
+    let Some(&(start, _, end, _)) = list.iter().find(|(_, typ, _, section)| {
+        *section == 2 && count(answer, *typ) == Some(TYPE_OPT as usize)
+    }) else {
+        return answer.to_vec();
+    };
+    let mut out = answer[..start].to_vec();
+    out.extend_from_slice(&answer[end..]);
+    let ar = count(answer, 10).unwrap_or(1).saturating_sub(1) as u16;
+    out[10..12].copy_from_slice(&ar.to_be_bytes());
+    out
+}
+
 /// The current snapshot, read again at most every two seconds.
 struct Snapshots {
     state: Arc<StateStore>,
@@ -307,11 +434,19 @@ async fn handle(query: &[u8], source: IpAddr, ctx: &Names, tcp: bool) -> Vec<u8>
         Reply::Local(answer) => answer,
         Reply::Forward => {
             let upstreams = upstreams(&snap, peer, &ctx.config);
-            let answer = if tcp {
-                forward_tcp(query, &upstreams).await
+            // The device's own DNS server (an AdGuard or Pi-hole on its DNS agent) learns which
+            // device asks; public resolvers (RIFT_VPN_DNS) never get the address.
+            let (outgoing, added) = if vpn::dns_agent(&snap, peer).is_some() {
+                with_client_subnet(query, peer.ipv4)
             } else {
-                forward_udp(query, &upstreams).await
+                (query.to_vec(), false)
             };
+            let answer = if tcp {
+                forward_tcp(&outgoing, &upstreams).await
+            } else {
+                forward_udp(&outgoing, &upstreams).await
+            };
+            let answer = answer.map(|a| if added { without_opt(&a) } else { a });
             answer.unwrap_or_else(|| {
                 let end = read_question(query).map(|q| q.end);
                 respond(query, end, RCODE_SERVFAIL, None)
@@ -699,6 +834,69 @@ mod tests {
             .expect("no relayed answer");
         assert_eq!(&answer[..2], &q[..2]);
         assert!(answer.ends_with(b"upstream"));
+    }
+
+    /// The ECS option in a message, if any: (family, source prefix, address bytes).
+    fn ecs_of(packet: &[u8]) -> Option<(u16, u8, Vec<u8>)> {
+        let list = records(packet)?;
+        let &(_, typ, end, _) = list
+            .iter()
+            .find(|(_, typ, _, s)| *s == 2 && count(packet, *typ) == Some(41))?;
+        let mut pos = typ + 10;
+        while pos + 4 <= end {
+            let (code, len) = (count(packet, pos)?, count(packet, pos + 2)?);
+            if code == 8 {
+                let family = count(packet, pos + 4)? as u16;
+                return Some((
+                    family,
+                    packet[pos + 6],
+                    packet[pos + 8..pos + 4 + len].to_vec(),
+                ));
+            }
+            pos += 4 + len;
+        }
+        None
+    }
+
+    #[test]
+    fn the_device_address_is_added_for_its_dns_server() {
+        let device = Ipv4Addr::new(10, 14, 0, 2);
+        // A query without EDNS: an OPT record with the address is added.
+        let plain = query("example.com", TYPE_A);
+        let (out, added) = with_client_subnet(&plain, device);
+        assert!(added);
+        assert_eq!(count(&out, 10), Some(1), "ARCOUNT");
+        assert_eq!(ecs_of(&out), Some((1, 32, vec![10, 14, 0, 2])));
+        assert_eq!(
+            &out[..12][..10],
+            &plain[..10],
+            "the header is otherwise unchanged"
+        );
+        // The answer loses the OPT record RIFT added.
+        assert_eq!(without_opt(&out), plain);
+        // A query with EDNS and the client's own ECS: replaced, other options kept.
+        let mut edns = plain.clone();
+        edns[11] = 1;
+        let cookie = [0u8, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8];
+        let own_ecs = [0u8, 8, 0, 7, 0, 1, 24, 0, 192, 168, 1];
+        let options: Vec<u8> = cookie.iter().chain(own_ecs.iter()).copied().collect();
+        // Root name, type OPT, payload 4096, TTL 0, then the two-byte data length.
+        edns.extend_from_slice(&[0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0]);
+        edns.push(options.len() as u8);
+        edns.extend_from_slice(&options);
+        let (out, added) = with_client_subnet(&edns, device);
+        assert!(!added, "the client's OPT record stays");
+        assert_eq!(count(&out, 10), Some(1));
+        assert_eq!(ecs_of(&out), Some((1, 32, vec![10, 14, 0, 2])));
+        assert!(
+            out.windows(cookie.len()).any(|w| w == cookie),
+            "other options are kept"
+        );
+        // Garbage goes out unchanged.
+        assert_eq!(
+            with_client_subnet(&[1, 2, 3], device),
+            (vec![1, 2, 3], false)
+        );
     }
 
     #[test]
