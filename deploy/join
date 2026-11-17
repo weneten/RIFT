@@ -1,0 +1,108 @@
+#!/bin/sh
+# Set up this machine as a RIFT agent in one step, with the line `rift add agent NAME` prints
+# on the server:
+#
+#   sudo sh deploy/join SERVER NAME TOKEN
+#
+# Without TOKEN it asks for it, so the token stays out of the shell history. The script
+# prepares the host (deploy/prepare-host), writes config.toml and .env (mode 0600, other
+# settings in an existing agent .env are kept), installs the `rift` command, starts the agent,
+# waits until the server has accepted it and then removes the used token from .env.
+# Safe to run again with a new invitation.
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+env_file=$repo_dir/.env
+config_file=$repo_dir/config.toml
+
+fail() {
+  printf 'rift: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  echo "usage: sudo sh deploy/join SERVER NAME [TOKEN]" >&2
+  echo "  the line that 'rift add agent NAME' prints on the server, for example" >&2
+  echo "  sudo sh deploy/join rift.example.net:8443 node1 v1.eyJ2..." >&2
+  exit 2
+}
+
+[ "$#" -ge 2 ] && [ "$#" -le 3 ] || usage
+server=$1
+name=$2
+token=${3-}
+[ "$(id -u)" -eq 0 ] || fail "run as root: sudo sh deploy/join $server $name ..."
+case $server in
+  *:[0-9]*) ;;
+  *) fail "SERVER needs the enrollment port, as printed by 'rift add agent': $server:8443" ;;
+esac
+printf '%s' "$name" | grep -Eq '^[A-Za-z0-9_-]{1,63}$' || fail "NAME may contain letters, digits, - and _ only: $name"
+if [ -z "$token" ]; then
+  [ -t 0 ] || fail "no TOKEN given and no terminal to ask for it"
+  printf 'Invitation token (input hidden): '
+  stty -echo 2> /dev/null || true
+  read -r token || true
+  stty echo 2> /dev/null || true
+  echo
+fi
+case $token in
+  v1.?*) ;;
+  *) fail "this does not look like a RIFT invitation token (it starts with v1.)" ;;
+esac
+
+command -v docker > /dev/null 2>&1 \
+  || fail "Docker is not installed. Install it first, for example: curl -fsSL https://get.docker.com | sh"
+docker compose version > /dev/null 2>&1 || fail "Docker Compose v2 ('docker compose') is missing"
+docker info > /dev/null 2>&1 || fail "Docker does not answer; is the docker service running?"
+
+if [ -f "$env_file" ] && grep -Eq '^COMPOSE_PROFILES=server' "$env_file"; then
+  fail "$env_file belongs to a RIFT server; an agent needs its own checkout or machine"
+fi
+
+echo "1/5 Preparing the host"
+sh "$script_dir/prepare-host"
+
+echo "2/5 Writing config.toml and .env"
+[ -f "$config_file" ] || cp "$script_dir/agent/config.toml" "$config_file"
+umask 077
+[ -f "$env_file" ] || cp "$repo_dir/.env.agent.example" "$env_file"
+chmod 600 "$env_file"
+. "$script_dir/env.sh"
+put_env COMPOSE_PROFILES agent
+put_env RIFT_SERVER "$server"
+put_env RIFT_AGENT_NAME "$name"
+put_env RIFT_ENROLLMENT_TOKEN "$token"
+umask 022
+
+echo "3/5 Installing the rift command"
+sh "$script_dir/install-cli"
+
+echo "4/5 Starting the agent"
+cd "$repo_dir"
+docker compose pull --quiet
+docker compose up -d --force-recreate
+
+echo "5/5 Waiting for the server to accept the agent"
+active=
+i=0
+while [ "$i" -lt 60 ]; do
+  if docker exec rift-agent rift --config /etc/rift/config.toml --json status 2> /dev/null \
+    | grep -q '"active":true'; then
+    active=1
+    break
+  fi
+  i=$((i + 1))
+  sleep 2
+done
+if [ -z "$active" ]; then
+  echo "rift: the agent is not active after two minutes. Its last messages:" >&2
+  docker logs --tail 10 rift-agent 2>&1 | sed 's/^/  /' >&2
+  echo "rift: the token stays in $env_file; fix the cause and run 'docker compose up -d' or this script again." >&2
+  exit 1
+fi
+
+# The invitation is used up and an active agent ignores it; it has no reason to stay on disk.
+put_env RIFT_ENROLLMENT_TOKEN ""
+echo "Agent $name is active. The used token was removed from .env."
+echo "On the server, 'rift list agents' shows it; publish ports with 'rift add forward $name ...'."

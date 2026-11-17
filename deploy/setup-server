@@ -1,0 +1,218 @@
+#!/bin/sh
+# Set up this machine as the RIFT server (VPS) in one step:
+#
+#   sudo sh deploy/setup-server
+#
+# It asks for the few values RIFT needs and offers what it detects as the default: the public
+# address on this machine's interfaces, the name agents dial, and whether to turn on the web
+# panel. Without a terminal, or with --yes, it takes the detected values. Options set them
+# directly:
+#
+#   --endpoint NAME_OR_IP   the DNS name or address agents dial (default: the public IPv4)
+#   --public-ips LIST       comma-separated addresses on this machine that forwards listen on
+#   --panel / --no-panel    turn the web panel on (private: over the VPN only) or off
+#   --yes                   do not ask; take the detected values
+#
+# Then it prepares the host (deploy/prepare-host), writes config.toml and .env (mode 0600;
+# settings in an existing server .env are kept unless replaced here), installs the `rift`
+# command, starts the server and waits until it is ready. Safe to run again.
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+env_file=$repo_dir/.env
+config_file=$repo_dir/config.toml
+
+fail() {
+  printf 'rift: %s\n' "$*" >&2
+  exit 1
+}
+
+endpoint=
+public_ips=
+panel=
+assume_yes=
+while [ "$#" -gt 0 ]; do
+  case $1 in
+    --endpoint) [ "$#" -ge 2 ] || fail "--endpoint needs a value"; endpoint=$2; shift 2 ;;
+    --public-ips) [ "$#" -ge 2 ] || fail "--public-ips needs a value"; public_ips=$2; shift 2 ;;
+    --panel) panel=true; shift ;;
+    --no-panel) panel=false; shift ;;
+    --yes | -y) assume_yes=1; shift ;;
+    -h | --help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) fail "unknown option $1 (see sh deploy/setup-server --help)" ;;
+  esac
+done
+[ "$(id -u)" -eq 0 ] || fail "run as root: sudo sh deploy/setup-server"
+
+interactive=
+if [ -z "$assume_yes" ] && [ -t 0 ] && [ -t 1 ]; then
+  interactive=1
+fi
+# ask "Question" DEFAULT -> the answer, or the default on Enter or without a terminal.
+ask() {
+  if [ -z "$interactive" ]; then
+    printf '%s\n' "$2"
+    return
+  fi
+  if [ -n "$2" ]; then
+    printf '%s [%s]: ' "$1" "$2" > /dev/tty
+  else
+    printf '%s: ' "$1" > /dev/tty
+  fi
+  read -r answer < /dev/tty || answer=
+  printf '%s\n' "${answer:-$2}"
+}
+# yes_no "Question" y|n -> 0 for yes.
+yes_no() {
+  reply=$2
+  if [ -n "$interactive" ]; then
+    hint="y/N"
+    [ "$2" = y ] && hint="Y/n"
+    printf '%s [%s]: ' "$1" "$hint" > /dev/tty
+    read -r reply < /dev/tty || reply=
+    reply=${reply:-$2}
+  fi
+  case $reply in [yY]*) return 0 ;; *) return 1 ;; esac
+}
+
+command -v docker > /dev/null 2>&1 \
+  || fail "Docker is not installed. Install it first, for example: curl -fsSL https://get.docker.com | sh"
+docker compose version > /dev/null 2>&1 || fail "Docker Compose v2 ('docker compose') is missing"
+docker info > /dev/null 2>&1 || fail "Docker does not answer; is the docker service running?"
+
+if [ -f "$env_file" ] && grep -Eq '^COMPOSE_PROFILES=agent' "$env_file"; then
+  fail "$env_file belongs to a RIFT agent; the server needs its own checkout or machine"
+fi
+if [ -f "$env_file" ] && [ -n "$interactive" ]; then
+  yes_no "$env_file exists. Update it (other settings stay)?" y || fail "nothing changed"
+fi
+
+# Addresses on this machine's interfaces. Private and shared ones (RFC 1918, 100.64/10) are
+# what a cloud NAT hands out; RIFT's own pools and container bridges are never candidates.
+private_v4() {
+  case $1 in
+    10.* | 192.168.* | 172.1[6-9].* | 172.2[0-9].* | 172.3[01].* | 100.6[4-9].* | 100.[7-9][0-9].* | 100.1[01][0-9].* | 100.12[0-7].*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+v4_public=
+v4_private=
+for ip in $(ip -4 -o addr show scope global 2> /dev/null | awk '$2 !~ /^(rift|docker|br-|veth|virbr|cni|flannel|wg)/ {split($4, a, "/"); print a[1]}'); do
+  if private_v4 "$ip"; then
+    [ -n "$v4_private" ] || v4_private=$ip
+  else
+    [ -n "$v4_public" ] || v4_public=$ip
+  fi
+done
+v6_public=$(ip -6 -o addr show scope global 2> /dev/null \
+  | awk '$2 !~ /^(rift|docker|br-|veth|virbr|wg)/ && $0 !~ /temporary|deprecated/ {split($4, a, "/"); print a[1]}' \
+  | grep -Eiv '^f[cd]' | head -n 1 || true)
+
+allow_private=
+if [ -z "$public_ips" ]; then
+  if [ -n "$v4_public" ]; then
+    public_ips=$(ask "Public IPv4 address forwards listen on" "$v4_public")
+  elif [ -n "$v4_private" ]; then
+    echo "No public IPv4 address is assigned to an interface; this looks like a cloud NAT (Oracle Cloud, AWS, Google Cloud)."
+    echo "RIFT then listens on the private address $v4_private and the provider forwards the public one to it."
+    public_ips=$(ask "Private IPv4 address forwards listen on" "$v4_private")
+  else
+    [ -n "$interactive" ] || fail "no IPv4 address found; give one with --public-ips"
+    public_ips=$(ask "IPv4 address forwards listen on" "")
+  fi
+  if [ -n "$v6_public" ] && yes_no "Also publish forwards over IPv6 ($v6_public)?" n; then
+    public_ips="$public_ips,$v6_public"
+  fi
+fi
+[ -n "$public_ips" ] || fail "no address for RIFT_PUBLIC_IPS"
+first_v4=${public_ips%%,*}
+if private_v4 "$first_v4"; then
+  allow_private=true
+fi
+
+if [ -z "$endpoint" ]; then
+  default_endpoint=
+  [ -n "$v4_public" ] && default_endpoint=$v4_public
+  if [ -n "$allow_private" ]; then
+    echo "Agents need the public name or address, not $first_v4."
+  fi
+  endpoint=$(ask "DNS name or public address agents dial (a name is easier to move later)" "$default_endpoint")
+fi
+[ -n "$endpoint" ] || fail "no endpoint; give it with --endpoint (for example rift.example.net)"
+# A name or an IPv4/IPv6 address; host:port (exactly one colon), a scheme or a path is wrong.
+case $endpoint in
+  */*) fail "the endpoint is a plain name or address, without scheme or path: $endpoint" ;;
+esac
+if [ "$(printf '%s' "$endpoint" | tr -cd : | wc -c)" -eq 1 ]; then
+  fail "the endpoint takes no port; RIFT adds the WireGuard and enrollment ports itself: $endpoint"
+fi
+
+if [ -z "$panel" ]; then
+  if yes_no "Turn on the web panel (reachable only over the VPN, set up later with 'rift panel connect')?" n; then
+    panel=true
+  else
+    panel=false
+  fi
+fi
+
+echo
+echo "Endpoint:   $endpoint"
+echo "Public IPs: $public_ips${allow_private:+ (private address behind a NAT)}"
+echo "Web panel:  $panel"
+if [ -n "$interactive" ]; then
+  yes_no "Set up the server with these values?" y || fail "nothing changed"
+fi
+
+echo "1/5 Preparing the host"
+sh "$script_dir/prepare-host"
+
+echo "2/5 Writing config.toml and .env"
+[ -f "$config_file" ] || cp "$script_dir/vps/config.toml" "$config_file"
+umask 077
+[ -f "$env_file" ] || cp "$repo_dir/.env.server.example" "$env_file"
+chmod 600 "$env_file"
+. "$script_dir/env.sh"
+put_env COMPOSE_PROFILES server
+put_env RIFT_PUBLIC_ENDPOINT "$endpoint"
+put_env RIFT_PUBLIC_IPS "$public_ips"
+if [ -n "$allow_private" ]; then
+  put_env RIFT_ALLOW_PRIVATE_LISTENERS true
+fi
+put_env RIFT_WEBPANEL "$panel"
+umask 022
+
+echo "3/5 Installing the rift command and the site helper"
+sh "$script_dir/install-cli"
+
+echo "4/5 Starting the server"
+cd "$repo_dir"
+docker compose pull --quiet
+docker compose up -d --force-recreate
+
+echo "5/5 Waiting for the server to be ready"
+ready=
+i=0
+while [ "$i" -lt 60 ]; do
+  if docker exec rift-server rift --config /etc/rift/config.toml status > /dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  i=$((i + 1))
+  sleep 2
+done
+if [ -z "$ready" ]; then
+  echo "rift: the server is not ready after two minutes. Its last messages:" >&2
+  docker logs --tail 10 rift-server 2>&1 | sed 's/^/  /' >&2
+  exit 1
+fi
+
+wg_port=$(sed -n 's/^RIFT_WG_PORT=\([0-9]*\).*/\1/p' "$env_file" | tail -n 1)
+echo
+echo "The RIFT server is running."
+echo "Open in your cloud firewall or security group: UDP ${wg_port:-51820} (WireGuard), TCP 8443 (agent enrollment)"
+echo "and later the ports of your forwards."
+echo "Next: add an agent with   rift add agent NAME"
+if [ "$panel" = true ]; then
+  echo "Web panel: connect a device with   rift panel connect laptop"
+fi

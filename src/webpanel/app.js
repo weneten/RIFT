@@ -246,12 +246,14 @@ function inviteDialog(existing) {
   ], "Create invitation", async () => {
     const result = await act({ action: "agent_invite", name: name.value.trim(), ttl: ttl.value });
     await load();
-    const copyButton = button("Copy", (e) => copy(result.lines, e.currentTarget), "primary");
     openModal(`Invitation for ${result.name}`,
-      el("p", { class: "hint" }, "Put these three lines into the agent's .env, then start it. The token is a secret and works once."),
+      el("p", { class: "hint" }, "Run this on the agent, in a RIFT checkout (git clone https://github.com/weneten/RIFT.git && cd RIFT). It prepares the host, starts the agent and removes the token once the agent is active. The token is a secret and works once."),
       result.replaces ? el("p", { class: "hint" }, `${result.name} keeps its addresses, forwards, grants and exits.`) : null,
+      el("pre", { class: "pre" }, result.join),
+      el("div", { class: "buttons" }, button("Copy command", (e) => copy(result.join, e.currentTarget), "primary")),
+      el("p", { class: "hint" }, "Or put these three lines into the agent's .env yourself, then start it:"),
       el("pre", { class: "pre" }, result.lines),
-      el("div", { class: "form" }, el("div", { class: "buttons" }, copyButton, button("Done", closeModal))));
+      el("div", { class: "form" }, el("div", { class: "buttons" }, button("Copy lines", (e) => copy(result.lines, e.currentTarget)), button("Done", closeModal))));
   }));
 }
 
@@ -322,6 +324,11 @@ function deviceDialog() {
     const wanted = ports.value.trim();
     if (wanted && !agent.value) throw new Error("Choose the agent the ports are on.");
     const existed = peers.some((p) => p.name === device);
+    // The configuration routes addresses, not ports: compare it to say whether to re-import.
+    let before = null;
+    if (existed) {
+      try { before = (await act({ action: "vpn_config", name: device })).config; } catch (_) { /* compared below */ }
+    }
     if (!existed) await act({ action: "vpn_peer_add", name: device, panel: panel.checked });
     else if (panel.checked) await act({ action: "panel_allow", name: device, allowed: true });
     const notes = [];
@@ -334,13 +341,22 @@ function deviceDialog() {
         for (const spec of wanted.split(/[\s,]+/).filter(Boolean)) {
           const [port, proto] = spec.split("/");
           notes.push(proto === "tcp" && /^\d+$/.test(port)
-            ? `Once connected: ${ip}:${port}/tcp, a web page there at http://${ip}:${port}`
+            ? `Once connected: ${ip}:${port}/tcp (if it serves a web page: http://${ip}:${port})`
             : `Once connected: ${ip}:${spec}`);
         }
       }
     }
-    if (existed) notes.push(`${device} already existed: import this configuration again on the device.`);
     await load();
+    if (existed && before !== null) {
+      const after = (await act({ action: "vpn_config", name: device })).config;
+      if (after === before) {
+        notes.push(`${device}'s configuration is unchanged: the new access works on the device as it is, without importing anything.`);
+        openModal(`Access of ${device}`, el("div", { class: "notice", role: "status" }, ...notes.map((t) => el("p", {}, t))),
+          el("div", { class: "form" }, el("div", { class: "buttons" }, button("Done", closeModal, "primary"))));
+        return;
+      }
+      notes.push(`${device}'s configuration changed: import this one on the device instead of the old one.`);
+    }
     if (wanted || panel.checked) await configDialog(device, undefined, notes);
     else grantsDialog(device);
   }));

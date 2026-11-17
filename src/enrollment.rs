@@ -91,6 +91,11 @@ pub fn create_invite(
     Ok(invite)
 }
 
+/// The one line that sets up an agent from a RIFT checkout on that machine (deploy/join).
+pub fn join_command(server: &str, name: &str, token: &str) -> String {
+    format!("sudo sh deploy/join {server} {name} {token}")
+}
+
 fn parse_invite(value: &str) -> Result<InviteBundle> {
     anyhow::ensure!(value.len() <= MAX_INVITE, "invitation is too large");
     let encoded = value

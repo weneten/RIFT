@@ -6,6 +6,10 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ### Added
 
+- `sudo sh deploy/join SERVER NAME TOKEN` sets up an agent in one step: host preparation, `config.toml` and `.env`, the `rift` command, start, waiting for the server to accept it, and removing the used token from `.env`. `rift add agent` and the web panel's invitation dialog print this command first; the three `.env` lines follow for a manual setup.
+- `sudo sh deploy/setup-server` sets up the server in one step. It asks for the public address, the endpoint and the web panel, with the values it detects as defaults (or takes `--endpoint`, `--public-ips`, `--panel`/`--no-panel`, `--yes`), recognises a cloud NAT, then prepares the host, writes the configuration, installs the `rift` command, starts the server and waits until it is ready.
+- `rift vpn connect` and the panel's "Connect device" say whether the device must import its configuration again: another port on an agent the device already reaches needs no new configuration, because a configuration routes addresses, not ports.
+
 - `rift vpn connect DEVICE AGENT TARGET... [--export]`: creates the device if it does not exist, grants the targets like `rift vpn allow` and prints the QR code with the addresses to open, for example `rift vpn connect phone node1 3000/tcp`. The web panel's "Add device" dialog is now "Connect device" and does the same. A target that is not valid fails before a device is created.
 
 - `rift add forward ... --allow-from ADDRESS[,NETWORK...]`: only the named clients reach the forward; the server neither redirects nor relays anyone else. Shown in the FROM column of `rift list forwards`, in the web panel, and carried by `rift export` / `rift import`.

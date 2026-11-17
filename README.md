@@ -65,6 +65,18 @@ The agent needs outbound connectivity to the server's enrollment and WireGuard p
 
 ## Install the server
 
+**The short way.** On the server, with Docker installed:
+
+```sh
+git clone https://github.com/weneten/RIFT.git
+cd RIFT
+sudo sh deploy/setup-server
+```
+
+The script asks for the public address forwards listen on, the DNS name or address agents dial, and whether to turn on the web panel; it offers what it detects on this machine as the default (Enter accepts it). Behind a cloud NAT it notices that only a private address is on the interface and sets `RIFT_ALLOW_PRIVATE_LISTENERS=true`. It then runs `deploy/prepare-host`, writes `config.toml` and `.env`, installs the `rift` command, starts the server and waits until it is ready. Without questions: `sudo sh deploy/setup-server --endpoint rift.example.net --public-ips 203.0.113.10 --no-panel --yes`. The steps below do the same by hand and explain each setting.
+
+### Manual installation
+
 Run the following on **each** Linux machine that will run RIFT:
 
 ```sh
@@ -127,9 +139,21 @@ On the **server**, create a short-lived, single-use invitation. Choose a unique 
 rift add agent node1 --ttl 15m
 ```
 
-The output contains `RIFT_SERVER`, `RIFT_AGENT_NAME` and `RIFT_ENROLLMENT_TOKEN`. Treat the token as a secret and transfer all three lines securely to the agent.
+The output starts with one command for the agent, for example `sudo sh deploy/join rift.example.net:8443 node1 v1.eyJ2...`, followed by the same values as three `.env` lines. Treat the token as a secret and transfer it securely.
+
+**The short way.** On the **agent**, with Docker installed:
+
+```sh
+git clone https://github.com/weneten/RIFT.git
+cd RIFT
+sudo sh deploy/join rift.example.net:8443 node1 v1.eyJ2...
+```
+
+Paste the command exactly as `rift add agent` printed it; leave the token out to be asked for it without it landing in the shell history. The script runs `deploy/prepare-host`, writes `config.toml` and `.env` (other settings of an existing agent `.env`, such as `RIFT_AGENT_ALLOW_PORTS`, are kept), installs the `rift` command, starts the agent, waits until the server has accepted it and then removes the used token from `.env`. The web panel's invitation dialog shows the same command.
 
 The enrollment port opens with the invitation. With the default `RIFT_ENROLLMENT=auto` the server listens on TCP 8443 (and RIFT's UFW rule for it exists) only while at least one invitation is open. It closes again as soon as the last agent is active or the last invitation has expired or been cancelled; expiry is noticed within one reconcile interval (10 s). RIFT can only close the port on the server itself: a rule in your cloud firewall or security group stays open, but nothing listens behind it. Set `RIFT_ENROLLMENT=always` to keep the port open permanently, or `off` to turn enrollment off. `rift status` shows the port's state and the open invitations.
+
+### Manual setup of an agent
 
 On the **agent**, from its own checkout:
 
@@ -164,7 +188,7 @@ rift list agents
 rift status
 ```
 
-Once active, remove the token line from the agent's `.env`; preserve its state volume for reconnection. If the invitation expires or is lost, cancel it and create another on the server. Repeat this process with a different name for every additional agent.
+Once active, the agent ignores the token (it was single-use anyway); `deploy/join` removes it from `.env` for you, by hand you may delete the line. Preserve the agent's state volume for reconnection. If the invitation expires or is lost, cancel it and create another on the server. Repeat this process with a different name for every additional agent.
 
 ## Harden the agent
 

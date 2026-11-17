@@ -993,9 +993,28 @@ async fn vpn_connect(config: &Config, json: bool, args: VpnAccessArgs, export: b
         .into_iter()
         .flatten()
         .any(|p| p["name"].as_str() == Some(name.as_str()));
-    if !exists {
+    // Only an exit through the agent asked for: that profile is the one to import.
+    let profile = match &plan.exit {
+        Some(Exit::Agent(agent)) if plan.accesses.is_empty() => Some(agent.clone()),
+        _ => None,
+    };
+    // A device's configuration routes addresses, not ports: another port on an agent it
+    // already reaches changes nothing on the device. Compare to say whether to re-import.
+    let before = if exists {
+        admin_ok(
+            config,
+            AdminRequest::VpnConfig {
+                name: name.clone(),
+                agent: profile.clone(),
+            },
+        )
+        .await
+        .ok()
+        .and_then(|data| data["config"].as_str().map(String::from))
+    } else {
         admin_ok(config, AdminRequest::VpnPeerAdd { name: name.clone() }).await?;
-    }
+        None
+    };
     let mut warnings = Vec::new();
     for request in requests {
         let data = admin_ok(config, request)
@@ -1019,23 +1038,19 @@ async fn vpn_connect(config: &Config, json: bool, args: VpnAccessArgs, export: b
         .as_deref()
         .map(|ip| reach_lines(ip, &plan.accesses))
         .unwrap_or_default();
-    // Only an exit through the agent asked for: that profile is the one to import.
-    let profile = match &plan.exit {
-        Some(Exit::Agent(agent)) if plan.accesses.is_empty() => Some(agent.clone()),
-        _ => None,
-    };
+    let data = admin_ok(
+        config,
+        AdminRequest::VpnConfig {
+            name: name.clone(),
+            agent: profile.clone(),
+        },
+    )
+    .await?;
+    let changed = before.as_deref() != data["config"].as_str();
     if json {
-        let data = admin_ok(
-            config,
-            AdminRequest::VpnConfig {
-                name: name.clone(),
-                agent: profile,
-            },
-        )
-        .await?;
         println!(
             "{}",
-            serde_json::json!({"device": name, "created": !exists, "warnings": warnings, "reach": reach, "config": data})
+            serde_json::json!({"device": name, "created": !exists, "reimport": changed, "warnings": warnings, "reach": reach, "config": data})
         );
         return Ok(());
     }
@@ -1045,9 +1060,13 @@ async fn vpn_connect(config: &Config, json: bool, args: VpnAccessArgs, export: b
     for warning in &warnings {
         eprintln!("Warning: {warning}");
     }
-    vpn_config(config, false, name.clone(), profile.clone(), !export).await?;
-    if exists {
-        eprintln!("{name} already existed: import this configuration again on the device so it routes the new access.");
+    if exists && !changed {
+        eprintln!("{name}'s configuration is unchanged: the new access works on the device as it is, without importing anything.");
+    } else {
+        vpn_config(config, false, name.clone(), profile.clone(), !export).await?;
+        if exists {
+            eprintln!("{name}'s configuration changed: import this one on the device instead of the old one.");
+        }
     }
     if !reach.is_empty() {
         eprintln!("Once the device is connected:");
@@ -1071,7 +1090,7 @@ fn reach_lines(tunnel_ipv4: &str, accesses: &[VpnAccess]) -> Vec<String> {
                 if *protocol == Protocol::Tcp && ports.start == ports.end =>
             {
                 format!(
-                    "{tunnel_ipv4}:{ports}/tcp (a web page there: http://{tunnel_ipv4}:{ports})"
+                    "{tunnel_ipv4}:{ports}/tcp (if it serves a web page: http://{tunnel_ipv4}:{ports})"
                 )
             }
             VpnAccess::Port { protocol, ports } => format!("{tunnel_ipv4}:{ports}/{protocol}"),
@@ -1184,13 +1203,16 @@ async fn show(
     if json {
         println!("{}", serde_json::to_string(&response.data)?);
     } else if invitation {
-        println!(
-            "RIFT_SERVER={}\nRIFT_AGENT_NAME={}\nRIFT_ENROLLMENT_TOKEN={}",
+        let (server, name, token) = (
             response.data["server"].as_str().unwrap_or_default(),
             response.data["name"].as_str().unwrap_or_default(),
-            response.data["token"].as_str().unwrap_or_default()
+            response.data["token"].as_str().unwrap_or_default(),
         );
-        eprintln!("Copy these values into the agent's private .env file. This invitation is single-use and expires.");
+        eprintln!("On the agent, in a RIFT checkout (git clone https://github.com/weneten/RIFT.git && cd RIFT), run:");
+        println!("{}", rift::enrollment::join_command(server, name, token));
+        eprintln!("Or put these lines into the agent's .env yourself:");
+        println!("RIFT_SERVER={server}\nRIFT_AGENT_NAME={name}\nRIFT_ENROLLMENT_TOKEN={token}");
+        eprintln!("The token is a secret; it works once and expires.");
         if response.data["replaces"].as_bool() == Some(true) {
             eprintln!("{} already exists: the install that uses this invitation takes over its key and keeps its addresses, forwards, grants and exits. The old install stops working then.", response.data["name"].as_str().unwrap_or_default());
         }

@@ -695,6 +695,12 @@ impl Action {
                     data["token"].as_str().unwrap_or_default()
                 )
                 .into();
+                data["join"] = crate::enrollment::join_command(
+                    data["server"].as_str().unwrap_or_default(),
+                    data["name"].as_str().unwrap_or_default(),
+                    data["token"].as_str().unwrap_or_default(),
+                )
+                .into();
                 data
             }
             Self::AgentCancelInvite { name } => {
