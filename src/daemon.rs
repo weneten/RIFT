@@ -483,6 +483,8 @@ async fn reload_config(s: &Server) -> Result<u64> {
         || next.webpanel_control != current.webpanel_control
         || next.webpanel_2fa != current.webpanel_2fa
         || next.webpanel_allow != current.webpanel_allow
+        || next.webpanel_proxies != current.webpanel_proxies
+        || next.webpanel_insecure != current.webpanel_insecure
         || next.route_table != current.route_table
         || next.rule_priority != current.rule_priority
         || next.mark != current.mark

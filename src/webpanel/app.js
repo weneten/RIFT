@@ -918,6 +918,10 @@ async function updateLoginForm() {
     const session = await api("/api/session");
     $("code-row").hidden = !session.two_factor;
     $("code").required = !!session.two_factor;
+    const refused = session.login_allowed === false;
+    $("https-only").hidden = !refused;
+    $("password").disabled = refused;
+    $("login-form").querySelector("button[type=submit]").disabled = refused;
   } catch (_) { /* keep the form as it is */ }
 }
 

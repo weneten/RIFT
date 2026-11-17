@@ -200,6 +200,12 @@ pub struct Config {
     /// Extra source addresses that may open the panel besides loopback and the VPN devices
     /// granted with `rift panel allow`. In public mode a non-empty list restricts the panel to it.
     pub webpanel_allow: Vec<IpNet>,
+    /// TLS reverse proxies in front of a public panel: from these, a request with
+    /// `X-Forwarded-Proto: https` may log in.
+    pub webpanel_proxies: Vec<IpNet>,
+    /// Allows the password over plain HTTP in public mode. Off: only HTTPS, the VPS itself, an
+    /// SSH tunnel or a VPN device may log in.
+    pub webpanel_insecure: bool,
     /// From the environment only. Without it a generated password lives in the state directory.
     #[serde(skip)]
     pub webpanel_password: Option<String>,
@@ -255,6 +261,8 @@ impl Default for Config {
             webpanel_control: PanelControl::Private,
             webpanel_2fa: PanelTwoFactor::Optional,
             webpanel_allow: vec![],
+            webpanel_proxies: vec![],
+            webpanel_insecure: false,
             webpanel_password: None,
             agent_name: None,
             agent_allow_ports: None,
@@ -331,6 +339,11 @@ impl Config {
         env_parse!("RIFT_WEBPANEL_PORT", webpanel_port);
         env_parse!("RIFT_WEBPANEL_CONTROL", webpanel_control);
         env_parse!("RIFT_WEBPANEL_2FA", webpanel_2fa);
+        env_parse!("RIFT_WEBPANEL_INSECURE", webpanel_insecure);
+        if let Ok(v) = std::env::var("RIFT_WEBPANEL_PROXIES") {
+            config.webpanel_proxies =
+                parse_allow_list(&v).context("invalid RIFT_WEBPANEL_PROXIES")?;
+        }
         if let Ok(v) = std::env::var("RIFT_WEBPANEL_ALLOW") {
             config.webpanel_allow = parse_allow_list(&v).context("invalid RIFT_WEBPANEL_ALLOW")?;
         }

@@ -305,7 +305,7 @@ impl<B: Backend> Panel<B> {
             ("GET", "/logo.svg") => Response::asset("image/svg+xml", LOGO),
             ("GET", "/api/session") => Response::json(
                 200,
-                &json!({"authenticated": self.session(&request), "can_write": self.trusted(&request, source), "two_factor": self.two_factor.enabled()}),
+                &json!({"authenticated": self.session(&request), "can_write": self.trusted(&request, source), "two_factor": self.two_factor.enabled(), "login_allowed": self.encrypted(&request, source)}),
             ),
             ("POST", path) if request.header(CSRF_HEADER) != Some("1") => {
                 tracing::warn!("web panel refused {path} from {source}: missing {CSRF_HEADER}");
@@ -367,6 +367,34 @@ impl<B: Backend> Panel<B> {
             && (source.is_loopback() || self.backend.panel_peers().contains(&source))
     }
 
+    /// Whether the password may be sent on this connection. A private panel is reached only
+    /// locally or through WireGuard. A public one also on plain HTTP over the internet, where
+    /// the password would cross the network readable: there a login needs HTTPS through a TLS
+    /// proxy listed in RIFT_WEBPANEL_PROXIES (or on loopback), the VPS itself or an SSH tunnel
+    /// (loopback without proxy headers), or WireGuard (a panel VPN device, an agent tunnel).
+    /// RIFT_WEBPANEL_INSECURE=true lifts the rule.
+    fn encrypted(&self, request: &Request, source: IpAddr) -> bool {
+        if self.config.webpanel_access != PanelAccess::Public || self.config.webpanel_insecure {
+            return true;
+        }
+        let source = source.to_canonical();
+        let proxied = PROXY_HEADERS.iter().any(|h| request.header(h).is_some());
+        let https = request.header("x-forwarded-proto") == Some("https");
+        let tunnel = match source {
+            IpAddr::V4(ip) => self.config.ipv4_pool.contains(&ip),
+            IpAddr::V6(ip) => self.config.ipv6_pool.contains(&ip),
+        };
+        let proxy = source.is_loopback()
+            || self
+                .config
+                .webpanel_proxies
+                .iter()
+                .any(|net| net.contains(&source));
+        (!proxied
+            && (source.is_loopback() || tunnel || self.backend.panel_peers().contains(&source)))
+            || (proxy && https)
+    }
+
     fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, i64>> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let epoch = self.two_factor.epoch();
@@ -395,6 +423,10 @@ impl<B: Backend> Panel<B> {
         let Ok(login) = serde_json::from_slice::<Login>(&request.body) else {
             return Response::error(400, "expected {\"password\": ..., \"code\": ...}");
         };
+        if !self.encrypted(request, source) {
+            tracing::warn!("web panel refused a login over plain HTTP from {source}");
+            return Response::error(403, HTTPS_ONLY);
+        }
         let _serial = self.login.lock().await;
         if self.two_factor.locked(now()) {
             return Response::error(429, "too many failed logins; try again later");
@@ -475,6 +507,7 @@ impl<B: Backend> Panel<B> {
     }
 }
 
+const HTTPS_ONLY: &str = "this public panel accepts the password over HTTPS only: open it through a TLS proxy listed in RIFT_WEBPANEL_PROXIES, an SSH tunnel or a VPN device (rift panel connect). RIFT_WEBPANEL_INSECURE=true allows plain HTTP";
 const READ_ONLY: &str =
     "read-only connection: changes need the VPS itself, an SSH tunnel or a panel VPN device";
 const PROXY_HEADERS: [&str; 5] = [
@@ -1261,6 +1294,90 @@ mod tests {
             "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}\r\n{body}",
             body.len()
         )
+    }
+
+    #[tokio::test]
+    async fn a_public_panel_takes_the_password_over_https_only() {
+        let login = r#"{"password":"correct horse battery"}"#;
+        let ok = |r: &str| r.starts_with("HTTP/1.1 200");
+        let csrf = "X-Rift-Panel: 1\r\n";
+        let https =
+            "X-Rift-Panel: 1\r\nX-Forwarded-Proto: https\r\nX-Forwarded-For: 198.51.100.9\r\n";
+        let mut cfg = config(PanelAccess::Public, "");
+        cfg.webpanel_proxies = crate::config::parse_allow_list("192.0.2.80").unwrap();
+        let (public, _fake) = panel(cfg.clone());
+        // Plain HTTP from the internet: refused, whatever header the client adds itself.
+        let plain = exchange(&public, "198.51.100.9", &post("/api/login", login, csrf)).await;
+        assert!(
+            plain.starts_with("HTTP/1.1 403") && plain.contains("HTTPS only"),
+            "{plain}"
+        );
+        let forged = exchange(&public, "198.51.100.9", &post("/api/login", login, https)).await;
+        assert!(forged.starts_with("HTTP/1.1 403"), "{forged}");
+        // Through the listed TLS proxy: only with X-Forwarded-Proto: https.
+        assert!(ok(&exchange(
+            &public,
+            "192.0.2.80",
+            &post("/api/login", login, https)
+        )
+        .await));
+        let http_proxy = "X-Rift-Panel: 1\r\nX-Forwarded-Proto: http\r\n";
+        let downgraded = exchange(
+            &public,
+            "192.0.2.80",
+            &post("/api/login", login, http_proxy),
+        )
+        .await;
+        assert!(downgraded.starts_with("HTTP/1.1 403"), "{downgraded}");
+        // The VPS itself or an SSH tunnel, a proxy on the VPS, a panel device, an agent tunnel.
+        assert!(ok(&exchange(
+            &public,
+            "127.0.0.1",
+            &post("/api/login", login, csrf)
+        )
+        .await));
+        assert!(ok(&exchange(
+            &public,
+            "127.0.0.1",
+            &post("/api/login", login, https)
+        )
+        .await));
+        assert!(ok(&exchange(
+            &public,
+            "10.14.0.2",
+            &post("/api/login", login, csrf)
+        )
+        .await));
+        assert!(ok(&exchange(
+            &public,
+            "10.13.0.7",
+            &post("/api/login", login, csrf)
+        )
+        .await));
+        // The session endpoint tells the login form.
+        let session = exchange(
+            &public,
+            "198.51.100.9",
+            "GET /api/session HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert!(session.contains("\"login_allowed\":false"), "{session}");
+        // RIFT_WEBPANEL_INSECURE=true lifts the rule; a private panel never had it.
+        cfg.webpanel_insecure = true;
+        let (insecure, _fake) = panel(cfg);
+        assert!(ok(&exchange(
+            &insecure,
+            "198.51.100.9",
+            &post("/api/login", login, csrf)
+        )
+        .await));
+        let (private, _fake) = panel(config(PanelAccess::Private, ""));
+        assert!(ok(&exchange(
+            &private,
+            "127.0.0.1",
+            &post("/api/login", login, csrf)
+        )
+        .await));
     }
 
     fn session_cookie(response: &str) -> String {
