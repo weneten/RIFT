@@ -1095,6 +1095,8 @@ def command_rm(host):
     remove_forward(state, site.get("forward_id"))
     del state["sites"][host]
     save_state(state)
+    forward = f"forward {site['forward_id']}" if site.get("forward_id") else "no forward"
+    print(f"Site {host} removed: {site['proxy']} configuration and {forward} (agent {site.get('agent', '?')}).")
     if note:
         print(note, file=sys.stderr)
     try:

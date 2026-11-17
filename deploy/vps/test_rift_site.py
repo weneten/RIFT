@@ -1,3 +1,4 @@
+import contextlib
 import importlib.machinery
 import importlib.util
 import io
@@ -996,6 +997,26 @@ class BackupTests(unittest.TestCase):
         with mock.patch.object(rift_site.os, "geteuid", return_value=1000):
             with self.assertRaisesRegex(rift_site.SiteError, "sudo"):
                 rift_site.command_restore(["x.tar.gz", "--yes"])
+
+
+class RemoveTests(unittest.TestCase):
+    def test_remove_says_what_it_removed(self):
+        state = {"sites": {"pd.example.net": {"agent": "PP", "proxy": "traefik", "forward_id": 9}}}
+        out = io.StringIO()
+        with mock.patch.object(rift_site, "load_state", return_value=state), \
+                mock.patch.object(rift_site, "sync_installation"), \
+                mock.patch.object(rift_site, "remove_site_config", return_value=None), \
+                mock.patch.object(rift_site, "remove_forward") as remove_forward, \
+                mock.patch.object(rift_site, "save_state"), \
+                mock.patch.object(rift_site, "reload_proxy"), \
+                contextlib.redirect_stdout(out):
+            rift_site.command_rm("pd.example.net")
+        remove_forward.assert_called_once_with(state, 9)
+        self.assertEqual(
+            out.getvalue().strip(),
+            "Site pd.example.net removed: traefik configuration and forward 9 (agent PP).",
+        )
+        self.assertNotIn("pd.example.net", state["sites"])
 
 
 class QueueTests(unittest.TestCase):
