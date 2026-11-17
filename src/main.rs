@@ -1016,12 +1016,15 @@ async fn vpn_connect(config: &Config, json: bool, args: VpnAccessArgs, export: b
         None
     };
     let mut warnings = Vec::new();
+    // Grants the agent's own limits refuse: stored, but not reachable yet.
+    let mut refused = Vec::new();
     for request in requests {
         let data = admin_ok(config, request)
             .await
             .context("the device and earlier grants of this command were already applied")?;
         if let Some(warning) = data["warning"].as_str() {
             warnings.push(warning.to_string());
+            refused.push(data["access"].clone());
         }
     }
     let tunnel = match &plan.agent {
@@ -1034,9 +1037,19 @@ async fn vpn_connect(config: &Config, json: bool, args: VpnAccessArgs, export: b
             .and_then(|a| a["tunnel_ipv4"].as_str().map(String::from)),
         None => None,
     };
+    let (usable, waiting): (Vec<VpnAccess>, Vec<VpnAccess>) =
+        plan.accesses.iter().cloned().partition(|access| {
+            !refused
+                .iter()
+                .any(|r| serde_json::to_value(access).is_ok_and(|a| &a == r))
+        });
     let reach = tunnel
         .as_deref()
-        .map(|ip| reach_lines(ip, &plan.accesses))
+        .map(|ip| reach_lines(ip, &usable))
+        .unwrap_or_default();
+    let not_yet = tunnel
+        .as_deref()
+        .map(|ip| reach_lines(ip, &waiting))
         .unwrap_or_default();
     let data = admin_ok(
         config,
@@ -1050,7 +1063,7 @@ async fn vpn_connect(config: &Config, json: bool, args: VpnAccessArgs, export: b
     if json {
         println!(
             "{}",
-            serde_json::json!({"device": name, "created": !exists, "reimport": changed, "warnings": warnings, "reach": reach, "config": data})
+            serde_json::json!({"device": name, "created": !exists, "reimport": changed, "warnings": warnings, "reach": reach, "refused": not_yet, "config": data})
         );
         return Ok(());
     }
@@ -1071,6 +1084,12 @@ async fn vpn_connect(config: &Config, json: bool, args: VpnAccessArgs, export: b
     if !reach.is_empty() {
         eprintln!("Once the device is connected:");
         for line in &reach {
+            eprintln!("  {line}");
+        }
+    }
+    if !not_yet.is_empty() {
+        eprintln!("Not reachable yet, the agent refuses it (see the warning above); it works once the agent allows it:");
+        for line in &not_yet {
             eprintln!("  {line}");
         }
     }

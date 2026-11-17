@@ -15,6 +15,13 @@ fn field(value: &Value, name: &str) -> String {
     text(&value[name])
 }
 
+/// The daemon added the entry, but the agent's own limits (RIFT_AGENT_ALLOW_*) refuse it.
+fn refused(data: &Value) -> bool {
+    data["warning"]
+        .as_str()
+        .is_some_and(|w| w.contains("will refuse it"))
+}
+
 /// A ban's expiry (Unix seconds) as a UTC date and time, for example `2026-11-16 10:00:00`.
 fn ban_expiry(value: &Value) -> String {
     match value.as_i64().and_then(|t| u64::try_from(t).ok()) {
@@ -603,6 +610,7 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
     let names = names(agents_data);
     match request {
         AdminRequest::ForwardsList => forwards(data, &names),
+        AdminRequest::ForwardAdd(_) if refused(data) => format!("Forward stored (ID {}), but not published: the agent refuses it (see the warning). It becomes active once the agent allows the port.\n{}", field(data, "id"), forwards(&Value::Array(vec![data.clone()]), &names)),
         AdminRequest::ForwardAdd(_) => format!("Forward created (ID {}).\n{}\nThe agent may need a moment to apply it; check 'rift status'.", field(data, "id"), forwards(&Value::Array(vec![data.clone()]), &names)),
         AdminRequest::ForwardRemove { id } => format!("Forward {id} removed."),
         AdminRequest::ForwardEnable { id, enabled } => format!("Forward {id} {}.{}", if *enabled { "enabled" } else { "disabled" }, if *enabled { " The agent may need a moment to apply it." } else { "" }),
@@ -623,6 +631,7 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
         AdminRequest::VpnPeerList => vpn_peers(data),
         AdminRequest::VpnPeerEnable { name, enabled } => format!("VPN device {name} {}.", if *enabled { "enabled" } else { "disabled; it can no longer connect" }),
         AdminRequest::VpnPeerRevoke { name } => format!("VPN device {name} revoked. Its key and grants are gone."),
+        AdminRequest::VpnAllow { peer, agent, access } if refused(data) => format!("Grant stored, but {peer} cannot reach {agent}: {} yet: {agent} refuses it (see the warning). It works once {agent} allows it.", vpn_access(&serde_json::to_value(access).unwrap_or_default())),
         AdminRequest::VpnAllow { peer, agent, access } => format!("{peer} may now reach {agent}: {}.", vpn_access(&serde_json::to_value(access).unwrap_or_default())),
         AdminRequest::VpnDeny { peer, agent, .. } => {
             let mut text = format!("Access of {peer} to {agent} withdrawn.");
@@ -631,6 +640,7 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
             }
             text
         }
+        AdminRequest::VpnDns { peer, agent: Some(agent) } if refused(data) => format!("DNS of {peer} stored, but {agent} refuses port 53 (see the warning): names will not resolve while the tunnel is on until {agent} allows it.\nImport the main profile again once it does: rift vpn config {peer}"),
         AdminRequest::VpnDns { peer, agent: Some(agent) } => format!("{peer} now uses {agent} as its DNS server (port 53 on {agent} is allowed).\nImport the main profile again: rift vpn config {peer}"),
         AdminRequest::VpnDns { peer, agent: None } => format!("{peer} uses the default DNS again.\nImport the main profile again: rift vpn config {peer}"),
         AdminRequest::VpnExit { peer, exit } => exit_added(peer, exit, data),
@@ -668,7 +678,30 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rift::model::{PortRange, Protocol, VpnAccess};
     use serde_json::json;
+
+    #[test]
+    fn a_refused_grant_or_forward_is_not_reported_as_working() {
+        let access = VpnAccess::Port {
+            protocol: Protocol::Tcp,
+            ports: PortRange {
+                start: 3030,
+                end: 3030,
+            },
+        };
+        let request = AdminRequest::VpnAllow {
+            peer: "handy".into(),
+            agent: "core".into(),
+            access,
+        };
+        let refused = json!({"warning": "the grant was added, but agent core will refuse it: the agent allows only ports 3000"});
+        let text = render(&request, &refused, None);
+        assert!(!text.contains("may now reach"), "{text}");
+        assert!(text.contains("cannot reach core"), "{text}");
+        let ok = render(&request, &json!({"warning": null}), None);
+        assert!(ok.contains("handy may now reach core"), "{ok}");
+    }
 
     #[test]
     fn bans_show_their_expiry_as_utc_time() {

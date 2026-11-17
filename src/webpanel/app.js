@@ -334,10 +334,13 @@ function deviceDialog() {
     const notes = [];
     if (wanted) {
       const result = await act({ action: "vpn_allow", peer: device, agent: agent.value, ports: wanted });
-      notes.push(...(result.warnings || []));
+      const refusals = result.warnings || [];
+      notes.push(...refusals);
       const host = (data.agents || []).find((a) => a.name === agent.value);
       const ip = host && host.tunnel_ipv4;
-      if (ip) {
+      if (ip && refusals.length) {
+        notes.push(`Stored, but not reachable yet: ${agent.value} refuses ${refusals.length === 1 ? "this grant" : "some of these grants"} (see above). It works once ${agent.value} allows it.`);
+      } else if (ip) {
         for (const spec of wanted.split(/[\s,]+/).filter(Boolean)) {
           const [port, proto] = spec.split("/");
           notes.push(proto === "tcp" && /^\d+$/.test(port)
