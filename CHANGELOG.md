@@ -6,6 +6,8 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ### Added
 
+- `SECURITY.md`: how to report a vulnerability privately (GitHub private vulnerability reporting), supported versions and scope.
+
 - `rift export` and `rift import` carry the names: the agents with names on (`named_agents`) and devices that turned them off (`names_off`). Older export files without them are read as before.
 
 - Names: lookups that RIFT passes to a device's own DNS server (`rift vpn dns`) carry the device's VPN address as EDNS Client Subnet, so a Pi-hole with ECS evaluation shows the real device instead of the server. Public resolvers (`RIFT_VPN_DNS`) never get it.

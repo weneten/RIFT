@@ -36,6 +36,7 @@ The agent initiates the connection to the server. RIFT manages the tunnel, expli
 - [Operations and troubleshooting](#operations-and-troubleshooting)
 - [Build and development](#build-and-development)
 - [Further documentation](#further-documentation)
+- [Security](#security)
 - [License](#license)
 
 ## How it works
@@ -1011,6 +1012,10 @@ The Linux network-namespace and Docker integration harnesses require disposable 
 
 - [Architecture and security boundaries](docs/architecture.md): packet paths, enrollment, translation, state and recovery.
 - [Deployment and verification](docs/deploy.md): preflight, firewall coexistence, rollout, rollback, integration tests and performance procedure.
+
+## Security
+
+Report vulnerabilities privately through GitHub's "Report a vulnerability" (Security tab); see [SECURITY.md](SECURITY.md).
 
 ## License
 
