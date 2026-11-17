@@ -695,6 +695,8 @@ mod tests {
 
     fn agent(id: &str, last: u8) -> AgentRecord {
         AgentRecord {
+            protocol: 0,
+            rift_version: String::new(),
             names: false,
             id: id.into(),
             name: id.into(),

@@ -954,6 +954,8 @@ Run the container-specific log command on the machine hosting that role.
 
 ### Updates, persistence and recovery
 
+**Order and compatibility.** Update the server first, then the agents, one at a time if you like: a server serves agents of its own release and of the previous one (from 0.2 on), so an agent that is updated later keeps working meanwhile. `rift list agents` shows each agent's RIFT version, and `rift status` names agents older than the server. An agent newer than its server is refused, so never update an agent before its server. Stored state is migrated on start; RIFT keeps a copy of the previous state (`state-before-vN-TIME.db`).
+
 To update the published image, on each host from its own checkout:
 
 ```sh

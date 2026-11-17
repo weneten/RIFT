@@ -968,6 +968,7 @@ fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> Value {
                 "tunnel_ipv4": a["tunnel_ipv4"],
                 "tunnel_ipv6": a["tunnel_ipv6"],
                 "names": a["names"].as_bool().unwrap_or(false),
+                "rift_version": a["rift_version"],
                 "dns_name": a["name"].as_str().and_then(crate::vpn::dns_label).map(|l| format!("{l}.{}", crate::vpn::NAMES_SUFFIX)),
                 "online": h.map(|h| h["online"].clone()).unwrap_or(Value::Bool(false)),
                 "configuration_ready": h.map(|h| h["configuration_ready"].clone()).unwrap_or(Value::Bool(false)),

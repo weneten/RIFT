@@ -309,6 +309,8 @@ mod tests {
         StateSnapshot {
             generation: 1,
             agents: vec![AgentRecord {
+                protocol: 0,
+                rift_version: String::new(),
                 names: false,
                 id: "a".into(),
                 name: "a".into(),

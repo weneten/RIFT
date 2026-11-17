@@ -559,7 +559,7 @@ async fn handle_control(mut stream: TcpStream, source: IpAddr, s: Arc<Server>) -
             attempt_id,
         } => {
             anyhow::ensure!(
-                version == VERSION && agent_id == agent.id,
+                protocol::supported(version) && agent_id == agent.id,
                 "identity mismatch"
             );
             let snap = s.state.activate(&agent.id, &attempt_id, source)?;
@@ -575,11 +575,14 @@ async fn handle_control(mut stream: TcpStream, source: IpAddr, s: Arc<Server>) -
             error,
             limits,
             exit,
+            rift_version,
         } => {
             anyhow::ensure!(
-                version == VERSION && agent_id == agent.id,
-                "identity mismatch"
+                protocol::supported(version),
+                "agent speaks protocol {version}, this server {}..={VERSION}; update the agent to this server's RIFT version",
+                protocol::MIN_PEER_VERSION
             );
+            anyhow::ensure!(agent_id == agent.id, "identity mismatch");
             if agent.status != AgentStatus::Active {
                 bail!("agent has not completed activation")
             }
@@ -594,9 +597,14 @@ async fn handle_control(mut stream: TcpStream, source: IpAddr, s: Arc<Server>) -
             }
             let changed_report = agent.limits.as_ref() != Some(&limits) || agent.exit != exit;
             let previous = agent.applied_generation;
-            let _ =
-                s.state
-                    .update_agent_sync(&agent.id, applied_generation, error, limits, exit)?;
+            let _ = s.state.update_agent_sync(
+                &agent.id,
+                applied_generation,
+                error,
+                limits,
+                exit,
+                (version, &rift_version),
+            )?;
             if previous != applied_generation || changed_report {
                 reconcile(&s).await?;
             }
@@ -634,7 +642,7 @@ async fn handle_control(mut stream: TcpStream, source: IpAddr, s: Arc<Server>) -
             ttl_seconds,
         } => {
             anyhow::ensure!(
-                version == VERSION && agent_id == agent.id,
+                protocol::supported(version) && agent_id == agent.id,
                 "identity mismatch"
             );
             anyhow::ensure!(
@@ -678,7 +686,7 @@ async fn handle_control(mut stream: TcpStream, source: IpAddr, s: Arc<Server>) -
             public_key,
         } => {
             anyhow::ensure!(
-                version == VERSION && agent_id == agent.id,
+                protocol::supported(version) && agent_id == agent.id,
                 "identity mismatch"
             );
             anyhow::ensure!(
@@ -794,7 +802,7 @@ fn policy_for(
     {
         vpn.push(crate::names::upstream_rule(server_ipv4));
     }
-    AgentPolicy {
+    let policy = AgentPolicy {
         generation: snapshot.generation,
         forwards: snapshot
             .forwards
@@ -805,7 +813,21 @@ fn policy_for(
         vpn_pool: Some(vpn_pool),
         vpn,
         exit: crate::vpn::agent_exit_policy(snapshot, id, vpn_pool, vpn_pool6),
-    }
+    };
+    let protocol = snapshot
+        .agents
+        .iter()
+        .find(|a| a.id == id)
+        .map_or(protocol::VERSION, |a| a.protocol);
+    downgrade(policy, protocol)
+}
+/// The policy as an agent speaking an older protocol can read it. Every protocol change that
+/// adds something to the policy leaves it out here for agents below that protocol, so a server
+/// serves the agents of the previous release (`protocol::MIN_PEER_VERSION`). Protocol 1 is
+/// the only one so far; nothing to leave out yet. An agent that has not synced yet (0) gets
+/// the current policy.
+fn downgrade(policy: AgentPolicy, _protocol: u16) -> AgentPolicy {
+    policy
 }
 
 #[cfg(unix)]
@@ -1039,7 +1061,7 @@ async fn admin_call_inner(s: &Server, r: AdminRequest) -> Result<serde_json::Val
                 .map(|n| n.moved.clone())
                 .unwrap_or_default();
             let inapplicable_forwards = inapplicable(&snap, &cfg.public_ips);
-            serde_json::json!({"moved_forwards":moved_forwards,"inapplicable_forwards":inapplicable_forwards,"snapshot":snap,"enrollment":enrollment,"invites":invites,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"refused_forwards":refused_forwards,"fully_applied":fully_applied,"connection_history":s.state.health()?})
+            serde_json::json!({"moved_forwards":moved_forwards,"inapplicable_forwards":inapplicable_forwards,"snapshot":snap,"enrollment":enrollment,"invites":invites,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"refused_forwards":refused_forwards,"fully_applied":fully_applied,"connection_history":s.state.health()?,"rift_version":protocol::RIFT_VERSION})
         }
         AdminRequest::AgentsList => serde_json::to_value(snap.agents)?,
         AdminRequest::AgentsShow { name } => {
@@ -2397,6 +2419,7 @@ async fn agent_sync(
             error: AGENT_REFUSALS.lock().ok().and_then(|r| r.clone()),
             limits: config.agent_limits(),
             exit: exit_report(config).await,
+            rift_version: protocol::RIFT_VERSION.into(),
         },
     )
     .await?;
@@ -2649,6 +2672,8 @@ mod tests {
             allow_from: Vec::new(),
         };
         let mut agent = AgentRecord {
+            protocol: 0,
+            rift_version: String::new(),
             names: false,
             id: "node4".into(),
             name: "node1".into(),
@@ -2729,6 +2754,8 @@ mod tests {
     #[test]
     fn an_agent_that_refuses_the_exit_loses_it_and_its_forward_until_it_allows_it() {
         let mut agent = AgentRecord {
+            protocol: 0,
+            rift_version: String::new(),
             names: false,
             id: "node4".into(),
             name: "node1".into(),

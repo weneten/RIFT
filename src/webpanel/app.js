@@ -772,7 +772,7 @@ function render() {
         actionButton("Remove", { action: "agent_remove", name: a.id }, `Remove ${a.name} with all its forwards and VPN grants? This cannot be undone.`, "danger"));
     }
     return el("tr", {},
-      el("td", {}, a.name),
+      el("td", {}, a.name, a.rift_version ? el("span", { class: "muted small", title: "RIFT version of the agent" }, ` ${a.rift_version}`) : null),
       el("td", {}, connection),
       el("td", {}, statePill, a.last_error ? el("span", { class: "muted small", title: a.last_error }, " ⚠") : null),
       el("td", {}, el("code", {}, a.tunnel_ipv4 || "-")),

@@ -388,6 +388,8 @@ impl StateStore {
         let t = now();
         let stage_deadline = (t + stage_seconds).min(expires);
         let record = AgentRecord {
+            protocol: 0,
+            rift_version: String::new(),
             names: false,
             id: id.into(),
             name: name.into(),
@@ -496,6 +498,7 @@ impl StateStore {
         error: Option<String>,
         limits: AgentLimits,
         exit: Option<ExitReport>,
+        version: (u16, &str),
     ) -> Result<StateSnapshot> {
         let mut c = self.lock()?;
         let tx = c.transaction()?;
@@ -514,12 +517,15 @@ impl StateStore {
             let changed = a.applied_generation != applied
                 || a.last_error != error
                 || a.limits.as_ref() != Some(&limits)
-                || a.exit != exit;
+                || a.exit != exit
+                || (a.protocol, a.rift_version.as_str()) != version;
             if changed {
                 a.applied_generation = applied;
                 a.last_error = error;
                 a.limits = Some(limits);
                 a.exit = exit;
+                a.protocol = version.0;
+                a.rift_version = version.1.chars().take(32).collect();
             }
             changed
         };
@@ -923,6 +929,8 @@ mod tests {
     #[test]
     fn vpn_state_is_validated() {
         let agent = |id: &str, n: u8| AgentRecord {
+            protocol: 0,
+            rift_version: String::new(),
             names: false,
             id: id.into(),
             name: id.into(),
@@ -998,6 +1006,8 @@ mod tests {
     fn exits_are_validated_and_follow_their_agent() {
         let store = StateStore::open(&tempdir().unwrap().path().join("s.db")).unwrap();
         let agent = |id: &str, n: u8, port: Option<u16>| AgentRecord {
+            protocol: 0,
+            rift_version: String::new(),
             names: false,
             id: id.into(),
             name: id.into(),
@@ -1555,6 +1565,8 @@ mod tests {
         store
             .mutate("fixture", |state| {
                 state.agents.push(AgentRecord {
+                    protocol: 0,
+                    rift_version: String::new(),
                     names: false,
                     id: "a".into(),
                     name: "a".into(),
@@ -1591,7 +1603,7 @@ mod tests {
             .as_i64()
             .is_some());
         assert!(store
-            .update_agent_sync("a", 2, None, AgentLimits::default(), None)
+            .update_agent_sync("a", 2, None, AgentLimits::default(), None, (1, "0.2.0"))
             .is_err());
     }
 }

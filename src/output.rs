@@ -182,6 +182,15 @@ pub fn reimport_note(request: &AdminRequest, data: &Value) -> Option<String> {
     ))
 }
 
+/// Whether release `a` is older than `b` (both like 0.2.1). Unknown versions are not.
+fn older(a: &str, b: &str) -> bool {
+    let parse = |v: &str| -> Option<Vec<u64>> { v.split('.').map(|p| p.parse().ok()).collect() };
+    match (parse(a), parse(b)) {
+        (Some(a), Some(b)) => a < b,
+        _ => false,
+    }
+}
+
 fn agents(data: &Value) -> String {
     let rows = data
         .as_array()
@@ -195,9 +204,14 @@ fn agents(data: &Value) -> String {
                 (Some(true), Some(label)) => format!("{label}.{}", rift::vpn::NAMES_SUFFIX),
                 _ => "-".into(),
             };
+            let version = a["rift_version"]
+                .as_str()
+                .filter(|v| !v.is_empty())
+                .unwrap_or("-");
             vec![
                 field(a, "name"),
                 field(a, "status"),
+                version.into(),
                 field(a, "tunnel_ipv4"),
                 dns,
                 field(a, "tunnel_ipv6"),
@@ -209,6 +223,7 @@ fn agents(data: &Value) -> String {
         &[
             "NAME",
             "STATE",
+            "VERSION",
             "TUNNEL IPv4",
             "DNS NAME",
             "TUNNEL IPv6",
@@ -350,6 +365,16 @@ fn status(data: &Value) -> String {
                 "Pending forward IDs: {}",
                 pending.iter().map(text).collect::<Vec<_>>().join(", ")
             ));
+        }
+        let server = data["rift_version"].as_str().unwrap_or_default();
+        for agent in data["snapshot"]["agents"].as_array().into_iter().flatten() {
+            let version = agent["rift_version"].as_str().unwrap_or_default();
+            if older(version, server) {
+                lines.push(format!(
+                    "Agent {} runs RIFT {version}, the server {server}: update the agent (git pull, sudo sh deploy/install-cli, docker compose pull && docker compose up -d).",
+                    field(agent, "name")
+                ));
+            }
         }
         for refused in data["refused_forwards"].as_array().into_iter().flatten() {
             lines.push(format!(
@@ -762,6 +787,20 @@ mod tests {
         assert!(text.contains("cannot reach core"), "{text}");
         let ok = render(&request, &json!({"warning": null}), None);
         assert!(ok.contains("handy may now reach core"), "{ok}");
+    }
+
+    #[test]
+    fn older_agents_are_named_in_the_status() {
+        assert!(older("0.1.9", "0.2.0") && older("0.2.0", "1.0.0") && older("1.9.0", "1.10.0"));
+        assert!(!older("0.2.0", "0.2.0") && !older("", "0.2.0") && !older("1.0.0", "0.9.9"));
+        let data = json!({"rift_version": "0.3.0", "snapshot": {"agents": [
+            {"name": "core", "rift_version": "0.2.0"}, {"name": "PP", "rift_version": "0.3.0"}]}});
+        let text = status(&data);
+        assert!(
+            text.contains("Agent core runs RIFT 0.2.0, the server 0.3.0"),
+            "{text}"
+        );
+        assert!(!text.contains("Agent PP"), "{text}");
     }
 
     #[test]

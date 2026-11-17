@@ -240,8 +240,11 @@ fn enroll(
     server_public_key: &str,
 ) -> Result<Welcome> {
     anyhow::ensure!(
-        req.version == protocol::VERSION,
-        "unsupported enrollment protocol version"
+        protocol::supported(req.version),
+        "this agent speaks enrollment protocol {}, the server {}..={}; use the server's RIFT version on the agent",
+        req.version,
+        protocol::MIN_PEER_VERSION,
+        protocol::VERSION
     );
     validate_name(&req.name)?;
     let id = uuid::Uuid::parse_str(&req.identity_id)?.to_string();

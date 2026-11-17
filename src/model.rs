@@ -277,6 +277,11 @@ pub struct AgentRecord {
     /// (`rift vpn names agent NAME on`).
     #[serde(default)]
     pub names: bool,
+    /// The protocol and release the agent reported with its last sync; 0 and empty before.
+    #[serde(default)]
+    pub protocol: u16,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rift_version: String,
 }
 /// What an agent that offers an internet exit tells the server with every sync.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -8,7 +8,21 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_FRAME: usize = 65536;
 const MAX_ADMIN_RESPONSE: usize = 4 * 1024 * 1024;
+/// The control and enrollment protocol this RIFT speaks.
 pub const VERSION: u16 = 1;
+/// The oldest protocol a server still accepts from agents. A server of release 1.N serves the
+/// agents of 1.(N-1) and 1.N, so agents can be updated after their server, one at a time. When
+/// a release changes the protocol, VERSION goes up and this stays at the previous one for one
+/// release; `daemon::policy_for` then leaves out what older agents cannot read.
+pub const MIN_PEER_VERSION: u16 = 1;
+
+/// Whether this server serves a peer that speaks `version`.
+pub fn supported(version: u16) -> bool {
+    (MIN_PEER_VERSION..=VERSION).contains(&version)
+}
+
+/// This RIFT's release, which agents report with every sync.
+pub const RIFT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct EnrollmentRequest {
@@ -40,6 +54,9 @@ pub enum ControlRequest {
         limits: AgentLimits,
         /// The agent's exit interface; `None` unless the agent offers an internet exit.
         exit: Option<ExitReport>,
+        /// The agent's release, for `rift list agents`; empty from agents before 0.2.
+        #[serde(default)]
+        rift_version: String,
     },
     Ban {
         version: u16,
@@ -271,6 +288,33 @@ pub async fn receive_admin<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Admin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_server_serves_the_previous_protocol_too() {
+        assert!(supported(VERSION) && supported(MIN_PEER_VERSION));
+        assert!(
+            !supported(VERSION + 1),
+            "a newer agent needs a newer server"
+        );
+        assert!(MIN_PEER_VERSION == 0 || !supported(MIN_PEER_VERSION - 1));
+    }
+
+    #[test]
+    fn a_sync_from_an_agent_before_0_2_is_read() {
+        // What a 0.1 agent sends: no rift_version.
+        let old = br#"{"Sync":{"version":1,"agent_id":"a","applied_generation":4,"error":null,"limits":{"ports":null,"subnets":[],"exit":false},"exit":null}}"#;
+        match serde_json::from_slice::<ControlRequest>(old) {
+            Ok(ControlRequest::Sync {
+                rift_version,
+                applied_generation,
+                ..
+            }) => {
+                assert!(rift_version.is_empty());
+                assert_eq!(applied_generation, 4);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
     #[tokio::test]
     async fn rejects_oversized_frames_before_allocating() {
         let (mut a, mut b) = tokio::io::duplex(8);
