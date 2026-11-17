@@ -1283,6 +1283,9 @@ async fn show(
             "{}",
             output::render(request, &response.data, agents.as_ref())
         );
+        if let Some(note) = output::reimport_note(request, &response.data) {
+            eprintln!("{note}");
+        }
     }
     Ok(())
 }

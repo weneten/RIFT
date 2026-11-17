@@ -26,7 +26,27 @@ async function api(path, body) {
   return result;
 }
 
-const act = (body) => api("/api/action", body);
+// Every change answers which devices' main profile it changed (`reimport`); they must import
+// it again. Callers that say so themselves pass { quiet: true }.
+const pendingImports = new Set();
+async function act(body, options) {
+  const result = await api("/api/action", body);
+  const devices = (result && Array.isArray(result.reimport)) ? result.reimport : [];
+  if (devices.length && !(options && options.quiet)) showReimport(devices);
+  return result;
+}
+
+function showReimport(devices) {
+  for (const d of devices) pendingImports.add(d);
+  const box = $("reimport");
+  const names = [...pendingImports];
+  if (!names.length) { box.hidden = true; box.replaceChildren(); return; }
+  box.replaceChildren(
+    el("p", {}, `The WireGuard configuration of ${names.join(", ")} changed. Import it again on the device, or the change does not reach it:`),
+    ...names.map((n) => button(`${n}: QR code`, () => configDialog(n))),
+    button("Dismiss", () => { pendingImports.clear(); showReimport([]); }));
+  box.hidden = false;
+}
 
 function el(tag, attrs, ...children) {
   const node = document.createElement(tag);
@@ -307,7 +327,7 @@ function banDialog(forward) {
 // main profile again, because their DNS server changed.
 async function namesChange(body) {
   try {
-    const result = await act(body);
+    const result = await act(body, { quiet: true });
     await load();
     const devices = result.reimport || [];
     const lines = [body.action === "agent_names"
@@ -347,11 +367,11 @@ function deviceDialog() {
     if (existed) {
       try { before = (await act({ action: "vpn_config", name: device })).config; } catch (_) { /* compared below */ }
     }
-    if (!existed) await act({ action: "vpn_peer_add", name: device, panel: panel.checked });
-    else if (panel.checked) await act({ action: "panel_allow", name: device, allowed: true });
+    if (!existed) await act({ action: "vpn_peer_add", name: device, panel: panel.checked }, { quiet: true });
+    else if (panel.checked) await act({ action: "panel_allow", name: device, allowed: true }, { quiet: true });
     const notes = [];
     if (wanted) {
-      const result = await act({ action: "vpn_allow", peer: device, agent: agent.value, ports: wanted });
+      const result = await act({ action: "vpn_allow", peer: device, agent: agent.value, ports: wanted }, { quiet: true });
       const refusals = result.warnings || [];
       notes.push(...refusals);
       const host = (data.agents || []).find((a) => a.name === agent.value);
@@ -453,7 +473,7 @@ function twoFactorOffDialog() {
 // Switches one exit of a device and says which profile to import again or delete in the
 // WireGuard app. `exit` is "server" (the main profile) or { agent } (an extra profile).
 async function changeExit(name, exit, on) {
-  const result = await act({ action: "vpn_exit", peer: name, exit, on });
+  const result = await act({ action: "vpn_exit", peer: name, exit, on }, { quiet: true });
   await load();
   const notes = [];
   if (exit === "server") {
@@ -482,14 +502,25 @@ function dnsRow(name, peer, agents, refresh) {
   choice.addEventListener("change", async () => {
     choice.disabled = true;
     try {
-      await act({ action: "vpn_dns", peer: name, agent: choice.value === "default" ? null : choice.value });
-      await refresh([`DNS of ${name} changed. Import the main profile again in the WireGuard app.`]);
+      const result = await act({ action: "vpn_dns", peer: name, agent: choice.value === "default" ? null : choice.value }, { quiet: true });
+      const notes = [(result.reimport || []).includes(name)
+        ? `DNS of ${name} changed. Import the main profile again in the WireGuard app.`
+        : `DNS of ${name} changed. RIFT passes the lookups on; the device's configuration stays as it is.`];
+      if (result.warning) notes.push(result.warning);
+      await refresh(notes);
     } catch (e) {
       choice.disabled = false;
       showBanner(`DNS of ${name}: ${e.message}`);
     }
   });
   return row("DNS server", choice);
+}
+
+// The note in a device's Access dialog after a change: import again, or nothing to do.
+function importNote(name, result) {
+  return (result && (result.reimport || []).includes(name))
+    ? [`The configuration of ${name} changed: import it again on the device (QR code / config below).`]
+    : [`The configuration of ${name} is unchanged: the change works without importing anything.`];
 }
 
 function grantsDialog(name, notes) {
@@ -499,14 +530,14 @@ function grantsDialog(name, notes) {
   const list = el("ul", { class: "grant-list" });
   if (peer.panel) {
     list.append(el("li", {}, el("span", {}, "web panel"),
-      button("Withdraw", async () => { await act({ action: "panel_allow", name, allowed: false }); await refresh(); }, "danger")));
+      button("Withdraw", async () => { const result = await act({ action: "panel_allow", name, allowed: false }); await refresh(importNote(name, result)); }, "danger")));
   }
   for (const g of peer.grants || []) {
     list.append(el("li", {}, el("span", { title: g.refused || "" }, `${g.agent || "?"}: ${access(g.access)}${g.refused ? " (refused by the agent)" : ""}`),
       button("Withdraw", async () => {
         try {
-          await act({ action: "vpn_deny", peer: name, agent: g.agent, access: g.access });
-          await refresh();
+          const result = await act({ action: "vpn_deny", peer: name, agent: g.agent, access: g.access });
+          await refresh(importNote(name, result));
         } catch (e) { showBanner(e.message); }
       }, "danger")));
   }
@@ -548,7 +579,7 @@ function grantsDialog(name, notes) {
       if (kind.value === "ports") body.ports = value.value;
       if (kind.value === "subnet") { body.subnets = value.value; body.snat = snat.checked; }
       const result = await act(body);
-      await refresh();
+      await refresh(importNote(name, result));
       if ((result.warnings || []).length) showBanner(result.warnings.join(" "));
     }));
   }

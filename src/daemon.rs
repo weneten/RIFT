@@ -778,25 +778,6 @@ fn inapplicable(snap: &StateSnapshot, public_ips: &[IpAddr]) -> Vec<serde_json::
         })
         .collect()
 }
-/// The devices that use RIFT's names, so a change can say whose profile changed.
-fn names_users(snap: &StateSnapshot) -> Vec<String> {
-    snap.vpn_peers
-        .iter()
-        .filter(|p| crate::vpn::uses_names(snap, p))
-        .map(|p| p.name.clone())
-        .collect()
-}
-/// Devices that started or stopped using names: their main profile has a new DNS line.
-fn changed_users(before: &[String], after: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = before
-        .iter()
-        .filter(|n| !after.contains(n))
-        .chain(after.iter().filter(|n| !before.contains(n)))
-        .cloned()
-        .collect();
-    out.sort();
-    out
-}
 fn policy_for(
     snapshot: &StateSnapshot,
     id: &str,
@@ -944,7 +925,77 @@ pub async fn admin_call(_config: &Config, _request: AdminRequest) -> Result<Admi
     bail!("admin socket is supported on Unix only")
 }
 
+/// Requests that change nothing, so no device configuration can change with them.
+fn reads_only(r: &AdminRequest) -> bool {
+    matches!(
+        r,
+        AdminRequest::Status
+            | AdminRequest::AgentsList
+            | AdminRequest::AgentsShow { .. }
+            | AdminRequest::ForwardsList
+            | AdminRequest::BansList
+            | AdminRequest::Logs { .. }
+            | AdminRequest::VpnPeerList
+            | AdminRequest::VpnConfig { .. }
+            | AdminRequest::PanelStatus
+            | AdminRequest::PanelPassword
+            | AdminRequest::PanelTwoFactorStatus
+            | AdminRequest::Export
+    )
+}
+
+/// The main profile of every enabled device, without its private key, to tell which ones a
+/// change touched (routes, DNS line). A device without access has an empty one.
+fn main_profiles(
+    s: &Server,
+    snap: &StateSnapshot,
+    cfg: &Config,
+) -> std::collections::BTreeMap<String, String> {
+    let params = crate::vpn::ClientParams {
+        server_public_key: &s.server_public_key,
+        host: &cfg.public_endpoint,
+        wg_port: cfg.wg_port,
+        mtu: cfg.mtu,
+        panel: cfg.webpanel.then_some(cfg.server_ipv4),
+        server_ipv4: cfg.server_ipv4,
+        dns: &cfg.vpn_dns,
+        server_ipv6: cfg.public_ips.iter().any(IpAddr::is_ipv6),
+    };
+    snap.vpn_peers
+        .iter()
+        .filter(|p| p.enabled)
+        .map(|p| {
+            let text = crate::vpn::client_config(snap, p, "", &params, None).unwrap_or_default();
+            (p.name.clone(), text)
+        })
+        .collect()
+}
+
+/// Every change answers, in `reimport`, the devices whose main profile it changed: they must
+/// import it again (`rift vpn config DEVICE`), whatever the change was (a grant on a new
+/// agent, names, panel access, an agent removed, ...).
 async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Value> {
+    if reads_only(&r) {
+        return admin_call_inner(s, r).await;
+    }
+    let cfg = s.config.read().await.clone();
+    let before = main_profiles(s, &s.state.snapshot()?, &cfg);
+    let mut data = admin_call_inner(s, r).await?;
+    let after = main_profiles(s, &s.state.snapshot()?, &cfg);
+    let changed: Vec<&String> = after
+        .iter()
+        .filter(|(name, text)| {
+            before.get(*name).is_some_and(|old| old != *text) && !text.is_empty()
+        })
+        .map(|(name, _)| name)
+        .collect();
+    if let Some(object) = data.as_object_mut() {
+        object.insert("reimport".into(), serde_json::json!(changed));
+    }
+    Ok(data)
+}
+
+async fn admin_call_inner(s: &Server, r: AdminRequest) -> Result<serde_json::Value> {
     let snap = s.state.snapshot()?;
     let data = match r {
         AdminRequest::Status => {
@@ -1582,7 +1633,6 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
             let label = crate::vpn::dns_label(&agent.name).ok_or_else(|| {
                 anyhow!("{name} is not usable as a DNS name; rename the agent to letters, digits and - (rift rename agent)")
             })?;
-            let before = names_users(snap);
             s.state.mutate("agent-names", |x| {
                 x.agents
                     .iter_mut()
@@ -1591,12 +1641,10 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                 Ok(())
             })?;
             reconcile(s).await?;
-            let after = names_users(&s.state.snapshot()?);
-            serde_json::json!({"name":name,"on":on,"dns_name":format!("{label}.{}", crate::vpn::NAMES_SUFFIX),"reimport":changed_users(&before, &after)})
+            serde_json::json!({"name":name,"on":on,"dns_name":format!("{label}.{}", crate::vpn::NAMES_SUFFIX)})
         }
         AdminRequest::VpnPeerNames { name, on } => {
             find_peer(&name)?;
-            let before = names_users(snap);
             s.state.mutate("vpn-peer-names", |x| {
                 x.vpn_peers
                     .iter_mut()
@@ -1605,8 +1653,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                 Ok(())
             })?;
             reconcile(s).await?;
-            let after = names_users(&s.state.snapshot()?);
-            serde_json::json!({"name":name,"on":on,"reimport":changed_users(&before, &after)})
+            serde_json::json!({"name":name,"on":on})
         }
         AdminRequest::VpnPeerEnable { name, enabled } => {
             find_peer(&name)?;

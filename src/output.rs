@@ -153,8 +153,15 @@ fn allowed_sources(value: &Value) -> String {
     }
 }
 
-/// The message after names were turned on or off, with the devices whose main profile changed.
-fn names_changed(what: &str, data: &Value) -> String {
+/// The devices whose main profile a change touched, and how to get the new one onto them.
+/// Exits name their profiles in their own message.
+pub fn reimport_note(request: &AdminRequest, data: &Value) -> Option<String> {
+    if matches!(
+        request,
+        AdminRequest::VpnExit { .. } | AdminRequest::VpnExitClear { .. }
+    ) {
+        return None;
+    }
     let devices: Vec<&str> = data["reimport"]
         .as_array()
         .into_iter()
@@ -162,18 +169,17 @@ fn names_changed(what: &str, data: &Value) -> String {
         .filter_map(Value::as_str)
         .collect();
     if devices.is_empty() {
-        format!("{what}\nNo device needs a new configuration.")
-    } else {
-        let commands: Vec<String> = devices
-            .iter()
-            .map(|d| format!("rift vpn config {d}"))
-            .collect();
-        format!(
-            "{what}\nThe main profile of {} changed (its DNS server); import it again: {}",
-            devices.join(", "),
-            commands.join(", ")
-        )
+        return None;
     }
+    let commands: Vec<String> = devices
+        .iter()
+        .map(|d| format!("rift vpn config {d}"))
+        .collect();
+    Some(format!(
+        "The configuration of {} changed; import it again on the device: {}",
+        devices.join(", "),
+        commands.join(", ")
+    ))
 }
 
 fn agents(data: &Value) -> String {
@@ -670,22 +676,10 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
         AdminRequest::AgentRemove { name } => format!("Agent {name} removed."),
         AdminRequest::AgentDisable { name } => format!("Agent {name} disabled."),
         AdminRequest::AgentEnable { name } => format!("Agent {name} enabled."),
-        AdminRequest::AgentNames { name, on } => names_changed(
-            &if *on {
-                format!("Devices with a grant on {name} now reach it as {}.", field(data, "dns_name"))
-            } else {
-                format!("{} no longer resolves.", field(data, "dns_name"))
-            },
-            data,
-        ),
-        AdminRequest::VpnPeerNames { name, on } => names_changed(
-            &if *on {
-                format!("{name} uses RIFT's names for the agents it reaches that have them on.")
-            } else {
-                format!("{name} no longer uses RIFT's names; it reaches agents by address.")
-            },
-            data,
-        ),
+        AdminRequest::AgentNames { name, on: true } => format!("Devices with a grant on {name} now reach it as {}.", field(data, "dns_name")),
+        AdminRequest::AgentNames { on: false, .. } => format!("{} no longer resolves.", field(data, "dns_name")),
+        AdminRequest::VpnPeerNames { name, on: true } => format!("{name} uses RIFT's names for the agents it reaches that have them on."),
+        AdminRequest::VpnPeerNames { name, on: false } => format!("{name} no longer uses RIFT's names; it reaches agents by address."),
         AdminRequest::AgentRename { name, new_name } => format!("Agent {name} renamed to {new_name}."),
         AdminRequest::AgentRotate { name } => format!("Key rotation requested for {name}. It will occur on the next control sync.\nRotation ID: {}", field(data, "rotation_id")),
         AdminRequest::CancelInvite { name } => format!("Invitation for {name} cancelled."),
@@ -707,9 +701,9 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
             }
             text
         }
-        AdminRequest::VpnDns { peer, agent: Some(agent) } if refused(data) => format!("DNS of {peer} stored, but {agent} refuses port 53 (see the warning): names will not resolve while the tunnel is on until {agent} allows it.\nImport the main profile again once it does: rift vpn config {peer}"),
-        AdminRequest::VpnDns { peer, agent: Some(agent) } => format!("{peer} now uses {agent} as its DNS server (port 53 on {agent} is allowed).\nImport the main profile again: rift vpn config {peer}"),
-        AdminRequest::VpnDns { peer, agent: None } => format!("{peer} uses the default DNS again.\nImport the main profile again: rift vpn config {peer}"),
+        AdminRequest::VpnDns { peer, agent: Some(agent) } if refused(data) => format!("DNS of {peer} stored, but {agent} refuses port 53 (see the warning): names will not resolve while the tunnel is on until {agent} allows it."),
+        AdminRequest::VpnDns { peer, agent: Some(agent) } => format!("{peer} now uses {agent} as its DNS server (port 53 on {agent} is allowed)."),
+        AdminRequest::VpnDns { peer, agent: None } => format!("{peer} uses the default DNS again."),
         AdminRequest::VpnExit { peer, exit } => exit_added(peer, exit, data),
         AdminRequest::VpnExitClear { peer, agent } => exit_removed(peer, agent.as_deref()),
         AdminRequest::PanelStatus => panel_status(data),
@@ -729,7 +723,7 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
         AdminRequest::PanelTwoFactorReset => "Two-factor panel login is off. The secret is deleted and all panel sessions have ended.".into(),
         AdminRequest::PanelAllow { name, allowed: true } => {
             let url = data["urls"].as_array().and_then(|u| u.get(1)).map(|u| field(u, "url")).unwrap_or_default();
-            format!("{name} may now open the web panel at {url}.\nIf the device was set up before, re-import its configuration: rift vpn config {name}")
+            format!("{name} may now open the web panel at {url}.")
         }
         AdminRequest::PanelAllow { name, allowed: false } => format!("{name} can no longer open the web panel."),
         AdminRequest::Reload => "Configuration reconciled.".into(),
