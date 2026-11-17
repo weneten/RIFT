@@ -34,7 +34,9 @@ NAT_VPS = f"rnv{PID}"
 NAT_GW = f"rng{PID}"
 NAT_AGENT = f"rna{PID}"
 BR_NAT = f"rbn{PID}"
-NETNS = [VPS, ROUTER, CLIENT, CLIENT_ALT, BACKEND, *AGENTS, NAT_VPS, NAT_GW, NAT_AGENT]
+# A phone or laptop with a real WireGuard client, for the private VPN access.
+DEVICE = f"rdv{PID}"
+NETNS = [VPS, ROUTER, CLIENT, CLIENT_ALT, BACKEND, *AGENTS, NAT_VPS, NAT_GW, NAT_AGENT, DEVICE]
 PUBLIC_V4 = "198.18.0.1"
 PUBLIC_V4_NEW = "198.18.0.2"
 PUBLIC_V6 = "2001:db8:42:5249::1"
@@ -199,6 +201,7 @@ def create_topology():
     attach(NAT_GW, f"hgn{PID}", f"ngn{PID}", BR_NAT)
     attach(NAT_VPS, f"hnv{PID}", f"nnv{PID}", BR_NAT)
     attach(NAT_AGENT, f"hna{PID}", f"nna{PID}", BR_AGENT)
+    attach(DEVICE, f"hdv{PID}", f"ndv{PID}", BR_PUBLIC)
 
     ns(VPS, "ip", "addr", "add", f"{PUBLIC_V4}/24", "dev", "eth0")
     ns(VPS, "ip", "addr", "add", f"{PUBLIC_V4_NEW}/24", "dev", "eth0")
@@ -228,6 +231,9 @@ def create_topology():
     ns(ROUTER, "sysctl", "-qw", "net.ipv4.ip_forward=1")
     ns(ROUTER, "sysctl", "-qw", "net.ipv6.conf.all.forwarding=1")
     create_nat_cloud_topology()
+    ns(DEVICE, "ip", "addr", "add", "198.18.0.20/24", "dev", "eth0")
+    write(pathlib.Path(f"/etc/netns/{DEVICE}") / "hosts",
+          f"127.0.0.1 localhost\n{PUBLIC_V4} {SERVER_HOST}\n", 0o644)
     ns(VPS, "sysctl", "-qw", "net.ipv4.ip_forward=1")
     ns(VPS, "sysctl", "-qw", "net.ipv6.conf.all.forwarding=1")
     ns(CLIENT, "sysctl", "-qw", "net.ipv4.ip_forward=1")
@@ -1062,6 +1068,139 @@ def plaintext_secret_scan(server_cfg, tokens):
           f"{len(keys)} key files are mode 0600")
 
 
+# ---------- a VPN device: grants, re-import notes and names ----------
+
+DNS_RESPONDER = r"""import socket,sys
+# A home DNS server (AdGuard stand-in): every A question gets 192.0.2.53.
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind((sys.argv[1],53))
+while True:
+    q,a=s.recvfrom(512)
+    end=12
+    while q[end]: end+=q[end]+1
+    end+=5
+    s.sendto(q[:2]+bytes([0x81,0x80,0,1,0,1,0,0,0,0])+q[12:end]+bytes([0xc0,0x0c,0,1,0,1,0,0,0,60,0,4,192,0,2,53]),a)
+"""
+
+DNS_QUERY = r"""import socket,sys
+# Asks sys.argv[1] for an A record of sys.argv[2]; prints the rcode and the address, if any.
+name=sys.argv[2]
+q=bytes([0x42,0x42,1,0,0,1,0,0,0,0,0,0])+b"".join(bytes([len(l)])+l.encode() for l in name.split("."))+bytes([0,0,1,0,1])
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(3)
+s.sendto(q,(sys.argv[1],53))
+r,_=s.recvfrom(512)
+assert r[:2]==q[:2] and r[2]&0x80, r
+an=int.from_bytes(r[6:8],"big")
+print(r[3]&0x0f, ".".join(map(str,r[-4:])) if an else "-")
+"""
+
+
+def device_apply(config_text, address):
+    """Loads a device configuration into the device's WireGuard interface, as the app would:
+    the keys, the peer, the routes of AllowedIPs. Address, DNS and MTU are app settings."""
+    keep = ("[Interface]", "[Peer]", "PrivateKey", "PublicKey", "Endpoint", "AllowedIPs",
+            "PersistentKeepalive")
+    lines = [line for line in config_text.splitlines() if line.startswith(keep)]
+    conf = write(WORK / "device.conf", "\n".join(lines) + "\n")
+    if ns(DEVICE, "ip", "link", "show", "wg0", check=False).returncode != 0:
+        ns(DEVICE, "ip", "link", "add", "wg0", "type", "wireguard")
+        ns(DEVICE, "ip", "addr", "add", f"{address}/32", "dev", "wg0")
+        ns(DEVICE, "ip", "link", "set", "wg0", "mtu", "1380", "up")
+    ns(DEVICE, "wg", "setconf", "wg0", str(conf))
+    ns(DEVICE, "ip", "route", "flush", "dev", "wg0", check=False)
+    allowed = next(line for line in lines if line.startswith("AllowedIPs")).split("=", 1)[1]
+    for net in (n.strip() for n in allowed.split(",")):
+        if ":" not in net:
+            ns(DEVICE, "ip", "route", "replace", net, "dev", "wg0")
+    dns = next((line.split("=", 1)[1].strip() for line in config_text.splitlines()
+                if line.startswith("DNS")), None)
+    return dns
+
+
+def device_reaches(address, port, proto="tcp", expect=None):
+    probe = r"""import socket,sys
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM if sys.argv[3]=="udp" else socket.SOCK_STREAM); s.settimeout(3)
+try:
+    s.connect((sys.argv[1],int(sys.argv[2]))); s.sendall(b"device"); print(s.recv(64).decode())
+except OSError as e:
+    print(f"no answer: {e}"); sys.exit(3)
+"""
+    result = ns(DEVICE, "python3", "-c", probe, address, str(port), proto, check=False)
+    if expect is not None:
+        return result.returncode == 0 and result.stdout.strip() == expect
+    return result.returncode == 0
+
+
+def vpn_device_test(server_cfg):
+    """A real WireGuard device: vpn connect, ports and agents it may and may not reach, which
+    changes need a new configuration, and the agents' .internal names through its tunnel."""
+    agents = {a["name"]: a for a in status(server_cfg)["snapshot"]["agents"]}
+    a1, a2, a3 = (agents[n]["tunnel_ipv4"] for n in ("agent1", "agent2", "agent3"))
+    connected = json.loads(cli(VPS, server_cfg, "vpn", "connect", "phone", "agent1", "19080/tcp",
+                               "--export").stdout)
+    assert connected["created"] is True, connected
+    assert any("19080" in line for line in connected["reach"]), connected
+    peers = {p["name"]: p for p in json.loads(cli(VPS, server_cfg, "list", "devices").stdout)}
+    me = peers["phone"]["ipv4"]
+    device_apply(connected["config"]["config"], me)
+    wait_until(lambda: device_reaches(a1, 19080, expect=me), "the device to reach its grant", timeout=40)
+    assert not device_reaches(a1, 19081, "udp"), "a port without a grant answered"
+    assert not device_reaches(a2, 19080), "an agent without a grant answered"
+    print("PASS a VPN device from vpn connect reaches its grant with its own address, and nothing else")
+
+    # Another port on the same agent: the configuration routes addresses, not ports.
+    same = json.loads(cli(VPS, server_cfg, "vpn", "allow", "phone", "agent1", "19081/udp").stdout)
+    assert same["reimport"] == [], same
+    wait_until(lambda: device_reaches(a1, 19081, "udp", expect=me), "the new port without a new configuration")
+    # A new agent changes the configuration, and RIFT says so.
+    other = json.loads(cli(VPS, server_cfg, "vpn", "allow", "phone", "agent2", "19080/tcp").stdout)
+    assert other["reimport"] == ["phone"], other
+    assert not device_reaches(a2, 19080), "the old configuration reached a new agent"
+    config = json.loads(cli(VPS, server_cfg, "vpn", "config", "phone", "--export").stdout)["config"]
+    device_apply(config, me)
+    wait_until(lambda: device_reaches(a2, 19080, expect=me), "the new agent after importing again")
+    print("PASS a new port on a known agent needs no new configuration; a new agent does, and RIFT names the device")
+
+    # Names: agent1 on. The device's DNS server becomes the server's tunnel address.
+    named = json.loads(cli(VPS, server_cfg, "vpn", "names", "agent", "agent1", "on").stdout)
+    assert named["reimport"] == ["phone"], named
+    config = json.loads(cli(VPS, server_cfg, "vpn", "config", "phone", "--export").stdout)["config"]
+    dns = device_apply(config, me)
+    assert dns == "10.13.0.1", config
+
+    def ask(name):
+        return ns(DEVICE, "python3", "-c", DNS_QUERY, dns, name).stdout.split()
+    assert wait_until(lambda: ask("agent1.internal") == ["0", a1], "agent1.internal through the tunnel", timeout=30)
+    assert ask("AGENT1.internal") == ["0", a1], "names are case-insensitive"
+    assert ask("agent2.internal") == ["3", "-"], "an agent without names resolved"
+    assert ask("agent3.internal") == ["3", "-"], "an agent without a grant resolved"
+    # Turning names on for agent2, which the device already uses names for: same DNS line.
+    second = json.loads(cli(VPS, server_cfg, "vpn", "names", "agent", "agent2", "on").stdout)
+    assert second["reimport"] == [], second
+    assert wait_until(lambda: ask("agent2.internal") == ["0", a2], "agent2.internal without a new configuration")
+
+    # Other names go to the device's DNS agent: a home DNS server on agent3, asked by the server.
+    start_echo_process(AGENTS[2], write(WORK / "dns-responder.py", DNS_RESPONDER, 0o755), [a3],
+                       "dns-responder")
+    home = json.loads(cli(VPS, server_cfg, "vpn", "dns", "phone", "agent3").stdout)
+    # The DNS line stays the server; the route to agent3 is new, so RIFT asks for a re-import.
+    assert home["reimport"] == ["phone"], home
+    config = json.loads(cli(VPS, server_cfg, "vpn", "config", "phone", "--export").stdout)["config"]
+    assert device_apply(config, me) == "10.13.0.1", config
+    assert wait_until(lambda: ask("example.com") == ["0", "192.0.2.53"],
+                      "example.com through RIFT to the home DNS server", timeout=40)
+    print("PASS names: NAME.internal only for agents with names and a grant, other names relayed to the device's DNS agent")
+
+    # The device opts out: its configuration changes, and the server no longer answers it.
+    off = json.loads(cli(VPS, server_cfg, "vpn", "names", "device", "phone", "off").stdout)
+    assert off["reimport"] == ["phone"], off
+    refused = ns(DEVICE, "python3", "-c", DNS_QUERY, "10.13.0.1", "agent1.internal", check=False)
+    assert refused.returncode != 0, f"a device without names still got an answer: {refused.stdout}"
+    for args in (["vpn", "names", "agent", "agent1", "off"], ["vpn", "names", "agent", "agent2", "off"],
+                 ["vpn", "dns", "phone", "default"], ["remove", "device", "phone"]):
+        cli(VPS, server_cfg, *args)
+    print("PASS a device that turned names off gets a new configuration and no answers")
+
+
 def main():
     global WORK
     if sys.platform != "linux" or os.geteuid() != 0:
@@ -1131,6 +1270,7 @@ def main():
         agent_local_ban_test(server_cfg)
         translation_ban_test(server_cfg)
         allow_from_test(server_cfg)
+        vpn_device_test(server_cfg)
         check_routes_and_foreign(prior, baselines)
         check_normal_traffic()
         migrate_endpoint_ip(server_cfg)
