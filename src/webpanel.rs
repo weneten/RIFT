@@ -557,7 +557,6 @@ enum Action {
         id: u64,
     },
     BanAdd {
-        agent: String,
         forward_id: u64,
         ip: IpAddr,
         ttl: String,
@@ -772,14 +771,12 @@ impl Action {
             }
             Self::ForwardRemove { id } => panel.admin(AdminRequest::ForwardRemove { id }).await?,
             Self::BanAdd {
-                agent,
                 forward_id,
                 ip,
                 ttl,
             } => {
                 panel
                     .admin(AdminRequest::Ban {
-                        agent,
                         forward_id,
                         ip,
                         ttl_seconds: seconds(&ttl)?,

@@ -1163,7 +1163,6 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
             serde_json::json!({"id":id,"enabled":enabled})
         }
         AdminRequest::Ban {
-            agent,
             forward_id,
             ip,
             ttl_seconds,
@@ -1172,20 +1171,21 @@ async fn admin_call_impl(s: &Server, r: AdminRequest) -> Result<serde_json::Valu
                 (1..=86400).contains(&ttl_seconds),
                 "ban TTL must be at most one day"
             );
-            let a = find_agent(&snap, &agent)?;
             let f = snap
                 .forwards
                 .iter()
-                .find(|f| {
-                    f.id == forward_id && f.agent_id == a.id && f.mode == ForwardMode::Translate
-                })
-                .ok_or_else(|| anyhow!("ban requires this agent's translated forward"))?;
-            let _ = f;
+                .find(|f| f.id == forward_id)
+                .ok_or_else(|| anyhow!("forward {forward_id} not found"))?;
+            anyhow::ensure!(
+                f.mode == ForwardMode::Translate,
+                "forward {forward_id} is transparent; bans work on translated forwards (--mode translate). A transparent forward keeps the client's address, so block it on the agent (for example with Fail2ban) or use --allow-from"
+            );
+            let agent_id = f.agent_id.clone();
             s.state.mutate("ban", |x| {
                 let id = x.bans.iter().map(|b| b.id).max().unwrap_or(0) + 1;
                 x.bans.push(Ban {
                     id,
-                    agent_id: a.id.clone(),
+                    agent_id: agent_id.clone(),
                     forward_id,
                     ip,
                     expires_at: now() + ttl_seconds as i64,
@@ -2095,18 +2095,11 @@ async fn agent_admin_request(config: &Config, request: AdminRequest) -> Result<s
             Ok(serde_json::to_value(policy.forwards)?)
         }
         AdminRequest::Ban {
-            agent,
             forward_id,
             ip,
             ttl_seconds,
         } => {
-            anyhow::ensure!(
-                identity.active
-                    && (agent == identity.id
-                        || agent == welcome.name
-                        || config.agent_name.as_deref() == Some(&agent)),
-                "ban must name this active agent"
-            );
+            anyhow::ensure!(identity.active, "this agent is not active yet");
             let mut control = connect_control(welcome).await?;
             protocol::send(
                 &mut control,

@@ -481,7 +481,7 @@ rift remove forward 1
 
 **Reinstalling an agent.** If a home server is reinstalled or its `rift-state` volume is lost, run `rift add agent NAME` again with its existing name (or "Re-invite" in the web panel) and start the new install with that invitation. The new install takes over the agent's key and keeps its ID, tunnel addresses, forwards, VPN grants, exits and sites, so VPN devices need no new profile. The old install stops working as soon as the invitation is used; until then nothing changes. Only an active agent can be invited again; enable a disabled one first.
 
-`rift rename agent OLD NEW` and `rift rotate agent NAME` are also available; `rift --help` lists every command. For translated forwards, `rift add ban AGENT FORWARD_ID ADDRESS --ttl 1h` blocks an original client address temporarily; `rift list bans` shows bans. Bans expire by TTL; there is no explicit remove command. Use `--json` for machine-readable administrative output and `rift --help` for the full CLI.
+`rift rename agent OLD NEW` and `rift rotate agent NAME` are also available; `rift --help` lists every command. For translated forwards, `rift add ban FORWARD_ID ADDRESS --ttl 1h` blocks an original client address temporarily; `rift list bans` shows bans. Bans expire by TTL; there is no explicit remove command. Use `--json` for machine-readable administrative output and `rift --help` for the full CLI.
 
 Forwards are shown as a compact table: the ID used for removal, agent, listener, target port, ingress, allowed sources (FROM), mode, purpose and state. Agent names are resolved when available; an ID is shown if they cannot be retrieved. On the server, the installed `rift` adds a SITE column for forwards that `rift add site` manages. For example:
 
@@ -817,7 +817,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | `rift list forwards` | All forwards with ID, purpose (`user`, or `exit` for the managed forward of an [internet exit](#use-rift-as-a-vpn-exit)) and state (`enabled`, `disabled`, `pending`, `refused`); on the server with a SITE column. |
 | `rift remove forward ID` | Deletes a forward. Refuses an `exit` forward. |
 | `rift disable forward ID` / `rift enable forward ID` | Switches a forward off and on again. |
-| `rift add ban AGENT FORWARD_ID IP [--ttl 1h]` | Blocks a client address on a translated forward for a while. |
+| `rift add ban FORWARD_ID IP [--ttl 1h]` | Blocks a client address on a translated forward for a while. |
 | `rift list bans` | Active bans with their expiry time (UTC). |
 
 **Websites (host commands, run with `sudo` on the server)**

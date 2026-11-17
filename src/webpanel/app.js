@@ -297,7 +297,7 @@ function banDialog(forward) {
     row("Client address", ip),
     row("Duration", ttl),
   ], "Ban", async () => {
-    await act({ action: "ban_add", agent: forward.agent, forward_id: forward.id, ip: ip.value.trim(), ttl: ttl.value });
+    await act({ action: "ban_add", forward_id: forward.id, ip: ip.value.trim(), ttl: ttl.value });
     closeModal();
     await load();
   }));

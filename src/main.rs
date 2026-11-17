@@ -383,9 +383,8 @@ enum AddWhat {
         #[arg(long, value_name = "ADDRESS[,NETWORK...]")]
         allow_from: Vec<String>,
     },
-    /// Block an original client address for a translated forward.
+    /// Block an original client address on a translated forward: `rift add ban FORWARD_ID IP`.
     Ban {
-        agent: String,
         forward_id: u64,
         ip: IpAddr,
         #[arg(long, default_value = "1h")]
@@ -621,13 +620,7 @@ async fn run() -> Result<()> {
                 more.extend(requests);
                 first
             }
-            AddWhat::Ban {
-                agent,
-                forward_id,
-                ip,
-                ttl,
-            } => AdminRequest::Ban {
-                agent,
+            AddWhat::Ban { forward_id, ip, ttl } => AdminRequest::Ban {
                 forward_id,
                 ip,
                 ttl_seconds: duration(&ttl)?,
@@ -1867,17 +1860,8 @@ mod tests {
             vec!["rift", "remove", "forward", "3"],
             vec!["rift", "disable", "forward", "3"],
             vec!["rift", "enable", "forward", "3"],
-            vec![
-                "rift",
-                "add",
-                "ban",
-                "node1",
-                "3",
-                "203.0.113.9",
-                "--ttl",
-                "1h",
-            ],
-            vec!["rift", "add", "ban", "node1", "3", "203.0.113.9"],
+            vec!["rift", "add", "ban", "3", "203.0.113.9", "--ttl", "1h"],
+            vec!["rift", "add", "ban", "3", "203.0.113.9"],
             vec!["rift", "list", "sites"],
             vec!["rift", "add", "site", "node1", "app.example.org", "8080"],
             vec!["rift", "remove", "site", "app.example.org"],
@@ -1886,23 +1870,18 @@ mod tests {
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }
-        let cli = Cli::try_parse_from(["rift", "add", "ban", "node1", "3", "203.0.113.9"]).unwrap();
+        let cli = Cli::try_parse_from(["rift", "add", "ban", "3", "203.0.113.9"]).unwrap();
         let Command::Add {
-            what:
-                AddWhat::Ban {
-                    agent,
-                    forward_id,
-                    ttl,
-                    ..
-                },
+            what: AddWhat::Ban {
+                forward_id, ttl, ..
+            },
         } = cli.command
         else {
             panic!("add ban");
         };
-        assert_eq!(
-            (agent.as_str(), forward_id, ttl.as_str()),
-            ("node1", 3, "1h")
-        );
+        assert_eq!((forward_id, ttl.as_str()), (3, "1h"));
+        // The agent is no longer named: the forward ID says which one it is.
+        assert!(Cli::try_parse_from(["rift", "add", "ban", "node1", "3", "203.0.113.9"]).is_err());
         let cli = Cli::try_parse_from(["rift", "remove", "forward", "7"]).unwrap();
         assert!(matches!(
             cli.command,

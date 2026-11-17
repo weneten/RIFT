@@ -17,6 +17,7 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ### Changed
 
+- `rift add ban FORWARD_ID IP [--ttl 1h]` no longer takes the agent: a forward ID belongs to exactly one agent, which RIFT now looks up itself. The old form `rift add ban AGENT FORWARD_ID IP` is gone. A ban on a transparent forward says why it cannot work and what to use instead.
 - `deploy/prepare-host` works in LXC containers (for example on Proxmox VE): it recognises the container, checks WireGuard without a network namespace where it may not create one, and says to load the module on the host when it is missing. It also says when the kernel has no IPv6. The README has a section on running RIFT in a Proxmox LXC container.
 - `rift vpn config DEVICE [AGENT]` prints the QR code; `--export` prints the configuration file. This is the form of `rift panel connect NAME [--export]`. The old `rift vpn config qr|export ...` answers with the new form. The device names `qr` and `export` are reserved.
 - A grant, DNS server or forward that the agent's own limits (`RIFT_AGENT_ALLOW_*`) refuse is no longer reported as working: `rift vpn allow` printed the refusal and then "DEVICE may now reach AGENT". The message now says it is stored but not reachable until the agent allows it; `rift vpn connect` and the panel's "Connect device" list such ports apart.

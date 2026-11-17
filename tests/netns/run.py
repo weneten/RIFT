@@ -464,7 +464,7 @@ except OSError as e:
 '''
     result = ns(CLIENT, "python3", "-c", client, PUBLIC_V4, "allowed").stdout.strip()
     assert result.startswith("fd88:5249:4654::1"), f"translated return path failed: {result}"
-    cli(VPS, server_cfg, "add", "ban", "agent1",
+    cli(VPS, server_cfg, "add", "ban",
         str(forward_id), "198.18.0.10", "--ttl", "4s",
         env={"RIFT_PUBLIC_ENDPOINT": SERVER_HOST,
              "RIFT_PUBLIC_IPS": f"{PUBLIC_V4},{PUBLIC_V4_NEW},{PUBLIC_V6}"})
@@ -491,7 +491,7 @@ s.bind((sys.argv[1],0)); s.connect(("198.18.0.1",18096)); s.sendall(b"agent-ban"
 got=s.recv(128).decode(); print(got); assert got.startswith("fd88:5249:4654::1"),got
 '''
     assert ns(CLIENT, "python3", "-c", probe, "198.18.0.10").stdout.strip().startswith("fd88:5249:4654::1")
-    cli(VPS, server_cfg, "add", "ban", "agent3",
+    cli(VPS, server_cfg, "add", "ban",
         str(forward["id"]), "198.18.0.10", "--ttl", "4s",
         env={"RIFT_PUBLIC_ENDPOINT": SERVER_HOST,
              "RIFT_PUBLIC_IPS": f"{PUBLIC_V4},{PUBLIC_V4_NEW},{PUBLIC_V6}"})

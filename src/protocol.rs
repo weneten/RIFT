@@ -103,8 +103,8 @@ pub enum AdminRequest {
         id: u64,
         enabled: bool,
     },
+    /// The forward names the agent: a forward ID belongs to exactly one agent.
     Ban {
-        agent: String,
         forward_id: u64,
         ip: std::net::IpAddr,
         ttl_seconds: u64,
