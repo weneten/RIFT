@@ -6,6 +6,8 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ### Added
 
+- `deploy/field-check` collects the evidence for the release gates that need real hosts (cloud NAT, reboot, firewalls, Proxmox LXC, throughput) into a report without secrets; `--before-reboot`/`--after-reboot` check that RIFT comes back alone, `--perf` guides an iperf3 run through a temporary forward. See docs/deploy.md.
+
 - `SECURITY.md`: how to report a vulnerability privately (GitHub private vulnerability reporting), supported versions and scope.
 
 - `rift export` and `rift import` carry the names: the agents with names on (`named_agents`) and devices that turned them off (`names_off`). Older export files without them are read as before.

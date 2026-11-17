@@ -1,0 +1,243 @@
+#!/bin/sh
+# Checks a RIFT host in the field and writes a report to send in. Run it on the server and on
+# every agent:
+#
+#   sudo sh deploy/field-check                   what this host looks like and whether RIFT runs
+#   sudo sh deploy/field-check --before-reboot   also remember the current state, then reboot
+#   sudo sh deploy/field-check --after-reboot    after the reboot: did everything come back?
+#   sudo sh deploy/field-check --perf AGENT CLIENT_IP
+#                                                on the server: a throughput test through AGENT
+#
+# It only reads, except --before-reboot (writes /var/lib/rift-field/reference) and --perf
+# (adds one forward, after asking, and removes it again). The report holds no keys, tokens or
+# passwords: no .env, no key files. It does hold this host's addresses and agent names; read it
+# before you send it.
+set -u
+
+mode=check
+case "${1-}" in
+  "" ) ;;
+  --before-reboot) mode=before ;;
+  --after-reboot) mode=after ;;
+  --perf) mode=perf ;;
+  -h | --help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) echo "rift: unknown option $1 (see --help)" >&2; exit 2 ;;
+esac
+[ "$(id -u)" -eq 0 ] || { echo "rift: run as root: sudo sh deploy/field-check ${1-}" >&2; exit 1; }
+
+reference_dir=/var/lib/rift-field
+report="rift-field-report-$(date -u +%Y%m%d-%H%M%S).txt"
+umask 077
+exec 3> "$report"
+fails=0
+warns=0
+
+out() { printf '%s\n' "$*" >&3; }
+section() { out ""; out "== $*"; }
+result() {
+  # result PASS|WARN|FAIL "text"
+  out "$1  $2"
+  printf '%s  %s\n' "$1" "$2"
+  case $1 in FAIL) fails=$((fails + 1)) ;; WARN) warns=$((warns + 1)) ;; esac
+}
+run() {
+  # run "label" command...: the command's output into the report.
+  label=$1
+  shift
+  out "-- $label"
+  "$@" >&3 2>&1 || out "(exit $?)"
+}
+have() { command -v "$1" > /dev/null 2>&1; }
+
+container=
+for name in rift-server rift-agent; do
+  if have docker && docker inspect "$name" > /dev/null 2>&1; then container=$name; fi
+done
+role=${container#rift-}
+rift() { docker exec "$container" rift --config /etc/rift/config.toml "$@"; }
+
+section "RIFT field check ($mode), $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+out "role: ${role:-none}"
+out "kernel: $(uname -srm)"
+[ -r /etc/os-release ] && out "os: $(. /etc/os-release && printf '%s' "${PRETTY_NAME:-unknown}")"
+virt=$(systemd-detect-virt 2> /dev/null || true)
+out "virtualization: ${virt:-unknown}"
+out "boot id: $(cat /proc/sys/kernel/random/boot_id 2> /dev/null)"
+out "uptime: $(cut -d' ' -f1 /proc/uptime 2> /dev/null) s"
+
+section "Results"
+
+# ---------- the basics ----------
+if [ -z "$container" ]; then
+  result FAIL "no rift-server or rift-agent container on this host"
+else
+  state=$(docker inspect -f '{{.State.Status}}' "$container")
+  restart=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$container")
+  [ "$state" = running ] && result PASS "$container is running" || result FAIL "$container is $state"
+  case $restart in
+    unless-stopped | always) result PASS "$container restarts with Docker ($restart)" ;;
+    *) result FAIL "$container has restart policy '$restart'; it will not come back after a reboot" ;;
+  esac
+  out "rift version: $(rift --version 2> /dev/null)"
+fi
+if have systemctl; then
+  if systemctl is-enabled docker > /dev/null 2>&1; then
+    result PASS "the docker service starts at boot"
+  else
+    result FAIL "the docker service is not enabled at boot (systemctl enable docker)"
+  fi
+fi
+
+if [ -d /sys/module/wireguard ]; then
+  result PASS "the WireGuard kernel module is loaded"
+else
+  result WARN "the WireGuard module is not loaded right now (RIFT loads it on start on a VM; in a container the host must)"
+fi
+if grep -qs wireguard /etc/modules-load.d/*.conf; then
+  out "wireguard is in /etc/modules-load.d"
+fi
+
+for key in net.ipv4.ip_forward net.ipv6.conf.all.forwarding; do
+  value=$(cat "/proc/sys/$(printf '%s' "$key" | tr . /)" 2> /dev/null)
+  [ "$value" = 1 ] && result PASS "$key = 1" || result FAIL "$key = ${value:-missing} (run deploy/prepare-host)"
+done
+if [ -f /etc/sysctl.d/99-rift.conf ]; then
+  result PASS "the forwarding sysctls survive a reboot (/etc/sysctl.d/99-rift.conf)"
+else
+  result FAIL "/etc/sysctl.d/99-rift.conf is missing; forwarding is off after a reboot (run deploy/prepare-host)"
+fi
+
+# ---------- firewalls next to RIFT ----------
+section "Firewalls"
+if have ufw; then run "ufw status verbose" ufw status verbose; fi
+if have firewall-cmd; then
+  run "firewalld state" firewall-cmd --state
+  run "firewalld default zone" firewall-cmd --get-default-zone
+  if firewall-cmd --state > /dev/null 2>&1; then
+    result WARN "firewalld is running: RIFT's coexistence with it is not verified yet; the report helps"
+  fi
+fi
+if have iptables; then
+  run "iptables INPUT" iptables -S INPUT
+  run "iptables FORWARD" iptables -S FORWARD
+  if iptables -S INPUT 2> /dev/null | grep -q 'REJECT.*icmp-host-prohibited'; then
+    out "note: INPUT ends in REJECT icmp-host-prohibited (Oracle Cloud image)"
+  fi
+fi
+if have nft; then run "nftables tables" nft list tables; fi
+if have nft && nft list table inet rift > /dev/null 2>&1; then
+  result PASS "RIFT's nftables table is in place"
+elif [ -n "$container" ]; then
+  result FAIL "RIFT's nftables table is missing"
+fi
+
+# ---------- RIFT itself ----------
+section "RIFT"
+if [ -n "$container" ] && [ "${state:-}" = running ]; then
+  run "rift status" rift status
+  run "rift doctor" rift doctor
+  if [ "$role" = server ]; then
+    run "rift list agents" rift list agents
+    run "rift list forwards" rift list forwards
+    if rift --json status 2> /dev/null | grep -q '"fully_applied":true'; then
+      result PASS "the server has applied its whole configuration"
+    else
+      result FAIL "the server has not applied its whole configuration (see rift status above)"
+    fi
+  else
+    if rift --json status 2> /dev/null | grep -q '"active":true'; then
+      result PASS "the agent is active"
+    else
+      result FAIL "the agent is not active"
+    fi
+  fi
+fi
+
+# ---------- reboot ----------
+snapshot() {
+  # What has to come back after a reboot, one line each.
+  if have nft && nft list table inet rift > /dev/null 2>&1; then echo "nft-table"; fi
+  ip -4 rule show 2> /dev/null | grep -q '^11000:' && echo "policy-rule"
+  ip link show rift0 > /dev/null 2>&1 && echo "interface rift0"
+  if [ "$role" = server ]; then
+    rift list forwards 2> /dev/null | awk 'NR > 1 {print "forward", $1, $NF}'
+    rift --json status 2> /dev/null | tr '{' '\n' | grep '"online":true' | sed -n 's/.*"name":"\([^"]*\)".*/agent-online \1/p'
+  else
+    rift --json status 2> /dev/null | grep -q '"active":true' && echo "agent-active"
+  fi
+}
+if [ "$mode" = before ]; then
+  mkdir -p "$reference_dir"
+  cat /proc/sys/kernel/random/boot_id > "$reference_dir/boot_id"
+  snapshot | sort > "$reference_dir/reference"
+  section "Reference before the reboot"
+  cat "$reference_dir/reference" >&3
+  result PASS "reference saved; now reboot this host, then run: sudo sh deploy/field-check --after-reboot"
+fi
+if [ "$mode" = after ]; then
+  section "After the reboot"
+  if [ ! -f "$reference_dir/reference" ]; then
+    result FAIL "no reference; run --before-reboot first"
+  elif [ "$(cat "$reference_dir/boot_id")" = "$(cat /proc/sys/kernel/random/boot_id)" ]; then
+    result FAIL "this host has not rebooted since --before-reboot"
+  else
+    # Give RIFT up to three minutes to come back on its own.
+    i=0
+    while [ "$i" -lt 36 ]; do
+      snapshot | sort > "$reference_dir/now"
+      cmp -s "$reference_dir/reference" "$reference_dir/now" && break
+      i=$((i + 1))
+      sleep 5
+    done
+    out "-- difference (reference -> now)"
+    diff "$reference_dir/reference" "$reference_dir/now" >&3 2>&1
+    if cmp -s "$reference_dir/reference" "$reference_dir/now"; then
+      result PASS "everything came back after the reboot without help ($((i * 5)) s)"
+    else
+      result FAIL "not everything came back after the reboot within three minutes (see the difference)"
+    fi
+  fi
+fi
+
+# ---------- throughput ----------
+if [ "$mode" = perf ]; then
+  section "Throughput"
+  agent=${2-}
+  client=${3-}
+  if [ "$role" != server ] || [ -z "$agent" ] || [ -z "$client" ]; then
+    result FAIL "usage on the server: sudo sh deploy/field-check --perf AGENT CLIENT_IP (the address your test client connects from)"
+  else
+    printf 'This adds the forward 5201/both to %s, open only to %s, and removes it again. Go on? [y/N] ' "$agent" "$client"
+    read -r answer < /dev/tty
+    case $answer in
+      [yY]*)
+        created=$(rift --json add forward "$agent" 5201/both --allow-from "$client" 2>&1)
+        ids=$(printf '%s\n' "$created" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+        out "forwards: $ids"
+        public=$(rift --json status 2> /dev/null | sed -n 's/.*"public_ips":\["\([^"]*\)".*/\1/p')
+        echo
+        echo "1. On the agent $agent:   iperf3 -s"
+        echo "2. On this server:        iperf3 -s -p 5202   (the direct line, for comparison)"
+        echo "3. On the client $client, each for 30 seconds:"
+        echo "     iperf3 -c ${public:-SERVER_IP} -p 5202 -t 30          (direct, without RIFT)"
+        echo "     iperf3 -c ${public:-SERVER_IP} -p 5201 -t 30          (through RIFT to $agent)"
+        echo "     iperf3 -c ${public:-SERVER_IP} -p 5201 -t 30 -R       (the other direction)"
+        echo "     iperf3 -c ${public:-SERVER_IP} -p 5201 -t 30 -u -b 200M  (UDP: loss and jitter)"
+        echo "4. Paste the client's summary lines here, then an empty line:"
+        section "Measurements (pasted)"
+        while IFS= read -r line < /dev/tty && [ -n "$line" ]; do out "$line"; done
+        for id in $ids; do rift remove forward "$id" > /dev/null 2>&1 && out "removed forward $id"; done
+        result PASS "measurements recorded; the test forward is removed"
+        ;;
+      *) result WARN "throughput test skipped" ;;
+    esac
+  fi
+fi
+
+section "Summary"
+out "fail: $fails, warn: $warns"
+exec 3>&-
+echo
+echo "$fails failure(s), $warns warning(s). Report: $(pwd)/$report"
+echo "Read it, then send it in (it holds this host's addresses, but no keys or passwords)."
+[ "$fails" -eq 0 ]

@@ -79,6 +79,19 @@ The release gate should include:
 
 The bridge and published-port tests validate real client datapaths; neither proves production host-network safety or SSH continuity. The SFTP test validates a small file transfer and source logging, not large-transfer behavior or production key lifecycle. The Traefik test validates TLS termination, file-provider routing, and source logging, not reverse-proxy headers or production health checks. Also run staging tests for firewall backend compatibility, systemd/host reboot behavior, cloud security groups, and SSH continuity.
 
+## Field checks on real hosts
+
+Some release gates need real machines: a real cloud NAT, a host reboot, other firewalls next to RIFT, Proxmox LXC, and throughput. `deploy/field-check` collects the evidence; run it as root on the server and on every agent and send in the reports it writes (`rift-field-report-TIME.txt` in the current directory). It reads only, holds no keys, tokens or passwords (no `.env`, no key files), but does contain the host's addresses and agent names: read a report before sending it.
+
+| Gate | What to do | What to send |
+|---|---|---|
+| Basics | `sudo sh deploy/field-check` on every host. | The report: container, restart policy, Docker at boot, WireGuard module, forwarding sysctls, firewalls, `rift status` and `rift doctor`. |
+| Real cloud NAT | Install the server on a cloud VM whose public address is not on the interface (Oracle Cloud, AWS, Google Cloud), as in the README, then run the basic check there and on an agent, and test a forward from outside. | Both reports and whether the forward answered with the client's own address. |
+| Host reboot | `sudo sh deploy/field-check --before-reboot`, reboot, `sudo sh deploy/field-check --after-reboot`. Do it for the server and for an agent. | The after-reboot report: it compares interface, nftables table, policy rule, forwards and agents with the reference and waits up to three minutes for RIFT to come back alone. |
+| Firewalls | Run the basic check on hosts with UFW active, with firewalld, and on an Oracle Cloud image (its `REJECT` rule); test a forward and a VPN grant on each. | The reports (they list UFW, firewalld, iptables and nftables state) and which tests worked. |
+| Proxmox LXC | Set up an agent in an LXC container as in the README section, then run the basic check inside it, before and after a reboot of the container. | The reports. |
+| Throughput | On the server: `sudo sh deploy/field-check --perf AGENT CLIENT_IP`. It asks, adds the forward `5201/both` open only to `CLIENT_IP`, prints the iperf3 commands for agent, server and client, takes the client's pasted summary lines into the report and removes the forward. | The report, plus the CPU and link of each host. |
+
 ## Reproducible performance procedure
 
 Do not publish benchmark numbers without collecting them. On the same Linux host pair and with the same CPU allocation, run `iperf3` directly over the underlay and then over the WireGuard path for IPv4 and IPv6, TCP and UDP. Record the kernel, CPU, image digest, MTU, test duration, number of parallel streams, and tunnel state. Use a warm-up, then at least three measured runs for each case; repeat with three agents active. Report throughput, RTT/jitter/loss (UDP), CPU utilization, and any handshakes/retransmits. Verify the normal unmarked baseline separately so throughput changes are not mistaken for routing correctness.
