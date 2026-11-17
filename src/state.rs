@@ -24,17 +24,83 @@ type InvitationRow = (
     i64,
 );
 
-/// Shown when stored state was written by another RIFT version. RIFT keeps no compatibility
-/// with older state formats.
+/// Shown when stored state cannot be read even after the migrations below.
 pub const OLD_STATE: &str =
     "the stored RIFT state comes from a different RIFT version and cannot be read";
+
+/// The format of the state database, kept in SQLite's `user_version`. A database written
+/// before formats were numbered has 0 and is format 1 (RIFT 0.1). Every change to what is
+/// stored adds a migration below and a fixture test, so an update never loses state.
+pub const STATE_VERSION: u32 = 2;
+
+/// Migration `n` turns format `n` into `n + 1`, inside one transaction.
+type Migration = fn(&rusqlite::Transaction) -> Result<()>;
+const MIGRATIONS: &[(u32, Migration)] = &[(1, migrate_1_to_2)];
+
+/// Format 2 adds the names of agents and devices (`names`, `names_off`). Both default to off,
+/// so the stored JSON stays as it is; the step only records the format.
+fn migrate_1_to_2(_tx: &rusqlite::Transaction) -> Result<()> {
+    Ok(())
+}
+
+fn stored_version(c: &Connection) -> Result<u32> {
+    Ok(c.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))?)
+}
+
+/// Brings the database to `STATE_VERSION`. A new database just gets the number. An older one
+/// is first copied to `state-before-vN-TIME.db` next to it (mode 0600), then migrated step by
+/// step in one transaction; a failure leaves it untouched. A newer one is refused: RIFT cannot
+/// go back to an older format.
+fn migrate(db: &mut Connection, path: &Path, existed: bool) -> Result<()> {
+    let stored = stored_version(db)?;
+    if stored > STATE_VERSION {
+        bail!(
+            "the stored RIFT state has format {stored}, written by a newer RIFT; this RIFT reads \
+             up to format {STATE_VERSION}. Run the newer version again; going back needs a \
+             backup made by this version"
+        );
+    }
+    if !existed {
+        db.pragma_update(None, "user_version", STATE_VERSION)?;
+        return Ok(());
+    }
+    let from = stored.max(1);
+    if from == STATE_VERSION {
+        if stored == 0 {
+            db.pragma_update(None, "user_version", STATE_VERSION)?;
+        }
+        return Ok(());
+    }
+    let backup = path.with_file_name(format!("state-before-v{STATE_VERSION}-{}.db", now()));
+    db.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
+        .with_context(|| format!("copy the state to {} before migrating it", backup.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let tx = db.transaction()?;
+    for (version, step) in MIGRATIONS {
+        if *version >= from && *version < STATE_VERSION {
+            step(&tx).with_context(|| format!("migrate the state from format {version}"))?;
+        }
+    }
+    tx.pragma_update(None, "user_version", STATE_VERSION)?;
+    tx.commit()?;
+    tracing::info!(
+        "state migrated from format {from} to {STATE_VERSION}; the previous state is in {}",
+        backup.display()
+    );
+    Ok(())
+}
 
 impl StateStore {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let db = Connection::open(path)
+        let existed = std::fs::metadata(path).is_ok_and(|m| m.len() > 0);
+        let mut db = Connection::open(path)
             .with_context(|| format!("open state database {}", path.display()))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
@@ -46,6 +112,7 @@ impl StateStore {
             CREATE TABLE IF NOT EXISTS applied (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL, error TEXT);
             CREATE TABLE IF NOT EXISTS health (agent_id TEXT PRIMARY KEY, online INTEGER NOT NULL, last_disconnect INTEGER, last_handshake INTEGER NOT NULL);
             INSERT OR IGNORE INTO snapshot(id,generation,body) VALUES(1,0,'{\"generation\":0,\"agents\":[],\"forwards\":[],\"bans\":[],\"vpn_peers\":[],\"vpn_grants\":[]}');")?;
+        migrate(&mut db, path, existed)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -61,6 +128,11 @@ impl StateStore {
         }
         Ok(Self { db: Mutex::new(db) })
     }
+    /// The format this database is in; 0 (no number yet) is format 1.
+    pub fn version(&self) -> Result<u32> {
+        let c = self.lock()?;
+        Ok(stored_version(&c)?.max(1))
+    }
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
         self.db.lock().map_err(|_| anyhow!("state lock poisoned"))
     }
@@ -68,9 +140,9 @@ impl StateStore {
         let body: String = c.query_row("SELECT body FROM snapshot WHERE id=1", [], |r| r.get(0))?;
         let snapshot: StateSnapshot = serde_json::from_str(&body).map_err(|e| {
             anyhow!(
-                "{OLD_STATE} (state.db: {e}). On the server: remove it with `docker compose \
-                 down -v`, start again and set it up anew, or restore a backup made by this \
-                 version"
+                "{OLD_STATE} (state.db: {e}). Restore the copy RIFT made before it changed the \
+                 format (state-before-v*.db in the state volume) with a matching RIFT version, \
+                 or a backup made by this version"
             )
         })?;
         validate_snapshot(&snapshot)?;
@@ -743,6 +815,111 @@ pub fn lowest_free_id(used: impl IntoIterator<Item = u64>) -> u64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    /// The tables as RIFT 0.1 created them, without a format number.
+    fn v1_database(path: &Path) {
+        let c = Connection::open(path).unwrap();
+        c.execute_batch("CREATE TABLE snapshot (id INTEGER PRIMARY KEY CHECK(id=1), generation INTEGER NOT NULL, body TEXT NOT NULL);
+            CREATE TABLE invites (name TEXT PRIMARY KEY, token_hash BLOB NOT NULL, expires_at INTEGER NOT NULL, reserved_agent TEXT, reserved_attempt TEXT, reserved_key TEXT, stage_deadline INTEGER, consumed INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE journal (seq INTEGER PRIMARY KEY AUTOINCREMENT, generation INTEGER NOT NULL, operation TEXT NOT NULL, created_at INTEGER NOT NULL, result TEXT NOT NULL);
+            CREATE TABLE rotations (agent_id TEXT PRIMARY KEY, rotation_id TEXT NOT NULL, new_key TEXT, committed INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE applied (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL, error TEXT);
+            CREATE TABLE health (agent_id TEXT PRIMARY KEY, online INTEGER NOT NULL, last_disconnect INTEGER, last_handshake INTEGER NOT NULL);").unwrap();
+        c.execute(
+            "INSERT INTO snapshot(id,generation,body) VALUES(1,7,?1)",
+            [include_str!("../tests/fixtures/state-v1-snapshot.json")],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn state_of_rift_0_1_is_migrated_with_a_copy_first() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        v1_database(&path);
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.version().unwrap(), STATE_VERSION);
+        let snap = store.snapshot().unwrap();
+        assert_eq!(snap.generation, 7);
+        assert_eq!(snap.agents[0].name, "PP");
+        assert!(!snap.agents[0].names, "names default to off");
+        assert!(!snap.vpn_peers[0].names_off);
+        assert_eq!(snap.forwards[0].listen_ports.start, 2222);
+        assert_eq!(snap.vpn_grants.len(), 1);
+        let copies: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.starts_with(&format!("state-before-v{STATE_VERSION}-")))
+            .collect();
+        assert_eq!(copies.len(), 1, "one copy before the migration");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join(&copies[0]))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "the copy is private");
+        }
+        let copy = Connection::open(dir.path().join(&copies[0])).unwrap();
+        assert_eq!(
+            stored_version(&copy).unwrap(),
+            0,
+            "the copy keeps the old format"
+        );
+        drop(store);
+        // Opening again migrates nothing and copies nothing.
+        StateStore::open(&path).unwrap();
+        let again = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .is_ok_and(|e| e.file_name().to_string_lossy().starts_with("state-before"))
+            })
+            .count();
+        assert_eq!(again, 1);
+    }
+
+    #[test]
+    fn a_new_database_starts_at_the_current_format_without_a_copy() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.db")).unwrap();
+        assert_eq!(store.version().unwrap(), STATE_VERSION);
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|e| e
+                    .as_ref()
+                    .is_ok_and(|e| e.file_name().to_string_lossy().starts_with("state-before")))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn state_from_a_newer_rift_is_refused() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        StateStore::open(&path).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", STATE_VERSION + 1)
+            .unwrap();
+        let error = StateStore::open(&path)
+            .err()
+            .expect("a newer format was opened");
+        assert!(error.to_string().contains("newer RIFT"), "{error}");
+    }
+
+    #[test]
+    fn every_format_has_a_migration_to_the_next() {
+        for version in 1..STATE_VERSION {
+            assert!(
+                MIGRATIONS.iter().any(|(from, _)| *from == version),
+                "no migration from format {version}"
+            );
+        }
+    }
+
     #[test]
     fn vpn_state_is_validated() {
         let agent = |id: &str, n: u8| AgentRecord {
@@ -906,7 +1083,11 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("different RIFT version"), "{error}");
-        assert!(error.contains("docker compose down -v"), "{error}");
+        assert!(error.contains("state-before-v"), "{error}");
+        assert!(
+            !error.contains("down -v"),
+            "no advice that deletes the state: {error}"
+        );
     }
     #[test]
     fn forward_ids_fill_gaps_before_growing() {

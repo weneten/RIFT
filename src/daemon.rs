@@ -1991,13 +1991,14 @@ async fn run_agent_inner(
     let id_path = config.identity_path();
     let key_path = config.private_key_path();
     let mut identity = if id_path.exists() {
-        serde_json::from_slice::<AgentIdentity>(&std::fs::read(&id_path)?).map_err(|e| {
-            anyhow!("{} (identity.json: {e}). On the agent: remove it with `docker compose down -v`, then enroll the agent again with a new invitation", crate::state::OLD_STATE)
-        })?
+        let identity = read_identity(&std::fs::read(&id_path)?)?;
+        atomic_json(&id_path, &identity)?;
+        identity
     } else {
         let (private, public) = net::generate_keypair().await?;
         atomic_write(&key_path, private.as_bytes(), 0o600)?;
         let id = AgentIdentity {
+            version: IDENTITY_VERSION,
             id: uuid::Uuid::new_v4().to_string(),
             attempt_id: uuid::Uuid::new_v4().to_string(),
             public_key: public,
@@ -2340,14 +2341,40 @@ fn note_refusals(refusals: &[String]) {
         }
     }
 }
+/// identity.json in the current format. Files from older RIFT versions are migrated (none
+/// needs a change yet: format 1 only adds the number); a file from a newer RIFT is refused,
+/// as this RIFT cannot know what it holds.
+fn read_identity(bytes: &[u8]) -> Result<AgentIdentity> {
+    let mut identity: AgentIdentity = serde_json::from_slice(bytes).map_err(|e| {
+        anyhow!(
+            "{} (identity.json: {e}). Run the RIFT version that wrote it, or restore a backup of the agent's state volume",
+            crate::state::OLD_STATE
+        )
+    })?;
+    anyhow::ensure!(
+        identity.version <= IDENTITY_VERSION,
+        "identity.json has format {}, written by a newer RIFT; this RIFT reads up to format {IDENTITY_VERSION}. Run the newer version again",
+        identity.version
+    );
+    identity.version = IDENTITY_VERSION;
+    Ok(identity)
+}
 /// The cached policy, narrowed again by the current allowlists so a tightened `.env`
-/// takes effect on restart without waiting for the server.
+/// takes effect on restart without waiting for the server. The server sends the whole policy
+/// with every sync, so a cache this RIFT cannot read (from another version) is dropped and
+/// replaced on the next sync instead of stopping the agent.
 fn load_agent_policy(config: &Config) -> Result<AgentPolicy> {
-    let cached: AgentPolicy =
-        serde_json::from_slice(&std::fs::read(config.state_dir.join("agent-policy.json"))?)
-            .map_err(|e| {
-                anyhow!("{} (agent-policy.json: {e}). On the agent: remove it with `docker compose down -v`, then enroll the agent again with a new invitation", crate::state::OLD_STATE)
-            })?;
+    let path = config.state_dir.join("agent-policy.json");
+    let cached: AgentPolicy = match serde_json::from_slice(&std::fs::read(&path)?) {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::warn!(
+                "dropping the cached policy ({error}); the server sends it again on the next sync"
+            );
+            std::fs::remove_file(&path).ok();
+            AgentPolicy::default()
+        }
+    };
     Ok(agent_policy::restrict(&cached, &config.agent_limits()).0)
 }
 async fn agent_sync(
@@ -2553,6 +2580,21 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_of_rift_0_1_is_read_and_a_newer_one_refused() {
+        // identity.json as RIFT 0.1 wrote it: no format number.
+        let old = br#"{"id":"a","attempt_id":"b","public_key":"k","welcome":null,"active":false,"applied_generation":3}"#;
+        let identity = read_identity(old).unwrap();
+        assert_eq!(identity.version, IDENTITY_VERSION);
+        assert_eq!(identity.applied_generation, 3);
+        let newer = format!(
+            r#"{{"version":{},"id":"a","attempt_id":"b","public_key":"k","welcome":null,"active":false,"applied_generation":3}}"#,
+            IDENTITY_VERSION + 1
+        );
+        let error = read_identity(newer.as_bytes()).unwrap_err().to_string();
+        assert!(error.contains("newer RIFT"), "{error}");
+    }
 
     fn peer(name: &str, enabled: bool) -> VpnPeer {
         VpnPeer {

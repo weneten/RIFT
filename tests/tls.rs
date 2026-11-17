@@ -182,6 +182,7 @@ async fn run_case(
         invite(&token_ca)?,
     );
     let mut identity = AgentIdentity {
+        version: rift::model::IDENTITY_VERSION,
         id: uuid::Uuid::new_v4().to_string(),
         attempt_id: uuid::Uuid::new_v4().to_string(),
         public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),

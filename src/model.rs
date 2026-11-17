@@ -489,9 +489,14 @@ pub struct Welcome {
     pub control_port: u16,
     pub mtu: u16,
 }
+/// The format of an agent's identity.json; see `daemon::read_identity`.
+pub const IDENTITY_VERSION: u32 = 1;
 // No private key or invitation is stored in this file. wireguard.key is separate.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentIdentity {
+    /// The file's format; 0 in files written before formats were numbered (RIFT 0.1).
+    #[serde(default)]
+    pub version: u32,
     pub id: String,
     pub attempt_id: String,
     pub public_key: String,

@@ -6,6 +6,8 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ### Added
 
+- Stored state is migrated on update instead of refused. `state.db` has a format number; RIFT copies an older database to `state-before-vN-TIME.db` (mode 0600) in the state volume and migrates it in one transaction. A database from a newer RIFT is refused with a clear message instead of the old advice to delete the volume. RIFT 0.1 state is read as format 1. An agent's `identity.json` has a format number too, and an agent drops a cached policy it cannot read; the server sends it again.
+
 - Names for VPN devices: `rift vpn names agent NAME on` lets every device with a grant on the agent reach it as `NAME.internal`, for example `http://pp.internal:3000`. The name follows the agent, so a new agent under the same name is found again. A small DNS server on the server's tunnel address answers these names only for the agents a device has a grant on, with their IPv4 tunnel address, and passes all other lookups on to the device's DNS agent (`rift vpn dns`) or `RIFT_VPN_DNS`. `rift vpn names device NAME off` keeps a device out. Turning names on or off lists the devices whose main profile changed. In the web panel: "Names on/off" per agent and "Use RIFT's names" per device. `rift list agents` has a DNS NAME column.
 
 - `sudo sh deploy/join SERVER NAME TOKEN` sets up an agent in one step: host preparation, `config.toml` and `.env`, the `rift` command, start, waiting for the server to accept it, and removing the used token from `.env`. `rift add agent` and the web panel's invitation dialog print this command first; the three `.env` lines follow for a manual setup.

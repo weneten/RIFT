@@ -1,0 +1,73 @@
+{
+  "generation": 7,
+  "agents": [
+    {
+      "id": "0b9b2c6e-7d1e-4b8a-9a53-1d2f3e4a5b6c",
+      "name": "PP",
+      "public_key": "c2VydmVyLWtleS1wcC0wMDAwMDAwMDAwMDAwMDAwMDA=",
+      "tunnel_ipv4": "10.13.0.2",
+      "tunnel_ipv6": "fd88:5249:4654::2",
+      "status": "active",
+      "attempt_id": "5a6b7c8d-1e2f-4a3b-8c9d-0e1f2a3b4c5d",
+      "generation": 7,
+      "applied_generation": 7,
+      "last_error": null,
+      "created_at": 1790000000,
+      "pending_deadline": null,
+      "limits": null,
+      "exit": null,
+      "exit_port": null
+    }
+  ],
+  "forwards": [
+    {
+      "id": 1,
+      "agent_id": "0b9b2c6e-7d1e-4b8a-9a53-1d2f3e4a5b6c",
+      "listen_ip": "203.0.113.10",
+      "listen_ports": {
+        "start": 2222,
+        "end": 2222
+      },
+      "target_ports": {
+        "start": 22,
+        "end": 22
+      },
+      "protocol": "tcp",
+      "mode": "transparent",
+      "ingress": "public",
+      "target_family": "v4",
+      "enabled": true,
+      "generation": 3,
+      "purpose": "user"
+    }
+  ],
+  "bans": [],
+  "vpn_peers": [
+    {
+      "name": "handy",
+      "public_key": "aGFuZHkta2V5LTAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=",
+      "ipv4": "10.14.0.2",
+      "enabled": true,
+      "created_at": 1790000100,
+      "panel": false,
+      "ipv6": "fd88:5249:4655::2",
+      "server_exit": false,
+      "agent_exits": []
+    }
+  ],
+  "vpn_grants": [
+    {
+      "peer": "handy",
+      "agent_id": "0b9b2c6e-7d1e-4b8a-9a53-1d2f3e4a5b6c",
+      "access": {
+        "port": {
+          "protocol": "tcp",
+          "ports": {
+            "start": 3000,
+            "end": 3000
+          }
+        }
+      }
+    }
+  ]
+}
