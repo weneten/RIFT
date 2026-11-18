@@ -337,7 +337,7 @@ async fn reconcile(s: &Server) -> Result<()> {
                 }
             }
             s.state
-                .mark_failed(snapshot.generation, &sanitize_error(&error.to_string()))?;
+                .mark_failed(snapshot.generation, &sanitize_error(&format!("{error:#}")))?;
             Err(error.context("desired configuration not applied; retained safe previously confirmed grants where possible"))
         }
     }
@@ -886,7 +886,7 @@ async fn serve_admin(listener: tokio::net::UnixListener, s: Arc<Server>) -> Resu
                 let limit = Duration::from_secs(request_seconds(&req) - 1);
                 let response = match timeout(limit, admin_call_impl(&s, req)).await {
                     Ok(Ok(v)) => AdminResponse::success(v),
-                    Ok(Err(e)) => AdminResponse::error(sanitize_error(&e.to_string())),
+                    Ok(Err(e)) => AdminResponse::error(sanitize_error(&format!("{e:#}"))),
                     Err(_) => AdminResponse::error("the request took too long"),
                 };
                 protocol::send_admin(&mut stream, &response).await
@@ -918,8 +918,10 @@ fn admin_peer_allowed(stream: &tokio::net::UnixStream) -> bool {
 async fn serve_admin(_listener: (), _s: Arc<Server>) -> Result<()> {
     bail!("RIFT admin socket is supported on Unix only")
 }
+/// One line of at most 800 characters, with the causes: the cause names what failed, such as
+/// the message of a rejected nft batch.
 fn sanitize_error(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).take(300).collect()
+    s.chars().filter(|c| !c.is_control()).take(800).collect()
 }
 
 /// How long a caller waits for the answer.
@@ -2209,7 +2211,7 @@ async fn serve_agent_admin(listener: tokio::net::UnixListener, config: Config) -
                 let request: AdminRequest = protocol::receive(&mut stream).await?;
                 let response = match agent_admin_request(&config, request).await {
                     Ok(data) => AdminResponse::success(data),
-                    Err(error) => AdminResponse::error(sanitize_error(&error.to_string())),
+                    Err(error) => AdminResponse::error(sanitize_error(&format!("{error:#}"))),
                 };
                 protocol::send_admin(&mut stream, &response).await
             })

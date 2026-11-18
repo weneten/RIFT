@@ -475,18 +475,23 @@ def run(cmd, cwd=None):
 
 
 def rift(state, *args):
-    raw = run(
-        [
-            "docker",
-            "exec",
-            state["container"],
-            "rift",
-            "--config",
-            state["rift_config"],
-            "--json",
-            *args,
-        ]
-    )
+    try:
+        raw = run(
+            [
+                "docker",
+                "exec",
+                state["container"],
+                "rift",
+                "--config",
+                state["rift_config"],
+                "--json",
+                *args,
+            ]
+        )
+    except SiteError as error:
+        # rift prefixes its errors with "rift: ", and so does this helper.
+        detail = str(error)
+        raise SiteError(detail[6:] if detail.startswith("rift: ") else detail) from None
     return json.loads(raw) if raw.strip() else None
 
 
