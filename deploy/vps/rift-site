@@ -1084,6 +1084,75 @@ def command_add(agent, host, port, proxy, allow_from=()):
         print(note)
 
 
+def command_migrate_sites(new):
+    """Moves every site to proxy `new`, which must hold port 443 already (deploy/setup-proxy
+    --migrate stops the old one and sets up the new one first). A site keeps its forward: the
+    port and the local-ingress forward do not depend on the proxy. The old configuration goes
+    once the new one is in place; an old Nginx Proxy Manager is stopped and keeps its hosts in
+    its own data. Each site is moved on its own; one that fails does not stop the others."""
+    if new not in PROXIES:
+        raise SiteError("proxy must be traefik, caddy, nginx, or npm")
+    state = load_state()
+    if state is None or not state.get("sites"):
+        print("No sites to move.")
+        return
+    sync_installation(state)
+    require_edge(new, *capture_edge())
+    if new == "traefik":
+        notice = ensure_traefik_provider(state)
+        if notice:
+            print(notice)
+    moved, failed, notes = [], [], []
+    for host in sorted(state["sites"]):
+        site = state["sites"][host]
+        old = site.get("proxy")
+        if old == new:
+            continue
+        allow_from = list(site.get("allow_from") or [])
+        listen = int(site["listen"])
+        try:
+            if new == "npm":
+                published = npm_publish(state, host, listen, allow_from)
+                host_id = published["host_id"]
+                if published["note"]:
+                    notes.append(f"{host}: {published['note']}")
+            else:
+                path = site_path(state, new, host)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(render_site(state, new, host, listen, allow_from), encoding="utf-8")
+                host_id = None
+            note = reload_proxy(state, new, host)
+            if note:
+                notes.append(f"{host}: {note}")
+        except Exception as error:  # one site must not stop the others
+            if new != "npm":
+                site_path(state, new, host).unlink(missing_ok=True)
+            failed.append(f"{host}: {error}")
+            continue
+        if old in ("traefik", "caddy", "nginx"):
+            site_path(state, old, host).unlink(missing_ok=True)
+        site["proxy"] = new
+        site.pop("npm_host_id", None)
+        if host_id is not None:
+            site["npm_host_id"] = host_id
+        save_state(state)
+        moved.append(f"{host} (from {old})")
+    if moved:
+        print(f"Moved to {new} ({len(moved)}):")
+        for line in moved:
+            print(f"  {line}")
+    if failed:
+        print(f"Failed ({len(failed)}); run `rift add site AGENT DOMAIN PORT {new}` for each:")
+        for line in failed:
+            print(f"  {line}")
+    if not moved and not failed:
+        print(f"Every site already uses {new}.")
+    for line in notes:
+        print(f"Note: {line}")
+    if failed:
+        raise SiteError(f"{len(failed)} site(s) could not be moved to {new}")
+
+
 def command_rm(host):
     state = load_state()
     if state is not None:
@@ -2206,6 +2275,9 @@ def main(argv):
         return
     if command == "purge" and len(argv) == 2:
         command_purge()
+        return
+    if command == "migrate-sites" and len(argv) == 3:
+        command_migrate_sites(argv[2])
         return
     if command == "export":
         command_export(argv[2:])

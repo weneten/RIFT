@@ -365,6 +365,14 @@ sudo sh deploy/setup-proxy caddy --email you@example.net
 
 All three run in Docker, which every RIFT server has, so they work on any distribution. Each is set up the way `rift add site` expects it and becomes the helper's default proxy. Ports 80 and 443 must be free; the script refuses to take them from another program. `--email` is the address for Let's Encrypt's expiry notices, stored as `RIFT_LETSENCRYPT_EMAIL` in the server `.env`. For `npm` it is required: it is also the login of the web interface. The script then creates that login with a random password, stores both as `RIFT_NPM_EMAIL` and `RIFT_NPM_PASSWORD` in `.env` (which `rift add site` uses for the API) and checks them. The web interface listens on the server only; open it through an SSH tunnel (`ssh -L 8181:127.0.0.1:81 root@SERVER`, then `http://127.0.0.1:8181`). Nginx Proxy Manager writes that first password once into its container log (`docker logs rift-npm`); if you change it in the interface, change it in `.env` too.
 
+**Switch to another proxy** with `--migrate`, for example from Caddy to Nginx Proxy Manager:
+
+```sh
+sudo sh deploy/setup-proxy npm --email you@example.net --migrate
+```
+
+It stops the old proxy of this script (its files stay in `/opt/rift-...`), sets up the new one and moves every site of `rift add site` to it. Each site keeps its forward; only the proxy configuration moves, and the new proxy requests new certificates. Websites are down for the moments between stopping the old proxy and the new one serving them. If the new proxy cannot be set up, the old one starts again unchanged. A proxy that this script did not set up (another container, Caddy or Nginx on the host) is not stopped: stop and disable it yourself, then run the command; with `--migrate` the sites move too. Without `--migrate` the script refuses while another proxy holds the ports, and says when sites still use another proxy.
+
 Open TCP 80 and 443 in your cloud firewall. Then, once the domain's A record (and AAAA, if you publish IPv6) points at the server:
 
 ```sh
@@ -888,7 +896,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | `rift add site AGENT DOMAIN PORT [traefik\|caddy\|nginx\|npm] [--allow-from ADDRESS[,NETWORK...]]` | Publishes `https://DOMAIN` through your reverse proxy to `PORT` on the agent. Without a proxy word the default is used. With `--allow-from` the proxy answers other clients with 403. |
 | `rift list sites` | All sites with their forward state (`ok`, `missing`, `refused`). |
 | `rift remove site DOMAIN` | Removes the site, its proxy configuration and its forward. |
-| `rift proxy [traefik\|caddy\|nginx\|npm] [--container NAME --sites-dir DIR]` | Shows or sets the default proxy; with the options, Caddy runs in that container and reads the site files from that host directory. `sudo sh deploy/setup-proxy traefik\|caddy\|npm` sets up a proxy in Docker. |
+| `rift proxy [traefik\|caddy\|nginx\|npm] [--container NAME --sites-dir DIR]` | Shows or sets the default proxy; with the options, Caddy runs in that container and reads the site files from that host directory. `sudo sh deploy/setup-proxy traefik\|caddy\|npm [--migrate]` sets up a proxy in Docker, or switches to it and moves every site. |
 
 The web panel runs `add site`, `remove site`, `export`, `import` and `backup` through the host service (`rift-site-queue.path`, installed by `deploy/install-cli`); see [Web panel](#web-panel).
 

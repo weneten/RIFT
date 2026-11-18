@@ -1,7 +1,7 @@
 #!/bin/sh
 # Set up a reverse proxy in Docker on the RIFT server, for websites with HTTPS (`rift add site`):
 #
-#   sudo sh deploy/setup-proxy traefik|caddy|npm [--email ADDRESS] [--yes]
+#   sudo sh deploy/setup-proxy traefik|caddy|npm [--email ADDRESS] [--migrate] [--yes]
 #
 #   traefik   Traefik (/opt/rift-traefik); certificates from Let's Encrypt
 #   caddy     Caddy (/opt/rift-caddy); certificates from Let's Encrypt
@@ -10,11 +10,14 @@
 #
 #   --email ADDRESS   address for Let's Encrypt (expiry notices), stored as
 #                     RIFT_LETSENCRYPT_EMAIL in .env; for npm also its admin login (required)
+#   --migrate         switch from another proxy of this script: stop it, set up this one and
+#                     move every site of `rift add site` to it (back to the old one if the new
+#                     one cannot be set up)
 #   --yes             do not ask
 #
 # Each one is set up the way `rift add site` expects it, so the next step is
-# `rift add site AGENT DOMAIN PORT`. Ports 80 and 443 must be free (or held by the same proxy,
-# set up by this script before). Safe to run again: existing settings are kept.
+# `rift add site AGENT DOMAIN PORT`. Ports 80 and 443 must be free, held by the same proxy, or
+# with --migrate held by another proxy of this script. Safe to run again: settings are kept.
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -23,6 +26,7 @@ env_file=$repo_dir/.env
 traefik_image=traefik:v3.3
 caddy_image=caddy:2.8-alpine
 npm_image=jc21/nginx-proxy-manager:2.17.0
+site_helper=/usr/local/lib/rift/rift-site
 
 fail() {
   printf 'rift: %s\n' "$*" >&2
@@ -32,13 +36,15 @@ fail() {
 proxy=
 email=
 assume_yes=
+migrate=
 while [ "$#" -gt 0 ]; do
   case $1 in
     traefik | caddy | npm) [ -z "$proxy" ] || fail "name one proxy"; proxy=$1; shift ;;
     nginx) fail "plain Nginx is not set up by this script; use npm (Nginx Proxy Manager), or your own Nginx as in the README" ;;
     --email) [ "$#" -ge 2 ] || fail "--email needs a value"; email=$2; shift 2 ;;
+    --migrate) migrate=1; shift ;;
     --yes | -y) assume_yes=1; shift ;;
-    -h | --help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) fail "unknown argument $1 (see sh deploy/setup-proxy --help)" ;;
   esac
 done
@@ -46,7 +52,7 @@ done
 [ "$(id -u)" -eq 0 ] || fail "run as root: sudo sh deploy/setup-proxy $proxy"
 [ -f "$env_file" ] && grep -Eq '^COMPOSE_PROFILES=server' "$env_file" \
   || fail "no RIFT server here ($env_file); run sudo sh deploy/setup-server first"
-command -v rift > /dev/null 2>&1 && [ -x /usr/local/lib/rift/rift-site ] \
+command -v rift > /dev/null 2>&1 && [ -x "$site_helper" ] \
   || fail "the rift command and its site helper are missing; run sudo sh deploy/install-cli first"
 docker info > /dev/null 2>&1 || fail "Docker does not answer; is the docker service running?"
 
@@ -73,12 +79,42 @@ holder() {
   fi
   ss -Hltnp "sport = :$port" 2> /dev/null | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | head -n 1
 }
+# The directory of a proxy container this script set up, or nothing.
+our_dir() {
+  wd=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$1" 2> /dev/null || true)
+  case $wd in
+    /opt/rift-traefik | /opt/rift-caddy | /opt/rift-npm) printf '%s\n' "$wd" ;;
+  esac
+}
+old_dir=
 for port in 80 443; do
   held=$(holder "$port")
-  if [ -n "$held" ] && [ "$held" != "container $container" ]; then
-    fail "port $port is held by $held. Stop it first, or keep it and point 'rift proxy' at it (see the README, Publish websites with HTTPS)"
+  if [ -z "$held" ] || [ "$held" = "container $container" ]; then
+    continue
+  fi
+  other=
+  case $held in
+    "container "*) other=$(our_dir "${held#container }") ;;
+  esac
+  if [ -n "$other" ] && [ -n "$migrate" ]; then
+    old_dir=$other
+  elif [ -n "$other" ]; then
+    fail "port $port is held by $held ($other). To switch to $proxy and move every site: sudo sh deploy/setup-proxy $proxy --migrate"
+  else
+    fail "port $port is held by $held. Stop it first (and disable it), then run this again; with --migrate the sites of rift add site move to $proxy too. Or keep it and point 'rift proxy' at it (see the README, Publish websites with HTTPS)"
   fi
 done
+
+# Sites of `rift add site` that use another proxy than this one.
+other_sites=$(python3 -c '
+import json, os, sys
+path = os.environ.get("RIFT_SITE_STATE", "/var/lib/rift-site/sites.json")
+try:
+    sites = json.load(open(path)).get("sites") or {}
+except (OSError, ValueError):
+    sites = {}
+print(sum(1 for site in sites.values() if site.get("proxy") != sys.argv[1]))
+' "$proxy")
 
 # ---------- the e-mail address ----------
 if [ -z "$email" ]; then
@@ -98,6 +134,12 @@ if [ -n "$email" ] && ! printf '%s\n' "$email" | grep -Eq '^[A-Za-z0-9._%+-]+@[A
 fi
 
 if [ -n "$interactive" ]; then
+  if [ -n "$old_dir" ]; then
+    printf 'This stops the proxy in %s; websites are down until %s serves them.\n' "$old_dir" "$proxy" > /dev/tty
+  fi
+  if [ -n "$migrate" ] && [ "$other_sites" -gt 0 ]; then
+    printf '%s site(s) move to %s and get new certificates.\n' "$other_sites" "$proxy" > /dev/tty
+  fi
   printf 'Set up %s in Docker on ports 80 and 443 (%s)? [Y/n]: ' "$proxy" "$dir" > /dev/tty
   read -r reply < /dev/tty || reply=
   case ${reply:-y} in [yY]*) ;; *) fail "nothing changed" ;; esac
@@ -243,11 +285,36 @@ EOF
   rift proxy npm > /dev/null
 }
 
+# With --migrate the old proxy stops first. If the new one cannot be set up, it runs again,
+# unchanged: its configuration is only removed once the sites have moved.
+switched=
+restore_old() {
+  if [ -n "$old_dir" ] && [ -z "$switched" ]; then
+    echo "rift: $proxy could not be set up; starting the proxy in $old_dir again" >&2
+    if [ -f "$dir/compose.yml" ]; then
+      (cd "$dir" && docker compose down > /dev/null 2>&1) || true
+    fi
+    (cd "$old_dir" && docker compose up -d > /dev/null 2>&1) || echo "rift: could not start it; run: cd $old_dir && docker compose up -d" >&2
+  fi
+}
+trap restore_old EXIT
+if [ -n "$old_dir" ]; then
+  echo "Stopping the proxy in $old_dir"
+  (cd "$old_dir" && docker compose down)
+fi
+
 echo "Setting up $proxy"
 "setup_$proxy"
+switched=1
 if [ -n "$server_env_changed" ]; then
   # The server container passes these settings to the site helper.
   (cd "$repo_dir" && docker compose up -d > /dev/null)
+fi
+
+migrate_failed=
+if [ -n "$migrate" ] && [ "$other_sites" -gt 0 ]; then
+  echo "Moving the sites to $proxy"
+  "$site_helper" migrate-sites "$proxy" || migrate_failed=1
 fi
 
 echo
@@ -264,4 +331,13 @@ fi
 if [ -z "$email" ]; then
   echo "Without an e-mail address Let's Encrypt cannot warn you before a certificate expires;"
   echo "run this again with --email to add one."
+fi
+if [ -n "$old_dir" ]; then
+  echo "The old proxy is stopped; its files stay in $old_dir. Delete them once everything works."
+fi
+if [ -z "$migrate" ] && [ "$other_sites" -gt 0 ]; then
+  echo "$other_sites site(s) still use another proxy. Move them with: sudo sh deploy/setup-proxy $proxy --migrate"
+fi
+if [ -n "$migrate_failed" ]; then
+  exit 1
 fi

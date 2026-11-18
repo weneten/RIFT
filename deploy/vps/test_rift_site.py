@@ -1052,6 +1052,103 @@ class ProxyCommandTests(unittest.TestCase):
                 self.run_main(*args)
 
 
+class MigrateTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        root = Path(self.dir.name)
+        self.state = rift_site.default_state("203.0.113.10")
+        self.state["caddy"]["sites_dir"] = str(root / "caddy")
+        self.state["traefik"]["dynamic_dir"] = str(root / "dynamic")
+        self.state["traefik"]["major"] = 3
+        for name in ("caddy", "dynamic"):
+            (root / name).mkdir()
+        self.state["sites"] = {
+            "a.example.net": {"agent": "node1", "target": 8080, "listen": 20000, "proxy": "caddy", "forward_id": 3},
+            "b.example.net": {"agent": "node1", "target": 9000, "listen": 20001, "proxy": "caddy",
+                              "forward_id": 4, "allow_from": ["198.51.100.7/32"]},
+        }
+        for host in self.state["sites"]:
+            (root / "caddy" / f"{host}.caddy").write_text("old")
+        self.saved = []
+
+    def migrate(self, new, **patches):
+        defaults = {
+            "load_state": mock.Mock(return_value=self.state),
+            "save_state": mock.Mock(side_effect=lambda s: self.saved.append(json.loads(json.dumps(s)))),
+            "sync_installation": mock.Mock(),
+            "capture_edge": mock.Mock(return_value=([], [])),
+            "require_edge": mock.Mock(),
+            "ensure_traefik_provider": mock.Mock(return_value=None),
+            "run": mock.Mock(return_value=""),
+            "rift": mock.Mock(side_effect=AssertionError("forwards must not change")),
+        }
+        defaults.update(patches)
+        out = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            for name, value in defaults.items():
+                stack.enter_context(mock.patch.object(rift_site, name, value))
+            stack.enter_context(contextlib.redirect_stdout(out))
+            try:
+                rift_site.command_migrate_sites(new)
+            except rift_site.SiteError as error:
+                return out.getvalue(), error
+        return out.getvalue(), None
+
+    def test_sites_move_to_another_file_proxy_and_keep_their_forward(self):
+        out, error = self.migrate("traefik")
+        self.assertIsNone(error, out)
+        dynamic = Path(self.state["traefik"]["dynamic_dir"])
+        self.assertIn("url: http://203.0.113.10:20000", (dynamic / "a.example.net.yml").read_text())
+        self.assertIn("ipAllowList", (dynamic / "b.example.net.yml").read_text())
+        self.assertEqual(list(Path(self.state["caddy"]["sites_dir"]).iterdir()), [])
+        final = self.saved[-1]["sites"]
+        self.assertEqual({h: s["proxy"] for h, s in final.items()}, {"a.example.net": "traefik", "b.example.net": "traefik"})
+        self.assertEqual(final["a.example.net"]["forward_id"], 3)
+        self.assertIn("Moved to traefik (2)", out)
+
+    def test_sites_move_to_nginx_proxy_manager(self):
+        publish = mock.Mock(side_effect=[{"host_id": 7, "note": None}, {"host_id": 8, "note": "no TLS"}])
+        out, error = self.migrate("npm", npm_publish=publish)
+        self.assertIsNone(error, out)
+        publish.assert_any_call(self.state, "b.example.net", 20001, ["198.51.100.7/32"])
+        final = self.saved[-1]["sites"]
+        self.assertEqual((final["a.example.net"]["npm_host_id"], final["b.example.net"]["npm_host_id"]), (7, 8))
+        self.assertIn("Note: b.example.net: no TLS", out)
+
+    def test_an_old_nginx_proxy_manager_is_not_asked(self):
+        for site in self.state["sites"].values():
+            site["proxy"], site["npm_host_id"] = "npm", 5
+        removed = mock.Mock()
+        out, error = self.migrate("caddy", npm_remove=removed, npm_request=mock.Mock(side_effect=AssertionError))
+        self.assertIsNone(error, out)
+        removed.assert_not_called()
+        self.assertNotIn("npm_host_id", self.saved[-1]["sites"]["a.example.net"])
+
+    def test_one_failing_site_does_not_stop_the_others(self):
+        calls = []
+
+        def reload(state, proxy, host):
+            calls.append(host)
+            if host == "a.example.net":
+                raise rift_site.SiteError("caddy reload failed")
+
+        self.state["sites"]["a.example.net"]["proxy"] = "traefik"
+        self.state["sites"]["b.example.net"]["proxy"] = "traefik"
+        out, error = self.migrate("caddy", reload_proxy=reload)
+        self.assertIsNotNone(error)
+        self.assertIn("a.example.net: caddy reload failed", out)
+        final = self.saved[-1]["sites"]
+        self.assertEqual((final["a.example.net"]["proxy"], final["b.example.net"]["proxy"]), ("traefik", "caddy"))
+        caddy = Path(self.state["caddy"]["sites_dir"])
+        self.assertFalse((caddy / "a.example.net.caddy").exists(), "a failed site left its new file behind")
+
+    def test_the_new_proxy_must_hold_443(self):
+        out, error = self.migrate("npm", require_edge=mock.Mock(side_effect=rift_site.SiteError("caddy holds port 443, not npm")))
+        self.assertIn("holds port 443", str(error))
+        self.assertEqual(self.saved, [])
+
+
 class RemoveTests(unittest.TestCase):
     def test_remove_says_what_it_removed(self):
         state = {"sites": {"pd.example.net": {"agent": "PP", "proxy": "traefik", "forward_id": 9}}}
