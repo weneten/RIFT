@@ -2065,6 +2065,8 @@ fn source_clause(forward: &Forward) -> String {
 }
 
 const NAT_CHAIN: &str = "add chain inet rift postrouting_nat { type nat hook postrouting priority srcnat; policy accept; }\n";
+const OUTPUT_NAT_CHAIN: &str =
+    "add chain inet rift output_nat { type nat hook output priority dstnat; policy accept; }\n";
 
 // Keep meta l4proto before conntrack port comparisons in both renderers.
 // nftables 1.0.6 needs this context to infer the transport-port datatype.
@@ -2097,6 +2099,12 @@ fn render_server_rules(
          add rule inet rift input iifname \"{interface}\" ct state established,related accept\n\
          add rule inet rift input iifname \"{interface}\" drop\n"
     ));
+    // A reverse proxy installed on the VPS itself (Caddy or Nginx from the distribution)
+    // connects to the public address from this host: such packets never pass prerouting, so a
+    // local-ingress forward is translated for them in the output hook as well.
+    if forwards.iter().any(|f| f.ingress == Ingress::Local) {
+        out.push_str(OUTPUT_NAT_CHAIN);
+    }
     for f in forwards {
         let agent = agents
             .get(&f.agent_id)
@@ -2118,6 +2126,11 @@ fn render_server_rules(
             out.push_str(&format!(
                 "add rule inet rift prerouting_nat {iif} {from}{addr_family} daddr {addr} {proto} dport {listen_port} dnat {target_family} to {target}\n"
             ));
+            if f.ingress == Ingress::Local {
+                out.push_str(&format!(
+                    "add rule inet rift output_nat {from}{addr_family} daddr {addr} {proto} dport {listen_port} dnat {target_family} to {target}\n"
+                ));
+            }
             // A missing MSS option must not skip the separate grant accept.
             if f.protocol == Protocol::Tcp {
                 out.push_str(&format!(
@@ -3631,6 +3644,26 @@ mod tests {
         assert!(
             rendered.contains("forward iifname \"rift0\" oifname != \"rift0\" ct direction reply")
         );
+        // A proxy on the VPS itself connects from this host and is translated on output.
+        assert!(rendered.contains(OUTPUT_NAT_CHAIN));
+        assert!(rendered
+            .contains("add rule inet rift output_nat ip daddr 203.0.113.1 tcp dport 80 dnat ip to 10.88.0.2:8080"));
+        f.ingress = Ingress::Public;
+        let public = render_server_rules(
+            "rift0",
+            0x52490000,
+            0xffff0000,
+            8444,
+            Ipv4Addr::new(10, 88, 0, 1),
+            "fd88:5249:4654::1".parse().unwrap(),
+            &[&f],
+            &agents,
+            &uplinks,
+            &vpn::Rules::default(),
+        )
+        .unwrap();
+        assert!(!public.contains("output_nat"), "{public}");
+        f.ingress = Ingress::Local;
         assert!(render_server_rules(
             "rift0",
             0x52490000,

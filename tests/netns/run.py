@@ -637,6 +637,44 @@ got=s.recv(128).decode(); print(got); assert got.startswith("fd88:5249:4654::1")
     print("PASS --allow-from lets only the listed sources reach transparent IPv4/IPv6 TCP/UDP and translated forwards")
 
 
+def host_local_proxy_test(server_cfg):
+    """A reverse proxy on the VPS itself (Caddy or Nginx from the distribution) reaches a
+    local-ingress forward through the public address; clients from the internet do not."""
+    env = {"RIFT_PUBLIC_ENDPOINT": SERVER_HOST,
+           "RIFT_PUBLIC_IPS": f"{PUBLIC_V4},{PUBLIC_V4_NEW},{PUBLIC_V6}"}
+    cases = [("18130:19080/tcp", PUBLIC_V4, "4", "tcp"),
+             ("18131:19081/udp", PUBLIC_V4, "4", "udp"),
+             ("18132:19080/tcp", PUBLIC_V6, "6", "tcp")]
+    created = []
+    for spec, listen_ip, _, _ in cases:
+        forward = json.loads(cli(VPS, server_cfg, "add", "forward", "agent2", spec,
+                                 "--listen-ip", listen_ip, "--ingress", "local", env=env).stdout)
+        created.append(forward["id"])
+    wait_policy(server_cfg, 3)
+    output = ns(VPS, "nft", "list", "chain", "inet", "rift", "output_nat").stdout
+    assert "dport 18130" in output and "dport 18132" in output, output
+    for spec, listen_ip, fam, proto in cases:
+        port = spec.split(":")[0]
+        # The VPS connects from its own public address, as a proxy on the host does; the echo
+        # on agent2 answers with the source it saw.
+        result = ns(VPS, "python3", "-c", _client_probe(), fam, proto, listen_ip, listen_ip, port,
+                    check=False)
+        assert result.returncode == 0, \
+            f"a client on the VPS itself did not reach local forward {spec}: {result.stdout} {result.stderr}"
+    # From the internet the same forwards stay closed.
+    for spec, listen_ip, fam, proto in cases[:1]:
+        port = spec.split(":")[0]
+        blocked = ns(CLIENT, "python3", "-c", _client_probe(), fam, proto, "198.18.0.10",
+                     listen_ip, port, check=False)
+        assert blocked.returncode != 0, f"a local-ingress forward {spec} answered a client from outside"
+    for forward_id in created:
+        cli(VPS, server_cfg, "remove", "forward", str(forward_id))
+    wait_policy(server_cfg, 3)
+    assert "output_nat" not in ns(VPS, "nft", "list", "table", "inet", "rift").stdout, \
+        "the output chain stayed after the last local forward was removed"
+    print("PASS a proxy on the VPS itself reaches local-ingress forwards over IPv4/IPv6 TCP/UDP; outside clients do not")
+
+
 def _client_probe():
     return r'''import socket,sys
 fam=socket.AF_INET6 if sys.argv[1]=="6" else socket.AF_INET
@@ -1277,6 +1315,7 @@ def main():
         agent_local_ban_test(server_cfg)
         translation_ban_test(server_cfg)
         allow_from_test(server_cfg)
+        host_local_proxy_test(server_cfg)
         vpn_device_test(server_cfg)
         check_routes_and_foreign(prior, baselines)
         check_normal_traffic()
