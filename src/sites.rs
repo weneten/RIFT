@@ -4,8 +4,9 @@
 //! therefore only reads the helper's records (`/var/lib/rift-site`, mounted read-only) and
 //! queues requests as small JSON files in a separate directory (`/var/lib/rift-site-queue`,
 //! mounted read-write). A systemd path unit on the host runs `rift-site process-queue`, which
-//! validates every request again and writes `<id>.result.json` next to it. A request can only
-//! add or remove one site, with the parameters checked here.
+//! validates every request again and writes `<id>.result.json` next to it. A request adds or
+//! removes one site, or runs `rift export`, `rift import` or `rift backup` on the host; the
+//! host leaves their file as `<id>.data`, which the panel fetches once.
 
 use crate::config::validate_name;
 use anyhow::{bail, ensure, Context, Result};
@@ -24,8 +25,12 @@ pub const MAX_PENDING: usize = 20;
 const PROXIES: [&str; 4] = ["traefik", "caddy", "nginx", "npm"];
 const MAX_STATE: u64 = 1024 * 1024;
 const MAX_RESULT: u64 = 64 * 1024;
+/// The largest import the host takes (its QUEUE_MAX_IMPORT), with room for the request itself.
+pub const MAX_IMPORT: usize = 500 * 1024;
+/// The largest file the panel fetches from the host (a backup).
+const MAX_DATA: u64 = 256 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Request {
     Add {
@@ -42,6 +47,22 @@ pub enum Request {
     Remove {
         id: String,
         host: String,
+    },
+    /// `rift export` on the host, with its sites.
+    Export {
+        id: String,
+    },
+    /// `rift backup` on the host: every key of the server.
+    Backup {
+        id: String,
+    },
+    /// `rift import` on the host; `map` holds `OLD=NEW` agent names.
+    Import {
+        id: String,
+        document: Value,
+        dry_run: bool,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        map: Vec<String>,
     },
 }
 
@@ -117,10 +138,54 @@ pub fn remove(host: &str) -> Result<Request> {
     })
 }
 
+pub fn export() -> Request {
+    Request::Export { id: new_id() }
+}
+
+pub fn backup() -> Request {
+    Request::Backup { id: new_id() }
+}
+
+/// An import of `document` (an export file); `map` is `OLD=NEW` agent names, separated by
+/// commas or spaces.
+pub fn import(document: Value, dry_run: bool, map: &str) -> Result<Request> {
+    ensure!(
+        document.is_object() && document.get("format").is_some(),
+        "this is not a RIFT export file (no \"format\" field)"
+    );
+    let mut pairs = Vec::new();
+    for pair in map
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|p| !p.is_empty())
+    {
+        let (old, new) = pair
+            .split_once('=')
+            .with_context(|| format!("{pair}: use OLD=NEW, for example node2=node1"))?;
+        validate_name(old).with_context(|| format!("{pair}: {old} is not an agent name"))?;
+        validate_name(new).with_context(|| format!("{pair}: {new} is not an agent name"))?;
+        pairs.push(format!("{old}={new}"));
+    }
+    let request = Request::Import {
+        id: new_id(),
+        document,
+        dry_run,
+        map: pairs,
+    };
+    ensure!(
+        serde_json::to_vec(&request)?.len() <= MAX_IMPORT,
+        "the export file is too large for the panel; use `rift import` on the server"
+    );
+    Ok(request)
+}
+
 impl Request {
     pub fn id(&self) -> &str {
         match self {
-            Self::Add { id, .. } | Self::Remove { id, .. } => id,
+            Self::Add { id, .. }
+            | Self::Remove { id, .. }
+            | Self::Export { id }
+            | Self::Backup { id }
+            | Self::Import { id, .. } => id,
         }
     }
 }
@@ -187,11 +252,43 @@ pub fn result(queue: &Path, id: &str) -> Result<Value> {
     let Ok(answer) = serde_json::from_str::<Value>(&text) else {
         return Ok(json!({"done": false}));
     };
-    Ok(json!({
+    let mut out = json!({
         "done": true,
         "ok": answer["ok"].as_bool().unwrap_or(false),
         "message": answer["message"].as_str().unwrap_or_default(),
-    }))
+    });
+    if let Some(file) = answer["file"].as_str() {
+        out["file"] = file.into();
+    }
+    Ok(out)
+}
+
+/// The host's answer with the file it left for the request (export, import report or
+/// backup): `{"done": false}` until it exists, then the answer with `file` (its name) and
+/// `data` (its bytes). The file and the answer are removed once read, so a backup leaves the
+/// host only once.
+pub fn fetch(queue: &Path, id: &str) -> Result<(Value, Option<Vec<u8>>)> {
+    let answer = result(queue, id)?;
+    if answer["done"] != true {
+        return Ok((answer, None));
+    }
+    let path = queue.join(format!("{id}.data"));
+    let data = if answer["file"].is_string() {
+        let file = std::fs::File::open(&path)
+            .with_context(|| "the host's file is gone; it is kept for 15 minutes, so ask again")?;
+        let mut data = Vec::new();
+        file.take(MAX_DATA + 1).read_to_end(&mut data)?;
+        ensure!(
+            data.len() as u64 <= MAX_DATA,
+            "the host's file is too large"
+        );
+        Some(data)
+    } else {
+        None
+    };
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(queue.join(format!("{id}.result.json")));
+    Ok((answer, data))
 }
 
 fn forward_state(site: &Value, forwards: &[Value]) -> (&'static str, Value) {

@@ -43,9 +43,9 @@ install -d -m 700 /var/lib/rift-site-queue
 chmod 700 /var/lib/rift-site-queue
 
 if [ ! -d /run/systemd/system ] || ! command -v systemctl > /dev/null 2>&1; then
-    printf '%s\n' 'No systemd here: the web panel cannot add or remove sites. Run' \
-        '  sudo rift add site / sudo rift remove site' \
-        'on the server instead.'
+    printf '%s\n' 'No systemd here: the web panel cannot add or remove sites or run export, import' \
+        'and backup. Run sudo rift add site, remove site, export, import and backup on the' \
+        'server instead.'
     exit 0
 fi
 
@@ -70,4 +70,4 @@ ExecStart=/usr/local/lib/rift/rift-site process-queue
 EOF
 systemctl daemon-reload
 systemctl enable --now rift-site-queue.path
-printf '%s\n' 'Enabled rift-site-queue.path: the web panel can now add and remove sites.'
+printf '%s\n' 'Enabled rift-site-queue.path: the web panel can now add and remove sites and run export, import and backup.'

@@ -280,8 +280,21 @@ impl<B: Backend> Panel<B> {
     }
 
     async fn connection<S: AsyncRead + AsyncWrite + Unpin>(&self, stream: &mut S, source: IpAddr) {
-        let response = match timeout(Duration::from_secs(10), read_request(stream)).await {
+        let response = match timeout(Duration::from_secs(10), read_head(stream)).await {
             Ok(Ok(request)) => {
+                let request = match request
+                    .read_body(stream, |head| self.body_limit(head, source))
+                    .await
+                {
+                    Ok(request) => request,
+                    Err(e) => {
+                        let _ = stream
+                            .write_all(&Response::text(400, &format!("{e}\n")).to_bytes())
+                            .await;
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+                };
                 if source_allowed(&self.config, &self.backend.panel_peers(), source) {
                     self.handle(request, source).await
                 } else {
@@ -320,8 +333,37 @@ impl<B: Backend> Panel<B> {
                 response.cookie = Some(cookie("", 0, secure));
                 response
             }
-            (_, "/api/overview" | "/api/action") if !self.session(&request) => {
+            (_, "/api/overview" | "/api/action" | "/api/import") if !self.session(&request) => {
                 Response::error(401, "log in first")
+            }
+            ("POST", "/api/import") => {
+                if !self.trusted(&request, source) {
+                    tracing::warn!(
+                        "web panel refused an import from {source}: read-only connection"
+                    );
+                    return Response::error(403, READ_ONLY);
+                }
+                #[derive(Deserialize)]
+                struct Import {
+                    document: Value,
+                    #[serde(default)]
+                    dry_run: bool,
+                    #[serde(default)]
+                    map: String,
+                }
+                let import: Import = match serde_json::from_slice(&request.body) {
+                    Ok(import) => import,
+                    Err(e) => return Response::error(400, &format!("malformed import: {e}")),
+                };
+                if !import.dry_run {
+                    tracing::info!("web panel import from {source}");
+                }
+                match crate::sites::import(import.document, import.dry_run, &import.map)
+                    .and_then(|r| crate::sites::enqueue(&self.queue_dir, &r))
+                {
+                    Ok(id) => Response::json(200, &json!({"id": id})),
+                    Err(e) => Response::error(400, &format!("{e:#}")),
+                }
             }
             ("GET", "/api/overview") => match self.overview(self.trusted(&request, source)).await {
                 Ok(data) => Response::json(200, &data),
@@ -340,7 +382,7 @@ impl<B: Backend> Panel<B> {
                     );
                     return Response::error(403, READ_ONLY);
                 }
-                if action.writes() {
+                if action.writes() && !matches!(action, Action::HostFile { .. }) {
                     tracing::info!("web panel action from {source}: {action:?}");
                 }
                 match action.run(self).await {
@@ -351,7 +393,7 @@ impl<B: Backend> Panel<B> {
             (
                 _,
                 "/" | "/index.html" | "/app.js" | "/app.css" | "/logo.svg" | "/api/session"
-                | "/api/login" | "/api/logout" | "/api/overview" | "/api/action",
+                | "/api/login" | "/api/logout" | "/api/overview" | "/api/action" | "/api/import",
             ) => Response::error(405, "method not allowed"),
             _ => Response::error(404, "not found"),
         }
@@ -395,6 +437,53 @@ impl<B: Backend> Panel<B> {
             || (proxy && https)
     }
 
+    /// Only an import from a logged-in, trusted session may be larger than MAX_BODY.
+    fn body_limit(&self, request: &Request, source: IpAddr) -> usize {
+        if request.method == "POST"
+            && request.path == "/api/import"
+            && self.session(request)
+            && self.trusted(request, source)
+        {
+            crate::sites::MAX_IMPORT
+        } else {
+            MAX_BODY
+        }
+    }
+
+    /// The password and, with two-factor login on, a fresh code; under the login lock, with
+    /// the same penalty and lockout as a login.
+    async fn credentials(&self, password: &str, code: &str) -> Result<(), Response> {
+        let _serial = self.login.lock().await;
+        if self.two_factor.locked(now()) {
+            return Err(Response::error(
+                429,
+                "too many failed logins; try again later",
+            ));
+        }
+        let given: [u8; 32] = Sha256::digest(password.as_bytes()).into();
+        // Compare digests without an early exit.
+        let mismatch = given
+            .iter()
+            .zip(self.password.iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+        // The code is only checked, and its step only used up, after the right password.
+        let code_ok = !self.two_factor.enabled()
+            || (mismatch == 0 && self.two_factor.verify_login(code, now()));
+        if mismatch != 0 || !code_ok {
+            if self.two_factor.failed(now()) {
+                tracing::warn!(
+                    "web panel: {} failed logins in a row, all logins are locked for {} minutes",
+                    crate::totp::MAX_FAILURES,
+                    crate::totp::LOCKOUT_SECONDS / 60
+                );
+            }
+            tokio::time::sleep(self.penalty).await;
+            return Err(Response::error(401, "wrong password or code"));
+        }
+        self.two_factor.succeeded();
+        Ok(())
+    }
+
     fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, i64>> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let epoch = self.two_factor.epoch();
@@ -427,38 +516,16 @@ impl<B: Backend> Panel<B> {
             tracing::warn!("web panel refused a login over plain HTTP from {source}");
             return Response::error(403, HTTPS_ONLY);
         }
-        let _serial = self.login.lock().await;
-        if self.two_factor.locked(now()) {
-            return Response::error(429, "too many failed logins; try again later");
-        }
         if self.config.webpanel_2fa == PanelTwoFactor::Required && !self.two_factor.enabled() {
             return Response::error(
                 403,
                 "two-factor login is required; set it up with `rift panel 2fa setup`",
             );
         }
-        let given: [u8; 32] = Sha256::digest(login.password.as_bytes()).into();
-        // Compare digests without an early exit.
-        let mismatch = given
-            .iter()
-            .zip(self.password.iter())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
-        // The code is only checked, and its step only used up, after the right password.
-        let code_ok = !self.two_factor.enabled()
-            || (mismatch == 0 && self.two_factor.verify_login(&login.code, now()));
-        if mismatch != 0 || !code_ok {
+        if let Err(response) = self.credentials(&login.password, &login.code).await {
             tracing::warn!("web panel login failed from {source}");
-            if self.two_factor.failed(now()) {
-                tracing::warn!(
-                    "web panel: {} failed logins in a row, all logins are locked for {} minutes",
-                    crate::totp::MAX_FAILURES,
-                    crate::totp::LOCKOUT_SECONDS / 60
-                );
-            }
-            tokio::time::sleep(self.penalty).await;
-            return Response::error(401, "wrong password or code");
+            return response;
         }
-        self.two_factor.succeeded();
         let token = {
             use rand::{rngs::OsRng, RngCore};
             let mut bytes = [0u8; 32];
@@ -680,6 +747,19 @@ enum Action {
     SiteResult {
         id: String,
     },
+    /// `rift export` on the host; fetch the file with `HostFile`.
+    Export,
+    /// `rift backup` on the host. It holds every key, so it needs the password and, with
+    /// two-factor login on, a fresh code again.
+    Backup {
+        password: Secret,
+        #[serde(default)]
+        code: Code,
+    },
+    /// The host's answer to an export, import or backup with its file (base64), once.
+    HostFile {
+        id: String,
+    },
     /// Starts turning two-factor login on: a new pending secret to scan.
     TwoFactorSetup,
     TwoFactorConfirm {
@@ -692,9 +772,19 @@ enum Action {
 }
 
 /// A one-time code, kept out of the action log.
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(transparent)]
 struct Code(String);
+
+/// The panel password, kept out of the action log.
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct Secret(String);
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
 impl std::fmt::Debug for Code {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("***")
@@ -957,6 +1047,34 @@ impl Action {
                 json!({"id": crate::sites::enqueue(&panel.queue_dir, &request)?})
             }
             Self::SiteResult { id } => crate::sites::result(&panel.queue_dir, &id)?,
+            Self::Export => {
+                json!({"id": crate::sites::enqueue(&panel.queue_dir, &crate::sites::export())?})
+            }
+            Self::Backup { password, code } => {
+                if let Err(response) = panel.credentials(&password.0, &code.0).await {
+                    tracing::warn!("web panel refused a backup: wrong password or code");
+                    let detail = serde_json::from_slice::<Value>(&response.body)
+                        .ok()
+                        .and_then(|v| v["error"].as_str().map(String::from))
+                        .unwrap_or_else(|| "wrong password or code".into());
+                    if panel.two_factor.enabled() {
+                        bail!("{detail} (a code works only once; wait for the next one)");
+                    }
+                    bail!("{detail}");
+                }
+                tracing::warn!("web panel: a backup with every key was requested");
+                json!({"id": crate::sites::enqueue(&panel.queue_dir, &crate::sites::backup())?})
+            }
+            Self::HostFile { id } => {
+                use base64::Engine;
+                let (mut answer, data) = crate::sites::fetch(&panel.queue_dir, &id)?;
+                if let Some(data) = data {
+                    answer["data"] = base64::engine::general_purpose::STANDARD
+                        .encode(data)
+                        .into();
+                }
+                answer
+            }
             Self::TwoFactorSetup => {
                 let setup = panel.two_factor.setup(crate::totp::host(&panel.config))?;
                 json!({"secret": setup.secret, "uri": setup.uri, "qr_svg": crate::vpn::qr_svg(&setup.uri)?})
@@ -1088,7 +1206,36 @@ impl Request {
     }
 }
 
-async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Request> {
+/// A request whose head is read; `read_body` reads the rest once the limit for it is known.
+struct Head {
+    request: Request,
+    length: usize,
+    /// What came after the head in the first reads.
+    rest: Vec<u8>,
+}
+
+impl Head {
+    async fn read_body<S: AsyncRead + Unpin>(
+        self,
+        stream: &mut S,
+        limit: impl Fn(&Request) -> usize,
+    ) -> Result<Request> {
+        let Head {
+            mut request,
+            length,
+            mut rest,
+        } = self;
+        ensure!(length <= limit(&request), "request body too large");
+        ensure!(rest.len() <= length, "more data than the content length");
+        let already = rest.len();
+        rest.resize(length, 0);
+        stream.read_exact(&mut rest[already..]).await?;
+        request.body = rest;
+        Ok(request)
+    }
+}
+
+async fn read_head<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Head> {
     let mut buffer = Vec::with_capacity(1024);
     let head_end = loop {
         if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -1116,7 +1263,7 @@ async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Request> {
         let (name, value) = line.split_once(':').context("malformed header")?;
         headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
     }
-    let mut request = Request {
+    let request = Request {
         method: method.to_string(),
         path,
         headers,
@@ -1130,14 +1277,16 @@ async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Request> {
         Some(value) => value.parse().context("invalid content length")?,
         None => 0,
     };
-    ensure!(length <= MAX_BODY, "request body too large");
-    let mut body = buffer.split_off(head_end + 4);
-    ensure!(body.len() <= length, "more data than the content length");
-    let already = body.len();
-    body.resize(length, 0);
-    stream.read_exact(&mut body[already..]).await?;
-    request.body = body;
-    Ok(request)
+    ensure!(
+        length <= MAX_BODY.max(crate::sites::MAX_IMPORT),
+        "request body too large"
+    );
+    let rest = buffer.split_off(head_end + 4);
+    Ok(Head {
+        request,
+        length,
+        rest,
+    })
 }
 
 struct Response {
@@ -2150,5 +2299,185 @@ mod tests {
             ..cfg
         };
         assert_eq!(password(&set).unwrap(), "from the environment");
+    }
+
+    fn queued(queue: &std::path::Path) -> Vec<Value> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(queue).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if name.len() == 37 && name.ends_with(".json") {
+                out.push(serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap());
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_backup_needs_the_password_again_and_a_trusted_connection() {
+        let (mut panel, _) = panel(config(PanelAccess::Private, ""));
+        let queue = tempfile::tempdir().unwrap();
+        panel.queue_dir = queue.path().into();
+        let cookie = logged_in(&panel).await;
+        let wrong = act(
+            &panel,
+            "127.0.0.1",
+            &cookie,
+            r#"{"action":"backup","password":"nope"}"#,
+            "",
+        )
+        .await;
+        assert!(
+            wrong.starts_with("HTTP/1.1 400") && wrong.contains("wrong password or code"),
+            "{wrong}"
+        );
+        let right = format!(r#"{{"action":"backup","password":"{PASSWORD}"}}"#);
+        let proxied = act(
+            &panel,
+            "127.0.0.1",
+            &cookie,
+            &right,
+            "X-Forwarded-For: 203.0.113.7\r\n",
+        )
+        .await;
+        assert!(proxied.starts_with("HTTP/1.1 403"), "{proxied}");
+        assert!(queued(queue.path()).is_empty());
+        let ok = act(&panel, "127.0.0.1", &cookie, &right, "").await;
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        let requests = queued(queue.path());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["action"], "backup");
+        assert_eq!(requests[0].as_object().unwrap().len(), 2, "{}", requests[0]);
+        // The password never reaches the log.
+        let action: Action = serde_json::from_str(&right).unwrap();
+        assert!(!format!("{action:?}").contains(PASSWORD));
+
+        // With two-factor login on, a fresh code is needed too.
+        // (The session from before stays; a login would use up the step the backup needs.)
+        let secret = enable_two_factor(&panel);
+        let without = act(&panel, "127.0.0.1", &cookie, &right, "").await;
+        assert!(without.starts_with("HTTP/1.1 400"), "{without}");
+        let code = code_for(&secret, 1);
+        let with = format!(r#"{{"action":"backup","password":"{PASSWORD}","code":"{code}"}}"#);
+        assert!(act(&panel, "127.0.0.1", &cookie, &with, "")
+            .await
+            .starts_with("HTTP/1.1 200"));
+        // A code works once.
+        let again = act(&panel, "127.0.0.1", &cookie, &with, "").await;
+        assert!(
+            again.starts_with("HTTP/1.1 400") && again.contains("works only once"),
+            "{again}"
+        );
+        assert_eq!(queued(queue.path()).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_host_file_is_handed_out_once() {
+        let (mut panel, _) = panel(config(PanelAccess::Private, ""));
+        let queue = tempfile::tempdir().unwrap();
+        panel.queue_dir = queue.path().into();
+        let cookie = logged_in(&panel).await;
+        let proxied = "X-Forwarded-For: 203.0.113.7\r\n";
+        let export = r#"{"action":"export"}"#;
+        assert!(act(&panel, "127.0.0.1", &cookie, export, proxied)
+            .await
+            .starts_with("HTTP/1.1 403"));
+        let answer = act(&panel, "127.0.0.1", &cookie, export, "").await;
+        let id = answer.split("\"id\":\"").nth(1).unwrap()[..32].to_string();
+        assert_eq!(
+            queued(queue.path())[0],
+            json!({"action": "export", "id": id})
+        );
+        let poll = format!(r#"{{"action":"host_file","id":"{id}"}}"#);
+        assert!(act(&panel, "127.0.0.1", &cookie, &poll, "")
+            .await
+            .contains("\"done\":false"));
+        std::fs::write(
+            queue.path().join(format!("{id}.result.json")),
+            r#"{"id":"x","ok":true,"message":"Exported 1 agent(s)","file":"rift-export-2026-11-18.json"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            queue.path().join(format!("{id}.data")),
+            b"{\"format\": 2}\n",
+        )
+        .unwrap();
+        // Only a trusted connection gets the file.
+        assert!(act(&panel, "127.0.0.1", &cookie, &poll, proxied)
+            .await
+            .starts_with("HTTP/1.1 403"));
+        let done = act(&panel, "127.0.0.1", &cookie, &poll, "").await;
+        assert!(
+            done.contains("\"file\":\"rift-export-2026-11-18.json\""),
+            "{done}"
+        );
+        assert!(done.contains("\"data\":\"eyJmb3JtYXQiOiAyfQo=\""), "{done}");
+        assert!(!queue.path().join(format!("{id}.data")).exists());
+        assert!(act(&panel, "127.0.0.1", &cookie, &poll, "")
+            .await
+            .contains("\"done\":false"));
+    }
+
+    #[tokio::test]
+    async fn a_large_import_needs_a_trusted_session() {
+        let (mut panel, _) = panel(config(PanelAccess::Private, ""));
+        let queue = tempfile::tempdir().unwrap();
+        panel.queue_dir = queue.path().into();
+        let cookie = logged_in(&panel).await;
+        let document = json!({"format": 2, "agents": [], "forwards": [], "devices": [], "sites": [], "note": "x".repeat(100 * 1024)});
+        let body = json!({"document": document, "dry_run": true, "map": "node2=node1"}).to_string();
+        let send = |extra: String| {
+            let raw = post("/api/import", &body, &format!("X-Rift-Panel: 1\r\n{extra}"));
+            let panel = &panel;
+            async move {
+                let (mut client, mut server) = tokio::io::duplex(1024 * 1024);
+                client.write_all(raw.as_bytes()).await.unwrap();
+                panel
+                    .connection(&mut server, "127.0.0.1".parse().unwrap())
+                    .await;
+                drop(server);
+                let mut out = String::new();
+                client.read_to_string(&mut out).await.unwrap();
+                out
+            }
+        };
+        let anonymous = send(String::new()).await;
+        assert!(anonymous.contains("request body too large"), "{anonymous}");
+        let proxied = send(format!(
+            "Cookie: {cookie}\r\nX-Forwarded-For: 203.0.113.7\r\n"
+        ))
+        .await;
+        assert!(proxied.contains("request body too large"), "{proxied}");
+        assert!(queued(queue.path()).is_empty());
+        let ok = send(format!("Cookie: {cookie}\r\n")).await;
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        let request = &queued(queue.path())[0];
+        assert_eq!(request["action"], "import");
+        assert_eq!(request["dry_run"], true);
+        assert_eq!(request["map"], json!(["node2=node1"]));
+        assert_eq!(request["document"]["format"], 2);
+        // A small import from a read-only connection is refused as a change.
+        let small = post(
+            "/api/import",
+            r#"{"document":{"format":2},"dry_run":true}"#,
+            &format!("Cookie: {cookie}\r\nX-Rift-Panel: 1\r\nX-Forwarded-For: 203.0.113.7\r\n"),
+        );
+        assert!(exchange(&panel, "127.0.0.1", &small)
+            .await
+            .starts_with("HTTP/1.1 403"));
+        for bad in [
+            r#"{"document":[1],"dry_run":true}"#,
+            r#"{"document":{"format":2},"map":"node2"}"#,
+            r#"{"document":{"format":2},"map":"a=b;id"}"#,
+        ] {
+            let raw = post(
+                "/api/import",
+                bad,
+                &format!("Cookie: {cookie}\r\nX-Rift-Panel: 1\r\n"),
+            );
+            let answer = exchange(&panel, "127.0.0.1", &raw).await;
+            assert!(answer.starts_with("HTTP/1.1 400"), "{bad}: {answer}");
+        }
+        assert_eq!(queued(queue.path()).len(), 1);
     }
 }

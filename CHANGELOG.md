@@ -31,9 +31,9 @@ First release. RIFT publishes services of home servers behind NAT or CGNAT throu
 
 ### Operation
 
-- Web panel with password and optional two-factor login, reachable over the VPN (`rift panel connect`) or, behind a TLS proxy, publicly; a public panel takes the password over HTTPS only. It manages agents, forwards, sites, bans, VPN devices, exits and names; backup, restore, export and import stay on the CLI.
+- Web panel with password and optional two-factor login, reachable over the VPN (`rift panel connect`) or, behind a TLS proxy, publicly; a public panel takes the password over HTTPS only. It manages agents, forwards, sites, bans, VPN devices, exits and names, exports and imports settings (with a preview before anything changes) and downloads a backup after asking for the password and code again; restore stays on the CLI.
 - `rift status`, `rift doctor`, `rift list ...` and `--json` output; `rift list agents` shows each agent's RIFT version and `rift status` names agents older than the server.
-- `rift backup` and `rift restore` for the server state; `rift export` and `rift import` move forwards, sites, devices, grants and names to another server.
+- `rift backup` and `rift restore` for the server state; `rift export` and `rift import` move forwards, sites, devices, grants and names to another server. The web panel offers export, import and backup through the same code on the host.
 - Stored state and the agent identity carry a format number and are migrated on update, after a copy of the old state is kept; state from a newer RIFT is refused. State written by builds before 1.0 is migrated as well.
 - The agent's own limits (`RIFT_AGENT_ALLOW_PORTS`, `RIFT_AGENT_ALLOW_SUBNETS`, `RIFT_AGENT_ALLOW_EXIT`) bound what the server can open on it.
 - Security reports go through GitHub's private vulnerability reporting (`SECURITY.md`).

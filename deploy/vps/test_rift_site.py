@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import tarfile
 import tempfile
 import time
@@ -611,7 +612,7 @@ class ExportTests(unittest.TestCase):
 
     def test_sites_replace_the_forwards_they_made(self):
         core = {
-            "format": 1,
+            "format": 2,
             "agents": ["node1"],
             "forwards": [
                 self.forward("node1", 2222, 22),
@@ -642,23 +643,23 @@ class ExportTests(unittest.TestCase):
             document["sites"],
             [{"agent": "node1", "host": "app.example.org", "port": 8080, "proxy": "caddy"}],
         )
-        self.assertEqual(document["format"], 1)
+        self.assertEqual(document["format"], 2)
         self.assertNotIn("forward_id", json.dumps(document))
         self.assertIn("2 forward(s)", rift_site.export_summary(document))
         self.assertIn("1 site(s)", rift_site.export_summary(document))
         self.assertEqual(rift_site.document_counts(document)["grants"], 1)
 
     def test_other_formats_are_refused(self):
-        rift_site.check_export_format({"format": 1})
-        with self.assertRaisesRegex(rift_site.SiteError, "format 2"):
-            rift_site.check_export_format({"format": 2})
+        rift_site.check_export_format({"format": 2})
+        with self.assertRaisesRegex(rift_site.SiteError, "format 1"):
+            rift_site.check_export_format({"format": 1})
         with self.assertRaises(rift_site.SiteError):
             rift_site.check_export_format({"agents": []})
         with self.assertRaises(rift_site.SiteError):
             rift_site.check_export_format([])
 
     def test_export_writes_the_file_and_names_it_by_date(self):
-        core = {"format": 1, "agents": ["node1"], "forwards": [], "devices": []}
+        core = {"format": 2, "agents": ["node1"], "forwards": [], "devices": []}
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(rift_site, "site_state", return_value={"sites": {}}), \
                 mock.patch.object(rift_site, "rift", return_value=core) as call, \
@@ -671,12 +672,22 @@ class ExportTests(unittest.TestCase):
             self.assertTrue((Path(tmp) / "mine.json").exists())
 
 
+class ExportFormatTests(unittest.TestCase):
+    def test_the_host_reads_the_format_the_container_writes(self):
+        # `rift export` in the container writes portable::FORMAT; the host imports only
+        # EXPORT_FORMAT. They drifted apart once, and no export could be imported again.
+        source = (Path(__file__).resolve().parents[2] / "src" / "portable.rs").read_text()
+        match = re.search(r"pub const FORMAT: u32 = (\d+);", source)
+        self.assertIsNotNone(match)
+        self.assertEqual(int(match.group(1)), rift_site.EXPORT_FORMAT)
+
+
 class ExportFieldTests(unittest.TestCase):
     def test_fields_of_the_server_pass_through_the_export(self):
-        core = {"format": 2, "agents": ["PP"], "named_agents": ["PP"], "forwards": [],
+        core = {"format": 2, "agents": ["node1"], "named_agents": ["node1"], "forwards": [],
                 "devices": [{"name": "tablet", "names_off": True, "grants": []}]}
         document = rift_site.export_document(core, {})
-        self.assertEqual(document["named_agents"], ["PP"])
+        self.assertEqual(document["named_agents"], ["node1"])
         self.assertTrue(document["devices"][0]["names_off"])
 
 
@@ -795,7 +806,7 @@ class ImportTests(unittest.TestCase):
         self.assertTrue(rift_site.render_import_report(items, False).startswith("Created (2)"))
 
     def test_import_passes_the_file_and_filters_to_the_container(self):
-        document = {"format": 1, "agents": [], "forwards": [], "devices": [], "sites": []}
+        document = {"format": 2, "agents": [], "forwards": [], "devices": [], "sites": []}
         report = {"dry_run": True, "items": [{"status": "present", "what": "device tv", "detail": None}]}
         with tempfile.TemporaryDirectory() as tmp:
             export = Path(tmp) / "e.json"
@@ -810,7 +821,7 @@ class ImportTests(unittest.TestCase):
                 args[2:],
                 ("import", "-", "--agent", "node1", "--skip-agent", "x", "--map", "a=b", "--dry-run"),
             )
-            self.assertEqual(json.loads(args[1])["format"], 1)
+            self.assertEqual(json.loads(args[1])["format"], 2)
             export.write_text(json.dumps({"format": 7}))
             with self.assertRaisesRegex(rift_site.SiteError, "format 7"):
                 rift_site.command_import([str(export)])
@@ -1209,6 +1220,111 @@ class QueueTests(unittest.TestCase):
         self.assertFalse(old.exists())
         self.assertFalse(stale_tmp.exists())
         self.assertTrue(fresh.exists())
+
+    def test_an_export_leaves_the_file_of_the_command_line_next_to_the_result(self):
+        document = {"format": 2, "agents": ["node1"], "forwards": [], "devices": [], "sites": []}
+        data = (json.dumps(document, indent=2) + "\n").encode()
+        name = self.request({"action": "export"})
+        with mock.patch.object(rift_site, "export_file", return_value=(document, data)):
+            self.process()
+        result = self.result(name)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["file"], f"rift-export-{rift_site.today()}.json")
+        self.assertIn("1 agent(s)", result["message"])
+        path = self.queue / f"{name}.data"
+        self.assertEqual(path.read_bytes(), data)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_a_backup_is_written_next_to_the_result(self):
+        def backup(path):
+            Path(path).write_bytes(b"archive")
+            os.chmod(path, 0o600)
+
+        name = self.request({"action": "backup"})
+        with mock.patch.object(rift_site, "write_backup", side_effect=backup) as write:
+            self.process()
+        write.assert_called_once_with(self.queue / f"{name}.data")
+        result = self.result(name)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["file"], f"rift-backup-{rift_site.today()}.tar.gz")
+        self.assertEqual((self.queue / f"{name}.data").read_bytes(), b"archive")
+
+    def test_a_failed_backup_leaves_no_file(self):
+        def backup(path):
+            Path(path).write_bytes(b"half")
+            raise rift_site.SiteError("the container is not running")
+
+        name = self.request({"action": "backup"})
+        with mock.patch.object(rift_site, "write_backup", side_effect=backup):
+            self.process()
+        result = self.result(name)
+        self.assertFalse(result["ok"])
+        self.assertNotIn("file", result)
+        self.assertFalse((self.queue / f"{name}.data").exists())
+
+    def test_an_import_runs_the_import_of_the_command_line(self):
+        document = {"format": 2, "agents": [], "forwards": [], "devices": [], "sites": []}
+        items = [{"status": "created", "what": "device tv", "detail": None}]
+        name = self.request(
+            {"action": "import", "document": document, "dry_run": True, "map": ["node2=node1"]}
+        )
+        with mock.patch.object(rift_site, "run_import", return_value=items) as run:
+            self.process()
+        raw, options = run.call_args[0]
+        self.assertEqual(json.loads(raw), document)
+        self.assertEqual(
+            options, {"agents": [], "skip_agents": [], "map": [("node2", "node1")], "dry_run": True}
+        )
+        result = self.result(name)
+        self.assertTrue(result["ok"], result)
+        self.assertIn("Would create (1)", result["message"])
+        report = json.loads((self.queue / f"{name}.data").read_text())
+        self.assertEqual(report, {"dry_run": True, "items": items})
+
+    def test_import_requests_are_checked(self):
+        good = {"action": "import", "document": {"format": 2}, "dry_run": False}
+        for bad in (
+            {**good, "document": [1]},
+            {**good, "dry_run": "yes"},
+            {**good, "map": "a=b"},
+            {**good, "map": ["a"]},
+            {**good, "map": ["a=b c"]},
+            {**good, "extra": 1},
+            {"action": "export", "extra": 1},
+            {"action": "backup", "path": "/etc/shadow"},
+        ):
+            name = self.request(bad)
+            with mock.patch.object(rift_site, "run_import") as run, \
+                    mock.patch.object(rift_site, "write_backup") as backup:
+                self.process()
+            run.assert_not_called()
+            backup.assert_not_called()
+            self.assertFalse(self.result(name)["ok"], bad)
+
+    def test_only_an_import_may_be_large(self):
+        big = "x" * (rift_site.QUEUE_MAX_BYTES + 10)
+        name = self.request({"action": "add", "agent": "node1", "host": "a.example", "port": 1, "proxy": None,
+                             "allow_from": [big]})
+        self.process()
+        self.assertIn("too large", self.result(name)["message"])
+        document = {"format": 2, "agents": [], "forwards": [], "devices": [], "sites": [], "pad": big}
+        name = self.request({"action": "import", "document": document, "dry_run": True})
+        with mock.patch.object(rift_site, "run_import", return_value=[]):
+            self.process()
+        self.assertTrue(self.result(name)["ok"])
+
+    def test_fetched_files_expire_sooner_than_results(self):
+        now = time.time()
+        data = self.queue / f"{'a' * 32}.data"
+        data.write_bytes(b"keys")
+        result = self.queue / f"{'a' * 32}.result.json"
+        result.write_text("{}")
+        old = now - rift_site.QUEUE_DATA_AGE - 1
+        os.utime(data, (old, old))
+        os.utime(result, (old, old))
+        rift_site.clean_queue_results(self.queue, now)
+        self.assertFalse(data.exists())
+        self.assertTrue(result.exists())
 
     def test_a_missing_queue_is_not_an_error(self):
         self.assertEqual(rift_site.command_process_queue(self.queue / "none"), 0)

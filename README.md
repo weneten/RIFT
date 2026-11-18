@@ -112,7 +112,7 @@ Install the host command (it reads `COMPOSE_PROFILES` from `.env`, so `.env` mus
 sudo sh deploy/install-cli
 ```
 
-This installs `/usr/local/bin/rift`, which runs `rift` inside the `rift-server` container, and replaces any existing file at that path. It requires Docker access (use `sudo rift ...` if your user cannot access Docker). Ensure `/usr/local/bin` is in your PATH, including sudo's PATH. The original `docker exec rift-server rift --config /etc/rift/config.toml ...` remains available. On the server the script also installs the site helper under `/usr/local/lib/rift`, which `sudo rift add site ...` and the other site commands run (they require Python 3 and administrator access). It creates `/var/lib/rift-site` and `/var/lib/rift-site-queue` (mounted into the server container) and enables the systemd path unit `rift-site-queue.path` that lets the web panel add and remove sites.
+This installs `/usr/local/bin/rift`, which runs `rift` inside the `rift-server` container, and replaces any existing file at that path. It requires Docker access (use `sudo rift ...` if your user cannot access Docker). Ensure `/usr/local/bin` is in your PATH, including sudo's PATH. The original `docker exec rift-server rift --config /etc/rift/config.toml ...` remains available. On the server the script also installs the site helper under `/usr/local/lib/rift`, which `sudo rift add site ...` and the other site commands run (they require Python 3 and administrator access). It creates `/var/lib/rift-site` and `/var/lib/rift-site-queue` (mounted into the server container) and enables the systemd path unit `rift-site-queue.path` that lets the web panel add and remove sites and run export, import and backup.
 
 Start the server:
 
@@ -691,7 +691,7 @@ Import the configuration into the WireGuard app, connect, and open `http://10.13
 
 - The server container mounts `/var/lib/rift-site` **read-only** (the helper's `sites.json`, which the card lists) and `/var/lib/rift-site-queue` read-write. Nothing else of the host is visible, and the container cannot write to the site records or the proxy configuration.
 - An add or remove from a trusted connection (the same rule as every other change) validates the request in the panel first (agent name, domain of at most 253 characters, port 1-65535, proxy `traefik`, `caddy`, `nginx` or `npm`, or none) and writes one small JSON file into the queue: `{id, action: "add", agent, host, port, proxy?}` or `{id, action: "remove", host}`. At most 20 requests wait at a time.
-- On the host, the systemd units `rift-site-queue.path` and `rift-site-queue.service` (installed by `deploy/install-cli`) run `rift-site process-queue` when a request appears. It checks every request again, trusting nothing from the container: only the actions `add` and `remove`, exactly their keys, a request id that matches the file name, the same name, domain, port and proxy rules, an optional `allow_from` list of addresses or networks, no links, at most 4 KiB. A request that fails any check is refused without running anything. A valid one goes through the same code as `sudo rift add site` and `sudo rift remove site`; no request text reaches a shell. The answer (`ok` and the helper's output or error) is written to `<id>.result.json`, the request file is deleted, and results older than a day are cleaned up. The panel polls for the answer for up to 30 seconds and shows it.
+- On the host, the systemd units `rift-site-queue.path` and `rift-site-queue.service` (installed by `deploy/install-cli`) run `rift-site process-queue` when a request appears. It checks every request again, trusting nothing from the container: only the actions `add`, `remove`, `export`, `import` and `backup`, exactly their keys, a request id that matches the file name, the same name, domain, port and proxy rules, an optional `allow_from` list of addresses or networks, agent names in an import's `OLD=NEW` pairs, no links, at most 4 KiB (512 KiB for an import, which carries the export file). A request that fails any check is refused without running anything. A valid one goes through the same code as `sudo rift add site`, `sudo rift remove site`, `rift export`, `rift import` and `sudo rift backup`; no request text reaches a shell. The answer (`ok` and the helper's output or error) is written to `<id>.result.json`, the request file is deleted, and results older than a day are cleaned up. An export, an import report or a backup is left as `<id>.data` (mode 0600); the panel hands it to the browser once and deletes it, and the host deletes one that was not fetched after 15 minutes. The panel polls for the answer and shows it.
 
 If the host command is not installed, the card says that sites are managed on the host. If it is installed but the units are not active, a request ends with "The host service did not pick up the request; is `rift-site-queue.path` installed and active?". Run `sudo sh deploy/install-cli` (also after `git pull`) and check `systemctl status rift-site-queue.path`. It creates `/var/lib/rift-site` and `/var/lib/rift-site-queue`. If Docker creates them first (Compose v2 does for a missing bind source) the panel works the same once the units exist. `sudo sh deploy/uninstall-host` removes the units and `--purge` also the queue directory.
 
@@ -712,6 +712,8 @@ RIFT has two ways to save a server. Pick by what you want to keep.
 | Use it to | Rebuild from scratch, copy settings to another server, keep a readable record. | Move to another VPS or recover from a lost disk without touching agents or devices. |
 
 All four commands run on the server and read or write files in your current directory. `rift restore` needs `sudo`. The others need only Docker access; the examples run `rift backup` with `sudo` so that the archive, which holds every key, belongs to root.
+
+The web panel offers the first three in its "Settings and backup" card, from a connection that may change things: **Export settings** downloads the same file as `rift export`; **Import settings** uploads one, shows what `--dry-run` would do and imports it after you confirm (with `OLD=NEW` agent names like `--map`); **Download backup** asks for the panel password, and with two-factor login a fresh code, again and downloads the same archive as `sudo rift backup`. The host service runs them (see [Web panel](#web-panel)), so they need `deploy/install-cli` like sites. Restore stays on the command line: it replaces the server the panel runs in.
 
 ### Export and import settings
 
@@ -753,7 +755,7 @@ Failed (1)
   forward node1 80/tcp on 203.0.113.10: the public port range overlaps forward 4
 ```
 
-`rift --json import FILE` prints the same report as JSON. The file is plain JSON with `"format": 1`; forwards, devices and sites refer to agents by name.
+`rift --json import FILE` prints the same report as JSON. The file is plain JSON with `"format": 2`; forwards, devices and sites refer to agents by name.
 
 ### Back up and restore everything
 
@@ -841,7 +843,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | `rift remove site DOMAIN` | Removes the site, its proxy configuration and its forward. |
 | `rift proxy [traefik\|caddy\|nginx\|npm]` | Shows or sets the default proxy. |
 
-The web panel runs `add site` and `remove site` through the host service (`rift-site-queue.path`, installed by `deploy/install-cli`); see [Web panel](#web-panel).
+The web panel runs `add site`, `remove site`, `export`, `import` and `backup` through the host service (`rift-site-queue.path`, installed by `deploy/install-cli`); see [Web panel](#web-panel).
 
 **VPN devices (phones, laptops)**
 

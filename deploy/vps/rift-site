@@ -1257,7 +1257,9 @@ def command_proxy(name):
 # the container only produces and consumes streams (`rift export -`, `rift import -`,
 # `rift backup -`).
 
-EXPORT_FORMAT = 1
+# The export format of `rift export` in the container (src/portable.rs FORMAT); the host adds
+# its sites to the same document and checks the number before it imports.
+EXPORT_FORMAT = 2
 BACKUP_FORMAT = 1
 BACKUP_MANIFEST = "rift-backup.json"
 BACKUP_SERVER = "server"
@@ -1363,15 +1365,21 @@ def command_export(args):
     parser.add_argument("file", nargs="?", help="where to write (default: rift-export-DATE.json)")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     options = parser.parse_args(args)
-    state = site_state()
-    document = export_document(rift(state, "export", "-"), state.get("sites") or {})
+    document, data = export_file()
     path = Path(options.file) if options.file else Path.cwd() / f"rift-export-{today()}.json"
-    write_file(path, (json.dumps(document, indent=2) + "\n").encode("utf-8"), 0o644)
+    write_file(path, data, 0o644)
     if options.json:
         print(json.dumps({"file": str(path), **document_counts(document)}))
     else:
         print(path)
         print(f"Exported {export_summary(document)}. The file holds no keys or tokens.")
+
+
+def export_file():
+    """The export document and the exact bytes `rift export` writes."""
+    state = site_state()
+    document = export_document(rift(state, "export", "-"), state.get("sites") or {})
+    return document, (json.dumps(document, indent=2) + "\n").encode("utf-8")
 
 
 def document_counts(document):
@@ -1566,6 +1574,15 @@ def command_import(args):
         "dry_run": given.dry_run,
     }
     raw = sys.stdin.read() if given.file == "-" else Path(given.file).read_text(encoding="utf-8")
+    items = run_import(raw, options)
+    if given.json:
+        print(json.dumps({"dry_run": options["dry_run"], "items": items}))
+    else:
+        print(render_import_report(items, options["dry_run"]))
+
+
+def run_import(raw, options):
+    """Imports an export file (text) with the options of `rift import`; returns the report items."""
     try:
         document = json.loads(raw)
     except json.JSONDecodeError:
@@ -1591,10 +1608,7 @@ def command_import(args):
         alive = {host for host, site in sites.items() if site_forward_alive(site, forwards)}
         plan = plan_site_import(entries, options, agents, sites, alive)
         items += import_sites(state, plan, options["dry_run"])
-    if given.json:
-        print(json.dumps({"dry_run": options["dry_run"], "items": items}))
-    else:
-        print(render_import_report(items, options["dry_run"]))
+    return items
 
 
 def tar_member_name(name):
@@ -1621,8 +1635,23 @@ def command_backup(args):
     parser.add_argument("file", nargs="?", help="where to write (default: rift-backup-DATE.tar.gz)")
     parser.add_argument("--json", action="store_true")
     options = parser.parse_args(args)
-    state = site_state()
     path = Path(options.file) if options.file else Path.cwd() / f"rift-backup-{today()}.tar.gz"
+    write_backup(path)
+    if options.json:
+        print(json.dumps({"file": str(path)}))
+        return
+    print(path)
+    print(
+        "WARNING: this file contains every key of this server (WireGuard, enrollment CA, "
+        "VPN devices) and the panel password.\nKeep it private and store it somewhere safe, "
+        "not on this server only."
+    )
+
+
+def write_backup(path):
+    """Writes the whole backup archive to `path` (mode 0600), through a partial file."""
+    state = site_state()
+    path = Path(path)
     partial = path.with_name("." + path.name + ".partial")
     manifest = json.dumps(
         {
@@ -1654,15 +1683,6 @@ def command_backup(args):
         partial.unlink(missing_ok=True)
         raise
     partial.replace(path)
-    if options.json:
-        print(json.dumps({"file": str(path)}))
-        return
-    print(path)
-    print(
-        "WARNING: this file contains every key of this server (WireGuard, enrollment CA, "
-        "VPN devices) and the panel password.\nKeep it private and store it somewhere safe, "
-        "not on this server only."
-    )
 
 
 def verify_backup(path):
@@ -1879,17 +1899,26 @@ QUEUE_DIR = Path(os.environ.get("RIFT_SITE_QUEUE", "/var/lib/rift-site-queue"))
 QUEUE_REQUEST = re.compile(r"^([0-9a-f]{32})\.json$")
 QUEUE_RESULT_AGE = 24 * 3600
 QUEUE_MAX_BYTES = 4096
+# An import carries a whole export file.
+QUEUE_MAX_IMPORT = 512 * 1024
 QUEUE_MAX_MESSAGE = 4000
+# A file the panel fetches (export, import report, backup) is removed after it, or after
+# this many seconds: a backup holds every key.
+QUEUE_DATA_AGE = 15 * 60
 QUEUE_KEYS = {
     "add": ({"id", "action", "agent", "host", "port"}, {"proxy", "allow_from"}),
     "remove": ({"id", "action", "host"}, set()),
+    "export": ({"id", "action"}, set()),
+    "backup": ({"id", "action"}, set()),
+    "import": ({"id", "action", "document", "dry_run"}, {"map"}),
 }
 
 
 def parse_queue_request(name, raw):
     """A request from the web panel's container, checked as if it came from anyone.
 
-    Only `add` and `remove` exist, each with exactly its own keys. Raises SiteError otherwise.
+    Only the actions in QUEUE_KEYS exist, each with exactly its own keys. Raises SiteError
+    otherwise.
     """
     try:
         request = json.loads(raw)
@@ -1899,13 +1928,37 @@ def parse_queue_request(name, raw):
         raise SiteError("the request must be a JSON object")
     action = request.get("action")
     if not isinstance(action, str) or action not in QUEUE_KEYS:
-        raise SiteError("only the actions add and remove are accepted")
+        raise SiteError(f"only the actions {', '.join(QUEUE_KEYS)} are accepted")
     required, optional = QUEUE_KEYS[action]
     keys = set(request)
     if not required <= keys or keys - required - optional:
         raise SiteError(f"a {action} request has exactly the keys {', '.join(sorted(required | optional))}")
     if request["id"] != name:
         raise SiteError("the request id does not match its file name")
+    if action != "import" and len(raw) > QUEUE_MAX_BYTES:
+        raise SiteError("the request is too large")
+    if action in ("export", "backup"):
+        return action, ()
+    if action == "import":
+        document, dry_run = request["document"], request["dry_run"]
+        if not isinstance(document, dict):
+            raise SiteError("document must be an export file (a JSON object)")
+        if not isinstance(dry_run, bool):
+            raise SiteError("dry_run must be true or false")
+        pairs = request.get("map", [])
+        if not isinstance(pairs, list) or not all(isinstance(p, str) for p in pairs):
+            raise SiteError("map must be a list of OLD=NEW")
+        mapped = []
+        for pair in pairs:
+            try:
+                old, new = parse_map(pair)
+            except argparse.ArgumentTypeError as error:
+                raise SiteError(str(error)) from None
+            if not valid_agent(old) or not valid_agent(new):
+                raise SiteError(f"{pair}: both sides must be agent names")
+            mapped.append((old, new))
+        options = {"agents": [], "skip_agents": [], "map": mapped, "dry_run": dry_run}
+        return action, (json.dumps(document), options)
     host = request["host"]
     if not isinstance(host, str) or not valid_host(host):
         raise SiteError("host is not a valid domain name")
@@ -1934,8 +1987,8 @@ def read_queue_file(path):
     with os.fdopen(descriptor, "rb") as handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
             raise SiteError("the request is not a regular file")
-        data = handle.read(QUEUE_MAX_BYTES + 1)
-    if len(data) > QUEUE_MAX_BYTES:
+        data = handle.read(QUEUE_MAX_IMPORT + 1)
+    if len(data) > QUEUE_MAX_IMPORT:
         raise SiteError("the request is too large")
     return data
 
@@ -1944,27 +1997,69 @@ def join_message(output, error):
     return "\n".join(part for part in (output.strip(), error.strip()) if part)
 
 
-def run_queue_request(action, args):
-    """Runs the validated request through the same code as the command line."""
+def run_queue_request(action, args, queue=None, name=None):
+    """Runs the validated request through the same code as the command line.
+
+    Returns (ok, message, file): `file` is the name of the file the panel fetches next to the
+    result (an export, an import report or a backup), or None.
+    """
     output = io.StringIO()
+    file = None
     try:
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             if action == "add":
                 command_add(*args)
-            else:
+            elif action == "remove":
                 command_rm(*args)
+            elif action == "export":
+                document, data = export_file()
+                file = f"rift-export-{today()}.json"
+                write_queue_data(queue, name, data)
+                print(f"Exported {export_summary(document)}. The file holds no keys or tokens.")
+            elif action == "backup":
+                file = f"rift-backup-{today()}.tar.gz"
+                write_backup(queue / f"{name}.data")
+                print("The backup holds every key of this server. Keep it private.")
+            else:
+                raw, options = args
+                items = run_import(raw, options)
+                file = "report.json"
+                report = {"dry_run": options["dry_run"], "items": items}
+                write_queue_data(queue, name, (json.dumps(report) + "\n").encode("utf-8"))
+                print(render_import_report(items, options["dry_run"]))
     except SiteError as error:
-        return False, join_message(output.getvalue(), str(error))
+        discard_queue_data(queue, name)
+        return False, join_message(output.getvalue(), str(error)), None
     except Exception as error:  # a failing request must not stop the others
-        return False, join_message(output.getvalue(), f"{type(error).__name__}: {error}")
-    return True, output.getvalue().strip()
+        discard_queue_data(queue, name)
+        return False, join_message(output.getvalue(), f"{type(error).__name__}: {error}"), None
+    return True, output.getvalue().strip(), file
 
 
-def write_queue_result(queue, name, ok, message):
+def write_queue_data(queue, name, data):
+    """The file the panel fetches for request `name`, mode 0600, written in one rename."""
+    temporary = queue / f"{name}.data.tmp"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data)
+    os.replace(temporary, queue / f"{name}.data")
+
+
+def discard_queue_data(queue, name):
+    if queue is not None and name is not None:
+        for suffix in (".data", ".data.tmp", ".data.partial"):
+            (queue / f"{name}{suffix}").unlink(missing_ok=True)
+        (queue / f".{name}.data.partial").unlink(missing_ok=True)
+
+
+def write_queue_result(queue, name, ok, message, file=None):
     message = message.strip()
     if len(message) > QUEUE_MAX_MESSAGE:
         message = message[:QUEUE_MAX_MESSAGE] + "..."
-    document = json.dumps({"id": name, "ok": ok, "message": message}) + "\n"
+    answer = {"id": name, "ok": ok, "message": message}
+    if file:
+        answer["file"] = file
+    document = json.dumps(answer) + "\n"
     temporary = queue / f"{name}.result.json.tmp"
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -1974,10 +2069,14 @@ def write_queue_result(queue, name, ok, message):
 
 def clean_queue_results(queue, now):
     for entry in os.scandir(queue):
-        if not (entry.name.endswith(".result.json") or entry.name.endswith(".tmp")):
+        if entry.name.endswith(".data") or entry.name.endswith(".partial"):
+            age = QUEUE_DATA_AGE
+        elif entry.name.endswith(".result.json") or entry.name.endswith(".tmp"):
+            age = QUEUE_RESULT_AGE
+        else:
             continue
         try:
-            if now - entry.stat(follow_symlinks=False).st_mtime > QUEUE_RESULT_AGE:
+            if now - entry.stat(follow_symlinks=False).st_mtime > age:
                 os.unlink(entry.path)
         except OSError:
             pass
@@ -1986,8 +2085,8 @@ def clean_queue_results(queue, now):
 def command_process_queue(queue=None, now=None):
     """Handles the requests the web panel queued, oldest first, and answers each one.
 
-    Nothing from a request is used beyond the validated add/remove parameters. Every request
-    file is removed, whatever happened, so the path unit does not start again for it.
+    Nothing from a request is used beyond its validated parameters. Every request file is
+    removed, whatever happened, so the path unit does not start again for it.
     """
     queue = Path(queue or QUEUE_DIR)
     if not queue.is_dir():
@@ -2008,11 +2107,11 @@ def command_process_queue(queue=None, now=None):
             path = queue / filename
             try:
                 action, args = parse_queue_request(name, read_queue_file(path))
-                ok, message = run_queue_request(action, args)
+                ok, message, file = run_queue_request(action, args, queue, name)
             except SiteError as error:
-                ok, message = False, f"request refused: {error}"
+                ok, message, file = False, f"request refused: {error}", None
             try:
-                write_queue_result(queue, name, ok, message)
+                write_queue_result(queue, name, ok, message, file)
             finally:
                 os.unlink(path)
             processed += 1

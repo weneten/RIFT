@@ -97,6 +97,16 @@
       </table></div>
     </section>
 
+    <section class="card write">
+      <h2>Settings and backup</h2>
+      <p class="muted">An <strong>export</strong> holds agent names, forwards, VPN devices with their grants, names and sites, but no keys: import it here or on another server. A <strong>backup</strong> holds everything with every key, to move or recover this server with <code>sudo rift restore FILE</code>.</p>
+      <div class="btns">
+        <button id="export-settings" type="button">Export settings</button>
+        <button id="import-settings" type="button">Import settings</button>
+        <button id="download-backup" type="button" class="danger">Download backup</button>
+      </div>
+    </section>
+
     <section class="card">
       <h2>Panel</h2>
       <ul id="panel-urls" class="plain"></ul>

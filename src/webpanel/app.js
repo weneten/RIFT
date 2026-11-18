@@ -218,8 +218,8 @@ async function copy(text, button) {
   }
 }
 
-function download(name, text) {
-  const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+function download(name, content, type) {
+  const url = URL.createObjectURL(new Blob([content], { type: type || "text/plain" }));
   const link = el("a", { href: url, download: name });
   document.body.append(link);
   link.click();
@@ -692,6 +692,149 @@ function siteDialog() {
   }));
 }
 
+// ---------- export, import and backup (run by the host service) ----------
+
+function decodeBase64(text) {
+  const binary = atob(text);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+// Waits for the host's answer to a queued export, import or backup; returns it with its file.
+async function awaitHostFile(id, status) {
+  for (let waited = 0; waited < 120000; waited += 1000) {
+    await sleep(1000);
+    const result = await act({ action: "host_file", id }, { quiet: true });
+    if (result.done) {
+      if (!result.ok) throw new Error(result.message || "the host service failed");
+      return result;
+    }
+    if (waited === 10000 && status) status.textContent = "Still waiting for the host service…";
+  }
+  throw new Error(HOST_MISSING);
+}
+
+function doneDialog(title, ...content) {
+  openModal(title, ...content,
+    el("div", { class: "form" }, el("div", { class: "buttons" }, button("Done", closeModal, "primary"))));
+}
+
+async function exportDialog() {
+  const status = el("p", { role: "status" }, "Asking the host service…");
+  openModal("Export settings", status);
+  try {
+    const queued = await act({ action: "export" });
+    const result = await awaitHostFile(queued.id, status);
+    download(result.file, decodeBase64(result.data), "application/json");
+    doneDialog("Export settings",
+      el("p", {}, `Saved ${result.file}.`),
+      el("p", { class: "muted" }, result.message));
+  } catch (e) {
+    doneDialog("Export settings", el("p", { class: "error", role: "alert" }, e.message));
+  }
+}
+
+const REPORT_GROUPS = [
+  ["created", "Created", "Would create"],
+  ["present", "Already present", "Already present"],
+  ["skipped", "Skipped", "Skipped"],
+  ["failed", "Failed", "Failed"],
+];
+
+function importReport(report) {
+  const items = report.items || [];
+  if (!items.length) return [el("p", {}, "Nothing to import.")];
+  const out = [];
+  for (const [status, title, dryTitle] of REPORT_GROUPS) {
+    const group = items.filter((i) => i.status === status);
+    if (!group.length) continue;
+    out.push(el("h4", {}, `${report.dry_run ? dryTitle : title} (${group.length})`));
+    out.push(el("ul", { class: "plain report" }, group.map((i) =>
+      el("li", { class: status === "failed" ? "error" : "" }, i.detail ? `${i.what}: ${i.detail}` : i.what))));
+  }
+  return out;
+}
+
+async function runImport(document, map, dryRun, status) {
+  const queued = await api("/api/import", { document, dry_run: dryRun, map });
+  const result = await awaitHostFile(queued.id, status);
+  return JSON.parse(new TextDecoder().decode(decodeBase64(result.data)));
+}
+
+function importDialog() {
+  const file = el("input", { type: "file", accept: ".json,application/json", required: true });
+  const map = el("input", { placeholder: "optional: node2=node1 node3=node1" });
+  openModal("Import settings", form([
+    row("Export file", file),
+    row("Agent names", map),
+    el("p", { class: "hint" }, "An import creates what this server lacks and leaves everything else alone. It never creates agents: invite them first. Map agents whose name differs here as OLD=NEW. You see what would happen before anything changes."),
+  ], "Check", async () => {
+    if (!file.files.length) throw new Error("choose an export file");
+    let document;
+    try {
+      document = JSON.parse(await file.files[0].text());
+    } catch (_) {
+      throw new Error("this is not a RIFT export file (not JSON)");
+    }
+    const status = el("p", { role: "status" }, "Checking with the host service…");
+    openModal("Import settings", status);
+    let report;
+    try {
+      report = await runImport(document, map.value, true, status);
+    } catch (e) {
+      doneDialog("Import settings", el("p", { class: "error", role: "alert" }, e.message));
+      return;
+    }
+    const creates = (report.items || []).some((i) => i.status === "created");
+    openModal("Import settings",
+      el("p", {}, "Nothing has changed yet."),
+      ...importReport(report),
+      el("div", { class: "form" }, el("div", { class: "buttons" },
+        button(creates ? "Cancel" : "Close", closeModal),
+        creates ? button("Import", async () => {
+          const running = el("p", { role: "status" }, "Importing…");
+          openModal("Import settings", running);
+          try {
+            const done = await runImport(document, map.value, false, running);
+            await load();
+            doneDialog("Import settings", ...importReport(done));
+          } catch (e) {
+            doneDialog("Import settings", el("p", { class: "error", role: "alert" }, e.message));
+          }
+        }, "primary") : null)));
+  }));
+}
+
+function backupDialog() {
+  const password = el("input", { type: "password", required: true, autocomplete: "current-password" });
+  const factor = (data && data.two_factor) || {};
+  const code = el("input", { inputmode: "numeric", autocomplete: "one-time-code", pattern: "[0-9]{6}", maxlength: 6, required: !!factor.enabled });
+  openModal("Download backup", form([
+    el("p", { class: "error" }, "The backup holds every key of this server: WireGuard, the enrollment CA, the VPN devices and the panel password. Whoever has the file can pose as this server."),
+    el("p", { class: "hint" }, "Keep it private and offline, not only on this server. Restore it on a server with sudo rift restore FILE."),
+    row("Panel password", password),
+    factor.enabled ? row("Code", code) : null,
+    factor.enabled ? el("p", { class: "hint" }, "A code works once. If you just logged in with the current code, wait for the next one.") : null,
+  ].filter(Boolean), "Download backup", async () => {
+    const body = { action: "backup", password: password.value };
+    if (factor.enabled) body.code = code.value.trim();
+    const queued = await act(body);
+    password.value = "";
+    const status = el("p", { role: "status" }, "The host service is writing the backup…");
+    openModal("Download backup", status);
+    try {
+      const result = await awaitHostFile(queued.id, status);
+      download(result.file, decodeBase64(result.data), "application/gzip");
+      doneDialog("Download backup",
+        el("p", {}, `Saved ${result.file}.`),
+        el("p", { class: "error" }, "Keep it private: it holds every key of this server."));
+    } catch (e) {
+      doneDialog("Download backup", el("p", { class: "error", role: "alert" }, e.message));
+    }
+  }));
+}
+
 // ---------- rendering ----------
 
 function fill(tbody, rows, columns, emptyText) {
@@ -872,6 +1015,9 @@ function render() {
 
   const factor = data.two_factor || {};
   $("add-site").onclick = siteDialog;
+  $("export-settings").onclick = exportDialog;
+  $("import-settings").onclick = importDialog;
+  $("download-backup").onclick = backupDialog;
   $("two-factor").replaceChildren(...[
     el("span", { class: "muted" }, "Two-factor login: "),
     factor.enabled ? pill("on", "ok") : pill("off", "off"),
