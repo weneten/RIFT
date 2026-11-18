@@ -15,8 +15,12 @@
 #   --endpoint NAME_OR_IP   the DNS name or address agents dial (RIFT_PUBLIC_ENDPOINT)
 #   --public-ips LIST       addresses on this machine that forwards listen on (RIFT_PUBLIC_IPS)
 #   --panel / --no-panel    turn the web panel on (private: over the VPN only) or off
-#   --proxy NAME            also set up a reverse proxy for websites in Docker: traefik, caddy,
-#                           npm (Nginx Proxy Manager) or none (deploy/setup-proxy)
+#   --proxy NAME            the reverse proxy for websites (rift add site): traefik, caddy or
+#                           npm (Nginx Proxy Manager) are set up in Docker (deploy/setup-proxy);
+#                           own uses one that already runs here; none sets up nothing
+#   --proxy-kind KIND       with --proxy own: traefik, caddy, nginx (with certbot) or npm
+#   --caddy-container NAME  with --proxy-kind caddy: Caddy runs in this Docker container ...
+#   --caddy-sites-dir DIR   ... and reads the site files from this host directory
 #   --email ADDRESS         the Let's Encrypt address for that proxy
 #   --publish-panel DOMAIN  also reach the panel at https://DOMAIN through that proxy
 #                           (deploy/publish-panel); --publish-panel - unpublishes it
@@ -186,9 +190,35 @@ check_panel_port() {
   [ "$1" -ne "$control_port" ] && [ "$1" -ne "${_e##*:}" ]
 }
 check_addr_list() { is_list is_net_or_ip "$1" empty-ok; }
-check_proxy() { one_of "$1" traefik caddy npm none; }
+check_proxy() { one_of "$1" traefik caddy npm own none; }
+check_kind() { one_of "$1" traefik caddy nginx npm; }
+check_container() {
+  why="not a container name: $1"
+  printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]*$'
+}
+check_abs_dir() {
+  why="an absolute host directory, e.g. /opt/caddy/rift-sites"
+  case $1 in /*) ;; *) return 1 ;; esac
+  case /$1/ in */../*) return 1 ;; esac
+}
+check_npm_password() {
+  why="no single quote"
+  case $1 in *"'"*) return 1 ;; esac
+}
+# A value Compose reads literally: single-quoted unless it has only plain characters.
+env_quote() {
+  if printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9._@%+=:,/-]*$'; then
+    printf '%s' "$1"
+  else
+    printf "'%s'" "$1"
+  fi
+}
 
 proxy=
+own_kind=
+caddy_container=
+has_caddy_container=
+caddy_sites_dir=
 publish=
 has_publish=
 assume_yes=
@@ -199,6 +229,9 @@ while [ "$#" -gt 0 ]; do
     --panel) preset RIFT_WEBPANEL true; shift ;;
     --no-panel) preset RIFT_WEBPANEL false; shift ;;
     --proxy) [ "$#" -ge 2 ] || fail "--proxy needs a value"; proxy=$2; shift 2 ;;
+    --proxy-kind) [ "$#" -ge 2 ] || fail "--proxy-kind needs a value"; own_kind=$2; shift 2 ;;
+    --caddy-container) [ "$#" -ge 2 ] || fail "--caddy-container needs a value"; caddy_container=$2; has_caddy_container=1; shift 2 ;;
+    --caddy-sites-dir) [ "$#" -ge 2 ] || fail "--caddy-sites-dir needs a value"; caddy_sites_dir=$2; shift 2 ;;
     --email) [ "$#" -ge 2 ] || fail "--email needs a value"; preset RIFT_LETSENCRYPT_EMAIL "$2"; shift 2 ;;
     --publish-panel) [ "$#" -ge 2 ] || fail "--publish-panel needs a domain"; publish=$2; has_publish=1; shift 2 ;;
     --version) [ "$#" -ge 2 ] || fail "--version needs a value"; preset RIFT_VERSION "$2"; shift 2 ;;
@@ -416,34 +449,180 @@ for container in traefik rift-caddy rift-npm; do
     /opt/rift-npm) existing_proxy=npm; break ;;
   esac
 done
+# Another program on port 443: its proxy kind and, for a container, its name. The same rules
+# as edge_holders in deploy/vps/rift-site: a host process first, then a container.
+kind_of() {
+  _b=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case $_b in *proxy-manager*) echo npm; return 0 ;; esac
+  if printf '%s\n' "$_b" | grep -Eq '(^|[^a-z0-9])npm([^a-z0-9]|$)'; then echo npm; return 0; fi
+  _hits=
+  for _k in traefik caddy nginx; do
+    case $_b in *"$_k"*) _hits="$_hits $_k" ;; esac
+  done
+  # shellcheck disable=SC2086
+  set -- $_hits
+  [ "$#" -ne 1 ] || echo "$1"
+}
+foreign_holder=
+foreign_kind=
+foreign_container=
+if [ "$existing_proxy" = none ]; then
+  for process in $(ss -Hltnp 'sport = :443' 2> /dev/null | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | sort -u); do
+    [ "$process" != docker-proxy ] || continue
+    foreign_holder=$process
+    foreign_kind=$(kind_of "$process")
+    [ -z "$foreign_kind" ] || break
+  done
+  if [ -z "$foreign_kind" ]; then
+    row=$(docker ps --format '{{.Names}} {{.Image}} {{.Ports}}' 2> /dev/null \
+      | awk '$0 ~ /(0\.0\.0\.0|\[::\]|:::):443->/ {print $1, $2; exit}')
+    if [ -n "$row" ]; then
+      foreign_container=${row%% *}
+      foreign_holder="container $foreign_container"
+      foreign_kind=$(kind_of "$row")
+    fi
+  fi
+fi
+# What `rift proxy` stored before (rerun): the default proxy and Caddy's site directory.
+state_proxy=
+state_caddy_dir=
+state_caddy_container=
+if [ -f "$site_state" ]; then
+  state_proxy=$(sed -n 's/^  "proxy": "\([a-z]*\)".*/\1/p' "$site_state" | head -n 1)
+  state_caddy_dir=$(sed -n '/^  "caddy": {/,/^  }/s/.*"sites_dir": *"\([^"]*\)".*/\1/p' "$site_state" | head -n 1)
+  state_caddy_container=$(sed -n '/^  "caddy": {/,/^  }/p' "$site_state" | tr -d ' \n' \
+    | sed -n 's/.*"reload":\["docker","exec","\([^"]*\)".*/\1/p')
+fi
+
+default_proxy=$existing_proxy
+[ "$default_proxy" != none ] || [ -z "$foreign_holder" ] || default_proxy=own
 if [ -z "$proxy" ]; then
   note "A reverse proxy serves websites with HTTPS ('rift add site'); it needs ports 80 and 443."
-  ask "Reverse proxy in Docker: traefik, caddy, npm (Nginx Proxy Manager) or none" "$existing_proxy" check_proxy
-  proxy=$answer
+  note "  traefik, caddy, npm  set one up in Docker (deploy/setup-proxy; npm is Nginx Proxy Manager)"
+  note "  own                  use a proxy that already runs here: Traefik, Caddy, Nginx with certbot or NPM"
+  note "  none                 no websites for now (later: sudo sh deploy/setup-proxy NAME)"
+  if [ -n "$foreign_holder" ]; then
+    note "Port 443 is held by $foreign_holder${foreign_kind:+ ($foreign_kind)}."
+  fi
+  while :; do
+    ask "Reverse proxy: traefik, caddy, npm, own or none" "$default_proxy" check_proxy
+    proxy=$answer
+    case $proxy in
+      traefik | caddy | npm)
+        if [ -n "$foreign_holder" ]; then
+          note "deploy/setup-proxy does not take port 443 from $foreign_holder; choose own to use it,"
+          note "or stop and disable it first."
+          yes_no "Set up $proxy anyway?" n || continue
+        fi
+        ;;
+    esac
+    break
+  done
 fi
 check_proxy "$proxy" || fail "--proxy: $why"
 migrate=
-if [ "$proxy" != none ] && [ "$existing_proxy" != none ] && [ "$proxy" != "$existing_proxy" ]; then
+if [ "$proxy" != none ] && [ "$proxy" != own ] && [ "$existing_proxy" != none ] && [ "$proxy" != "$existing_proxy" ]; then
   note "$existing_proxy runs now; switching stops it and moves every site to $proxy (new certificates)."
   yes_no "Switch from $existing_proxy to $proxy?" y || fail "nothing changed"
   migrate=1
 fi
 if [ "$proxy" = none ] && [ "$existing_proxy" != none ]; then
   note "$existing_proxy keeps running; this script does not remove it."
+elif [ "$proxy" = none ] && [ -n "$foreign_holder" ]; then
+  note "$foreign_holder keeps port 443; choose own to let 'rift add site' use it."
 fi
 
-[ "$proxy" != none ] || asking=
-if [ "$proxy" = npm ]; then
-  setting RIFT_LETSENCRYPT_EMAIL "E-mail address for Let's Encrypt and the Nginx Proxy Manager login" is_email
-  flag RIFT_REQUEST_CERTIFICATE "Request a Let's Encrypt certificate for each new site (accepts the Let's Encrypt terms)?"
-else
-  setting RIFT_LETSENCRYPT_EMAIL "E-mail address for Let's Encrypt expiry notices (optional)" maybe_email
-  put RIFT_REQUEST_CERTIFICATE "$(current RIFT_REQUEST_CERTIFICATE)"
+# A proxy of your own: which one it is and what `rift add site` needs to reach it.
+write_npm=
+if [ "$proxy" = own ]; then
+  if [ -z "$own_kind" ]; then
+    ask "Which proxy is it: traefik, caddy, nginx or npm" "${foreign_kind:-$state_proxy}" check_kind
+    own_kind=$answer
+  fi
+  check_kind "$own_kind" || fail "--proxy-kind: $why"
+  case $own_kind in
+    traefik)
+      note "'rift add site' needs Traefik from Docker Compose with the container name traefik; the first"
+      note "site adds a watched file provider to it (README: Set up a proxy by hand)."
+      ;;
+    nginx)
+      note "'rift add site' writes /etc/nginx/rift-sites/DOMAIN.conf: include /etc/nginx/rift-sites/*.conf;"
+      note "in the http block. certbot with its Nginx plugin requests the certificates."
+      ;;
+    caddy)
+      if [ -z "$caddy_container" ] && [ -z "$has_caddy_container" ]; then
+        in_docker=n
+        [ -n "$foreign_container" ] || [ -n "$state_caddy_container" ] && in_docker=y
+        if yes_no "Does Caddy run in a Docker container?" "$in_docker"; then
+          ask "Name of the Caddy container" "${state_caddy_container:-$foreign_container}" check_container
+          caddy_container=$answer
+        fi
+      fi
+      if [ -n "$caddy_container" ]; then
+        check_container "$caddy_container" || fail "--caddy-container: $why"
+        if [ -z "$caddy_sites_dir" ]; then
+          mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/caddy"}}{{.Source}}{{end}}{{end}}' "$caddy_container" 2> /dev/null || true)
+          ask "Host directory for the site files, mounted into the container (the Caddyfile imports them)" \
+            "${state_caddy_dir:-${mount:+$mount/rift-sites}}" check_abs_dir
+          caddy_sites_dir=$answer
+        fi
+        check_abs_dir "$caddy_sites_dir" || fail "--caddy-sites-dir: $why"
+        note "The Caddyfile must import that directory as seen in the container, e.g. import /etc/caddy/rift-sites/*.caddy"
+      else
+        caddy_sites_dir=
+        note "Caddy on the host: the Caddyfile must contain  import /etc/caddy/rift-sites/*.caddy"
+      fi
+      ;;
+    npm)
+      write_npm=1
+      note "'rift add site' uses the API of Nginx Proxy Manager on http://127.0.0.1:81 with an admin login."
+      setting RIFT_NPM_EMAIL "Nginx Proxy Manager admin login (e-mail)" is_email
+      if has_preset RIFT_NPM_PASSWORD; then
+        setting RIFT_NPM_PASSWORD "" check_npm_password
+      elif [ -n "$interactive" ]; then
+        if [ -n "$(current RIFT_NPM_PASSWORD)" ]; then
+          secret "Its password (hidden; Enter keeps the current one)" check_npm_password
+        else
+          secret "Its password (hidden)" check_npm_password
+        fi
+        [ -n "$answer" ] || answer=$(current RIFT_NPM_PASSWORD)
+        put RIFT_NPM_PASSWORD "$answer"
+      else
+        put RIFT_NPM_PASSWORD "$(current RIFT_NPM_PASSWORD)"
+      fi
+      [ -n "$(get RIFT_NPM_PASSWORD)" ] || fail "RIFT_NPM_PASSWORD: the Nginx Proxy Manager admin password is needed"
+      ;;
+  esac
 fi
+
+# Let's Encrypt: npm of deploy/setup-proxy needs the address (its login); RIFT requests the
+# certificates itself only for Nginx (certbot) and Nginx Proxy Manager.
+case $proxy:$own_kind in
+  npm:*)
+    setting RIFT_LETSENCRYPT_EMAIL "E-mail address for Let's Encrypt and the Nginx Proxy Manager login" is_email
+    flag RIFT_REQUEST_CERTIFICATE "Request a Let's Encrypt certificate for each new site (accepts the Let's Encrypt terms)?"
+    ;;
+  own:nginx | own:npm)
+    setting RIFT_LETSENCRYPT_EMAIL "E-mail address for Let's Encrypt expiry notices (optional)" maybe_email
+    flag RIFT_REQUEST_CERTIFICATE "Request a Let's Encrypt certificate for each new site (accepts the Let's Encrypt terms)?"
+    ;;
+  traefik:* | caddy:*)
+    setting RIFT_LETSENCRYPT_EMAIL "E-mail address for Let's Encrypt expiry notices (optional)" maybe_email
+    put RIFT_REQUEST_CERTIFICATE "$(current RIFT_REQUEST_CERTIFICATE)"
+    ;;
+  *)
+    asking=
+    setting RIFT_LETSENCRYPT_EMAIL "" maybe_email
+    flag RIFT_REQUEST_CERTIFICATE ""
+    end_group
+    ;;
+esac
+# The Docker network of deploy/setup-proxy's proxies; kept as it is for the other choices.
+case $proxy in traefik | caddy | npm) ;; *) asking= ;; esac
 setting RIFT_PROXY_SUBNET "Docker network of the proxy (the panel trusts it)" is_net4
 end_group
 for key in RIFT_NPM_EMAIL RIFT_NPM_PASSWORD; do
-  if has_preset "$key"; then
+  if has_preset "$key" && [ -z "$write_npm" ]; then
     setting "$key" ""
   fi
 done
@@ -459,9 +638,12 @@ if [ -z "$has_publish" ]; then
   # A route to a panel that is off goes; with no proxy chosen here the existing one keeps it.
   [ "$panel" = true ] || publish=
   if [ "$panel" = true ] && [ "$proxy" != none ]; then
-    note "The panel can also be reached at https://DOMAIN through $proxy, for networks that block"
+    note "The panel can also be reached at https://DOMAIN through $([ "$proxy" = own ] && echo "your $own_kind" || echo "$proxy"), for networks that block"
     note "WireGuard. Changes are then allowed there: only the password (and the code, if two-factor"
     note "login is on) protects your network from the internet. Turn two-factor login on."
+    if [ "$proxy" = own ]; then
+      note "A proxy of your own works on the host; in Docker it must be in the network $(get RIFT_PROXY_SUBNET)."
+    fi
     ask "Domain for the panel (empty: not published)" "$current_route" maybe_domain
     publish=$answer
   fi
@@ -472,7 +654,7 @@ maybe_domain "$publish" || fail "--publish-panel: $why"
 if [ -n "$publish" ]; then
   [ "$panel" = true ] || fail "publishing the panel needs the web panel on (--panel)"
   [ "$proxy" != none ] || [ "$publish" = "$current_route" ] \
-    || fail "publishing the panel needs a proxy (--proxy traefik|caddy|npm)"
+    || fail "publishing the panel needs a proxy (--proxy traefik|caddy|npm|own)"
   # deploy/publish-panel allows changes through the proxy.
   put RIFT_WEBPANEL_CONTROL public
 fi
@@ -500,7 +682,12 @@ for key in $keys; do
     *) show "$key" ;;
   esac
 done
-printf '  %-30s %s\n' "Reverse proxy" "$proxy${migrate:+ (switch from $existing_proxy)}"
+case $proxy in
+  own) proxy_line="your own $own_kind${caddy_container:+ in Docker ($caddy_container, $caddy_sites_dir)}" ;;
+  none) proxy_line="none" ;;
+  *) proxy_line="$proxy in Docker${migrate:+ (switch from $existing_proxy)}" ;;
+esac
+printf '  %-30s %s\n' "Reverse proxy" "$proxy_line"
 printf '  %-30s %s\n' "Panel published at" "${publish:+https://$publish}${publish:-no}"
 if [ "$version" != latest ]; then
   echo "The image is pinned to $version; check out the matching tag too: git checkout v$version"
@@ -532,7 +719,7 @@ for key in $keys; do
     RIFT_PUBLIC_ENDPOINT | RIFT_PUBLIC_IPS | RIFT_WEBPANEL) put_env "$key" "$value" ;;
     RIFT_NPM_EMAIL | RIFT_NPM_PASSWORD)
       # deploy/setup-proxy keeps these; only --set changes them here.
-      if has_preset "$key"; then put_env "$key" "$value"; fi
+      if has_preset "$key" || [ -n "$write_npm" ]; then put_env "$key" "$(env_quote "$value")"; fi
       ;;
     *)
       if [ -z "$value" ] || [ "$value" = "$(builtin "$key")" ]; then
@@ -572,7 +759,15 @@ if [ -z "$ready" ]; then
 fi
 
 failed=
-if [ "$proxy" != none ]; then
+if [ "$proxy" = own ]; then
+  echo "6/$steps Making your $own_kind the proxy of 'rift add site'"
+  if [ -n "$caddy_container" ]; then
+    rift proxy caddy --container "$caddy_container" --sites-dir "$caddy_sites_dir" \
+      || failed="'rift proxy' failed (see above); run: sudo rift proxy caddy --container $caddy_container --sites-dir $caddy_sites_dir"
+  else
+    rift proxy "$own_kind" || failed="'rift proxy' failed (see above); run: sudo rift proxy $own_kind"
+  fi
+elif [ "$proxy" != none ]; then
   echo "6/$steps Setting up $proxy"
   email=$(get RIFT_LETSENCRYPT_EMAIL)
   sh "$script_dir/setup-proxy" "$proxy" ${email:+--email "$email"} ${migrate:+--migrate} --yes \

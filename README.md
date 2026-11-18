@@ -351,7 +351,7 @@ RIFT forwards ports; a reverse proxy on the server provides hostname routing and
 
 ### Set up a proxy
 
-`deploy/setup-server` asks for a proxy; on a server that is already running, set one up with:
+`deploy/setup-server` asks for a proxy: `traefik`, `caddy` or `npm` sets one up in Docker as below, `own` uses a proxy that already runs on the server (Traefik, Caddy on the host or in Docker, Nginx with certbot, or Nginx Proxy Manager with its admin login) and makes it the default of `rift add site` (`rift proxy`), and `none` sets up nothing. It detects what holds port 443 and offers it. On a server that is already running, set one up with:
 
 ```sh
 sudo sh deploy/setup-proxy caddy --email you@example.net
