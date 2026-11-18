@@ -416,11 +416,12 @@ fi
 [ -n "$(get RIFT_WEBPANEL_PASSWORD)" ] || password_note=" (generated; show it with: rift panel password)"
 note "Two-factor login: optional (turn it on later in the panel), required (no login until 'rift panel 2fa setup')."
 setting RIFT_WEBPANEL_2FA "Two-factor login: optional or required" check_2fa
-note "private: on the VPS itself (SSH tunnel) and for VPN devices from 'rift panel connect'."
-note "public: on every address; needs a TLS proxy in front for logins."
+note "private (recommended): on the VPS itself (SSH tunnel), for VPN devices from 'rift panel connect',"
+note "  and through the reverse proxy if you give the panel a domain under Websites below."
+note "public: the panel itself on every address over plain HTTP (port $(current RIFT_WEBPANEL_PORT)); rarely needed."
 setting RIFT_WEBPANEL_ACCESS "Where the panel listens: private or public" check_access
 note "Who may change things: private (the VPS itself and panel VPN devices), public (also through"
-note "a TLS proxy over HTTPS, the password protects everything), off (read-only)."
+note "a TLS proxy over HTTPS; a panel domain under Websites sets this itself), off (read-only)."
 setting RIFT_WEBPANEL_CONTROL "Changes allowed from: private, public or off" check_control
 if [ -n "$asking" ]; then
   group "Change advanced panel settings (port $(current RIFT_WEBPANEL_PORT), allowed addresses, TLS proxies)?" \
@@ -633,22 +634,44 @@ current_route=
 if [ -f "$site_state" ]; then
   current_route=$(sed -n '/"panel": {/,/}/s/.*"host": *"\([^"]*\)".*/\1/p' "$site_state" | head -n 1)
 fi
+# deploy/publish-panel needs a proxy container in RIFT_PROXY_SUBNET (a proxy on the host
+# reaches the panel on loopback). Containers of deploy/setup-proxy always are; check your own.
+publish_blocked=
+if [ "$proxy" = own ] && [ -n "$foreign_container" ]; then
+  in_subnet=
+  for address in $(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$foreign_container" 2> /dev/null || true); do
+    if is_ip4 "$address" && overlap4 "$address" "$(get RIFT_PROXY_SUBNET)"; then
+      in_subnet=1
+    fi
+  done
+  [ -n "$in_subnet" ] \
+    || publish_blocked="a panel domain needs the proxy container in $(get RIFT_PROXY_SUBNET); $foreign_container is not (README: Reach the panel over HTTPS)"
+fi
+proxy_name=$proxy
+[ "$proxy" != own ] || proxy_name="your $own_kind"
 if [ -z "$has_publish" ]; then
   publish=$current_route
   # A route to a panel that is off goes; with no proxy chosen here the existing one keeps it.
   [ "$panel" = true ] || publish=
-  if [ "$panel" = true ] && [ "$proxy" != none ]; then
-    note "The panel can also be reached at https://DOMAIN through $([ "$proxy" = own ] && echo "your $own_kind" || echo "$proxy"), for networks that block"
-    note "WireGuard. Changes are then allowed there: only the password (and the code, if two-factor"
-    note "login is on) protects your network from the internet. Turn two-factor login on."
-    if [ "$proxy" = own ]; then
-      note "A proxy of your own works on the host; in Docker it must be in the network $(get RIFT_PROXY_SUBNET)."
+  if [ "$panel" = true ] && [ "$proxy" != none ] && [ -n "$publish_blocked" ]; then
+    note "The panel stays reachable over SSH and the VPN; $publish_blocked."
+  elif [ "$panel" = true ] && [ "$proxy" != none ]; then
+    if yes_no "Also reach the panel at https://DOMAIN through $proxy_name (for networks that block WireGuard)?" \
+      "$([ -n "$current_route" ] && echo y || echo n)"; then
+      note "Changes are then allowed there: only the password (and the code, if two-factor login"
+      note "is on) protects your network from the internet. Turn two-factor login on."
+      ask "Domain for the panel (its A record points at this server)" "$current_route" is_domain
+      publish=$answer
+    else
+      publish=
+      [ -z "$current_route" ] || note "The route https://$current_route is removed."
     fi
-    ask "Domain for the panel (empty: not published)" "$current_route" maybe_domain
-    publish=$answer
   fi
 elif [ "$publish" = - ]; then
   publish=
+fi
+if [ -n "$publish" ] && [ "$publish" != "$current_route" ] && [ -n "$publish_blocked" ]; then
+  fail "$publish_blocked"
 fi
 maybe_domain "$publish" || fail "--publish-panel: $why"
 if [ -n "$publish" ]; then
