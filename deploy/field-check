@@ -166,19 +166,54 @@ snapshot() {
     rift --json status 2> /dev/null | grep -q '"active":true' && echo "agent-active"
   fi
 }
+boot_marker() {
+  # Changes with every boot of this host: the kernel's boot ID, and the start time of PID 1.
+  # A LXC container shares the boot ID with its Proxmox host, but has its own PID 1, whose
+  # start time (field 22 of /proc/1/stat, counted after the name in parentheses) changes
+  # when only the container restarts.
+  printf '%s %s\n' "$(cat /proc/sys/kernel/random/boot_id 2> /dev/null)" \
+    "$(sed 's/.*) //' /proc/1/stat 2> /dev/null | awk '{print $20}')"
+}
+scope() {
+  # scope FILE: what a reference covers, in words.
+  agents=$(grep -c '^agent-online ' "$1")
+  forwards=$(grep -c '^forward ' "$1")
+  if [ "$role" = server ]; then
+    printf '%s agent(s) online, %s forward(s), %s item(s) in all' "$agents" "$forwards" "$(wc -l < "$1" | tr -d ' ')"
+  else
+    printf '%s item(s)' "$(wc -l < "$1" | tr -d ' ')"
+  fi
+}
 if [ "$mode" = before ]; then
   mkdir -p "$reference_dir"
-  cat /proc/sys/kernel/random/boot_id > "$reference_dir/boot_id"
+  rm -f "$reference_dir/boot_id"
+  boot_marker > "$reference_dir/boot_marker"
   snapshot | sort > "$reference_dir/reference"
   section "Reference before the reboot"
   cat "$reference_dir/reference" >&3
-  result PASS "reference saved; now reboot this host, then run: sudo sh deploy/field-check --after-reboot"
+  if [ ! -s "$reference_dir/reference" ]; then
+    result FAIL "nothing of RIFT to compare after a reboot; start RIFT first, then run --before-reboot again"
+  else
+    # Words separated by "_" here stand for one line with a space.
+    expected="nft-table interface_rift0"
+    [ "$role" = agent ] && expected="$expected policy-rule agent-active"
+    missing=
+    for item in $expected; do
+      line=$(printf '%s' "$item" | tr _ ' ')
+      grep -qx "$line" "$reference_dir/reference" || missing="$missing, $line"
+    done
+    missing=${missing#, }
+    [ -n "$missing" ] && result WARN "RIFT is not fully up, the reference lacks: $missing (the reboot test proves less)"
+    result PASS "reference saved ($(scope "$reference_dir/reference")); now reboot this host, then run: sudo sh deploy/field-check --after-reboot"
+  fi
 fi
 if [ "$mode" = after ]; then
   section "After the reboot"
-  if [ ! -f "$reference_dir/reference" ]; then
+  if [ ! -f "$reference_dir/reference" ] || [ ! -f "$reference_dir/boot_marker" ]; then
     result FAIL "no reference; run --before-reboot first"
-  elif [ "$(cat "$reference_dir/boot_id")" = "$(cat /proc/sys/kernel/random/boot_id)" ]; then
+  elif [ ! -s "$reference_dir/reference" ]; then
+    result FAIL "the reference is empty, there is nothing to compare; start RIFT and run --before-reboot again"
+  elif [ "$(cat "$reference_dir/boot_marker")" = "$(boot_marker)" ]; then
     result FAIL "this host has not rebooted since --before-reboot"
   else
     # Give RIFT up to three minutes to come back on its own.
@@ -192,7 +227,7 @@ if [ "$mode" = after ]; then
     out "-- difference (reference -> now)"
     diff "$reference_dir/reference" "$reference_dir/now" >&3 2>&1
     if cmp -s "$reference_dir/reference" "$reference_dir/now"; then
-      result PASS "everything came back after the reboot without help ($((i * 5)) s)"
+      result PASS "everything came back after the reboot without help ($((i * 5)) s; $(scope "$reference_dir/reference"))"
     else
       result FAIL "not everything came back after the reboot within three minutes (see the difference)"
     fi
