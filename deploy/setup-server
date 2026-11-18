@@ -55,7 +55,7 @@ RIFT_IPV4_POOL RIFT_SERVER_IPV4 RIFT_IPV6_POOL RIFT_SERVER_IPV6
 RIFT_VPN_POOL RIFT_VPN_POOL6 RIFT_VPN_DNS
 RIFT_WEBPANEL RIFT_WEBPANEL_PASSWORD RIFT_WEBPANEL_2FA RIFT_WEBPANEL_ACCESS RIFT_WEBPANEL_CONTROL
 RIFT_WEBPANEL_PORT RIFT_WEBPANEL_ALLOW RIFT_WEBPANEL_PROXIES RIFT_WEBPANEL_INSECURE
-RIFT_PROXY_SUBNET RIFT_REQUEST_CERTIFICATE RIFT_LETSENCRYPT_EMAIL RIFT_NPM_EMAIL RIFT_NPM_PASSWORD"
+RIFT_NPM_EMAIL RIFT_NPM_PASSWORD RIFT_LETSENCRYPT_EMAIL RIFT_REQUEST_CERTIFICATE RIFT_PROXY_SUBNET"
 builtin() {
   case $1 in
     RIFT_VERSION) echo latest ;;
@@ -661,34 +661,61 @@ fi
 
 # ---------- summary ----------
 version=$(get RIFT_VERSION)
+# The summary, in the order of the questions, one block per section.
+line() { printf '    %-29s %s\n' "$1" "$2"; }
 show() {
-  _v=$(get "$1")
-  [ "$_v" = "$(builtin "$1")" ] && [ -n "$_v" ] && _v="$_v (default)"
-  printf '  %-30s %s\n' "$1" "${_v:-(empty)}"
+  for _s in "$@"; do
+    _v=$(get "$_s")
+    [ "$_v" = "$(builtin "$_s")" ] && [ -n "$_v" ] && _v="$_v (default)"
+    line "$_s" "${_v:-(empty)}"
+  done
+}
+secret_line() {
+  if [ -n "$(get "$1")" ]; then line "$1" "(set)"; else line "$1" "$2"; fi
 }
 echo
 echo "Settings:"
-for key in $keys; do
-  case $key in
-    RIFT_WEBPANEL_PASSWORD)
-      if [ -n "$(get "$key")" ]; then
-        printf '  %-30s %s\n' "$key" "(set)"
-      else
-        printf '  %-30s %s\n' "$key" "(generated)"
-      fi
-      ;;
-    RIFT_NPM_PASSWORD) [ -z "$(get "$key")" ] || printf '  %-30s %s\n' "$key" "(set)" ;;
-    RIFT_NPM_EMAIL) [ -z "$(get "$key")" ] || show "$key" ;;
-    *) show "$key" ;;
-  esac
-done
+echo "  Image"
+show RIFT_VERSION
+echo "  Addresses"
+show RIFT_PUBLIC_IPS RIFT_ALLOW_PRIVATE_LISTENERS RIFT_PUBLIC_ENDPOINT
+echo "  Ports and enrollment"
+show RIFT_WG_PORT RIFT_ENROLLMENT_BIND RIFT_ENROLLMENT
+echo "  Tunnel addresses"
+show RIFT_IPV4_POOL RIFT_SERVER_IPV4 RIFT_IPV6_POOL RIFT_SERVER_IPV6
+echo "  VPN devices"
+show RIFT_VPN_POOL RIFT_VPN_POOL6 RIFT_VPN_DNS
+echo "  Web panel"
+show RIFT_WEBPANEL
+if [ "$panel" = true ]; then
+  secret_line RIFT_WEBPANEL_PASSWORD "(generated)"
+  show RIFT_WEBPANEL_2FA RIFT_WEBPANEL_ACCESS RIFT_WEBPANEL_CONTROL RIFT_WEBPANEL_PORT \
+    RIFT_WEBPANEL_ALLOW RIFT_WEBPANEL_PROXIES RIFT_WEBPANEL_INSECURE
+  panel_port=$(get RIFT_WEBPANEL_PORT)
+  if [ "$(get RIFT_WEBPANEL_ACCESS)" = public ]; then
+    line "Reachable at" "http://ADDRESS:$panel_port on every address (logins only through a TLS proxy)"
+  else
+    line "Reachable at" "http://127.0.0.1:$panel_port on the VPS or through an SSH tunnel"
+    line "" "http://$(get RIFT_SERVER_IPV4):$panel_port from VPN devices of 'rift panel connect'"
+  fi
+  if [ -n "$publish" ]; then
+    line "" "https://$publish through the proxy"
+  else
+    line "" "(no HTTPS domain)"
+  fi
+else
+  line "Reachable at" "nowhere (the panel is off; its other settings are kept)"
+fi
+echo "  Websites"
 case $proxy in
   own) proxy_line="your own $own_kind${caddy_container:+ in Docker ($caddy_container, $caddy_sites_dir)}" ;;
-  none) proxy_line="none" ;;
+  none) proxy_line="none (nothing is set up)" ;;
   *) proxy_line="$proxy in Docker${migrate:+ (switch from $existing_proxy)}" ;;
 esac
-printf '  %-30s %s\n' "Reverse proxy" "$proxy_line"
-printf '  %-30s %s\n' "Panel published at" "${publish:+https://$publish}${publish:-no}"
+line "Reverse proxy" "$proxy_line"
+[ -z "$(get RIFT_NPM_EMAIL)" ] || show RIFT_NPM_EMAIL
+[ -z "$(get RIFT_NPM_PASSWORD)" ] || secret_line RIFT_NPM_PASSWORD ""
+show RIFT_LETSENCRYPT_EMAIL RIFT_REQUEST_CERTIFICATE RIFT_PROXY_SUBNET
 if [ "$version" != latest ]; then
   echo "The image is pinned to $version; check out the matching tag too: git checkout v$version"
 fi
