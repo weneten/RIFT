@@ -1052,6 +1052,98 @@ class ProxyCommandTests(unittest.TestCase):
                 self.run_main(*args)
 
 
+class CaddyMoveTests(unittest.TestCase):
+    """`rift proxy caddy` with --host, or --container and --sites-dir, moves Caddy's routes."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.root = Path(self.dir.name)
+        (self.root / "old").mkdir()
+        self.state = rift_site.default_state("203.0.113.10")
+        self.state["proxy"] = "caddy"
+        self.state["caddy"] = {
+            "sites_dir": str(self.root / "old"),
+            "reload": ["docker", "exec", "old-caddy", "caddy", "reload", "--config", "/etc/caddy/Caddyfile"],
+        }
+        self.state["sites"] = {
+            "a.example.net": {"agent": "node1", "target": 8080, "listen": 20000, "proxy": "caddy",
+                              "forward_id": 3, "allow_from": ["198.51.100.7/32"]},
+            "b.example.net": {"agent": "node1", "target": 9000, "listen": 20001, "proxy": "traefik",
+                              "forward_id": 4},
+        }
+        self.state["panel"] = {"host": "panel.example.net", "proxy": "caddy"}
+        for host in ("a.example.net", "panel.example.net"):
+            (self.root / "old" / f"{host}.caddy").write_text("old")
+        self.saved = []
+        self.runs = []
+
+    def proxy(self, *args, fail_on=None):
+        def run(command, *rest, **kwargs):
+            self.runs.append(command)
+            if fail_on and command[:3] == fail_on:
+                raise rift_site.SiteError("reload failed")
+            return ""
+
+        with mock.patch.object(rift_site, "load_state", return_value=self.state), \
+                mock.patch.object(rift_site, "save_state", side_effect=lambda s: self.saved.append(json.loads(json.dumps(s)))), \
+                mock.patch.object(rift_site, "run", side_effect=run), \
+                mock.patch.object(rift_site, "rift", return_value={"port": 8090, "server_ipv4": "10.13.0.1"}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rift_site.main(["rift-site", "proxy", "caddy", *args])
+
+    def test_a_new_container_gets_the_routes(self):
+        new = self.root / "new"
+        self.proxy("--container", "new-caddy", "--sites-dir", str(new))
+        self.assertEqual(self.saved[-1]["caddy"]["sites_dir"], str(new))
+        self.assertIn("203.0.113.10:20000", (new / "a.example.net.caddy").read_text())
+        self.assertIn("198.51.100.7/32", (new / "a.example.net.caddy").read_text())
+        # The panel route of a Caddy in Docker goes to the tunnel address.
+        self.assertIn("10.13.0.1:8090", (new / "panel.example.net.caddy").read_text())
+        self.assertFalse((new / "b.example.net.caddy").exists())
+        self.assertEqual(list((self.root / "old").iterdir()), [])
+        self.assertEqual(self.runs[0][:3], ["docker", "exec", "new-caddy"])
+        self.assertEqual(self.runs[1][:3], ["docker", "exec", "old-caddy"])
+
+    def test_host_resets_caddy_to_the_host(self):
+        host_dir = self.root / "host"
+        real = rift_site.default_state
+
+        def patched(ip):
+            state = real(ip)
+            state["caddy"]["sites_dir"] = str(host_dir)
+            return state
+
+        with mock.patch.object(rift_site, "default_state", side_effect=patched):
+            self.proxy("--host")
+        self.assertEqual(self.saved[-1]["caddy"]["reload"][0], "caddy")
+        # A Caddy on the host reaches the panel on loopback.
+        self.assertIn("127.0.0.1:8090", (host_dir / "panel.example.net.caddy").read_text())
+        self.assertTrue((host_dir / "a.example.net.caddy").exists())
+
+    def test_without_options_caddy_stays_where_it_is(self):
+        self.proxy()
+        self.assertEqual(self.saved[-1]["caddy"]["sites_dir"], str(self.root / "old"))
+        self.assertEqual(self.runs, [])
+        self.assertEqual((self.root / "old" / "a.example.net.caddy").read_text(), "old")
+
+    def test_a_failed_reload_keeps_the_old_caddy(self):
+        new = self.root / "new"
+        with self.assertRaises(rift_site.SiteError):
+            self.proxy("--container", "new-caddy", "--sites-dir", str(new), fail_on=["docker", "exec", "new-caddy"])
+        self.assertEqual(self.saved, [])
+        self.assertEqual(list(new.iterdir()), [])
+        self.assertEqual((self.root / "old" / "a.example.net.caddy").read_text(), "old")
+        self.assertEqual(self.state["caddy"]["sites_dir"], str(self.root / "old"))
+
+    def test_host_excludes_the_container_options(self):
+        for args in (("--host", "--container", "x", "--sites-dir", "/x"), ("--host", "--host")):
+            with self.assertRaises(rift_site.SiteError, msg=args):
+                self.proxy(*args)
+        with self.assertRaises(rift_site.SiteError), contextlib.redirect_stdout(io.StringIO()):
+            rift_site.main(["rift-site", "proxy", "traefik", "--host"])
+
+
 class MigrateTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()

@@ -791,6 +791,8 @@ if [ "$proxy" = own ]; then
   if [ -n "$caddy_container" ]; then
     rift proxy caddy --container "$caddy_container" --sites-dir "$caddy_sites_dir" \
       || failed="'rift proxy' failed (see above); run: sudo rift proxy caddy --container $caddy_container --sites-dir $caddy_sites_dir"
+  elif [ "$own_kind" = caddy ]; then
+    rift proxy caddy --host || failed="'rift proxy' failed (see above); run: sudo rift proxy caddy --host"
   else
     rift proxy "$own_kind" || failed="'rift proxy' failed (see above); run: sudo rift proxy $own_kind"
   fi

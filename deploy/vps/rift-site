@@ -1475,31 +1475,92 @@ def command_list():
 CONTAINER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
-def command_proxy(name, container=None, sites_dir=None):
+def command_proxy(name, container=None, sites_dir=None, host=False):
     """Shows or sets the default proxy. For Caddy, `container` and `sites_dir` say that it runs
-    in that Docker container and reads the site files from that host directory."""
+    in that Docker container and reads the site files from that host directory; `host` says
+    that it runs on the host itself (/etc/caddy/rift-sites). Without either, Caddy stays where
+    it was. When Caddy moves, the files of its sites and panel route move with it."""
     state = load_state() or default_state("")
     if not name:
         print(state.get("proxy") or "traefik")
         return
     if name not in PROXIES:
         raise SiteError("proxy must be traefik, caddy, nginx, or npm")
-    if container or sites_dir:
+    new_caddy = None
+    if host:
+        if name != "caddy":
+            raise SiteError("--host is for caddy")
+        if container or sites_dir:
+            raise SiteError("--host runs Caddy on the host; leave out --container and --sites-dir")
+        new_caddy = dict(default_state("")["caddy"])
+    elif container or sites_dir:
         if name != "caddy":
             raise SiteError("--container and --sites-dir are for caddy")
         if not container or not CONTAINER_NAME.match(container):
             raise SiteError("--container needs the name of the Caddy container")
         if not sites_dir or not sites_dir.startswith("/") or ".." in Path(sites_dir).parts:
             raise SiteError("--sites-dir needs an absolute host directory")
-        state["caddy"] = {
+        new_caddy = {
             "sites_dir": sites_dir,
             "reload": ["docker", "exec", container, "caddy", "reload", "--config", "/etc/caddy/Caddyfile"],
         }
-    state["proxy"] = name
     if not state.get("public_ip"):
         state["public_ip"] = read_server_public_ip(state["container"], state["rift_config"])
+    moved = []
+    if new_caddy is not None and new_caddy != state.get("caddy"):
+        moved = move_caddy(state, new_caddy)
+    state["proxy"] = name
     save_state(state)
     print(name)
+    if moved:
+        print(f"Moved {len(moved)} Caddy route(s) to {state['caddy']['sites_dir']}: {', '.join(moved)}")
+
+
+def move_caddy(state, new_caddy):
+    """Points state at another Caddy (host or container, other site directory) and writes the
+    files of its sites and panel route there; returns the moved domains. If the new Caddy cannot
+    be reloaded, its new files are removed again and state keeps the old Caddy."""
+    old_caddy = state["caddy"]
+    sites = {host: site for host, site in (state.get("sites") or {}).items() if site.get("proxy") == "caddy"}
+    panel = state.get("panel") if (state.get("panel") or {}).get("proxy") == "caddy" else None
+    state["caddy"] = new_caddy
+    if not sites and not panel:
+        return []
+    old_dir = Path(old_caddy["sites_dir"])
+    written = []
+    try:
+        for host, site in sites.items():
+            path = site_path(state, "caddy", host)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            text = render_site(state, "caddy", host, int(site["listen"]), list(site.get("allow_from") or []))
+            path.write_text(text, encoding="utf-8")
+            written.append(path)
+        if panel:
+            try:
+                status = rift(state, "panel", "status") or {}
+            except SiteError:
+                status = {}
+            target_host, port = panel_target(state, "caddy", status)
+            path = site_path(state, "caddy", panel["host"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(render_caddy(panel["host"], f"http://{target_host}:{port}"), encoding="utf-8")
+            written.append(path)
+        run(new_caddy["reload"])
+    except Exception as error:
+        for path in written:
+            if path.parent != old_dir:
+                path.unlink(missing_ok=True)
+        state["caddy"] = old_caddy
+        raise SiteError(f"the Caddy sites could not be moved ({error}); Caddy stays as it was") from None
+    hosts = list(sites) + ([panel["host"]] if panel else [])
+    if Path(new_caddy["sites_dir"]) != old_dir:
+        for host in hosts:
+            (old_dir / f"{host}.caddy").unlink(missing_ok=True)
+        try:  # the old Caddy drops the routes; it may be stopped already
+            run(old_caddy["reload"])
+        except Exception:
+            pass
+    return hosts
 
 # ---------------------------------------------------------------------------------------
 # Export, import, backup and restore. These run on the host because the files live there;
@@ -2373,7 +2434,7 @@ def usage():
         "usage: rift add site AGENT HOST PORT [traefik|caddy|nginx|npm] [--allow-from ADDRESS[,NETWORK...]]\n"
         "       rift remove site HOST\n"
         "       rift list sites\n"
-        "       rift proxy [traefik|caddy|nginx|npm] [--container NAME --sites-dir DIR]\n"
+        "       rift proxy [traefik|caddy|nginx|npm] [--container NAME --sites-dir DIR | --host]\n"
         "       rift export [FILE]\n"
         "       rift import FILE [--agent NAME]... [--skip-agent NAME]... [--map OLD=NEW]... [--dry-run]\n"
         "       rift backup [FILE]\n"
@@ -2428,13 +2489,21 @@ def main(argv):
     if command == "forwards" and len(argv) == 2:
         command_forwards()
         return
-    if command == "proxy" and len(argv) in (2, 3, 5, 7):
+    if command == "proxy" and len(argv) >= 2:
         rest = argv[3:]
+        host = "--host" in rest
+        if host:
+            rest = [word for word in rest if word != "--host"]
         options = dict(zip(rest[::2], rest[1::2]))
-        if set(options) - {"--container", "--sites-dir"} or len(options) * 2 != len(rest):
+        if (
+            len(argv) > 2 and argv[2].startswith("-")
+            or set(options) - {"--container", "--sites-dir"}
+            or len(options) * 2 != len(rest)
+            or argv[3:].count("--host") > 1
+        ):
             raise SiteError(usage())
         command_proxy(
-            argv[2] if len(argv) > 2 else None, options.get("--container"), options.get("--sites-dir")
+            argv[2] if len(argv) > 2 else None, options.get("--container"), options.get("--sites-dir"), host
         )
         return
     if command == "purge" and len(argv) == 2:

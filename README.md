@@ -440,7 +440,7 @@ Use this for a proxy you already run, or to see what `setup-proxy` writes. `rift
   sudo rift proxy caddy --container rift-caddy --sites-dir /opt/rift-caddy/caddy/rift-sites
   ```
 
-  A Caddy installed on the host itself instead needs the files in `/etc/caddy/rift-sites` and is reloaded with `caddy reload --config /etc/caddy/Caddyfile` (`sudo rift proxy caddy`).
+  A Caddy installed on the host itself instead needs the files in `/etc/caddy/rift-sites` and is reloaded with `caddy reload --config /etc/caddy/Caddyfile` (`sudo rift proxy caddy --host`). Plain `sudo rift proxy caddy` keeps Caddy where it was set up. When Caddy moves (between host and container, or to another site directory), the command writes the files of its sites and panel route to the new directory, reloads the new Caddy and removes the old files; if the new Caddy cannot be reloaded, nothing changes.
 
 - **Nginx Proxy Manager** with its API on `http://127.0.0.1:81` and its admin login as `RIFT_NPM_EMAIL` and `RIFT_NPM_PASSWORD` in the server `.env`; see below.
 
@@ -909,7 +909,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | `rift add site AGENT DOMAIN PORT [traefik\|caddy\|nginx\|npm] [--allow-from ADDRESS[,NETWORK...]]` | Publishes `https://DOMAIN` through your reverse proxy to `PORT` on the agent. Without a proxy word the default is used. With `--allow-from` the proxy answers other clients with 403. |
 | `rift list sites` | All sites with their forward state (`ok`, `missing`, `refused`). |
 | `rift remove site DOMAIN` | Removes the site, its proxy configuration and its forward. |
-| `rift proxy [traefik\|caddy\|nginx\|npm] [--container NAME --sites-dir DIR]` | Shows or sets the default proxy; with the options, Caddy runs in that container and reads the site files from that host directory. `sudo sh deploy/setup-proxy traefik\|caddy\|npm [--migrate]` sets up a proxy in Docker, or switches to it and moves every site. |
+| `rift proxy [traefik\|caddy\|nginx\|npm] [--container NAME --sites-dir DIR \| --host]` | Shows or sets the default proxy; with the options, Caddy runs in that container and reads the site files from that host directory, with `--host` on the host itself (its sites move along). `sudo sh deploy/setup-proxy traefik\|caddy\|npm [--migrate]` sets up a proxy in Docker, or switches to it and moves every site. |
 
 The web panel runs `add site`, `remove site`, `export`, `import` and `backup` through the host service (`rift-site-queue.path`, installed by `deploy/install-cli`); see [Web panel](#web-panel).
 
