@@ -63,7 +63,7 @@ known_key() {
 
 # ---------- checks of agent settings (the rules of src/config.rs) ----------
 check_server() {
-  why="the server's name or address with the enrollment port, as printed by 'rift add agent': rift.example.net:8443"
+  why="the server's name or address with the enrollment port, as printed by \"rift add agent\": rift.example.net:8443"
   case $1 in
     \[*\]:*) _h=${1%]:*}; _h=${_h#[} ;;
     *:*:*) return 1 ;;
@@ -72,7 +72,7 @@ check_server() {
   esac
   _p=${1##*:}
   is_host "$_h" && is_port "$_p" || {
-    why="the server's name or address with the enrollment port, as printed by 'rift add agent': rift.example.net:8443"
+    why="the server's name or address with the enrollment port, as printed by \"rift add agent\": rift.example.net:8443"
     return 1
   }
 }
@@ -170,9 +170,9 @@ heading "Image"
 setting RIFT_VERSION "Image version: latest (follows main) or a release such as 1.0.0" is_version
 
 # ---------- invitation ----------
-heading "Invitation (from 'rift add agent NAME' on the server)"
+heading "Invitation (from \"rift add agent NAME\" on the server)"
 [ -n "$interactive" ] || has_preset RIFT_SERVER || [ -n "$(current RIFT_SERVER)" ] \
-  || fail "usage: sudo sh deploy/join SERVER NAME [TOKEN], as printed by 'rift add agent NAME'"
+  || fail "usage: sudo sh deploy/join SERVER NAME [TOKEN], as printed by \"rift add agent NAME\""
 setting RIFT_SERVER "Server with enrollment port (SERVER:8443)" check_server
 setting RIFT_AGENT_NAME "Agent name" check_name
 # A token left in .env by a run that did not finish is used again unless another one is given.
@@ -198,7 +198,7 @@ else
   put RIFT_ENROLLMENT_TOKEN "$stored_token"
 fi
 if [ -z "$(get RIFT_ENROLLMENT_TOKEN)" ] && [ -z "$enrolled" ]; then
-  fail "no TOKEN given and this host has no enrolled agent; give the token printed by 'rift add agent'"
+  fail "no TOKEN given and this host has no enrolled agent; give the token printed by \"rift add agent\""
 fi
 
 # ---------- limits ----------
@@ -293,4 +293,10 @@ if [ -n "$token" ]; then
 else
   echo "Agent $name is active with the new settings."
 fi
-echo "On the server, \"rift list agents\" shows it; publish ports with \"rift add forward $name ...\"."
+next_steps "Next steps, on the server:"
+next_step "See the agent" "rift list agents"
+next_step "Publish a port of this host, for example 8080 over TCP" "rift add forward $name 8080/tcp"
+next_step "Or publish a website of this host with HTTPS" "sudo rift add site $name DOMAIN PORT"
+next_steps "On this host:"
+next_step "Check the agent" "rift status"
+next_step "Change its settings (allowed ports, LAN networks, exit)" "sudo sh deploy/join"

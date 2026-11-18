@@ -355,25 +355,25 @@ if [ -n "$migrate" ] && [ "$other_sites" -gt 0 ]; then
 fi
 
 echo
-echo "$proxy runs in Docker ($dir) and is the proxy for rift add site. Next:"
-echo "  1. Point the domain's A record (and AAAA, if you publish IPv6) at this server."
-echo "  2. Open TCP 80 and 443 in your cloud firewall or security group."
-echo "  3. rift add site AGENT DOMAIN PORT     for example: rift add site node1 app.example.net 8080"
+echo "$proxy runs in Docker ($dir) and is the proxy for \"rift add site\"."
 if [ "$proxy" = npm ]; then
-  echo "Web interface: on this server at http://127.0.0.1:81, from elsewhere through an SSH tunnel"
-  echo "  (ssh -L 8181:127.0.0.1:81 root@SERVER, then http://127.0.0.1:8181). Login: RIFT_NPM_EMAIL and"
-  echo "  RIFT_NPM_PASSWORD in $env_file. Nginx Proxy Manager logs that password once on its first start;"
-  echo "  change it in the interface and in .env together if you want."
-fi
-if [ -z "$email" ]; then
-  echo "Without an e-mail address Let's Encrypt cannot warn you before a certificate expires;"
-  echo "run this again with --email to add one."
+  echo "Its web interface is on this server at http://127.0.0.1:81. Login: RIFT_NPM_EMAIL and"
+  echo "RIFT_NPM_PASSWORD in $env_file; Nginx Proxy Manager logs that password once on its first"
+  echo "start. Change it in the interface and in .env together if you want."
 fi
 if [ -n "$old_dir" ]; then
   echo "The old proxy is stopped; its files stay in $old_dir. Delete them once everything works."
 fi
+next_steps
+next_step "Point the domain's A record (and AAAA for IPv6) at this server, open TCP 80 and 443 in your cloud firewall, then publish a website" "sudo rift add site AGENT DOMAIN PORT"
+if [ "$proxy" = npm ]; then
+  next_step "Open the Nginx Proxy Manager interface from your computer, then http://127.0.0.1:8181" "ssh -L 8181:127.0.0.1:81 root@SERVER"
+fi
 if [ -z "$migrate" ] && [ "$other_sites" -gt 0 ]; then
-  echo "$other_sites site(s) still use another proxy. Move them with: sudo sh deploy/setup-proxy $proxy --migrate"
+  next_step "Move the $other_sites site(s) that still use another proxy" "sudo sh deploy/setup-proxy $proxy --migrate"
+fi
+if [ -z "$email" ]; then
+  next_step "Get warned before a certificate expires (Let's Encrypt needs an address)" "sudo sh deploy/setup-proxy $proxy --email ADDRESS"
 fi
 if [ -n "$migrate_failed" ]; then
   exit 1

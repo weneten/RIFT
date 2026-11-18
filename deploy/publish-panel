@@ -150,11 +150,18 @@ if [ -n "$trust_net" ] && [ "$trust_net" != "$subnet" ]; then
 fi
 if [ -n "$read_only" ]; then
   echo "It is read-only there; change things on the VPS, through an SSH tunnel or from a panel"
-  echo "VPN device (rift panel connect). Allow changes there with: sudo sh deploy/publish-panel $domain"
+  echo "VPN device (\"rift panel connect\")."
+  two_factor_off=
 elif docker exec rift-server rift --config /etc/rift/config.toml --json panel 2fa status 2> /dev/null | grep -q '"enabled":true'; then
   echo "Changes are allowed there. Two-factor login is on."
+  two_factor_off=
 else
   echo "WARNING: two-factor login is off. The panel password alone now allows changes from the"
-  echo "internet. Turn it on: rift panel 2fa setup"
+  echo "internet."
+  two_factor_off=1
 fi
-echo "Show the password with: rift panel password. Undo with: sudo sh deploy/publish-panel --off"
+next_steps
+[ -z "$two_factor_off" ] || next_step "Turn on two-factor login" "rift panel 2fa setup"
+next_step "Show the panel password" "rift panel password"
+[ -z "$read_only" ] || next_step "Allow changes through https://$domain" "sudo sh deploy/publish-panel $domain"
+next_step "Remove the route again" "sudo sh deploy/publish-panel --off"

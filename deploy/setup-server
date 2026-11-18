@@ -349,7 +349,7 @@ group "Change the ports (WireGuard UDP $(current RIFT_WG_PORT), enrollment $(cur
 setting RIFT_WG_PORT "WireGuard UDP port" check_wg_port
 setting RIFT_ENROLLMENT_BIND "Enrollment listener, ADDRESS:PORT (TCP)" check_bind
 end_group
-note "The enrollment port: auto opens it only while an invitation from 'rift add agent' is open,"
+note "The enrollment port: auto opens it only while an invitation from \"rift add agent\" is open,"
 note "always keeps it open, off turns enrollment off."
 setting RIFT_ENROLLMENT "Enrollment port: auto, always or off" check_enrollment
 
@@ -416,9 +416,9 @@ else
   put RIFT_WEBPANEL_PASSWORD "$(current RIFT_WEBPANEL_PASSWORD)"
 fi
 [ -n "$(get RIFT_WEBPANEL_PASSWORD)" ] || password_note=" (generated; show it with: rift panel password)"
-note "Two-factor login: optional (turn it on later in the panel), required (no login until 'rift panel 2fa setup')."
+note "Two-factor login: optional (turn it on later in the panel), required (no login until \"rift panel 2fa setup\")."
 setting RIFT_WEBPANEL_2FA "Two-factor login: optional or required" check_2fa
-note "private (recommended): on the VPS itself (SSH tunnel), for VPN devices from 'rift panel connect',"
+note "private (recommended): on the VPS itself (SSH tunnel), for VPN devices from \"rift panel connect\","
 note "  and through the reverse proxy if you give the panel a domain under Websites below."
 note "public: the panel itself on every address over plain HTTP (port $(current RIFT_WEBPANEL_PORT)); rarely needed."
 setting RIFT_WEBPANEL_ACCESS "Where the panel listens: private or public" check_access
@@ -500,7 +500,7 @@ fi
 default_proxy=$existing_proxy
 [ "$default_proxy" != none ] || [ -z "$foreign_holder" ] || default_proxy=own
 if [ -z "$proxy" ]; then
-  note "A reverse proxy serves websites with HTTPS ('rift add site'); it needs ports 80 and 443."
+  note "A reverse proxy serves websites with HTTPS (\"rift add site\"); it needs ports 80 and 443."
   note "  traefik, caddy, npm  set one up in Docker (deploy/setup-proxy; npm is Nginx Proxy Manager)"
   note "  own                  use a proxy that already runs here: Traefik, Caddy, Nginx with certbot or NPM"
   note "  none                 no websites for now (later: sudo sh deploy/setup-proxy NAME)"
@@ -532,7 +532,7 @@ fi
 if [ "$proxy" = none ] && [ "$existing_proxy" != none ]; then
   note "$existing_proxy keeps running; this script does not remove it."
 elif [ "$proxy" = none ] && [ -n "$foreign_holder" ]; then
-  note "$foreign_holder keeps port 443; choose own to let 'rift add site' use it."
+  note "$foreign_holder keeps port 443; choose own to let \"rift add site\" use it."
 fi
 
 # A proxy of your own: which one it is and what `rift add site` needs to reach it.
@@ -545,11 +545,11 @@ if [ "$proxy" = own ]; then
   check_kind "$own_kind" || fail "--proxy-kind: $why"
   case $own_kind in
     traefik)
-      note "'rift add site' needs Traefik from Docker Compose with the container name traefik; the first"
+      note "\"rift add site\" needs Traefik from Docker Compose with the container name traefik; the first"
       note "site adds a watched file provider to it (README: Set up a proxy by hand)."
       ;;
     nginx)
-      note "'rift add site' writes /etc/nginx/rift-sites/DOMAIN.conf: include /etc/nginx/rift-sites/*.conf;"
+      note "\"rift add site\" writes /etc/nginx/rift-sites/DOMAIN.conf: include /etc/nginx/rift-sites/*.conf;"
       note "in the http block. certbot with its Nginx plugin requests the certificates."
       ;;
     caddy)
@@ -578,7 +578,7 @@ if [ "$proxy" = own ]; then
       ;;
     npm)
       write_npm=1
-      note "'rift add site' uses the API of Nginx Proxy Manager on http://127.0.0.1:81 with an admin login."
+      note "\"rift add site\" uses the API of Nginx Proxy Manager on http://127.0.0.1:81 with an admin login."
       setting RIFT_NPM_EMAIL "Nginx Proxy Manager admin login (e-mail)" is_email
       if has_preset RIFT_NPM_PASSWORD; then
         setting RIFT_NPM_PASSWORD "" check_npm_password
@@ -729,7 +729,7 @@ if [ "$panel" = true ]; then
     line "Reachable at" "http://ADDRESS:$panel_port on every address (logins only through a TLS proxy)"
   else
     line "Reachable at" "http://127.0.0.1:$panel_port on the VPS or through an SSH tunnel"
-    line "" "http://$(get RIFT_SERVER_IPV4):$panel_port from VPN devices of 'rift panel connect'"
+    line "" "http://$(get RIFT_SERVER_IPV4):$panel_port from VPN devices of \"rift panel connect\""
   fi
   if [ -n "$publish" ]; then
     if [ "$(get RIFT_WEBPANEL_CONTROL)" = public ]; then
@@ -824,7 +824,7 @@ fi
 
 failed=
 if [ "$proxy" = own ]; then
-  echo "6/$steps Making your $own_kind the proxy of 'rift add site'"
+  echo "6/$steps Making your $own_kind the proxy of \"rift add site\""
   if [ -n "$caddy_container" ]; then
     set -- caddy --container "$caddy_container" --sites-dir "$caddy_sites_dir"
   elif [ "$own_kind" = caddy ]; then
@@ -836,18 +836,18 @@ if [ "$proxy" = own ]; then
   if output=$(rift proxy "$@"); then
     printf '%s\n' "$output" | sed '1d'
   else
-    failed="'rift proxy' failed (see above); run: sudo rift proxy $*"
+    failed="\"rift proxy\" failed (see above); run: sudo rift proxy $*"
   fi
 elif [ "$proxy" != none ]; then
   echo "6/$steps Setting up $proxy"
   email=$(get RIFT_LETSENCRYPT_EMAIL)
-  sh "$script_dir/setup-proxy" "$proxy" ${email:+--email "$email"} ${migrate:+--migrate} --yes \
+  RIFT_NO_NEXT_STEPS=1 sh "$script_dir/setup-proxy" "$proxy" ${email:+--email "$email"} ${migrate:+--migrate} --yes \
     || failed="$proxy was not set up (see above); run: sudo sh deploy/setup-proxy $proxy${migrate:+ --migrate}"
 fi
 if [ -n "$publish_step" ] && [ -z "$failed" ]; then
   if [ -n "$publish" ]; then
     echo "$publish_step/$steps Publishing the panel at https://$publish"
-    sh "$script_dir/publish-panel" "$publish" $publish_mode --yes \
+    RIFT_NO_NEXT_STEPS=1 sh "$script_dir/publish-panel" "$publish" $publish_mode --yes \
       || failed="the panel was not published (see above); run: sudo sh deploy/publish-panel $publish $publish_mode"
   else
     echo "$publish_step/$steps Removing the panel route https://$current_route"
@@ -858,21 +858,32 @@ fi
 
 enrollment_port=$(get RIFT_ENROLLMENT_BIND)
 enrollment_port=${enrollment_port##*:}
-ports="UDP $(get RIFT_WG_PORT) (WireGuard)"
-case $(get RIFT_ENROLLMENT) in
-  auto) ports="$ports, TCP $enrollment_port (agent enrollment, listens only while an invitation is open)" ;;
-  always) ports="$ports, TCP $enrollment_port (agent enrollment)" ;;
-esac
-[ "$panel" = true ] && [ "$(get RIFT_WEBPANEL_ACCESS)" = public ] && ports="$ports, TCP $(get RIFT_WEBPANEL_PORT) (web panel)"
-[ "$proxy" = none ] || ports="$ports, TCP 80 and 443 (websites)"
+port_line() { printf '  %-13s %s\n' "$1" "$2"; }
 echo
 echo "The RIFT server is running."
-echo "Open in your cloud firewall or security group: $ports"
-echo "and later the ports of your forwards."
-echo "Next: add an agent with \"rift add agent NAME\""
+echo
+echo "Open in your cloud firewall or security group:"
+port_line "UDP $(get RIFT_WG_PORT)" "WireGuard"
+case $(get RIFT_ENROLLMENT) in
+  auto) port_line "TCP $enrollment_port" "agent enrollment (listens only while an invitation is open)" ;;
+  always) port_line "TCP $enrollment_port" "agent enrollment" ;;
+esac
+if [ "$panel" = true ] && [ "$(get RIFT_WEBPANEL_ACCESS)" = public ]; then
+  port_line "TCP $(get RIFT_WEBPANEL_PORT)" "web panel"
+fi
+[ "$proxy" = none ] || port_line "TCP 80, 443" "websites"
+echo "  and later the ports of your forwards"
+next_steps
+next_step "Add an agent (prints the command to run on the agent host)" "rift add agent NAME"
+if [ "$proxy" != none ]; then
+  next_step "Publish a website of an agent (its domain's A record points at this server)" "sudo rift add site AGENT DOMAIN PORT"
+fi
 if [ "$panel" = true ]; then
-  echo "Web panel: connect a device with \"rift panel connect laptop\""
-  [ -z "$password_note" ] || echo "Panel password$password_note"
+  next_step "Connect a device to the web panel" "rift panel connect laptop"
+  [ -z "$password_note" ] || next_step "Show the generated panel password" "rift panel password"
+  if [ "$(get RIFT_WEBPANEL_CONTROL)" = public ] && [ "$(get RIFT_WEBPANEL_2FA)" != required ]; then
+    next_step "Turn on two-factor login (changes are allowed through a proxy)" "rift panel 2fa setup"
+  fi
 fi
 if [ -n "$failed" ]; then
   echo "The server runs, but $failed" >&2

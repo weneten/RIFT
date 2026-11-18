@@ -38,3 +38,15 @@ get_env() {
   [ -f "$env_file" ] || return 0
   sed -n "s/^$1=//p" "$env_file" | tail -n 1 | sed "s/^\"\(.*\)\"\$/\1/; s/^'\(.*\)'\$/\1/"
 }
+
+# The closing list of next steps, the same in every deploy script: a heading, then each step
+# as what it does and, indented below it, the command. RIFT_NO_NEXT_STEPS=1 leaves it out
+# (deploy/setup-server sets it for the scripts it runs and prints one list itself).
+next_steps() {
+  [ -z "${RIFT_NO_NEXT_STEPS:-}" ] || return 0
+  printf '\n%s\n' "${1:-Next steps:}"
+}
+next_step() {
+  [ -z "${RIFT_NO_NEXT_STEPS:-}" ] || return 0
+  printf '\n  %s:\n    %s\n' "$1" "$2"
+}
