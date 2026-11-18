@@ -137,10 +137,10 @@ By default RIFT creates its own enrollment CA and certificate in the persistent 
 On the **server**, create a short-lived, single-use invitation. Choose a unique name for each agent:
 
 ```sh
-rift add agent node1 --ttl 15m
+rift add agent node1
 ```
 
-It prints two ways to set up the agent: the commands for the join script, and the same invitation as three `.env` lines for a manual setup. The token in both is a secret and works once; transfer it securely.
+The invitation is valid for 15 minutes; `--ttl 1h` (or any other duration) gives it longer. It prints two ways to set up the agent: the commands for the join script, and the same invitation as three `.env` lines for a manual setup. The token in both is a secret and works once; transfer it securely.
 
 The agent runs on its own machine, never on the server: both use the compose project `rift`, its state volume and the host network. `deploy/join` refuses a machine with a `rift-server` container, `deploy/setup-server` one with `rift-agent`.
 
@@ -886,7 +886,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 
 | Command | What it does |
 | --- | --- |
-| `rift add agent NAME [--ttl 15m]` | Creates a single-use invitation and prints the `deploy/join` command for the agent, plus the same values as three `.env` lines for a manual setup. Opens the enrollment port until the agent is active. |
+| `rift add agent NAME [--ttl DURATION]` | Creates a single-use invitation, valid for 15 minutes unless `--ttl` says otherwise, and prints the `deploy/join` command for the agent, plus the same values as three `.env` lines for a manual setup. Opens the enrollment port until the agent is active. |
 | `rift list agents` | All agents with state and tunnel addresses. |
 | `rift show agent NAME` | Every stored detail of one agent. |
 | `rift remove invite NAME` | Cancels an open invitation. |
