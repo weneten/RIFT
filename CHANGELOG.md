@@ -4,6 +4,12 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ## [Unreleased]
 
+### Setup
+
+- `deploy/setup-server` asks for every setting of the server `.env` (image version, ports and enrollment, tunnel and VPN pools, VPN DNS, every web panel setting including the password and two-factor login, the reverse proxy with its Let's Encrypt settings and the panel route of `deploy/publish-panel`), in the order of `.env.server.example`. Rarely changed groups are asked only after a yes. Defaults come from the existing `.env`, so running it again changes settings in place; values are checked before anything is written; `--set KEY=VALUE`, `--version` and `--publish-panel` set them without questions. A setting at RIFT's default stays a comment in `.env`, and `RIFT_ALLOW_PRIVATE_LISTENERS` is reset when the address is no longer private.
+- `deploy/join` also asks for the agent's limits (`RIFT_AGENT_ALLOW_PORTS`, `RIFT_AGENT_ALLOW_SUBNETS` with the LAN networks it finds, `RIFT_AGENT_ALLOW_EXIT`) and the image version, asks for a missing server, name or token, and changes the settings of an enrolled agent when run again without a token. Options: `--allow-ports`, `--allow-subnets`, `--exit`/`--no-exit`, `--version`, `--set KEY=VALUE`, `--yes`.
+- `.env.server.example` and `.env.agent.example` are grouped into sections in the order of the scripts; commented lines show RIFT's defaults.
+
 ## [1.0.0]
 
 First release. RIFT publishes services of home servers behind NAT or CGNAT through a VPS: the home server (agent) dials the VPS (server) over WireGuard, and the server forwards public ports to it or lets private VPN devices reach it. See the [README](https://github.com/weneten/RIFT/blob/v1.0.0/README.md) for setup and the [test matrix](https://github.com/weneten/RIFT/blob/v1.0.0/docs/deploy.md#functional-test-matrix) for what is tested and what is not.

@@ -1,52 +1,216 @@
 #!/bin/sh
-# Set up this machine as the RIFT server (VPS) in one step:
+# Set up this machine as the RIFT server (VPS) in one step, or change its settings later:
 #
 #   sudo sh deploy/setup-server
 #
-# It asks for the few values RIFT needs and offers what it detects as the default: the public
-# address on this machine's interfaces, the name agents dial, and whether to turn on the web
-# panel. Without a terminal, or with --yes, it takes the detected values. Options set them
-# directly:
+# It goes through every setting of the server .env, in the order of .env.server.example:
+# image, addresses, ports and enrollment, tunnel pools, VPN devices, web panel, websites.
+# Each question offers a default (Enter takes it, - clears an optional value): what it
+# detects on this machine, else the value of the existing .env, else RIFT's default. Groups
+# that are rarely changed (ports, address pools, advanced panel settings) are asked only
+# after a yes. So running it again with Enter everywhere changes nothing.
+# Without a terminal, or with --yes, it takes the defaults. Options set values and skip
+# their questions:
 #
-#   --endpoint NAME_OR_IP   the DNS name or address agents dial (default: the public IPv4)
-#   --public-ips LIST       comma-separated addresses on this machine that forwards listen on
+#   --endpoint NAME_OR_IP   the DNS name or address agents dial (RIFT_PUBLIC_ENDPOINT)
+#   --public-ips LIST       addresses on this machine that forwards listen on (RIFT_PUBLIC_IPS)
 #   --panel / --no-panel    turn the web panel on (private: over the VPN only) or off
 #   --proxy NAME            also set up a reverse proxy for websites in Docker: traefik, caddy,
 #                           npm (Nginx Proxy Manager) or none (deploy/setup-proxy)
 #   --email ADDRESS         the Let's Encrypt address for that proxy
-#   --yes                   do not ask; take the detected values (and no proxy)
+#   --publish-panel DOMAIN  also reach the panel at https://DOMAIN through that proxy
+#                           (deploy/publish-panel); --publish-panel - unpublishes it
+#   --version VERSION       the image: latest or a release such as 1.0.0 (RIFT_VERSION)
+#   --set KEY=VALUE         any setting of .env.server.example, e.g. --set RIFT_WG_PORT=51900;
+#                           repeatable; an empty VALUE returns it to RIFT's default
+#   --yes                   do not ask; take the defaults
 #
 # Then it prepares the host (deploy/prepare-host), writes config.toml and .env (mode 0600;
-# settings in an existing server .env are kept unless replaced here), installs the `rift`
-# command, starts the server, waits until it is ready and sets up the proxy. Safe to run again.
+# a setting at RIFT's default stays a comment), installs the `rift` command, starts the
+# server, waits until it is ready and sets up the proxy and the panel route.
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 env_file=$repo_dir/.env
 config_file=$repo_dir/config.toml
+site_state=/var/lib/rift-site/sites.json
 
 fail() {
   printf 'rift: %s\n' "$*" >&2
   exit 1
 }
+usage() {
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+}
 
-endpoint=
-public_ips=
-panel=
+# RIFT's default of each setting, in the order of .env.server.example.
+keys="RIFT_VERSION RIFT_PUBLIC_IPS RIFT_ALLOW_PRIVATE_LISTENERS RIFT_PUBLIC_ENDPOINT
+RIFT_WG_PORT RIFT_ENROLLMENT_BIND RIFT_ENROLLMENT
+RIFT_IPV4_POOL RIFT_SERVER_IPV4 RIFT_IPV6_POOL RIFT_SERVER_IPV6
+RIFT_VPN_POOL RIFT_VPN_POOL6 RIFT_VPN_DNS
+RIFT_WEBPANEL RIFT_WEBPANEL_PASSWORD RIFT_WEBPANEL_2FA RIFT_WEBPANEL_ACCESS RIFT_WEBPANEL_CONTROL
+RIFT_WEBPANEL_PORT RIFT_WEBPANEL_ALLOW RIFT_WEBPANEL_PROXIES RIFT_WEBPANEL_INSECURE
+RIFT_PROXY_SUBNET RIFT_REQUEST_CERTIFICATE RIFT_LETSENCRYPT_EMAIL RIFT_NPM_EMAIL RIFT_NPM_PASSWORD"
+builtin() {
+  case $1 in
+    RIFT_VERSION) echo latest ;;
+    RIFT_ALLOW_PRIVATE_LISTENERS) echo false ;;
+    RIFT_WG_PORT) echo 51820 ;;
+    RIFT_ENROLLMENT) echo auto ;;
+    RIFT_ENROLLMENT_BIND) echo 0.0.0.0:8443 ;;
+    RIFT_IPV4_POOL) echo 10.13.0.0/24 ;;
+    RIFT_SERVER_IPV4) echo 10.13.0.1 ;;
+    RIFT_IPV6_POOL) echo fd88:5249:4654::/64 ;;
+    RIFT_SERVER_IPV6) echo fd88:5249:4654::1 ;;
+    RIFT_VPN_POOL) echo 10.14.0.0/24 ;;
+    RIFT_VPN_POOL6) echo fd88:5249:4655::/64 ;;
+    RIFT_VPN_DNS) echo 9.9.9.9,2620:fe::fe ;;
+    RIFT_WEBPANEL) echo false ;;
+    RIFT_WEBPANEL_ACCESS) echo private ;;
+    RIFT_WEBPANEL_PORT) echo 8090 ;;
+    RIFT_WEBPANEL_2FA) echo optional ;;
+    RIFT_WEBPANEL_CONTROL) echo private ;;
+    RIFT_WEBPANEL_INSECURE) echo false ;;
+    RIFT_PROXY_SUBNET) echo 10.255.13.0/24 ;;
+    RIFT_REQUEST_CERTIFICATE) echo true ;;
+    *) echo ;;
+  esac
+}
+known_key() {
+  for _k in $keys; do
+    [ "$1" = "$_k" ] && return 0
+  done
+  return 1
+}
+
+. "$script_dir/env.sh"
+. "$script_dir/ask.sh"
+
+# ---------- checks of server settings (the rules of src/config.rs) ----------
+control_port=8444
+exit_ports_min=51821
+exit_ports_max=51899
+check_public_ip() {
+  is_ip "$1" || return 1
+  case $1 in
+    0.0.0.0 | 127.* | :: | ::1) why="not a usable public address: $1"; return 1 ;;
+  esac
+}
+check_public_ips() { is_list check_public_ip "$1"; }
+check_endpoint() { is_host "$1"; }
+check_wg_port() {
+  is_port "$1" || return 1
+  if [ "$1" -ge "$exit_ports_min" ] && [ "$1" -le "$exit_ports_max" ]; then
+    why="$exit_ports_min-$exit_ports_max are the ports of internet exits; choose another"
+    return 1
+  fi
+}
+check_bind() {
+  why="ADDRESS:PORT, e.g. 0.0.0.0:8443 or [::]:8443"
+  case $1 in
+    \[*\]:*) _a=${1%]:*}; _a=${_a#[}; is_ip6 "$_a" || return 1 ;;
+    *:*:*) why="ADDRESS:PORT, e.g. 0.0.0.0:8443 or [::]:8443"; return 1 ;;
+    *:*) is_ip4 "${1%:*}" || return 1 ;;
+    *) return 1 ;;
+  esac
+  is_port "${1##*:}" || return 1
+  [ "${1##*:}" -ne "$control_port" ] || { why="$control_port is the tunnel control port; choose another"; return 1; }
+}
+check_enrollment() { one_of "$1" auto always off; }
+check_pool4() {
+  is_net4 "$1" || return 1
+  why="the pool must be a private network (10/8, 172.16/12, 192.168/16) from /8 to /29"
+  [ "${1#*/}" -ge 8 ] && [ "${1#*/}" -le 29 ] && is_private4 "${1%/*}"
+}
+check_server4() {
+  is_ip4 "$1" || return 1
+  _p=$(get RIFT_IPV4_POOL)
+  why="must be a host address inside $_p"
+  overlap4 "$1" "$_p" || return 1
+  _m=$(mask4 "${_p#*/}")
+  _net=$(($(ip4_int "${_p%/*}") & _m))
+  _n=$(ip4_int "$1")
+  [ "$_n" -ne "$_net" ] && [ "$_n" -ne $((_net | (~_m & 4294967295))) ]
+}
+check_pool6() {
+  is_net6 "$1" || return 1
+  why="the pool must be a ULA network (fc00::/7, e.g. fd88:5249:4654::/64) of /120 or larger"
+  [ "${1#*/}" -le 120 ] || return 1
+  case $1 in [fF][cCdD]*) return 0 ;; esac
+  return 1
+}
+check_vpn_pool() {
+  check_pool4 "$1" || return 1
+  if overlap4 "$1" "$(get RIFT_IPV4_POOL)"; then
+    why="overlaps the IPv4 tunnel pool $(get RIFT_IPV4_POOL)"
+    return 1
+  fi
+  _o=$IFS
+  IFS=,
+  for _ip in $(get RIFT_PUBLIC_IPS); do
+    if is_ip4 "$_ip" && overlap4 "$_ip" "$1"; then
+      IFS=$_o
+      why="contains the public address $_ip"
+      return 1
+    fi
+  done
+  IFS=$_o
+}
+check_vpn_pool6() {
+  check_pool6 "$1" || return 1
+  [ "${1%/*}" != "$(get RIFT_IPV6_POOL | sed 's,/.*,,')" ] || { why="the same network as the IPv6 tunnel pool"; return 1; }
+}
+check_dns() {
+  is_list is_ip "$1" || return 1
+  case ",$1," in
+    *,[0-9]*.*.*.*,*) return 0 ;;
+  esac
+  why="name one IPv4 address at least, for exits without IPv6"
+  return 1
+}
+check_password() {
+  [ -n "$1" ] || return 0
+  why="at least 12 characters"
+  [ "${#1}" -ge 12 ] || return 1
+  why="no spaces, quotes, backslash, \$, # or backtick (they break the .env)"
+  ! printf '%s' "$1" | grep -q "[[:space:]'\"\\\\\$#\`]"
+}
+check_2fa() { one_of "$1" optional required; }
+check_access() { one_of "$1" private public; }
+check_control() { one_of "$1" private public off; }
+check_panel_port() {
+  is_port "$1" || return 1
+  _e=$(get RIFT_ENROLLMENT_BIND)
+  why="must differ from the control port $control_port and the enrollment port ${_e##*:}"
+  [ "$1" -ne "$control_port" ] && [ "$1" -ne "${_e##*:}" ]
+}
+check_addr_list() { is_list is_net_or_ip "$1" empty-ok; }
+check_proxy() { one_of "$1" traefik caddy npm none; }
+
 proxy=
-email=
+publish=
+has_publish=
 assume_yes=
 while [ "$#" -gt 0 ]; do
   case $1 in
-    --endpoint) [ "$#" -ge 2 ] || fail "--endpoint needs a value"; endpoint=$2; shift 2 ;;
-    --public-ips) [ "$#" -ge 2 ] || fail "--public-ips needs a value"; public_ips=$2; shift 2 ;;
-    --panel) panel=true; shift ;;
-    --no-panel) panel=false; shift ;;
+    --endpoint) [ "$#" -ge 2 ] || fail "--endpoint needs a value"; preset RIFT_PUBLIC_ENDPOINT "$2"; shift 2 ;;
+    --public-ips) [ "$#" -ge 2 ] || fail "--public-ips needs a value"; preset RIFT_PUBLIC_IPS "$2"; shift 2 ;;
+    --panel) preset RIFT_WEBPANEL true; shift ;;
+    --no-panel) preset RIFT_WEBPANEL false; shift ;;
     --proxy) [ "$#" -ge 2 ] || fail "--proxy needs a value"; proxy=$2; shift 2 ;;
-    --email) [ "$#" -ge 2 ] || fail "--email needs a value"; email=$2; shift 2 ;;
+    --email) [ "$#" -ge 2 ] || fail "--email needs a value"; preset RIFT_LETSENCRYPT_EMAIL "$2"; shift 2 ;;
+    --publish-panel) [ "$#" -ge 2 ] || fail "--publish-panel needs a domain"; publish=$2; has_publish=1; shift 2 ;;
+    --version) [ "$#" -ge 2 ] || fail "--version needs a value"; preset RIFT_VERSION "$2"; shift 2 ;;
+    --set)
+      [ "$#" -ge 2 ] || fail "--set needs KEY=VALUE"
+      case $2 in *=*) ;; *) fail "--set needs KEY=VALUE, not $2" ;; esac
+      known_key "${2%%=*}" || fail "--set: ${2%%=*} is not a server setting (see .env.server.example)"
+      preset "${2%%=*}" "${2#*=}"
+      shift 2
+      ;;
     --yes | -y) assume_yes=1; shift ;;
-    -h | --help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) usage; exit 0 ;;
     *) fail "unknown option $1 (see sh deploy/setup-server --help)" ;;
   esac
 done
@@ -56,45 +220,33 @@ interactive=
 if [ -z "$assume_yes" ] && [ -t 0 ] && [ -t 1 ]; then
   interactive=1
 fi
-# ask "Question" DEFAULT -> the answer, or the default on Enter or without a terminal.
-ask() {
-  if [ -z "$interactive" ]; then
-    printf '%s\n' "$2"
-    return
-  fi
-  if [ -n "$2" ]; then
-    printf '%s [%s]: ' "$1" "$2" > /dev/tty
-  else
-    printf '%s: ' "$1" > /dev/tty
-  fi
-  read -r answer < /dev/tty || answer=
-  printf '%s\n' "${answer:-$2}"
-}
-# yes_no "Question" y|n -> 0 for yes.
-yes_no() {
-  reply=$2
-  if [ -n "$interactive" ]; then
-    hint="y/N"
-    [ "$2" = y ] && hint="Y/n"
-    printf '%s [%s]: ' "$1" "$hint" > /dev/tty
-    read -r reply < /dev/tty || reply=
-    reply=${reply:-$2}
-  fi
-  case $reply in [yY]*) return 0 ;; *) return 1 ;; esac
-}
 
 command -v docker > /dev/null 2>&1 \
   || fail "Docker is not installed. Install it first, for example: curl -fsSL https://get.docker.com | sh"
 docker compose version > /dev/null 2>&1 || fail "Docker Compose v2 ('docker compose') is missing"
 docker info > /dev/null 2>&1 || fail "Docker does not answer; is the docker service running?"
 
-if [ -f "$env_file" ] && grep -Eq '^COMPOSE_PROFILES=agent' "$env_file"; then
-  fail "$env_file belongs to a RIFT agent; the server needs its own checkout or machine"
-fi
-if [ -f "$env_file" ] && [ -n "$interactive" ]; then
-  yes_no "$env_file exists. Update it (other settings stay)?" y || fail "nothing changed"
+env_existed=
+if [ -f "$env_file" ]; then
+  grep -Eq '^COMPOSE_PROFILES=agent' "$env_file" \
+    && fail "$env_file belongs to a RIFT agent; the server needs its own checkout or machine"
+  env_existed=1
 fi
 
+if [ -n "$interactive" ]; then
+  if [ -n "$env_existed" ]; then
+    echo "Settings of the existing .env are the defaults; Enter keeps them, - clears an optional value."
+  else
+    echo "Enter takes the value in brackets; - clears an optional value."
+  fi
+fi
+
+# ---------- image ----------
+heading "Image"
+setting RIFT_VERSION "Image version: latest (follows main) or a release such as 1.0.0" is_version
+
+# ---------- addresses ----------
+heading "Addresses"
 # Addresses on this machine's interfaces. Private and shared ones (RFC 1918, 100.64/10) are
 # what a cloud NAT hands out; RIFT's own pools and container bridges are never candidates.
 private_v4() {
@@ -116,78 +268,253 @@ v6_public=$(ip -6 -o addr show scope global 2> /dev/null \
   | awk '$2 !~ /^(rift|docker|br-|veth|virbr|wg)/ && $0 !~ /temporary|deprecated/ {split($4, a, "/"); print a[1]}' \
   | grep -Eiv '^f[cd]' | head -n 1 || true)
 
-allow_private=
-if [ -z "$public_ips" ]; then
+if has_preset RIFT_PUBLIC_IPS || { [ -n "$env_existed" ] && [ -n "$(get_env RIFT_PUBLIC_IPS)" ]; }; then
+  setting RIFT_PUBLIC_IPS "Addresses forwards listen on (comma-separated, IPv4 first; IPv6 optional)" check_public_ips
+else
   if [ -n "$v4_public" ]; then
-    public_ips=$(ask "Public IPv4 address forwards listen on" "$v4_public")
+    default_ip=$v4_public
+    question="Public IPv4 address forwards listen on"
   elif [ -n "$v4_private" ]; then
-    echo "No public IPv4 address is assigned to an interface; this looks like a cloud NAT (Oracle Cloud, AWS, Google Cloud)."
-    echo "RIFT then listens on the private address $v4_private and the provider forwards the public one to it."
-    public_ips=$(ask "Private IPv4 address forwards listen on" "$v4_private")
+    note "No public IPv4 address is assigned to an interface; this looks like a cloud NAT (Oracle Cloud, AWS, Google Cloud)."
+    note "RIFT then listens on the private address $v4_private and the provider forwards the public one to it."
+    default_ip=$v4_private
+    question="Private IPv4 address forwards listen on"
   else
     [ -n "$interactive" ] || fail "no IPv4 address found; give one with --public-ips"
-    public_ips=$(ask "IPv4 address forwards listen on" "")
+    default_ip=
+    question="IPv4 address forwards listen on"
   fi
+  setting RIFT_PUBLIC_IPS "$question" check_public_ips "$default_ip"
   if [ -n "$v6_public" ] && yes_no "Also publish forwards over IPv6 ($v6_public)?" n; then
-    public_ips="$public_ips,$v6_public"
+    put RIFT_PUBLIC_IPS "$(get RIFT_PUBLIC_IPS),$v6_public"
   fi
 fi
-[ -n "$public_ips" ] || fail "no address for RIFT_PUBLIC_IPS"
-first_v4=${public_ips%%,*}
-if private_v4 "$first_v4"; then
-  allow_private=true
+first_ip=$(get RIFT_PUBLIC_IPS)
+first_ip=${first_ip%%,*}
+if has_preset RIFT_ALLOW_PRIVATE_LISTENERS; then
+  flag RIFT_ALLOW_PRIVATE_LISTENERS ""
+elif is_ip4 "$first_ip" && private_v4 "$first_ip"; then
+  put RIFT_ALLOW_PRIVATE_LISTENERS true
+else
+  put RIFT_ALLOW_PRIVATE_LISTENERS false
 fi
 
-if [ -z "$endpoint" ]; then
-  default_endpoint=
-  [ -n "$v4_public" ] && default_endpoint=$v4_public
-  if [ -n "$allow_private" ]; then
-    echo "Agents need the public name or address, not $first_v4."
-  fi
-  endpoint=$(ask "DNS name or public address agents dial (a name is easier to move later)" "$default_endpoint")
+default_endpoint=$(current RIFT_PUBLIC_ENDPOINT)
+[ -n "$default_endpoint" ] || default_endpoint=$v4_public
+if [ "$(get RIFT_ALLOW_PRIVATE_LISTENERS)" = true ]; then
+  note "Agents need the public name or address, not $first_ip."
 fi
-[ -n "$endpoint" ] || fail "no endpoint; give it with --endpoint (for example rift.example.net)"
-# A name or an IPv4/IPv6 address; host:port (exactly one colon), a scheme or a path is wrong.
-case $endpoint in
-  */*) fail "the endpoint is a plain name or address, without scheme or path: $endpoint" ;;
-esac
-if [ "$(printf '%s' "$endpoint" | tr -cd : | wc -c)" -eq 1 ]; then
-  fail "the endpoint takes no port; RIFT adds the WireGuard and enrollment ports itself: $endpoint"
-fi
+setting RIFT_PUBLIC_ENDPOINT "DNS name or public address agents dial (a name is easier to move later)" \
+  check_endpoint "$default_endpoint"
 
-if [ -z "$panel" ]; then
-  if yes_no "Turn on the web panel (reachable only over the VPN, set up later with 'rift panel connect')?" n; then
-    panel=true
+# ---------- ports and enrollment ----------
+heading "Ports and enrollment"
+group "Change the ports (WireGuard UDP $(current RIFT_WG_PORT), enrollment $(current RIFT_ENROLLMENT_BIND))?" \
+  "$(changed RIFT_WG_PORT RIFT_ENROLLMENT_BIND && echo y)"
+setting RIFT_WG_PORT "WireGuard UDP port" check_wg_port
+setting RIFT_ENROLLMENT_BIND "Enrollment listener, ADDRESS:PORT (TCP)" check_bind
+end_group
+note "The enrollment port: auto opens it only while an invitation from 'rift add agent' is open,"
+note "always keeps it open, off turns enrollment off."
+setting RIFT_ENROLLMENT "Enrollment port: auto, always or off" check_enrollment
+
+# ---------- tunnel pools ----------
+heading "Tunnel addresses"
+pool_warning=
+overlap=$(route_overlaps "$(current RIFT_IPV4_POOL)")
+if [ -n "$overlap" ]; then
+  note "The tunnel pool $(current RIFT_IPV4_POOL) overlaps a route of this host: $overlap"
+  pool_warning=y
+fi
+group "Change the tunnel pools (IPv4 $(current RIFT_IPV4_POOL), IPv6 $(current RIFT_IPV6_POOL))?" \
+  "$( { [ -n "$pool_warning" ] || changed RIFT_IPV4_POOL RIFT_SERVER_IPV4 RIFT_IPV6_POOL RIFT_SERVER_IPV6; } && echo y)"
+note "Changing them on a server in use needs a restart; agents get new tunnel addresses."
+setting RIFT_IPV4_POOL "IPv4 tunnel pool (private, /8 to /29)" check_pool4
+default_server4=$(current RIFT_SERVER_IPV4)
+if [ "$(get RIFT_IPV4_POOL)" != "$(current RIFT_IPV4_POOL)" ] || ! check_server4 "$default_server4"; then
+  default_server4=$(first_host4 "$(get RIFT_IPV4_POOL)")
+fi
+setting RIFT_SERVER_IPV4 "Server address in that pool" check_server4 "$default_server4"
+setting RIFT_IPV6_POOL "IPv6 tunnel pool (ULA, fd00::/8)" check_pool6
+default_server6=$(current RIFT_SERVER_IPV6)
+if [ "$(get RIFT_IPV6_POOL)" != "$(current RIFT_IPV6_POOL)" ]; then
+  case $(get RIFT_IPV6_POOL) in
+    *::/*) default_server6=$(get RIFT_IPV6_POOL); default_server6=${default_server6%/*}1 ;;
+    *) default_server6= ;;
+  esac
+fi
+setting RIFT_SERVER_IPV6 "Server IPv6 address in that pool" is_ip6 "$default_server6"
+end_group
+
+# ---------- VPN devices ----------
+heading "VPN devices (rift vpn ...)"
+pool_warning=
+overlap=$(route_overlaps "$(current RIFT_VPN_POOL)")
+if [ -n "$overlap" ]; then
+  note "The VPN pool $(current RIFT_VPN_POOL) overlaps a route of this host: $overlap"
+  pool_warning=y
+fi
+group "Change the VPN device pools (IPv4 $(current RIFT_VPN_POOL), IPv6 $(current RIFT_VPN_POOL6))?" \
+  "$( { [ -n "$pool_warning" ] || changed RIFT_VPN_POOL RIFT_VPN_POOL6; } && echo y)"
+setting RIFT_VPN_POOL "IPv4 pool of VPN devices (private, not overlapping the tunnel pool or a LAN you grant)" check_vpn_pool
+setting RIFT_VPN_POOL6 "IPv6 pool of VPN devices (ULA, not overlapping the IPv6 tunnel pool)" check_vpn_pool6
+end_group
+setting RIFT_VPN_DNS "DNS servers for devices with an internet exit (comma-separated, one IPv4 at least)" check_dns
+
+# ---------- web panel ----------
+heading "Web panel"
+flag RIFT_WEBPANEL "Turn on the web panel?"
+panel=$(get RIFT_WEBPANEL)
+[ "$panel" = true ] || asking=
+password_note=
+if has_preset RIFT_WEBPANEL_PASSWORD; then
+  setting RIFT_WEBPANEL_PASSWORD "" check_password
+elif [ -n "$interactive" ] && [ -n "$asking" ]; then
+  if [ -n "$(current RIFT_WEBPANEL_PASSWORD)" ]; then
+    secret "Panel password (hidden; Enter keeps the current one)" check_password
   else
-    panel=false
+    secret "Panel password, at least 12 characters (hidden; Enter generates one)" check_password
   fi
+  [ -n "$answer" ] || answer=$(current RIFT_WEBPANEL_PASSWORD)
+  put RIFT_WEBPANEL_PASSWORD "$answer"
+else
+  put RIFT_WEBPANEL_PASSWORD "$(current RIFT_WEBPANEL_PASSWORD)"
+fi
+[ -n "$(get RIFT_WEBPANEL_PASSWORD)" ] || password_note=" (generated; show it with: rift panel password)"
+note "Two-factor login: optional (turn it on later in the panel), required (no login until 'rift panel 2fa setup')."
+setting RIFT_WEBPANEL_2FA "Two-factor login: optional or required" check_2fa
+note "private: on the VPS itself (SSH tunnel) and for VPN devices from 'rift panel connect'."
+note "public: on every address; needs a TLS proxy in front for logins."
+setting RIFT_WEBPANEL_ACCESS "Where the panel listens: private or public" check_access
+note "Who may change things: private (the VPS itself and panel VPN devices), public (also through"
+note "a TLS proxy over HTTPS, the password protects everything), off (read-only)."
+setting RIFT_WEBPANEL_CONTROL "Changes allowed from: private, public or off" check_control
+if [ -n "$asking" ]; then
+  group "Change advanced panel settings (port $(current RIFT_WEBPANEL_PORT), allowed addresses, TLS proxies)?" \
+    "$(changed RIFT_WEBPANEL_PORT RIFT_WEBPANEL_ALLOW RIFT_WEBPANEL_PROXIES RIFT_WEBPANEL_INSECURE && echo y)"
+fi
+setting RIFT_WEBPANEL_PORT "Panel TCP port" check_panel_port
+note "Extra addresses that may open the panel read-only (rarely needed; public mode: restricts the panel to them)."
+setting RIFT_WEBPANEL_ALLOW "Allowed addresses or networks (comma-separated, empty for none)" check_addr_list
+setting RIFT_WEBPANEL_PROXIES "TLS proxies in front of the panel (comma-separated; empty if the proxy runs on this VPS)" check_addr_list
+if [ "$(get RIFT_WEBPANEL_ACCESS)" = public ]; then
+  flag RIFT_WEBPANEL_INSECURE "Allow the password over plain HTTP (test setups only)?"
+else
+  put RIFT_WEBPANEL_INSECURE "$(current RIFT_WEBPANEL_INSECURE)"
+fi
+end_group
+
+# ---------- websites ----------
+heading "Websites (rift add site)"
+# The proxy deploy/setup-proxy set up before, if any.
+existing_proxy=none
+for container in traefik rift-caddy rift-npm; do
+  wd=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$container" 2> /dev/null || true)
+  case $wd in
+    /opt/rift-traefik) existing_proxy=traefik; break ;;
+    /opt/rift-caddy) existing_proxy=caddy; break ;;
+    /opt/rift-npm) existing_proxy=npm; break ;;
+  esac
+done
+if [ -z "$proxy" ]; then
+  note "A reverse proxy serves websites with HTTPS ('rift add site'); it needs ports 80 and 443."
+  ask "Reverse proxy in Docker: traefik, caddy, npm (Nginx Proxy Manager) or none" "$existing_proxy" check_proxy
+  proxy=$answer
+fi
+check_proxy "$proxy" || fail "--proxy: $why"
+migrate=
+if [ "$proxy" != none ] && [ "$existing_proxy" != none ] && [ "$proxy" != "$existing_proxy" ]; then
+  note "$existing_proxy runs now; switching stops it and moves every site to $proxy (new certificates)."
+  yes_no "Switch from $existing_proxy to $proxy?" y || fail "nothing changed"
+  migrate=1
+fi
+if [ "$proxy" = none ] && [ "$existing_proxy" != none ]; then
+  note "$existing_proxy keeps running; this script does not remove it."
 fi
 
-if [ -z "$proxy" ]; then
-  if [ -n "$interactive" ]; then
-    echo "A reverse proxy serves websites with HTTPS ('rift add site'); it needs ports 80 and 443."
-  fi
-  proxy=$(ask "Set up a reverse proxy in Docker: traefik, caddy, npm (Nginx Proxy Manager) or none" none)
+[ "$proxy" != none ] || asking=
+if [ "$proxy" = npm ]; then
+  setting RIFT_LETSENCRYPT_EMAIL "E-mail address for Let's Encrypt and the Nginx Proxy Manager login" is_email
+  flag RIFT_REQUEST_CERTIFICATE "Request a Let's Encrypt certificate for each new site (accepts the Let's Encrypt terms)?"
+else
+  setting RIFT_LETSENCRYPT_EMAIL "E-mail address for Let's Encrypt expiry notices (optional)" maybe_email
+  put RIFT_REQUEST_CERTIFICATE "$(current RIFT_REQUEST_CERTIFICATE)"
 fi
-case $proxy in
-  traefik | caddy | npm | none) ;;
-  *) fail "the proxy is traefik, caddy, npm or none, not $proxy" ;;
-esac
-if [ "$proxy" != none ] && [ -z "$email" ]; then
-  email=$(ask "E-mail address for Let's Encrypt (expiry notices; for npm also its login)" "")
-  [ -n "$email" ] || [ "$proxy" != npm ] || fail "npm needs an e-mail address (--email)"
+setting RIFT_PROXY_SUBNET "Docker network of the proxy (the panel trusts it)" is_net4
+end_group
+for key in RIFT_NPM_EMAIL RIFT_NPM_PASSWORD; do
+  if has_preset "$key"; then
+    setting "$key" ""
+  fi
+done
+[ -z "$(get RIFT_NPM_EMAIL)" ] || is_email "$(get RIFT_NPM_EMAIL)" || fail "RIFT_NPM_EMAIL: $why"
+
+# The panel route of deploy/publish-panel: https://DOMAIN through the proxy.
+current_route=
+if [ -f "$site_state" ]; then
+  current_route=$(sed -n '/"panel": {/,/}/s/.*"host": *"\([^"]*\)".*/\1/p' "$site_state" | head -n 1)
+fi
+if [ -z "$has_publish" ]; then
+  publish=$current_route
+  # A route to a panel that is off goes; with no proxy chosen here the existing one keeps it.
+  [ "$panel" = true ] || publish=
+  if [ "$panel" = true ] && [ "$proxy" != none ]; then
+    note "The panel can also be reached at https://DOMAIN through $proxy, for networks that block"
+    note "WireGuard. Changes are then allowed there: only the password (and the code, if two-factor"
+    note "login is on) protects your network from the internet. Turn two-factor login on."
+    ask "Domain for the panel (empty: not published)" "$current_route" maybe_domain
+    publish=$answer
+  fi
+elif [ "$publish" = - ]; then
+  publish=
+fi
+maybe_domain "$publish" || fail "--publish-panel: $why"
+if [ -n "$publish" ]; then
+  [ "$panel" = true ] || fail "publishing the panel needs the web panel on (--panel)"
+  [ "$proxy" != none ] || [ "$publish" = "$current_route" ] \
+    || fail "publishing the panel needs a proxy (--proxy traefik|caddy|npm)"
+  # deploy/publish-panel allows changes through the proxy.
+  put RIFT_WEBPANEL_CONTROL public
+fi
+
+# ---------- summary ----------
+version=$(get RIFT_VERSION)
+show() {
+  _v=$(get "$1")
+  [ "$_v" = "$(builtin "$1")" ] && [ -n "$_v" ] && _v="$_v (default)"
+  printf '  %-30s %s\n' "$1" "${_v:-(empty)}"
+}
+echo
+echo "Settings:"
+for key in $keys; do
+  case $key in
+    RIFT_WEBPANEL_PASSWORD)
+      if [ -n "$(get "$key")" ]; then
+        printf '  %-30s %s\n' "$key" "(set)"
+      else
+        printf '  %-30s %s\n' "$key" "(generated)"
+      fi
+      ;;
+    RIFT_NPM_PASSWORD) [ -z "$(get "$key")" ] || printf '  %-30s %s\n' "$key" "(set)" ;;
+    RIFT_NPM_EMAIL) [ -z "$(get "$key")" ] || show "$key" ;;
+    *) show "$key" ;;
+  esac
+done
+printf '  %-30s %s\n' "Reverse proxy" "$proxy${migrate:+ (switch from $existing_proxy)}"
+printf '  %-30s %s\n' "Panel published at" "${publish:+https://$publish}${publish:-no}"
+if [ "$version" != latest ]; then
+  echo "The image is pinned to $version; check out the matching tag too: git checkout v$version"
+fi
+if [ -n "$interactive" ]; then
+  yes_no "Set up the server with these values?" y || fail "nothing changed"
 fi
 
 steps=5
-[ "$proxy" = none ] || steps=6
-
-echo
-echo "Endpoint:   $endpoint"
-echo "Public IPs: $public_ips${allow_private:+ (private address behind a NAT)}"
-echo "Web panel:  $panel"
-echo "Proxy:      $proxy${email:+ ($email)}"
-if [ -n "$interactive" ]; then
-  yes_no "Set up the server with these values?" y || fail "nothing changed"
+[ "$proxy" = none ] || steps=$((steps + 1))
+publish_step=
+if [ "$publish" != "$current_route" ]; then
+  steps=$((steps + 1))
+  publish_step=$steps
 fi
 
 echo "1/$steps Preparing the host"
@@ -198,14 +525,24 @@ echo "2/$steps Writing config.toml and .env"
 umask 077
 [ -f "$env_file" ] || cp "$repo_dir/.env.server.example" "$env_file"
 chmod 600 "$env_file"
-. "$script_dir/env.sh"
 put_env COMPOSE_PROFILES server
-put_env RIFT_PUBLIC_ENDPOINT "$endpoint"
-put_env RIFT_PUBLIC_IPS "$public_ips"
-if [ -n "$allow_private" ]; then
-  put_env RIFT_ALLOW_PRIVATE_LISTENERS true
-fi
-put_env RIFT_WEBPANEL "$panel"
+for key in $keys; do
+  value=$(get "$key")
+  case $key in
+    RIFT_PUBLIC_ENDPOINT | RIFT_PUBLIC_IPS | RIFT_WEBPANEL) put_env "$key" "$value" ;;
+    RIFT_NPM_EMAIL | RIFT_NPM_PASSWORD)
+      # deploy/setup-proxy keeps these; only --set changes them here.
+      if has_preset "$key"; then put_env "$key" "$value"; fi
+      ;;
+    *)
+      if [ -z "$value" ] || [ "$value" = "$(builtin "$key")" ]; then
+        default_env "$key" "$(builtin "$key")"
+      else
+        put_env "$key" "$value"
+      fi
+      ;;
+  esac
+done
 umask 022
 
 echo "3/$steps Installing the rift command and the site helper"
@@ -230,26 +567,48 @@ done
 if [ -z "$ready" ]; then
   echo "rift: the server is not ready after two minutes. Its last messages:" >&2
   docker logs --tail 10 rift-server 2>&1 | sed 's/^/  /' >&2
+  echo "rift: fix the setting it names in $env_file, or run this script again." >&2
   exit 1
 fi
 
-proxy_failed=
+failed=
 if [ "$proxy" != none ]; then
-  echo "6/6 Setting up $proxy"
-  sh "$script_dir/setup-proxy" "$proxy" ${email:+--email "$email"} --yes || proxy_failed=1
+  echo "6/$steps Setting up $proxy"
+  email=$(get RIFT_LETSENCRYPT_EMAIL)
+  sh "$script_dir/setup-proxy" "$proxy" ${email:+--email "$email"} ${migrate:+--migrate} --yes \
+    || failed="$proxy was not set up (see above); run: sudo sh deploy/setup-proxy $proxy${migrate:+ --migrate}"
+fi
+if [ -n "$publish_step" ] && [ -z "$failed" ]; then
+  if [ -n "$publish" ]; then
+    echo "$publish_step/$steps Publishing the panel at https://$publish"
+    sh "$script_dir/publish-panel" "$publish" --yes \
+      || failed="the panel was not published (see above); run: sudo sh deploy/publish-panel $publish"
+  else
+    echo "$publish_step/$steps Removing the panel route https://$current_route"
+    sh "$script_dir/publish-panel" --off --yes \
+      || failed="the panel route was not removed (see above); run: sudo sh deploy/publish-panel --off"
+  fi
 fi
 
-wg_port=$(sed -n 's/^RIFT_WG_PORT=\([0-9]*\).*/\1/p' "$env_file" | tail -n 1)
+enrollment_port=$(get RIFT_ENROLLMENT_BIND)
+enrollment_port=${enrollment_port##*:}
+ports="UDP $(get RIFT_WG_PORT) (WireGuard)"
+case $(get RIFT_ENROLLMENT) in
+  auto) ports="$ports, TCP $enrollment_port (agent enrollment, listens only while an invitation is open)" ;;
+  always) ports="$ports, TCP $enrollment_port (agent enrollment)" ;;
+esac
+[ "$panel" = true ] && [ "$(get RIFT_WEBPANEL_ACCESS)" = public ] && ports="$ports, TCP $(get RIFT_WEBPANEL_PORT) (web panel)"
+[ "$proxy" = none ] || ports="$ports, TCP 80 and 443 (websites)"
 echo
 echo "The RIFT server is running."
-echo "Open in your cloud firewall or security group: UDP ${wg_port:-51820} (WireGuard), TCP 8443 (agent enrollment)"
+echo "Open in your cloud firewall or security group: $ports"
 echo "and later the ports of your forwards."
 echo "Next: add an agent with   rift add agent NAME"
 if [ "$panel" = true ]; then
   echo "Web panel: connect a device with   rift panel connect laptop"
+  [ -z "$password_note" ] || echo "Panel password$password_note"
 fi
-if [ -n "$proxy_failed" ]; then
-  echo "The server runs, but $proxy was not set up (see above). Fix that and run:"
-  echo "  sudo sh deploy/setup-proxy $proxy"
+if [ -n "$failed" ]; then
+  echo "The server runs, but $failed" >&2
   exit 1
 fi

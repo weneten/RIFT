@@ -1,14 +1,31 @@
 #!/bin/sh
 # Set up this machine as a RIFT agent in one step, with the line `rift add agent NAME` prints
-# on the server:
+# on the server, or change the settings of an agent later:
 #
 #   sudo sh deploy/join SERVER NAME TOKEN
+#   sudo sh deploy/join
 #
-# Without TOKEN it asks for it, so the token stays out of the shell history. The script
-# prepares the host (deploy/prepare-host), writes config.toml and .env (mode 0600, other
-# settings in an existing agent .env are kept), installs the `rift` command, starts the agent,
-# waits until the server has accepted it and then removes the used token from .env.
-# Safe to run again with a new invitation.
+# It asks for what is missing (SERVER, NAME, the hidden TOKEN, so it stays out of the shell
+# history) and then for every setting of the agent .env, in the order of .env.agent.example:
+# the image and what the server may open on this host (ports, LAN networks, internet exit).
+# Each question offers the value of an existing .env, else RIFT's default (Enter takes it,
+# - clears an optional value). An agent that is already enrolled needs no new token: run it
+# without one to change its settings. Without a terminal, or with --yes, it takes the
+# defaults. Options set values and skip their questions:
+#
+#   --allow-ports LIST      ports the server may open here, e.g. 22/tcp,80,27015-27020/udp
+#                           (RIFT_AGENT_ALLOW_PORTS; empty: no limit)
+#   --allow-subnets LIST    LAN networks VPN devices may reach, e.g. 192.168.178.0/24
+#                           (RIFT_AGENT_ALLOW_SUBNETS; empty: no LAN access)
+#   --exit / --no-exit      offer this host's internet connection as an exit for VPN devices
+#   --version VERSION       the image: latest or a release such as 1.0.0 (RIFT_VERSION)
+#   --set KEY=VALUE         any setting of .env.agent.example; an empty VALUE returns it to
+#                           RIFT's default
+#   --yes                   do not ask; take the defaults
+#
+# Then it prepares the host (deploy/prepare-host), writes config.toml and .env (mode 0600), installs
+# the `rift` command, starts the agent, waits until the server has accepted it and then removes
+# the used token from .env.
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -20,44 +37,202 @@ fail() {
   printf 'rift: %s\n' "$*" >&2
   exit 1
 }
-
 usage() {
-  echo "usage: sudo sh deploy/join SERVER NAME [TOKEN]" >&2
-  echo "  the line that 'rift add agent NAME' prints on the server, for example" >&2
-  echo "  sudo sh deploy/join rift.example.net:8443 node1 v1.eyJ2..." >&2
-  exit 2
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
 }
 
-[ "$#" -ge 2 ] && [ "$#" -le 3 ] || usage
-server=$1
-name=$2
-token=${3-}
-[ "$(id -u)" -eq 0 ] || fail "run as root: sudo sh deploy/join $server $name ..."
-case $server in
-  *:[0-9]*) ;;
-  *) fail "SERVER needs the enrollment port, as printed by 'rift add agent': $server:8443" ;;
-esac
-printf '%s' "$name" | grep -Eq '^[A-Za-z0-9_-]{1,63}$' || fail "NAME may contain letters, digits, - and _ only: $name"
-if [ -z "$token" ]; then
-  [ -t 0 ] || fail "no TOKEN given and no terminal to ask for it"
-  printf 'Invitation token (input hidden): '
-  stty -echo 2> /dev/null || true
-  read -r token || true
-  stty echo 2> /dev/null || true
-  echo
+# The settings in the order of .env.agent.example, and RIFT's default of each.
+keys="RIFT_VERSION RIFT_SERVER RIFT_AGENT_NAME RIFT_ENROLLMENT_TOKEN
+RIFT_AGENT_ALLOW_PORTS RIFT_AGENT_ALLOW_SUBNETS RIFT_AGENT_ALLOW_EXIT"
+builtin() {
+  case $1 in
+    RIFT_VERSION) echo latest ;;
+    RIFT_AGENT_ALLOW_EXIT) echo false ;;
+    *) echo ;;
+  esac
+}
+known_key() {
+  for _k in $keys; do
+    [ "$1" = "$_k" ] && return 0
+  done
+  return 1
+}
+
+. "$script_dir/env.sh"
+. "$script_dir/ask.sh"
+
+# ---------- checks of agent settings (the rules of src/config.rs) ----------
+check_server() {
+  why="the server's name or address with the enrollment port, as printed by 'rift add agent': rift.example.net:8443"
+  case $1 in
+    \[*\]:*) _h=${1%]:*}; _h=${_h#[} ;;
+    *:*:*) return 1 ;;
+    *:*) _h=${1%:*} ;;
+    *) return 1 ;;
+  esac
+  _p=${1##*:}
+  is_host "$_h" && is_port "$_p" || {
+    why="the server's name or address with the enrollment port, as printed by 'rift add agent': rift.example.net:8443"
+    return 1
+  }
+}
+check_name() {
+  why="letters, digits, - and _ only (at most 63)"
+  printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9_-]{1,63}$'
+}
+check_token() {
+  why="this does not look like a RIFT invitation token (it starts with v1.)"
+  case $1 in v1.?*) return 0 ;; esac
+  return 1
+}
+check_port_item() {
+  why="PORT or PORT-PORT, optionally with /tcp, /udp or /both: $1"
+  printf '%s\n' "$1" | grep -Eq '^[0-9]{1,5}(-[0-9]{1,5})?(/(tcp|udp|both))?$' || return 1
+  _r=${1%/*}
+  _a=${_r%-*}
+  _b=${_r#*-}
+  is_port "$_a" && is_port "$_b" || { why="ports are 1 to 65535: $1"; return 1; }
+  [ "$_a" -le "$_b" ] || { why="the range starts above its end: $1"; return 1; }
+}
+check_ports() { is_list check_port_item "$1" empty-ok; }
+check_subnet() {
+  is_net4 "$1" || return 1
+  why="$1 must be a private network (10/8, 172.16/12, 192.168/16) of /8 or smaller"
+  [ "${1#*/}" -ge 8 ] && is_private4 "${1%/*}" || return 1
+  _m=$(mask4 "${1#*/}")
+  _n=$(ip4_int "${1%/*}")
+  why="$1 has host bits set; write it as $(int_ip4 $((_n & _m)))/${1#*/}"
+  [ $((_n & _m)) -eq "$_n" ]
+}
+check_subnets() { is_list check_subnet "$1" empty-ok; }
+
+assume_yes=
+positional=0
+while [ "$#" -gt 0 ]; do
+  case $1 in
+    --allow-ports) [ "$#" -ge 2 ] || fail "--allow-ports needs a value"; preset RIFT_AGENT_ALLOW_PORTS "$2"; shift 2 ;;
+    --allow-subnets) [ "$#" -ge 2 ] || fail "--allow-subnets needs a value"; preset RIFT_AGENT_ALLOW_SUBNETS "$2"; shift 2 ;;
+    --exit) preset RIFT_AGENT_ALLOW_EXIT true; shift ;;
+    --no-exit) preset RIFT_AGENT_ALLOW_EXIT false; shift ;;
+    --version) [ "$#" -ge 2 ] || fail "--version needs a value"; preset RIFT_VERSION "$2"; shift 2 ;;
+    --set)
+      [ "$#" -ge 2 ] || fail "--set needs KEY=VALUE"
+      case $2 in *=*) ;; *) fail "--set needs KEY=VALUE, not $2" ;; esac
+      known_key "${2%%=*}" || fail "--set: ${2%%=*} is not an agent setting (see .env.agent.example)"
+      preset "${2%%=*}" "${2#*=}"
+      shift 2
+      ;;
+    --yes | -y) assume_yes=1; shift ;;
+    -h | --help) usage; exit 0 ;;
+    -*) fail "unknown option $1 (see sh deploy/join --help)" ;;
+    *)
+      positional=$((positional + 1))
+      case $positional in
+        1) preset RIFT_SERVER "$1" ;;
+        2) preset RIFT_AGENT_NAME "$1" ;;
+        3) preset RIFT_ENROLLMENT_TOKEN "$1" ;;
+        *) fail "too many arguments; usage: sudo sh deploy/join [SERVER NAME [TOKEN]] [options]" ;;
+      esac
+      shift
+      ;;
+  esac
+done
+[ "$(id -u)" -eq 0 ] || fail "run as root: sudo sh deploy/join ..."
+
+interactive=
+if [ -z "$assume_yes" ] && [ -t 0 ] && [ -t 1 ]; then
+  interactive=1
 fi
-case $token in
-  v1.?*) ;;
-  *) fail "this does not look like a RIFT invitation token (it starts with v1.)" ;;
-esac
 
 command -v docker > /dev/null 2>&1 \
   || fail "Docker is not installed. Install it first, for example: curl -fsSL https://get.docker.com | sh"
 docker compose version > /dev/null 2>&1 || fail "Docker Compose v2 ('docker compose') is missing"
 docker info > /dev/null 2>&1 || fail "Docker does not answer; is the docker service running?"
 
-if [ -f "$env_file" ] && grep -Eq '^COMPOSE_PROFILES=server' "$env_file"; then
-  fail "$env_file belongs to a RIFT server; an agent needs its own checkout or machine"
+env_existed=
+if [ -f "$env_file" ]; then
+  grep -Eq '^COMPOSE_PROFILES=server' "$env_file" \
+    && fail "$env_file belongs to a RIFT server; an agent needs its own checkout or machine"
+  env_existed=1
+fi
+# An agent enrolled before keeps its identity in the state volume and needs no new token.
+enrolled=
+if [ -n "$env_existed" ] && docker volume inspect rift_rift-state > /dev/null 2>&1; then
+  enrolled=1
+fi
+
+if [ -n "$interactive" ]; then
+  echo "Enter takes the value in brackets; - clears an optional value."
+fi
+
+# ---------- image ----------
+heading "Image"
+setting RIFT_VERSION "Image version: latest (follows main) or a release such as 1.0.0" is_version
+
+# ---------- invitation ----------
+heading "Invitation (from 'rift add agent NAME' on the server)"
+[ -n "$interactive" ] || has_preset RIFT_SERVER || [ -n "$(current RIFT_SERVER)" ] \
+  || fail "usage: sudo sh deploy/join SERVER NAME [TOKEN], as printed by 'rift add agent NAME'"
+setting RIFT_SERVER "Server with enrollment port (SERVER:8443)" check_server
+setting RIFT_AGENT_NAME "Agent name" check_name
+# A token left in .env by a run that did not finish is used again unless another one is given.
+stored_token=$(current RIFT_ENROLLMENT_TOKEN)
+if has_preset RIFT_ENROLLMENT_TOKEN; then
+  setting RIFT_ENROLLMENT_TOKEN "" check_token
+elif [ -n "$interactive" ]; then
+  while :; do
+    if [ -n "$stored_token" ]; then
+      secret "Invitation token (hidden; Enter uses the one in .env)"
+      [ -n "$answer" ] || { answer=$stored_token; break; }
+    elif [ -n "$enrolled" ]; then
+      secret "Invitation token (hidden; Enter keeps the existing enrollment)"
+      [ -n "$answer" ] || break
+    else
+      secret "Invitation token (hidden)"
+    fi
+    check_token "$answer" && break
+    printf '    %s\n' "$why" > /dev/tty
+  done
+  put RIFT_ENROLLMENT_TOKEN "$answer"
+else
+  put RIFT_ENROLLMENT_TOKEN "$stored_token"
+fi
+if [ -z "$(get RIFT_ENROLLMENT_TOKEN)" ] && [ -z "$enrolled" ]; then
+  fail "no TOKEN given and this host has no enrolled agent; give the token printed by 'rift add agent'"
+fi
+
+# ---------- limits ----------
+heading "What the server may open on this host"
+note "These limits hold even against a compromised server. Empty ports: no limit."
+setting RIFT_AGENT_ALLOW_PORTS "Ports (comma-separated, e.g. 22/tcp,80,443,27015-27020/udp)" check_ports
+# LAN networks of this host as a hint; the default stays no LAN access.
+lans=$(ip -4 route show scope link 2> /dev/null \
+  | awk '$1 ~ /\// && $0 !~ / dev (rift|docker|br-|veth|virbr|cni|flannel|wg)/ {print $1}' \
+  | while read -r net; do check_subnet "$net" && printf '%s\n' "$net"; done | paste -sd, - || true)
+note "LAN networks VPN devices may reach through this agent (VPN network grants); empty: none."
+[ -z "$lans" ] || note "Networks on this host: $lans"
+setting RIFT_AGENT_ALLOW_SUBNETS "LAN networks (comma-separated)" check_subnets
+note "An internet exit lets VPN devices use this host's internet connection; they are masqueraded"
+note "and reach no private network except the ones above."
+flag RIFT_AGENT_ALLOW_EXIT "Offer this host as an internet exit for VPN devices?"
+
+# ---------- summary ----------
+server=$(get RIFT_SERVER)
+name=$(get RIFT_AGENT_NAME)
+token=$(get RIFT_ENROLLMENT_TOKEN)
+version=$(get RIFT_VERSION)
+echo
+echo "Settings:"
+printf '  %-26s %s\n' RIFT_VERSION "$version" RIFT_SERVER "$server" RIFT_AGENT_NAME "$name"
+printf '  %-26s %s\n' RIFT_ENROLLMENT_TOKEN "$([ -n "$token" ] && echo '(new invitation)' || echo '(enrolled before)')"
+printf '  %-26s %s\n' RIFT_AGENT_ALLOW_PORTS "${val_RIFT_AGENT_ALLOW_PORTS:-(no limit)}"
+printf '  %-26s %s\n' RIFT_AGENT_ALLOW_SUBNETS "${val_RIFT_AGENT_ALLOW_SUBNETS:-(no LAN access)}"
+printf '  %-26s %s\n' RIFT_AGENT_ALLOW_EXIT "$(get RIFT_AGENT_ALLOW_EXIT)"
+if [ "$version" != latest ]; then
+  echo "The image is pinned to $version; check out the matching tag too: git checkout v$version"
+fi
+if [ -n "$interactive" ]; then
+  yes_no "Set up the agent with these values?" y || fail "nothing changed"
 fi
 
 echo "1/5 Preparing the host"
@@ -68,11 +243,20 @@ echo "2/5 Writing config.toml and .env"
 umask 077
 [ -f "$env_file" ] || cp "$repo_dir/.env.agent.example" "$env_file"
 chmod 600 "$env_file"
-. "$script_dir/env.sh"
 put_env COMPOSE_PROFILES agent
-put_env RIFT_SERVER "$server"
-put_env RIFT_AGENT_NAME "$name"
-put_env RIFT_ENROLLMENT_TOKEN "$token"
+for key in $keys; do
+  value=$(get "$key")
+  case $key in
+    RIFT_SERVER | RIFT_AGENT_NAME | RIFT_ENROLLMENT_TOKEN) put_env "$key" "$value" ;;
+    *)
+      if [ -z "$value" ] || [ "$value" = "$(builtin "$key")" ]; then
+        default_env "$key" "$(builtin "$key")"
+      else
+        put_env "$key" "$value"
+      fi
+      ;;
+  esac
+done
 umask 022
 
 echo "3/5 Installing the rift command"
@@ -98,11 +282,15 @@ done
 if [ -z "$active" ]; then
   echo "rift: the agent is not active after two minutes. Its last messages:" >&2
   docker logs --tail 10 rift-agent 2>&1 | sed 's/^/  /' >&2
-  echo "rift: the token stays in $env_file; fix the cause and run 'docker compose up -d' or this script again." >&2
+  [ -z "$token" ] || echo "rift: the token stays in $env_file; fix the cause and run 'docker compose up -d' or this script again." >&2
   exit 1
 fi
 
-# The invitation is used up and an active agent ignores it; it has no reason to stay on disk.
-put_env RIFT_ENROLLMENT_TOKEN ""
-echo "Agent $name is active. The used token was removed from .env."
+if [ -n "$token" ]; then
+  # The invitation is used up and an active agent ignores it; it has no reason to stay on disk.
+  put_env RIFT_ENROLLMENT_TOKEN ""
+  echo "Agent $name is active. The used token was removed from .env."
+else
+  echo "Agent $name is active with the new settings."
+fi
 echo "On the server, 'rift list agents' shows it; publish ports with 'rift add forward $name ...'."
