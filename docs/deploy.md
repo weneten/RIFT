@@ -92,6 +92,23 @@ Some release gates need real machines: a real cloud NAT, a host reboot, other fi
 | Proxmox LXC | Set up an agent in an LXC container as in the README section, then run the basic check inside it, before and after a reboot of the container. Restarting only the container is enough (the check notices it by the container's own init); rebooting the Proxmox host is the stricter test. | The reports. |
 | Throughput | On the server: `sudo sh deploy/field-check --perf AGENT CLIENT_IP`. It asks, adds the forward `5201/both` open only to `CLIENT_IP`, prints the iperf3 commands for agent, server and client, takes the client's pasted summary lines into the report and removes the forward. | The report, plus the CPU and link of each host. |
 
+### Results so far
+
+Field checks of 2026-11-18, with the `main` image of that day (commit `07782f3`); one server and two agents.
+
+| Gate | Host | Result |
+|---|---|---|
+| Basics | Server: Ubuntu 24.04 VPS, public address on the interface | Passed: restart policy, Docker at boot, WireGuard module, forwarding sysctls, nftables table, whole configuration applied. |
+| Basics | Agent: Ubuntu Server on bare metal | Passed, agent active. |
+| Basics | Agent: Ubuntu 26.04 (kernel 7.0) in a Hyper-V VM | Passed, agent active. |
+| Host reboot | Server | Passed: both agents online again, all 7 forwards enabled, `rift0` and the nftables table back at the first check after boot, without help. |
+| Host reboot | Both agents | Passed: nftables table, `rift0`, policy rule and active state back at the first check after boot. |
+| Traffic after reboot | Forwards of the agents, from a mobile network | Answered. |
+| Real cloud NAT | — | **Not tested.** Covered only by the simulated 1:1 NAT in the namespace harness (see Cloud NAT above). |
+| Firewalls (firewalld, Oracle image) | — | **Not tested.** |
+| Proxmox LXC | — | **Not tested** on a real host; `deploy/prepare-host` and the README describe the setup. |
+| Throughput | — | **Not measured.** No performance numbers are published. |
+
 ## Reproducible performance procedure
 
 Do not publish benchmark numbers without collecting them. On the same Linux host pair and with the same CPU allocation, run `iperf3` directly over the underlay and then over the WireGuard path for IPv4 and IPv6, TCP and UDP. Record the kernel, CPU, image digest, MTU, test duration, number of parallel streams, and tunnel state. Use a warm-up, then at least three measured runs for each case; repeat with three agents active. Report throughput, RTT/jitter/loss (UDP), CPU utilization, and any handshakes/retransmits. Verify the normal unmarked baseline separately so throughput changes are not mistaken for routing correctness.
