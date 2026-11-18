@@ -91,6 +91,7 @@ known_key() {
 
 . "$script_dir/env.sh"
 . "$script_dir/ask.sh"
+. "$script_dir/proxy-net.sh"
 
 # ---------- checks of server settings (the rules of src/config.rs) ----------
 control_port=8444
@@ -635,18 +636,17 @@ current_route=
 if [ -f "$site_state" ]; then
   current_route=$(sed -n '/"panel": {/,/}/s/.*"host": *"\([^"]*\)".*/\1/p' "$site_state" | head -n 1)
 fi
-# deploy/publish-panel needs a proxy container in RIFT_PROXY_SUBNET (a proxy on the host
-# reaches the panel on loopback). Containers of deploy/setup-proxy always are; check your own.
+# A proxy of your own in Docker reaches the panel from the network its routing picks;
+# deploy/publish-panel trusts that network (README: Reach the panel over HTTPS).
 publish_blocked=
+publish_trust=
 if [ "$proxy" = own ] && [ -n "$foreign_container" ]; then
-  in_subnet=
-  for address in $(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$foreign_container" 2> /dev/null || true); do
-    if is_ip4 "$address" && overlap4 "$address" "$(get RIFT_PROXY_SUBNET)"; then
-      in_subnet=1
-    fi
-  done
-  [ -n "$in_subnet" ] \
-    || publish_blocked="a panel domain needs the proxy container in $(get RIFT_PROXY_SUBNET); $foreign_container is not (README: Reach the panel over HTTPS)"
+  panel_source_net "$foreign_container" "$(get RIFT_SERVER_IPV4)"
+  if [ -z "$source_net" ]; then
+    publish_blocked="it is unclear from which address $foreign_container reaches the panel (nsenter and ip are needed)"
+  elif [ "$source_net" != "$(get RIFT_PROXY_SUBNET)" ]; then
+    publish_trust="$foreign_container reaches the panel from its Docker network $source_net; the panel trusts that network as its proxy (its containers reach the login like anyone through the domain)"
+  fi
 fi
 proxy_name=$proxy
 [ "$proxy" != own ] || proxy_name="your $own_kind"
@@ -661,6 +661,7 @@ if [ -z "$has_publish" ]; then
       "$([ -n "$current_route" ] && echo y || echo n)"; then
       ask "Domain for the panel (its A record points at this server)" "$current_route" is_domain
       publish=$answer
+      [ -z "$publish_trust" ] || note "$publish_trust."
     else
       publish=
       [ -z "$current_route" ] || note "The route https://$current_route is removed."

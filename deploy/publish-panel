@@ -54,6 +54,8 @@ env_value() { sed -n "s/^$1=//p" "$env_file" | tail -n 1; }
 
 umask 077
 . "$script_dir/env.sh"
+. "$script_dir/ask.sh"
+. "$script_dir/proxy-net.sh"
 
 restart_server() {
   echo "Restarting the server with the new panel settings"
@@ -66,16 +68,39 @@ restart_server() {
   done
 }
 
-# Removes $subnet from a comma-separated list setting, if it is there.
-without_subnet() {
-  printf '%s' "$1" | tr ',' '\n' | grep -vx "$subnet" | paste -sd, -
+# A comma-separated list setting with or without the network $2.
+without_net() {
+  printf '%s' "$1" | tr ',' '\n' | grep -vxF "$2" | paste -sd, -
 }
+with_net() {
+  case ",$1," in
+    *",$2,"*) printf '%s' "$1" ;;
+    ",,") printf '%s' "$2" ;;
+    *) printf '%s,%s' "$1" "$2" ;;
+  esac
+}
+
+# A proxy on the host reaches the panel on loopback, which needs no entry. A proxy in a
+# Docker container reaches it on the server's tunnel address, from the network its own
+# routing picks: deploy/setup-proxy's network ($subnet), or the network of your own proxy.
+# That network goes into RIFT_WEBPANEL_PROXIES and RIFT_WEBPANEL_ALLOW. Containers in it can
+# then reach the panel's login like anyone can through https://DOMAIN.
+holder=$(docker ps --format '{{.Names}} {{.Ports}}' | awk 'index($0, ":443->") {print $1; exit}')
+server_ip=$(env_value RIFT_SERVER_IPV4)
+trust_net=
+if [ -n "$holder" ]; then
+  panel_source_net "$holder" "${server_ip:-10.13.0.1}"
+  trust_net=$source_net
+fi
 
 if [ -n "$off" ]; then
   "$site_helper" panel-route --off
   put_env RIFT_WEBPANEL_CONTROL private
-  put_env RIFT_WEBPANEL_PROXIES "$(without_subnet "$(env_value RIFT_WEBPANEL_PROXIES)")"
-  put_env RIFT_WEBPANEL_ALLOW "$(without_subnet "$(env_value RIFT_WEBPANEL_ALLOW)")"
+  for key in RIFT_WEBPANEL_PROXIES RIFT_WEBPANEL_ALLOW; do
+    value=$(without_net "$(env_value "$key")" "$subnet")
+    [ -z "$trust_net" ] || value=$(without_net "$value" "$trust_net")
+    put_env "$key" "$value"
+  done
   restart_server
   echo "The panel is no longer published; through a proxy it is read-only again."
   exit 0
@@ -84,16 +109,8 @@ fi
 printf '%s\n' "$domain" | grep -Eq '^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$' \
   || fail "not a domain name: $domain"
 
-# A proxy in a Docker container reaches the panel from its network, which must be the fixed
-# one deploy/setup-proxy gives it; a proxy on the host comes from loopback.
-holder=$(docker ps --format '{{.Names}} {{.Ports}}' | awk 'index($0, ":443->") {print $1; exit}')
-in_container=
-if [ -n "$holder" ]; then
-  in_container=1
-  address=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$holder" | awk '{print $1}')
-  python3 -c 'import ipaddress, sys; sys.exit(0 if ipaddress.ip_address(sys.argv[1]) in ipaddress.ip_network(sys.argv[2]) else 1)' \
-    "${address:-0.0.0.0}" "$subnet" 2> /dev/null \
-    || fail "the proxy container $holder is not in the proxy network $subnet. Run sudo sh deploy/setup-proxy for it once more (it gives the network that range), then this again"
+if [ -n "$holder" ] && [ -z "$trust_net" ]; then
+  fail "cannot tell from which address the proxy container $holder reaches the panel (nsenter and ip are needed on this host)"
 fi
 
 if [ -z "$assume_yes" ] && [ -t 0 ] && [ -t 1 ]; then
@@ -110,22 +127,15 @@ if [ -z "$assume_yes" ] && [ -t 0 ] && [ -t 1 ]; then
   case $reply in [yY]*) ;; *) fail "nothing changed" ;; esac
 fi
 
-add_subnet() {
-  case ",$1," in
-    *",$subnet,"*) printf '%s' "$1" ;;
-    ",,") printf '%s' "$subnet" ;;
-    *) printf '%s,%s' "$1" "$subnet" ;;
-  esac
-}
 put_env RIFT_WEBPANEL true
 if [ -z "$read_only" ]; then
   put_env RIFT_WEBPANEL_CONTROL public
 elif [ "$(env_value RIFT_WEBPANEL_CONTROL)" != off ]; then
   put_env RIFT_WEBPANEL_CONTROL private
 fi
-if [ -n "$in_container" ]; then
-  put_env RIFT_WEBPANEL_PROXIES "$(add_subnet "$(env_value RIFT_WEBPANEL_PROXIES)")"
-  put_env RIFT_WEBPANEL_ALLOW "$(add_subnet "$(env_value RIFT_WEBPANEL_ALLOW)")"
+if [ -n "$trust_net" ]; then
+  put_env RIFT_WEBPANEL_PROXIES "$(with_net "$(env_value RIFT_WEBPANEL_PROXIES)" "$trust_net")"
+  put_env RIFT_WEBPANEL_ALLOW "$(with_net "$(env_value RIFT_WEBPANEL_ALLOW)" "$trust_net")"
 fi
 umask 022
 restart_server
@@ -134,6 +144,10 @@ restart_server
 
 echo
 echo "The panel is at https://$domain once the domain's A record points at this server."
+if [ -n "$trust_net" ] && [ "$trust_net" != "$subnet" ]; then
+  echo "The proxy container $holder reaches the panel from its Docker network $trust_net, which the"
+  echo "panel now trusts as its proxy. If that network is recreated with another range, run this again."
+fi
 if [ -n "$read_only" ]; then
   echo "It is read-only there; change things on the VPS, through an SSH tunnel or from a panel"
   echo "VPN device (rift panel connect). Allow changes there with: sudo sh deploy/publish-panel $domain"
