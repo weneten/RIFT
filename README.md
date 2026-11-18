@@ -357,23 +357,25 @@ RIFT forwards ports; a reverse proxy on the server provides hostname routing and
 sudo sh deploy/setup-proxy caddy --email you@example.net
 ```
 
-| | `traefik` | `caddy` | `nginx` |
+| | `traefik` | `caddy` | `npm` (Nginx Proxy Manager) |
 | --- | --- | --- | --- |
-| Runs | in Docker, `/opt/rift-traefik` | from the distribution (apt) | from the distribution (apt), with certbot |
-| Certificates | Traefik (Let's Encrypt, HTTP challenge) | Caddy itself | certbot, run by `rift add site` |
-| Host | any with Docker | Debian or Ubuntu | Debian or Ubuntu |
+| Runs in Docker under | `/opt/rift-traefik` | `/opt/rift-caddy` | `/opt/rift-npm` |
+| Certificates | Traefik (Let's Encrypt) | Caddy (Let's Encrypt) | Nginx Proxy Manager (Let's Encrypt) |
+| Configure your own sites | Traefik's file provider in `dynamic/` | `caddy/Caddyfile` | web interface on `127.0.0.1:81` |
 
-Each is set up the way `rift add site` expects it and becomes the helper's default proxy. Ports 80 and 443 must be free; the script refuses to take them from another program. The address (`--email`) is for Let's Encrypt's expiry notices; it is stored as `RIFT_LETSENCRYPT_EMAIL` in the server `.env`. With UFW active, the script allows TCP 80 and 443 for Caddy and Nginx. Open both in your cloud firewall too. Then:
+All three run in Docker, which every RIFT server has, so they work on any distribution. Each is set up the way `rift add site` expects it and becomes the helper's default proxy. Ports 80 and 443 must be free; the script refuses to take them from another program. `--email` is the address for Let's Encrypt's expiry notices, stored as `RIFT_LETSENCRYPT_EMAIL` in the server `.env`. For `npm` it is required: it is also the login of the web interface. The script then creates that login with a random password, stores both as `RIFT_NPM_EMAIL` and `RIFT_NPM_PASSWORD` in `.env` (which `rift add site` uses for the API) and checks them. The web interface listens on the server only; open it through an SSH tunnel (`ssh -L 8181:127.0.0.1:81 root@SERVER`, then `http://127.0.0.1:8181`). Nginx Proxy Manager writes that first password once into its container log (`docker logs rift-npm`); if you change it in the interface, change it in `.env` too.
+
+Open TCP 80 and 443 in your cloud firewall. Then, once the domain's A record (and AAAA, if you publish IPv6) points at the server:
 
 ```sh
 sudo rift add site node1 app.example.net 8080
 ```
 
-once the domain's A record (and AAAA, if you publish IPv6) points at the server; see [Add a site](#add-a-site).
+See [Add a site](#add-a-site).
 
 ### Set up a proxy by hand
 
-Use this for an existing proxy, or to see what `setup-proxy` writes. The helper needs:
+Use this for a proxy you already run, or to see what `setup-proxy` writes. `rift add site` needs:
 
 - **Traefik** in Docker with the container name `traefik`, a watched file provider and the entry points and resolver below. The helper writes one file per site into the host directory mounted at `/dynamic`. A Traefik started from Compose without a file provider is converted on the first `rift add site` (see below).
 
@@ -399,7 +401,7 @@ Use this for an existing proxy, or to see what `setup-proxy` writes. The helper 
         - ./letsencrypt:/letsencrypt
   ```
 
-- **Caddy** on the host, reloaded with `caddy reload --config /etc/caddy/Caddyfile`. The helper writes `/etc/caddy/rift-sites/DOMAIN.caddy`; the Caddyfile imports them:
+- **Caddy** whose Caddyfile imports the site files the helper writes, one `DOMAIN.caddy` per site:
 
   ```text
   {
@@ -409,15 +411,34 @@ Use this for an existing proxy, or to see what `setup-proxy` writes. The helper 
   import /etc/caddy/rift-sites/*.caddy
   ```
 
-- **Nginx** on the host, reloaded with `nginx -s reload`, with `certbot` and its Nginx plugin for certificates. The helper writes `/etc/nginx/rift-sites/DOMAIN.conf`; include them in the `http` block, for example as `/etc/nginx/conf.d/rift-sites.conf`:
+  In Docker, mount a host directory with the Caddyfile and a `rift-sites` directory at `/etc/caddy` and tell the helper which container to reload:
 
-  ```nginx
-  include /etc/nginx/rift-sites/*.conf;
+  ```yaml
+  services:
+    caddy:
+      image: caddy:2.8-alpine
+      container_name: rift-caddy
+      restart: unless-stopped
+      ports:
+        - "80:80"
+        - "443:443"
+      volumes:
+        - ./caddy:/etc/caddy:ro
+        - ./data:/data
+        - ./config:/config
   ```
 
-- **Nginx Proxy Manager** through its API; see below.
+  ```sh
+  sudo rift proxy caddy --container rift-caddy --sites-dir /opt/rift-caddy/caddy/rift-sites
+  ```
 
-The proxy reaches a site's forward at the server's first public IPv4 address (from `RIFT_PUBLIC_IPS`) and the allocated port. That forward has `--ingress local`: it answers the proxy, from a Docker bridge or from the host itself, but not the internet, so the allocated ports need not and should not be opened in a firewall. The reload commands and paths above can be changed in `/var/lib/rift-site/sites.json` for other layouts. Back up an existing proxy configuration before the first `rift add site`.
+  A Caddy installed on the host itself instead needs the files in `/etc/caddy/rift-sites` and is reloaded with `caddy reload --config /etc/caddy/Caddyfile` (`sudo rift proxy caddy`).
+
+- **Nginx Proxy Manager** with its API on `http://127.0.0.1:81` and its admin login as `RIFT_NPM_EMAIL` and `RIFT_NPM_PASSWORD` in the server `.env`; see below.
+
+- **Nginx** installed on the host itself, with `certbot` and its Nginx plugin. The helper writes `/etc/nginx/rift-sites/DOMAIN.conf`, runs `nginx -t`, `nginx -s reload` and `certbot --nginx`; include the files in the `http` block, for example as `/etc/nginx/conf.d/rift-sites.conf` with `include /etc/nginx/rift-sites/*.conf;`. `setup-proxy` does not install plain Nginx: in Docker it would need a separate certbot and its renewal; use Nginx Proxy Manager for that.
+
+The proxy reaches a site's forward at the server's first public IPv4 address (from `RIFT_PUBLIC_IPS`) and the allocated port. That forward has `--ingress local`: it answers the proxy, from a Docker network or from the host itself, but not the internet, so the allocated ports need not and should not be opened in a firewall. The reload commands and paths above can be changed in `/var/lib/rift-site/sites.json` for other layouts. Back up an existing proxy configuration before the first `rift add site`.
 
 ### Using the site commands
 
@@ -867,7 +888,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | `rift add site AGENT DOMAIN PORT [traefik\|caddy\|nginx\|npm] [--allow-from ADDRESS[,NETWORK...]]` | Publishes `https://DOMAIN` through your reverse proxy to `PORT` on the agent. Without a proxy word the default is used. With `--allow-from` the proxy answers other clients with 403. |
 | `rift list sites` | All sites with their forward state (`ok`, `missing`, `refused`). |
 | `rift remove site DOMAIN` | Removes the site, its proxy configuration and its forward. |
-| `rift proxy [traefik\|caddy\|nginx\|npm]` | Shows or sets the default proxy. |
+| `rift proxy [traefik\|caddy\|nginx\|npm] [--container NAME --sites-dir DIR]` | Shows or sets the default proxy; with the options, Caddy runs in that container and reads the site files from that host directory. `sudo sh deploy/setup-proxy traefik\|caddy\|npm` sets up a proxy in Docker. |
 
 The web panel runs `add site`, `remove site`, `export`, `import` and `backup` through the host service (`rift-site-queue.path`, installed by `deploy/install-cli`); see [Web panel](#web-panel).
 

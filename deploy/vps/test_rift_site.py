@@ -1019,6 +1019,39 @@ class BackupTests(unittest.TestCase):
                 rift_site.command_restore(["x.tar.gz", "--yes"])
 
 
+class ProxyCommandTests(unittest.TestCase):
+    def run_main(self, *args):
+        saved = {}
+        with mock.patch.object(rift_site, "load_state", return_value=rift_site.default_state("203.0.113.10")), \
+                mock.patch.object(rift_site, "save_state", side_effect=lambda s: saved.update(s)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rift_site.main(["rift-site", "proxy", *args])
+        return saved
+
+    def test_caddy_in_a_container_is_reloaded_there(self):
+        state = self.run_main("caddy", "--container", "rift-caddy", "--sites-dir", "/opt/rift-caddy/sites")
+        self.assertEqual(state["proxy"], "caddy")
+        self.assertEqual(state["caddy"]["sites_dir"], "/opt/rift-caddy/sites")
+        self.assertEqual(
+            state["caddy"]["reload"],
+            ["docker", "exec", "rift-caddy", "caddy", "reload", "--config", "/etc/caddy/Caddyfile"],
+        )
+        # Without the options the host's Caddy stays the default.
+        self.assertEqual(self.run_main("caddy")["caddy"]["reload"][0], "caddy")
+
+    def test_container_options_are_checked(self):
+        for args in (
+            ("traefik", "--container", "x", "--sites-dir", "/x"),
+            ("caddy", "--container", "a;b", "--sites-dir", "/x"),
+            ("caddy", "--container", "rift-caddy", "--sites-dir", "relative"),
+            ("caddy", "--container", "rift-caddy", "--sites-dir", "/opt/../etc"),
+            ("caddy", "--container", "rift-caddy"),
+            ("caddy", "--name", "x", "--sites-dir", "/x"),
+        ):
+            with self.assertRaises(rift_site.SiteError, msg=args):
+                self.run_main(*args)
+
+
 class RemoveTests(unittest.TestCase):
     def test_remove_says_what_it_removed(self):
         state = {"sites": {"pd.example.net": {"agent": "PP", "proxy": "traefik", "forward_id": 9}}}

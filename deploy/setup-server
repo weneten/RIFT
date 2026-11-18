@@ -11,8 +11,8 @@
 #   --endpoint NAME_OR_IP   the DNS name or address agents dial (default: the public IPv4)
 #   --public-ips LIST       comma-separated addresses on this machine that forwards listen on
 #   --panel / --no-panel    turn the web panel on (private: over the VPN only) or off
-#   --proxy NAME            also set up a reverse proxy for websites: traefik, caddy, nginx
-#                           or none (deploy/setup-proxy)
+#   --proxy NAME            also set up a reverse proxy for websites in Docker: traefik, caddy,
+#                           npm (Nginx Proxy Manager) or none (deploy/setup-proxy)
 #   --email ADDRESS         the Let's Encrypt address for that proxy
 #   --yes                   do not ask; take the detected values (and no proxy)
 #
@@ -167,14 +167,15 @@ if [ -z "$proxy" ]; then
   if [ -n "$interactive" ]; then
     echo "A reverse proxy serves websites with HTTPS ('rift add site'); it needs ports 80 and 443."
   fi
-  proxy=$(ask "Set up a reverse proxy: traefik (Docker), caddy or nginx (apt), or none" none)
+  proxy=$(ask "Set up a reverse proxy in Docker: traefik, caddy, npm (Nginx Proxy Manager) or none" none)
 fi
 case $proxy in
-  traefik | caddy | nginx | none) ;;
-  *) fail "the proxy is traefik, caddy, nginx or none, not $proxy" ;;
+  traefik | caddy | npm | none) ;;
+  *) fail "the proxy is traefik, caddy, npm or none, not $proxy" ;;
 esac
 if [ "$proxy" != none ] && [ -z "$email" ]; then
-  email=$(ask "E-mail address for Let's Encrypt (expiry notices; Enter for none)" "")
+  email=$(ask "E-mail address for Let's Encrypt (expiry notices; for npm also its login)" "")
+  [ -n "$email" ] || [ "$proxy" != npm ] || fail "npm needs an e-mail address (--email)"
 fi
 
 steps=5

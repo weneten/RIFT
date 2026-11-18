@@ -1,26 +1,28 @@
 #!/bin/sh
-# Set up a reverse proxy on the RIFT server for websites with HTTPS (`rift add site`):
+# Set up a reverse proxy in Docker on the RIFT server, for websites with HTTPS (`rift add site`):
 #
-#   sudo sh deploy/setup-proxy traefik|caddy|nginx [--email ADDRESS] [--yes]
+#   sudo sh deploy/setup-proxy traefik|caddy|npm [--email ADDRESS] [--yes]
 #
-#   traefik   Traefik in Docker (/opt/rift-traefik), certificates from Let's Encrypt
-#   caddy     Caddy from the distribution (apt), certificates from Let's Encrypt by Caddy
-#   nginx     Nginx and certbot from the distribution (apt); `rift add site` runs certbot
+#   traefik   Traefik (/opt/rift-traefik); certificates from Let's Encrypt
+#   caddy     Caddy (/opt/rift-caddy); certificates from Let's Encrypt
+#   npm       Nginx Proxy Manager (/opt/rift-npm), with its web interface on 127.0.0.1:81;
+#             certificates from Let's Encrypt
 #
-#   --email ADDRESS   address for Let's Encrypt (expiry notices); stored as
-#                     RIFT_LETSENCRYPT_EMAIL in .env
+#   --email ADDRESS   address for Let's Encrypt (expiry notices), stored as
+#                     RIFT_LETSENCRYPT_EMAIL in .env; for npm also its admin login (required)
 #   --yes             do not ask
 #
 # Each one is set up the way `rift add site` expects it, so the next step is
 # `rift add site AGENT DOMAIN PORT`. Ports 80 and 443 must be free (or held by the same proxy,
-# set up by this script before). Caddy and Nginx need a Debian or Ubuntu host. Safe to run again.
+# set up by this script before). Safe to run again: existing settings are kept.
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 env_file=$repo_dir/.env
-traefik_dir=/opt/rift-traefik
 traefik_image=traefik:v3.3
+caddy_image=caddy:2.8-alpine
+npm_image=jc21/nginx-proxy-manager:2.17.0
 
 fail() {
   printf 'rift: %s\n' "$*" >&2
@@ -32,95 +34,94 @@ email=
 assume_yes=
 while [ "$#" -gt 0 ]; do
   case $1 in
-    traefik | caddy | nginx) [ -z "$proxy" ] || fail "name one proxy"; proxy=$1; shift ;;
+    traefik | caddy | npm) [ -z "$proxy" ] || fail "name one proxy"; proxy=$1; shift ;;
+    nginx) fail "plain Nginx is not set up by this script; use npm (Nginx Proxy Manager), or your own Nginx as in the README" ;;
     --email) [ "$#" -ge 2 ] || fail "--email needs a value"; email=$2; shift 2 ;;
     --yes | -y) assume_yes=1; shift ;;
-    -h | --help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) fail "unknown argument $1 (see sh deploy/setup-proxy --help)" ;;
   esac
 done
-[ -n "$proxy" ] || fail "name the proxy: sh deploy/setup-proxy traefik|caddy|nginx"
+[ -n "$proxy" ] || fail "name the proxy: sh deploy/setup-proxy traefik|caddy|npm"
 [ "$(id -u)" -eq 0 ] || fail "run as root: sudo sh deploy/setup-proxy $proxy"
 [ -f "$env_file" ] && grep -Eq '^COMPOSE_PROFILES=server' "$env_file" \
   || fail "no RIFT server here ($env_file); run sudo sh deploy/setup-server first"
 command -v rift > /dev/null 2>&1 && [ -x /usr/local/lib/rift/rift-site ] \
   || fail "the rift command and its site helper are missing; run sudo sh deploy/install-cli first"
+docker info > /dev/null 2>&1 || fail "Docker does not answer; is the docker service running?"
 
 interactive=
 if [ -z "$assume_yes" ] && [ -t 0 ] && [ -t 1 ]; then
   interactive=1
 fi
 
+case $proxy in
+  traefik) dir=/opt/rift-traefik; container=traefik ;;
+  caddy) dir=/opt/rift-caddy; container=rift-caddy ;;
+  npm) dir=/opt/rift-npm; container=rift-npm ;;
+esac
+
 # ---------- ports 80 and 443 ----------
 # Who holds a port: a container name, or the process name of a host program.
 holder() {
   port=$1
-  if command -v docker > /dev/null 2>&1; then
-    name=$(docker ps --format '{{.Names}} {{.Ports}}' 2> /dev/null \
-      | awk -v p=":$port->" 'index($0, p) {print $1; exit}')
-    if [ -n "$name" ]; then
-      printf 'container %s\n' "$name"
-      return
-    fi
+  name=$(docker ps --format '{{.Names}} {{.Ports}}' 2> /dev/null \
+    | awk -v p=":$port->" 'index($0, p) {print $1; exit}')
+  if [ -n "$name" ]; then
+    printf 'container %s\n' "$name"
+    return
   fi
   ss -Hltnp "sport = :$port" 2> /dev/null | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | head -n 1
 }
-ours() {
-  # Whether the holder is the proxy this script sets up (then it is set up again).
-  case $proxy:$1 in
-    traefik:"container traefik" | caddy:caddy | nginx:nginx) return 0 ;;
-    *) return 1 ;;
-  esac
-}
 for port in 80 443; do
   held=$(holder "$port")
-  if [ -n "$held" ] && ! ours "$held"; then
+  if [ -n "$held" ] && [ "$held" != "container $container" ]; then
     fail "port $port is held by $held. Stop it first, or keep it and point 'rift proxy' at it (see the README, Publish websites with HTTPS)"
   fi
 done
 
-if [ "$proxy" != traefik ]; then
-  command -v apt-get > /dev/null 2>&1 \
-    || fail "$proxy is installed from the distribution here, which needs apt (Debian or Ubuntu). Use traefik, or set $proxy up by hand as in the README"
-fi
-
-# ---------- the Let's Encrypt address ----------
+# ---------- the e-mail address ----------
 if [ -z "$email" ]; then
   email=$(sed -n 's/^RIFT_LETSENCRYPT_EMAIL=//p' "$env_file" | tail -n 1)
 fi
+if [ -z "$email" ] && [ "$proxy" = npm ]; then
+  email=$(sed -n 's/^RIFT_NPM_EMAIL=//p' "$env_file" | tail -n 1)
+fi
 if [ -z "$email" ] && [ -n "$interactive" ]; then
-  printf 'E-mail address for Let'"'"'s Encrypt (expiry notices; Enter for none): ' > /dev/tty
+  printf 'E-mail address for Let'"'"'s Encrypt (expiry notices%s): ' \
+    "$([ "$proxy" = npm ] && echo '; also the Nginx Proxy Manager login' || echo '; Enter for none')" > /dev/tty
   read -r email < /dev/tty || email=
 fi
+[ -n "$email" ] || [ "$proxy" != npm ] || fail "npm needs --email: it is the login of its web interface and its Let's Encrypt address"
 if [ -n "$email" ] && ! printf '%s\n' "$email" | grep -Eq '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'; then
   fail "not an e-mail address: $email"
 fi
 
 if [ -n "$interactive" ]; then
-  printf 'Set up %s on ports 80 and 443%s? [Y/n]: ' "$proxy" "${email:+ with $email for Let's Encrypt}" > /dev/tty
+  printf 'Set up %s in Docker on ports 80 and 443 (%s)? [Y/n]: ' "$proxy" "$dir" > /dev/tty
   read -r reply < /dev/tty || reply=
   case ${reply:-y} in [yY]*) ;; *) fail "nothing changed" ;; esac
 fi
 
 umask 077
 . "$script_dir/env.sh"
-if [ -n "$email" ]; then
+server_env_changed=
+if [ -n "$email" ] && ! grep -qx "RIFT_LETSENCRYPT_EMAIL=$email" "$env_file"; then
   put_env RIFT_LETSENCRYPT_EMAIL "$email"
-  # The server container passes it to the site helper (certbot for Nginx).
-  (cd "$repo_dir" && docker compose up -d > /dev/null)
+  server_env_changed=1
 fi
 umask 022
 
 # ---------- the proxy ----------
 setup_traefik() {
-  mkdir -p "$traefik_dir/dynamic" "$traefik_dir/letsencrypt"
-  chmod 700 "$traefik_dir/letsencrypt"
+  mkdir -p "$dir/dynamic" "$dir/letsencrypt"
+  chmod 700 "$dir/letsencrypt"
   acme=
   if [ -n "$email" ]; then
     acme="      - --certificatesresolvers.myresolver.acme.email=$email
 "
   fi
-  cat > "$traefik_dir/compose.yml" << EOF
+  cat > "$dir/compose.yml" << EOF
 # Written by deploy/setup-proxy for 'rift add site', which writes one file per site into
 # ./dynamic. Entry points web and websecure and the resolver myresolver are what it uses.
 services:
@@ -142,19 +143,17 @@ $acme      - --certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.j
       - ./dynamic:/dynamic:ro
       - ./letsencrypt:/letsencrypt
 EOF
-  (cd "$traefik_dir" && docker compose up -d)
+  (cd "$dir" && docker compose up -d)
+  rift proxy traefik > /dev/null
 }
 
 setup_caddy() {
-  DEBIAN_FRONTEND=noninteractive apt-get install -y caddy > /dev/null
-  mkdir -p /etc/caddy/rift-sites
-  caddyfile=/etc/caddy/Caddyfile
-  # The package's example serves a placeholder page on :80; replace only that one.
-  if [ ! -s "$caddyfile" ] || grep -q 'root \* /usr/share/caddy' "$caddyfile"; then
-    [ -s "$caddyfile" ] && cp "$caddyfile" "$caddyfile.rift-bak"
+  mkdir -p "$dir/caddy/rift-sites" "$dir/data" "$dir/config"
+  caddyfile=$dir/caddy/Caddyfile
+  if [ ! -s "$caddyfile" ]; then
     {
       echo "# Written by deploy/setup-proxy. 'rift add site' writes one file per site into"
-      echo "# /etc/caddy/rift-sites; add your own sites below."
+      echo "# rift-sites next to this file; add your own sites below."
       if [ -n "$email" ]; then
         printf '{\n\temail %s\n}\n\n' "$email"
       fi
@@ -163,44 +162,105 @@ setup_caddy() {
   elif ! grep -q '^import /etc/caddy/rift-sites/\*\.caddy' "$caddyfile"; then
     printf '\n# Added by deploy/setup-proxy for rift add site.\nimport /etc/caddy/rift-sites/*.caddy\n' >> "$caddyfile"
   fi
-  caddy validate --config "$caddyfile" --adapter caddyfile > /dev/null 2>&1 \
-    || fail "$caddyfile does not validate; check it with: caddy validate --config $caddyfile"
-  systemctl enable --now caddy > /dev/null 2>&1
-  systemctl reload caddy || systemctl restart caddy
+  cat > "$dir/compose.yml" << EOF
+# Written by deploy/setup-proxy for 'rift add site', which writes one file per site into
+# ./caddy/rift-sites and reloads Caddy with docker exec. Edit ./caddy/Caddyfile for your own sites.
+services:
+  caddy:
+    image: $caddy_image
+    container_name: rift-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy:/etc/caddy:ro
+      - ./data:/data
+      - ./config:/config
+EOF
+  docker run --rm -v "$dir/caddy:/etc/caddy:ro" "$caddy_image" \
+    caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile > /dev/null 2>&1 \
+    || fail "$caddyfile does not validate; check it with: docker run --rm -v $dir/caddy:/etc/caddy:ro $caddy_image caddy validate --config /etc/caddy/Caddyfile"
+  (cd "$dir" && docker compose up -d)
+  docker exec rift-caddy caddy reload --config /etc/caddy/Caddyfile > /dev/null 2>&1 || true
+  rift proxy caddy --container rift-caddy --sites-dir "$dir/caddy/rift-sites" > /dev/null
 }
 
-setup_nginx() {
-  DEBIAN_FRONTEND=noninteractive apt-get install -y nginx certbot python3-certbot-nginx > /dev/null
-  mkdir -p /etc/nginx/rift-sites
-  printf '# Written by deploy/setup-proxy: the sites of rift add site.\ninclude /etc/nginx/rift-sites/*.conf;\n' \
-    > /etc/nginx/conf.d/rift-sites.conf
-  nginx -t > /dev/null 2>&1 || fail "nginx -t fails; check the configuration with: nginx -t"
-  systemctl enable --now nginx > /dev/null 2>&1
-  systemctl reload nginx || systemctl restart nginx
+setup_npm() {
+  mkdir -p "$dir/data" "$dir/letsencrypt"
+  # The admin login: created by Nginx Proxy Manager on its first start, used by
+  # 'rift add site' through its API. An existing one is kept.
+  password=$(sed -n 's/^RIFT_NPM_PASSWORD=//p' "$env_file" | tail -n 1)
+  if [ -z "$password" ]; then
+    password=$(head -c 24 /dev/urandom | base64 | tr -d '/+=\n' | cut -c 1-24)
+  fi
+  umask 077
+  put_env RIFT_NPM_EMAIL "$email"
+  put_env RIFT_NPM_PASSWORD "$password"
+  printf 'INITIAL_ADMIN_EMAIL=%s\nINITIAL_ADMIN_PASSWORD=%s\n' "$email" "$password" > "$dir/admin.env"
+  umask 022
+  server_env_changed=1
+  # Its Nginx listens on [::] too, which fails on a kernel without IPv6.
+  no_ipv6=
+  if [ ! -e /proc/net/if_inet6 ]; then
+    no_ipv6='    environment:
+      DISABLE_IPV6: "true"
+'
+  fi
+  cat > "$dir/compose.yml" << EOF
+# Written by deploy/setup-proxy for 'rift add site', which creates one proxy host per site
+# through the API on port 81. The web interface listens on this server only: open it through
+# an SSH tunnel (ssh -L 8181:127.0.0.1:81 ...) and log in with RIFT_NPM_EMAIL and
+# RIFT_NPM_PASSWORD from the RIFT .env. admin.env only sets up that login on the first start.
+services:
+  npm:
+    image: $npm_image
+    container_name: rift-npm
+    restart: unless-stopped
+    env_file: ./admin.env
+${no_ipv6}    ports:
+      - "80:80"
+      - "443:443"
+      - "127.0.0.1:81:81"
+    volumes:
+      - ./data:/data
+      - ./letsencrypt:/etc/letsencrypt
+EOF
+  (cd "$dir" && docker compose up -d)
+  printf 'Waiting for Nginx Proxy Manager'
+  i=0
+  until curl -fsS -o /dev/null http://127.0.0.1:81/api/ 2> /dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 60 ] || { echo; fail "Nginx Proxy Manager does not answer on 127.0.0.1:81; see: docker logs rift-npm"; }
+    printf '.'
+    sleep 2
+  done
+  echo
+  body=$(printf '{"identity":"%s","secret":"%s"}' "$email" "$password")
+  if ! curl -fsS -o /dev/null -H 'Content-Type: application/json' -d "$body" http://127.0.0.1:81/api/tokens; then
+    fail "Nginx Proxy Manager does not accept the login from .env (it had an admin before). Set RIFT_NPM_EMAIL and RIFT_NPM_PASSWORD in $env_file to its admin login"
+  fi
+  rift proxy npm > /dev/null
 }
 
 echo "Setting up $proxy"
-if [ "$proxy" != traefik ]; then
-  DEBIAN_FRONTEND=noninteractive apt-get update > /dev/null
-fi
 "setup_$proxy"
-
-# The firewall on this host: RIFT opens its own ports, a proxy on the host needs 80 and 443.
-# (Docker publishes Traefik's ports past UFW.)
-if [ "$proxy" != traefik ] && command -v ufw > /dev/null 2>&1 && ufw status 2> /dev/null | grep -q '^Status: active'; then
-  ufw allow 80/tcp > /dev/null
-  ufw allow 443/tcp > /dev/null
-  echo "UFW: allowed TCP 80 and 443"
+if [ -n "$server_env_changed" ]; then
+  # The server container passes these settings to the site helper.
+  (cd "$repo_dir" && docker compose up -d > /dev/null)
 fi
-
-# Make it the helper's default proxy.
-rift proxy "$proxy" > /dev/null
 
 echo
-echo "$proxy is set up for websites. Next:"
+echo "$proxy runs in Docker ($dir) and is the proxy for rift add site. Next:"
 echo "  1. Point the domain's A record (and AAAA, if you publish IPv6) at this server."
 echo "  2. Open TCP 80 and 443 in your cloud firewall or security group."
 echo "  3. rift add site AGENT DOMAIN PORT     for example: rift add site node1 app.example.net 8080"
+if [ "$proxy" = npm ]; then
+  echo "Web interface: on this server at http://127.0.0.1:81, from elsewhere through an SSH tunnel"
+  echo "  (ssh -L 8181:127.0.0.1:81 root@SERVER, then http://127.0.0.1:8181). Login: RIFT_NPM_EMAIL and"
+  echo "  RIFT_NPM_PASSWORD in $env_file. Nginx Proxy Manager logs that password once on its first start;"
+  echo "  change it in the interface and in .env together if you want."
+fi
 if [ -z "$email" ]; then
   echo "Without an e-mail address Let's Encrypt cannot warn you before a certificate expires;"
   echo "run this again with --email to add one."

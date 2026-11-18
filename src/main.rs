@@ -67,7 +67,15 @@ enum Command {
         what: RotateWhat,
     },
     /// Show or change the reverse proxy that `rift add site` uses (host command).
-    Proxy { name: Option<String> },
+    Proxy {
+        name: Option<String>,
+        /// Caddy runs in this Docker container and is reloaded there.
+        #[arg(long, requires = "sites_dir")]
+        container: Option<String>,
+        /// The host directory that Caddy in the container reads the site files from.
+        #[arg(long, requires = "container")]
+        sites_dir: Option<String>,
+    },
     /// Give phones and laptops private access to chosen agents through the VPS.
     Vpn {
         #[command(subcommand)]
