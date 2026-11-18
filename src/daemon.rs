@@ -2027,6 +2027,7 @@ async fn run_agent_inner(
         atomic_write(&key_path, private.as_bytes(), 0o600)?;
         let id = AgentIdentity {
             version: IDENTITY_VERSION,
+            server_ca: None,
             id: uuid::Uuid::new_v4().to_string(),
             attempt_id: uuid::Uuid::new_v4().to_string(),
             public_key: public,
@@ -2075,8 +2076,8 @@ async fn run_agent_inner(
                 return Err(error);
             }
         }
-    } else if config.enrollment_token.is_some() {
-        tracing::debug!("ignoring enrollment token for an already active identity");
+    } else if let Some(token) = config.enrollment_token.as_deref() {
+        check_token_server(&identity, token)?;
     }
     // Rebuild the local kernel after every process or host restart before opening control.
     let policy_path = config.state_dir.join("agent-policy.json");
@@ -2235,8 +2236,13 @@ async fn agent_admin_request(config: &Config, request: AdminRequest) -> Result<s
     match request {
         AdminRequest::Status => {
             let k = Kernel::new(config.clone());
+            let peers = k.stats().await?;
+            // The server knows this agent's key: deploy/join waits for this, not for "active".
+            let connected = peers
+                .iter()
+                .any(|p| p.last_handshake > 0 && now().saturating_sub(p.last_handshake) <= 180);
             Ok(
-                serde_json::json!({"identity":identity,"peers":k.stats().await?,"doctor":k.doctor().await?}),
+                serde_json::json!({"identity":identity,"connected":connected,"peers":peers,"doctor":k.doctor().await?}),
             )
         }
         AdminRequest::ForwardsList => {
@@ -2286,6 +2292,30 @@ async fn shutdown_signal() {
         }
     }
     let _ = tokio::signal::ctrl_c().await;
+}
+
+/// An active agent ignores an enrollment token, unless the token comes from another server: then
+/// the server was set up again, and this identity would keep dialling the old one.
+fn check_token_server(identity: &AgentIdentity, token: &str) -> Result<()> {
+    let Ok(invited) = enrollment::invite_ca_fingerprint(token) else {
+        tracing::warn!("ignoring the unreadable enrollment token: this agent is already enrolled");
+        return Ok(());
+    };
+    match identity.server_ca.as_deref() {
+        Some(enrolled) if enrolled != invited => bail!(
+            "this agent is enrolled with another RIFT server than the one of RIFT_ENROLLMENT_TOKEN. \
+             If the server was set up again, remove this agent's old state with \
+             'docker compose down -v' in its RIFT directory and run 'sudo sh deploy/join' with a \
+             new invitation; otherwise remove RIFT_ENROLLMENT_TOKEN from .env"
+        ),
+        Some(_) => tracing::debug!("ignoring enrollment token for an already active identity"),
+        None => tracing::warn!(
+            "ignoring RIFT_ENROLLMENT_TOKEN: this agent is already enrolled. If its server was set \
+             up again since, remove this agent's old state with 'docker compose down -v' and run \
+             'sudo sh deploy/join' with a new invitation"
+        ),
+    }
+    Ok(())
 }
 
 async fn activate_agent(w: &Welcome, identity: &AgentIdentity) -> Result<u64> {
@@ -2609,6 +2639,38 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn token(ca: &str) -> String {
+        let raw = serde_json::json!({"version":1,"secret":"s".repeat(43),"ca_pem":ca});
+        format!(
+            "v1.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.to_string())
+        )
+    }
+
+    #[test]
+    fn a_token_of_another_server_stops_an_enrolled_agent() {
+        let mut identity = AgentIdentity {
+            version: IDENTITY_VERSION,
+            id: "a".into(),
+            attempt_id: "b".into(),
+            public_key: "k".into(),
+            welcome: None,
+            active: true,
+            applied_generation: 1,
+            server_ca: Some(enrollment::invite_ca_fingerprint(&token("old CA")).unwrap()),
+        };
+        // The same server's token (a repeated join) is ignored.
+        assert!(check_token_server(&identity, &token("old CA")).is_ok());
+        let error = check_token_server(&identity, &token("new CA"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("docker compose down -v"), "{error}");
+        // Unknown for an identity enrolled before the CA was stored, and for a broken token.
+        identity.server_ca = None;
+        assert!(check_token_server(&identity, &token("new CA")).is_ok());
+        assert!(check_token_server(&identity, "garbage").is_ok());
+    }
 
     #[test]
     fn identity_from_before_1_0_is_read_and_a_newer_one_refused() {

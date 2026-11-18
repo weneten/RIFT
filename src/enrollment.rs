@@ -96,6 +96,15 @@ pub fn join_command(server: &str, name: &str, token: &str) -> String {
     format!("sudo sh deploy/join {server} {name} {token}")
 }
 
+fn ca_fingerprint(ca_pem: &str) -> String {
+    format!("{:x}", Sha256::digest(ca_pem.as_bytes()))
+}
+
+/// The SHA-256 of the enrollment CA an invitation trusts, as stored in `AgentIdentity::server_ca`.
+pub fn invite_ca_fingerprint(token: &str) -> Result<String> {
+    Ok(ca_fingerprint(&parse_invite(token)?.ca_pem))
+}
+
 fn parse_invite(value: &str) -> Result<InviteBundle> {
     anyhow::ensure!(value.len() <= MAX_INVITE, "invitation is too large");
     let encoded = value
@@ -364,6 +373,7 @@ pub async fn enroll_agent(config: &Config, identity: &mut AgentIdentity) -> Resu
             // A re-enrollment keeps the agent's existing ID on the server.
             identity.id = w.agent_id.clone();
             identity.welcome = Some(w.clone());
+            identity.server_ca = Some(ca_fingerprint(&bundle.ca_pem));
             Ok(w)
         }
         EnrollmentResponse::Error { message } => bail!("enrollment refused: {message}"),

@@ -14,7 +14,13 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 - `rift add agent` prints the invitation as one block in order: `git clone`, `cd RIFT` and the `deploy/join` line, then the three `.env` lines for a manual setup, with how long the invitation is valid. Before, its hints went to stderr, and `docker exec` behind the host command printed them all before the commands. The web panel shows the clone step separately as well.
 - `deploy/join` refuses a machine that runs `rift-server`, and `deploy/setup-server` one that runs `rift-agent`: both share the compose project, the state volume and the host network. Before, only an existing `.env` of the other role was noticed, not a deleted or second checkout. While it waits for the server to accept the agent, `deploy/join` prints the agent's latest message every 10 seconds instead of staying silent for up to two minutes.
 - An apply error in `rift status` and the error of an admin command now include their cause, such as the message of a rejected nft batch, instead of only the outermost step ("atomically install RIFT nftables table"). `rift add site` no longer prints "rift: rift:".
+- `deploy/join` reports success only once the agent has a WireGuard handshake with the server (`"connected"` in `rift --json status` on the agent), not already when its identity is marked active. Without a handshake it names the two causes: an identity from a server that was set up again, or a closed UDP port.
+- An enrolled agent that gets `RIFT_ENROLLMENT_TOKEN` of another server (one set up again) stops with a message naming `docker compose down -v`, instead of ignoring the token and dialling the old server. The agent stores the fingerprint of its server's enrollment CA for this; agents enrolled before only log a warning.
 - `.env.server.example` and `.env.agent.example` are grouped into sections in the order of the scripts; commented lines show RIFT's defaults.
+
+### Fixes
+
+- Websites (`rift add site`) failed with the nftables 1.0.6 of the image: the output NAT chain of local-ingress forwards used the priority name `dstnat`, which nftables before 1.0.7 accepts only on the prerouting hook, so the server rejected the whole configuration ("invalid priority expression value in this context") and kept the previous one. The chain now uses the number -100.
 
 ## [1.0.0]
 

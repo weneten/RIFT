@@ -508,6 +508,10 @@ pub struct AgentIdentity {
     pub welcome: Option<Welcome>,
     pub active: bool,
     pub applied_generation: u64,
+    /// SHA-256 of the enrollment CA of the server this agent enrolled with, so a token of
+    /// another server (one set up again) is recognised. Missing for agents enrolled before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_ca: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct PeerStats {

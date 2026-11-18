@@ -24,7 +24,7 @@
 #   --yes                   do not ask; take the defaults
 #
 # Then it prepares the host (deploy/prepare-host), writes config.toml and .env (mode 0600), installs
-# the `rift` command, starts the agent, waits until the server has accepted it and then removes
+# the `rift` command, starts the agent, waits for its WireGuard handshake with the server and then removes
 # the used token from .env.
 set -eu
 
@@ -274,12 +274,15 @@ docker compose pull --quiet
 docker compose up -d --force-recreate
 
 echo "5/5 Waiting for the server to accept the agent"
-active=
+# Enrolled is not enough: an identity from a server that was set up again stays "active" but
+# never reaches it. Success is a WireGuard handshake, which needs the server to know this key.
+connected=
+status=
 i=0
 while [ "$i" -lt 60 ]; do
-  if docker exec rift-agent rift --config /etc/rift/config.toml --json status 2> /dev/null \
-    | grep -q '"active":true'; then
-    active=1
+  status=$(docker exec rift-agent rift --config /etc/rift/config.toml --json status 2> /dev/null || true)
+  if printf '%s' "$status" | grep -q '"connected":true'; then
+    connected=1
     break
   fi
   i=$((i + 1))
@@ -290,8 +293,17 @@ while [ "$i" -lt 60 ]; do
   fi
   sleep 2
 done
-if [ -z "$active" ]; then
-  echo "rift: the agent is not active after two minutes. Its last messages:" >&2
+if [ -z "$connected" ]; then
+  if printf '%s' "$status" | grep -q '"active":true'; then
+    endpoint=$(printf '%s' "$status" | sed -n 's/.*"server_endpoint":"\([^"]*\)".*/\1/p')
+    echo "rift: the agent is enrolled, but has no WireGuard handshake with ${endpoint:-the server} after two minutes." >&2
+    echo "rift: if the server was set up again since this agent was enrolled, the agent still holds the old" >&2
+    echo "rift: server's identity: run 'docker compose down -v' here, create a new invitation and run this again." >&2
+    echo "rift: otherwise allow the UDP port of ${endpoint:-the server} in the server's cloud firewall." >&2
+  else
+    echo "rift: the agent is not active after two minutes." >&2
+  fi
+  echo "rift: its last messages:" >&2
   docker logs --tail 10 rift-agent 2>&1 | sed 's/^/  /' >&2
   [ -z "$token" ] || echo "rift: the token stays in $env_file; fix the cause and run 'docker compose up -d' or this script again." >&2
   exit 1
@@ -300,9 +312,9 @@ fi
 if [ -n "$token" ]; then
   # The invitation is used up and an active agent ignores it; it has no reason to stay on disk.
   put_env RIFT_ENROLLMENT_TOKEN ""
-  echo "Agent $name is active. The used token was removed from .env."
+  echo "Agent $name is active and connected. The used token was removed from .env."
 else
-  echo "Agent $name is active with the new settings."
+  echo "Agent $name is connected with the new settings."
 fi
 next_steps "Next steps, on the server:"
 next_step "See the agent" "rift list agents"

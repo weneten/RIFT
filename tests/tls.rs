@@ -189,6 +189,7 @@ async fn run_case(
         welcome: None,
         active: false,
         applied_generation: 0,
+        server_ca: None,
     };
     let response = timeout(
         TEST_DEADLINE,

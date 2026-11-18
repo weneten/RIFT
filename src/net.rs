@@ -2066,8 +2066,10 @@ fn source_clause(forward: &Forward) -> String {
 }
 
 const NAT_CHAIN: &str = "add chain inet rift postrouting_nat { type nat hook postrouting priority srcnat; policy accept; }\n";
+// -100 is dstnat. nftables before 1.0.7 (1.0.6 in the image) defines the name dstnat only for
+// the prerouting hook and rejects it here with "invalid priority expression value".
 const OUTPUT_NAT_CHAIN: &str =
-    "add chain inet rift output_nat { type nat hook output priority dstnat; policy accept; }\n";
+    "add chain inet rift output_nat { type nat hook output priority -100; policy accept; }\n";
 
 // Keep meta l4proto before conntrack port comparisons in both renderers.
 // nftables 1.0.6 needs this context to infer the transport-port datatype.
