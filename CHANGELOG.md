@@ -20,7 +20,7 @@ First release. RIFT publishes services of home servers behind NAT or CGNAT throu
 - TCP and UDP forwards from the server's public addresses to an agent (`rift add forward`): transparent, so the service sees the client's own address, or translated between IPv4 and IPv6.
 - `--allow-from ADDRESS[,NETWORK...]` limits a forward to the named clients.
 - Time-limited client bans on translated forwards: `rift add ban FORWARD_ID IP [--ttl 1h]`.
-- HTTPS sites through an existing Traefik, Caddy, Nginx or Nginx Proxy Manager on the VPS (`rift add site`), optionally limited with `--allow-from`. `rift remove site` says what it removed; `rift list forwards` shows which site a forward belongs to.
+- HTTPS sites through Traefik, Caddy, Nginx or Nginx Proxy Manager on the VPS (`rift add site`), optionally limited with `--allow-from`. `sudo sh deploy/setup-proxy traefik|caddy|nginx` sets up a proxy the way `rift add site` expects it (Traefik in Docker; Caddy or Nginx with certbot from the distribution), and `deploy/setup-server` offers it. A proxy installed on the VPS itself reaches local-ingress forwards too. `rift remove site` says what it removed; `rift list forwards` shows which site a forward belongs to.
 
 ### Private VPN access
 

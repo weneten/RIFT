@@ -347,48 +347,77 @@ An agent whose Internet connection has no public IPv4 address (for example DS-Li
 
 ## Publish websites with HTTPS
 
-RIFT forwards ports; a reverse proxy provides hostname routing and HTTPS. The installed `rift add site`, `rift remove site` and `rift list sites` commands use the repository’s `deploy/vps/rift-site` helper to configure an **existing** Traefik, Caddy or Nginx proxy. The directory name is historical: the server can run on any suitable Linux host.
+RIFT forwards ports; a reverse proxy on the server provides hostname routing and HTTPS. The installed `rift add site`, `rift remove site` and `rift list sites` commands (the helper `deploy/vps/rift-site`) configure Traefik, Caddy, Nginx or Nginx Proxy Manager: for each site they create a forward from a free port in `20000-20999` to the agent and a proxy configuration that sends the domain there. The directory name `vps` is historical: the server can run on any suitable Linux host.
 
-### Example: a new Caddy proxy in Docker
+### Set up a proxy
 
-This example starts a separate Caddy container on the server and uses a manually created local-ingress forward. It requires Docker bridge networking, a free TCP 80 and 443 on the server, a reachable public IPv4 address assigned to its interface, and an HTTP service on `node1` port 8081. Replace the example domain and IP throughout. Configure the domain's A record and allow TCP 80 and 443 through all relevant firewalls before starting Caddy. Use a real domain for automatic certificate issuance.
-
-First create the forward on the **server**:
+`deploy/setup-server` asks for a proxy; on a server that is already running, set one up with:
 
 ```sh
-rift add forward node1 20000:8081/tcp --ingress local
+sudo sh deploy/setup-proxy caddy --email you@example.net
 ```
 
-The forward listens on the first IPv4 address in `RIFT_PUBLIC_IPS`. Port 20000 must be available; choose another if needed. Do not open it publicly. Then create a separate proxy project on the server:
+| | `traefik` | `caddy` | `nginx` |
+| --- | --- | --- | --- |
+| Runs | in Docker, `/opt/rift-traefik` | from the distribution (apt) | from the distribution (apt), with certbot |
+| Certificates | Traefik (Let's Encrypt, HTTP challenge) | Caddy itself | certbot, run by `rift add site` |
+| Host | any with Docker | Debian or Ubuntu | Debian or Ubuntu |
+
+Each is set up the way `rift add site` expects it and becomes the helper's default proxy. Ports 80 and 443 must be free; the script refuses to take them from another program. The address (`--email`) is for Let's Encrypt's expiry notices; it is stored as `RIFT_LETSENCRYPT_EMAIL` in the server `.env`. With UFW active, the script allows TCP 80 and 443 for Caddy and Nginx. Open both in your cloud firewall too. Then:
 
 ```sh
-mkdir -p caddy
-cat > caddy/Caddyfile <<'EOF'
-app.example.net {
-    reverse_proxy 203.0.113.10:20000
-}
-EOF
-cat > caddy/compose.yml <<'EOF'
-services:
-  caddy:
-    image: caddy:2
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
-volumes:
-  caddy-data:
-  caddy-config:
-EOF
-docker compose -f caddy/compose.yml up -d
-docker compose -f caddy/compose.yml logs -f
+sudo rift add site node1 app.example.net 8080
 ```
 
-Replace `203.0.113.10` in the Caddyfile with the same actual interface address used by the forward. Caddy's Docker bridge traffic must enter the host through a non-public interface so the local-ingress rule can match it. Confirm this path and any host firewall rules on your system. After Caddy obtains its certificate, test `https://app.example.net` externally. For another site, create another local-ingress forward on a different unused port and add another domain block to the Caddyfile; restart the Caddy Compose service after editing it. Keep Caddy's data volume for certificate persistence. To remove a site, remove its block, restart Caddy, then remove the corresponding forward by ID.
+once the domain's A record (and AAAA, if you publish IPv6) points at the server; see [Add a site](#add-a-site).
+
+### Set up a proxy by hand
+
+Use this for an existing proxy, or to see what `setup-proxy` writes. The helper needs:
+
+- **Traefik** in Docker with the container name `traefik`, a watched file provider and the entry points and resolver below. The helper writes one file per site into the host directory mounted at `/dynamic`. A Traefik started from Compose without a file provider is converted on the first `rift add site` (see below).
+
+  ```yaml
+  services:
+    traefik:
+      image: traefik:v3.3
+      container_name: traefik
+      restart: unless-stopped
+      command:
+        - --entrypoints.web.address=:80
+        - --entrypoints.websecure.address=:443
+        - --providers.file.directory=/dynamic
+        - --providers.file.watch=true
+        - --certificatesresolvers.myresolver.acme.email=you@example.net
+        - --certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json
+        - --certificatesresolvers.myresolver.acme.httpchallenge.entrypoint=web
+      ports:
+        - "80:80"
+        - "443:443"
+      volumes:
+        - ./dynamic:/dynamic:ro
+        - ./letsencrypt:/letsencrypt
+  ```
+
+- **Caddy** on the host, reloaded with `caddy reload --config /etc/caddy/Caddyfile`. The helper writes `/etc/caddy/rift-sites/DOMAIN.caddy`; the Caddyfile imports them:
+
+  ```text
+  {
+  	email you@example.net
+  }
+
+  import /etc/caddy/rift-sites/*.caddy
+  ```
+
+- **Nginx** on the host, reloaded with `nginx -s reload`, with `certbot` and its Nginx plugin for certificates. The helper writes `/etc/nginx/rift-sites/DOMAIN.conf`; include them in the `http` block, for example as `/etc/nginx/conf.d/rift-sites.conf`:
+
+  ```nginx
+  include /etc/nginx/rift-sites/*.conf;
+  ```
+
+- **Nginx Proxy Manager** through its API; see below.
+
+The proxy reaches a site's forward at the server's first public IPv4 address (from `RIFT_PUBLIC_IPS`) and the allocated port. That forward has `--ingress local`: it answers the proxy, from a Docker bridge or from the host itself, but not the internet, so the allocated ports need not and should not be opened in a firewall. The reload commands and paths above can be changed in `/var/lib/rift-site/sites.json` for other layouts. Back up an existing proxy configuration before the first `rift add site`.
 
 ### Using the site commands
 
@@ -398,10 +427,7 @@ The host commands `rift add site`, `rift remove site` and `rift list sites` set 
 
 1. Start the HTTP application on the agent, for example on port `8081`, listening on its tunnel address or on `0.0.0.0`. If it runs in Docker, publish the port on the agent host. Confirm the application itself works before adding RIFT.
 2. Create an A or AAAA DNS record for `app.example.net` pointing to the server's reachable address. Replace all example names with your own.
-3. Set up one supported proxy on the server and confirm it owns TCP 443. Open TCP 443 and, if required for certificates, TCP 80. Configure certificate issuance for your domain.
-4. Ensure the proxy can reach the server public address through an interface other than the public-address NIC, such as a Docker bridge. The helper creates a `local` ingress forward which matches packets entering on such an interface; a host-local connection that bypasses prerouting is not equivalent. Verify the actual packet path for your proxy setup.
-
-The helper assumes particular proxy layouts: Traefik uses a watched file provider, entrypoints `web` and `websecure`, and certificate resolver `myresolver`; Caddy and Nginx must load the generated site directories (`/etc/caddy/rift-sites` and `/etc/nginx/rift-sites`). Adapt your proxy configuration to those paths and reload commands. The helper stores its settings and site records in `/var/lib/rift-site/sites.json`. It uses the first IPv4 address in `RIFT_PUBLIC_IPS` for the proxy's local hop; clients can still reach the site over IPv6 when the proxy listens on IPv6 and the domain has an AAAA record. Inspect the helper and back up proxy configuration before using it on an existing installation.
+3. Set up a proxy as above and open TCP 80 and 443. The site is reachable over IPv6 too when the proxy listens on IPv6 and the domain has an AAAA record; the hop from the proxy to the agent uses IPv4.
 
 #### Add a site
 
@@ -413,7 +439,7 @@ sudo rift add site node1 app.example.net 8081 traefik
 
 Alternatively, end the command with `caddy`, `nginx` or `npm` (Nginx Proxy Manager) with the corresponding existing proxy. The helper allocates a port in `20000-20999`, creates a local-ingress TCP forward and writes a proxy configuration. The allocated port is for the proxy path and should not be opened publicly. The output ends with the DNS record the site needs and whether it already resolves there (`ok`, `missing` or `wrong`); create or fix the record before the first visit, since the certificate needs it too. Test `https://app.example.net` from an external client and check the proxy certificate and application response.
 
-Traefik uses its configured certificate resolver. The first add may migrate a recognized single-file Traefik provider to a watched directory, or add a watched file provider (`--providers.file.directory=/dynamic`, plus a volume for `<compose project>/dynamic`) to a Traefik that only uses Docker labels; it edits the Compose file (keeping a `.rift-bak` copy) and recreates the Traefik service, so expect a short interruption. Existing Docker-label routes remain. This needs Traefik to run from a Compose file with the container name `traefik` and a list-style `command:` and `volumes:`. Caddy obtains certificates through its configuration. For Nginx, the helper invokes `certbot --nginx` if available; without it the site is written but TLS is not requested, so configure a certificate separately. For Nginx and Nginx Proxy Manager, `RIFT_REQUEST_CERTIFICATE` in the server `.env` controls certificates: `true` (default) requests a Let's Encrypt certificate for each new site, which means accepting the Let's Encrypt terms of service (certbot is run with `--agree-tos`); `false` skips it and you handle TLS yourself. The optional `RIFT_LETSENCRYPT_EMAIL=you@example.net` is the contact for expiry notices. Without it certbot registers without an email, and Nginx Proxy Manager, which requires one, uses the admin login address. Traefik and Caddy ignore both settings. HTTP traffic between proxy and agent is carried inside WireGuard.
+Traefik uses its configured certificate resolver. The first add may migrate a recognized single-file Traefik provider to a watched directory, or add a watched file provider (`--providers.file.directory=/dynamic`, plus a volume for `<compose project>/dynamic`) to a Traefik that only uses Docker labels; it edits the Compose file (keeping a `.rift-bak` copy) and recreates the Traefik service, so expect a short interruption. Existing Docker-label routes remain. This needs Traefik to run from a Compose file with the container name `traefik` and a list-style `command:` and `volumes:`. Caddy obtains certificates through its configuration. For Nginx, the helper invokes `certbot --nginx` if available; without it the site is written but TLS is not requested, so configure a certificate separately. For Nginx and Nginx Proxy Manager, `RIFT_REQUEST_CERTIFICATE` in the server `.env` controls certificates: `true` (default) requests a Let's Encrypt certificate for each new site, which means accepting the Let's Encrypt terms of service (certbot is run with `--agree-tos`); `false` skips it and you handle TLS yourself. The optional `RIFT_LETSENCRYPT_EMAIL=you@example.net` is the contact for expiry notices. Without it certbot registers without an email, and Nginx Proxy Manager, which requires one, uses the admin login address. `deploy/setup-proxy` writes the address into the Traefik or Caddy configuration instead; the helper itself uses both settings only for Nginx and Nginx Proxy Manager. HTTP traffic between proxy and agent is carried inside WireGuard.
 
 Nginx Proxy Manager is configured through its API at `http://127.0.0.1:81` (change `npm.url` in `/var/lib/rift-site/sites.json` if needed). Put an NPM admin login and the Let's Encrypt address in the server `.env` (already `chmod 600`) and recreate the server container with `docker compose up -d --force-recreate`:
 
@@ -451,7 +477,7 @@ sudo rift proxy
 sudo rift proxy caddy
 ```
 
-For a custom reverse proxy, create a transparent TCP forward with `--ingress local` and configure the proxy to connect to the server address and allocated port via an appropriate incoming interface. Local ingress excludes packets arriving on a NIC that owns a configured public address; it is not a general-purpose loopback listener. See [architecture](docs/architecture.md#transparent-packet-path).
+For another reverse proxy, create a transparent TCP forward with `--ingress local` and let the proxy connect to the server's public address and that port, from a Docker bridge or from the host itself. Local ingress excludes packets arriving on a NIC that owns a configured public address, so the internet does not reach it. See [architecture](docs/architecture.md#transparent-packet-path).
 
 ## Manage agents and forwards
 
