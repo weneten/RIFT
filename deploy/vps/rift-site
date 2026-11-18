@@ -647,13 +647,16 @@ def npm_host_payload(host, public_ip, listen, certificate_id, allow_from=()):
     }
 
 
-def npm_publish(state, host, listen, allow_from=()):
+def npm_publish(state, host, listen, allow_from=(), target_host=None):
+    """Creates or updates the Nginx Proxy Manager host for `host`, forwarding to
+    `target_host` (default: the server's public address) and `listen`."""
+    target_host = target_host or state["public_ip"]
     settings = npm_settings(state)
     token, le_email = npm_login(settings)
     hosts = npm_request(settings, "GET", "/nginx/proxy-hosts", token=token) or []
     current = next((h for h in hosts if host in (h.get("domain_names") or [])), None)
     certificate_id = int(current.get("certificate_id") or 0) if current else 0
-    payload = npm_host_payload(host, state["public_ip"], listen, certificate_id, allow_from)
+    payload = npm_host_payload(host, target_host, listen, certificate_id, allow_from)
     if current:
         saved = npm_request(
             settings, "PUT", f"/nginx/proxy-hosts/{current['id']}", payload, token
@@ -686,9 +689,7 @@ def npm_publish(state, host, listen, allow_from=()):
             },
             token,
         )
-        secured = npm_host_payload(
-            host, state["public_ip"], listen, int(certificate["id"]), allow_from
-        )
+        secured = npm_host_payload(host, target_host, listen, int(certificate["id"]), allow_from)
         npm_request(settings, "PUT", f"/nginx/proxy-hosts/{host_id}", secured, token)
     except SiteError as error:
         note = f"the proxy host exists without TLS; certificate request failed: {error}"
@@ -1084,6 +1085,152 @@ def command_add(agent, host, port, proxy, allow_from=()):
         print(note)
 
 
+# ---------------------------------------------------------------------------------------
+# The web panel over HTTPS (deploy/publish-panel): a proxy route to the panel, which stays
+# private: a proxy in Docker reaches it on the server's tunnel address, one on the host on
+# loopback. state["panel"] remembers the route.
+
+def proxy_in_container(state, proxy):
+    if proxy in ("traefik", "npm"):
+        return True
+    if proxy == "caddy":
+        return (state["caddy"].get("reload") or [""])[0] == "docker"
+    return False
+
+
+def panel_target(state, proxy, status):
+    """(host, port) where `proxy` reaches the panel."""
+    port = int(status.get("port") or 8090)
+    if proxy_in_container(state, proxy):
+        return str(status.get("server_ipv4") or "10.13.0.1"), port
+    return "127.0.0.1", port
+
+
+def render_traefik_panel(host, url, resolver, http_entry, https_entry):
+    """Like a site, but plain HTTP only redirects to HTTPS: the panel takes no password there."""
+    name = router_name(host)
+    return (
+        "http:\n"
+        "  routers:\n"
+        f"    {name}-web:\n"
+        f"      rule: Host(`{host}`)\n"
+        "      entryPoints:\n"
+        f"        - {http_entry}\n"
+        "      middlewares:\n"
+        f"        - {name}-https\n"
+        f"      service: {name}\n"
+        f"    {name}-websecure:\n"
+        f"      rule: Host(`{host}`)\n"
+        "      entryPoints:\n"
+        f"        - {https_entry}\n"
+        "      tls:\n"
+        f"        certResolver: {resolver}\n"
+        f"      service: {name}\n"
+        "  middlewares:\n"
+        f"    {name}-https:\n"
+        "      redirectScheme:\n"
+        "        scheme: https\n"
+        "        permanent: true\n"
+        "  services:\n"
+        f"    {name}:\n"
+        "      loadBalancer:\n"
+        "        servers:\n"
+        f"          - url: {url}\n"
+    )
+
+
+def publish_panel_route(state, proxy, host, target):
+    """Writes and loads the route; returns (npm_host_id or None, note or None)."""
+    target_host, port = target
+    if proxy == "npm":
+        published = npm_publish(state, host, port, (), target_host)
+        return published["host_id"], published["note"]
+    url = f"http://{target_host}:{port}"
+    if proxy == "traefik":
+        cfg = state["traefik"]
+        text = render_traefik_panel(
+            host, url, cfg["cert_resolver"], cfg["http_entrypoint"], cfg["https_entrypoint"]
+        )
+    elif proxy == "caddy":
+        text = render_caddy(host, url)
+    else:
+        text = render_nginx(host, url)
+    path = site_path(state, proxy, host)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    try:
+        return None, reload_proxy(state, proxy, host)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def remove_panel_route(state, panel):
+    """Removes the route of `panel` from its proxy; returns a note or None."""
+    proxy, host = panel["proxy"], panel["host"]
+    if proxy == "npm":
+        try:
+            return npm_remove(state, panel.get("npm_host_id"), host)
+        except SiteError as error:
+            return f"the Nginx Proxy Manager host for {host} could not be removed: {error}"
+    site_path(state, proxy, host).unlink(missing_ok=True)
+    try:
+        reload_only(state, proxy)
+    except SiteError as error:
+        return f"{proxy} could not be reloaded: {error}"
+    return None
+
+
+def command_panel_route(args):
+    """panel-route DOMAIN: the panel at https://DOMAIN through the default proxy.
+    panel-route --off: remove that route."""
+    state = load_state()
+    if state is None:
+        state = default_state(read_server_public_ip())
+    sync_installation(state)
+    if args == ["--off"]:
+        panel = state.get("panel")
+        if not panel:
+            print("The panel has no route through the proxy.")
+            return
+        note = remove_panel_route(state, panel)
+        del state["panel"]
+        save_state(state)
+        print(f"Removed the route https://{panel['host']} ({panel['proxy']}).")
+        if note:
+            print(f"Note: {note}")
+        return
+    if len(args) != 1 or not valid_host(args[0]):
+        raise SiteError("usage: rift-site panel-route DOMAIN | --off")
+    host = args[0]
+    if host in state["sites"]:
+        raise SiteError(f"{host} is a site of agent {state['sites'][host].get('agent')}; use another name for the panel")
+    status = rift(state, "panel", "status") or {}
+    if not status.get("enabled"):
+        raise SiteError("the web panel is off; set RIFT_WEBPANEL=true in the server .env and recreate the container")
+    proxy = state.get("proxy") or "traefik"
+    require_edge(proxy, *capture_edge())
+    if proxy == "traefik":
+        notice = ensure_traefik_provider(state)
+        if notice:
+            print(notice)
+    old = state.get("panel")
+    if old and (old["host"] != host or old["proxy"] != proxy):
+        note = remove_panel_route(state, old)
+        if note:
+            print(f"Note: {note}")
+    target = panel_target(state, proxy, status)
+    host_id, note = publish_panel_route(state, proxy, host, target)
+    state["panel"] = {"host": host, "proxy": proxy}
+    if host_id is not None:
+        state["panel"]["npm_host_id"] = host_id
+    save_state(state)
+    print(f"https://{host} -> {proxy} -> panel at {target[0]}:{target[1]}")
+    print(dns_check(host, state))
+    if note:
+        print(f"Note: {note}")
+
+
 def command_migrate_sites(new):
     """Moves every site to proxy `new`, which must hold port 443 already (deploy/setup-proxy
     --migrate stops the old one and sets up the new one first). A site keeps its forward: the
@@ -1093,7 +1240,7 @@ def command_migrate_sites(new):
     if new not in PROXIES:
         raise SiteError("proxy must be traefik, caddy, nginx, or npm")
     state = load_state()
-    if state is None or not state.get("sites"):
+    if state is None or not (state.get("sites") or state.get("panel")):
         print("No sites to move.")
         return
     sync_installation(state)
@@ -1137,6 +1284,23 @@ def command_migrate_sites(new):
             site["npm_host_id"] = host_id
         save_state(state)
         moved.append(f"{host} (from {old})")
+    panel = state.get("panel")
+    if panel and panel["proxy"] != new:
+        try:
+            status = rift(state, "panel", "status") or {}
+            host_id, note = publish_panel_route(state, new, panel["host"], panel_target(state, new, status))
+        except Exception as error:  # the sites are moved all the same
+            failed.append(f"panel {panel['host']}: {error}")
+        else:
+            if panel["proxy"] in ("traefik", "caddy", "nginx"):
+                site_path(state, panel["proxy"], panel["host"]).unlink(missing_ok=True)
+            state["panel"] = {"host": panel["host"], "proxy": new}
+            if host_id is not None:
+                state["panel"]["npm_host_id"] = host_id
+            save_state(state)
+            moved.append(f"panel {panel['host']} (from {panel['proxy']})")
+            if note:
+                notes.append(f"panel {panel['host']}: {note}")
     if moved:
         print(f"Moved to {new} ({len(moved)}):")
         for line in moved:
@@ -2275,6 +2439,9 @@ def main(argv):
         return
     if command == "purge" and len(argv) == 2:
         command_purge()
+        return
+    if command == "panel-route" and len(argv) == 3:
+        command_panel_route(argv[2:])
         return
     if command == "migrate-sites" and len(argv) == 3:
         command_migrate_sites(argv[2])

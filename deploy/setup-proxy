@@ -27,6 +27,9 @@ traefik_image=traefik:v3.3
 caddy_image=caddy:2.8-alpine
 npm_image=jc21/nginx-proxy-manager:2.17.0
 site_helper=/usr/local/lib/rift/rift-site
+# The Docker network of the proxy has a fixed address range, so the web panel can trust it
+# (deploy/publish-panel puts it into RIFT_WEBPANEL_PROXIES). RIFT_PROXY_SUBNET in .env changes it.
+default_subnet=10.255.13.0/24
 
 fail() {
   printf 'rift: %s\n' "$*" >&2
@@ -60,6 +63,11 @@ interactive=
 if [ -z "$assume_yes" ] && [ -t 0 ] && [ -t 1 ]; then
   interactive=1
 fi
+
+subnet=$(sed -n 's/^RIFT_PROXY_SUBNET=//p' "$env_file" | tail -n 1)
+subnet=${subnet:-$default_subnet}
+printf '%s\n' "$subnet" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' \
+  || fail "RIFT_PROXY_SUBNET is not an IPv4 network like 10.255.13.0/24: $subnet"
 
 case $proxy in
   traefik) dir=/opt/rift-traefik; container=traefik ;;
@@ -110,10 +118,13 @@ other_sites=$(python3 -c '
 import json, os, sys
 path = os.environ.get("RIFT_SITE_STATE", "/var/lib/rift-site/sites.json")
 try:
-    sites = json.load(open(path)).get("sites") or {}
+    state = json.load(open(path))
 except (OSError, ValueError):
-    sites = {}
-print(sum(1 for site in sites.values() if site.get("proxy") != sys.argv[1]))
+    state = {}
+routes = list((state.get("sites") or {}).values())
+if state.get("panel"):
+    routes.append(state["panel"])  # the web panel route of deploy/publish-panel
+print(sum(1 for route in routes if route.get("proxy") != sys.argv[1]))
 ' "$proxy")
 
 # ---------- the e-mail address ----------
@@ -155,6 +166,17 @@ fi
 umask 022
 
 # ---------- the proxy ----------
+# Starts the Compose project in $dir. A network from before with another address range is
+# replaced (docker compose cannot change it in place).
+compose_up() {
+  network="$(basename "$dir")_default"
+  current=$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "$network" 2> /dev/null || true)
+  current=$(printf '%s' "$current" | tr -d ' ')
+  if [ -n "$current" ] && [ "$current" != "$subnet" ]; then
+    (cd "$dir" && docker compose down)
+  fi
+  (cd "$dir" && docker compose up -d)
+}
 setup_traefik() {
   mkdir -p "$dir/dynamic" "$dir/letsencrypt"
   chmod 700 "$dir/letsencrypt"
@@ -184,8 +206,13 @@ $acme      - --certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.j
     volumes:
       - ./dynamic:/dynamic:ro
       - ./letsencrypt:/letsencrypt
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: $subnet
 EOF
-  (cd "$dir" && docker compose up -d)
+  compose_up
   rift proxy traefik > /dev/null
 }
 
@@ -219,11 +246,16 @@ services:
       - ./caddy:/etc/caddy:ro
       - ./data:/data
       - ./config:/config
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: $subnet
 EOF
   docker run --rm -v "$dir/caddy:/etc/caddy:ro" "$caddy_image" \
     caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile > /dev/null 2>&1 \
     || fail "$caddyfile does not validate; check it with: docker run --rm -v $dir/caddy:/etc/caddy:ro $caddy_image caddy validate --config /etc/caddy/Caddyfile"
-  (cd "$dir" && docker compose up -d)
+  compose_up
   docker exec rift-caddy caddy reload --config /etc/caddy/Caddyfile > /dev/null 2>&1 || true
   rift proxy caddy --container rift-caddy --sites-dir "$dir/caddy/rift-sites" > /dev/null
 }
@@ -267,8 +299,13 @@ ${no_ipv6}    ports:
     volumes:
       - ./data:/data
       - ./letsencrypt:/etc/letsencrypt
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: $subnet
 EOF
-  (cd "$dir" && docker compose up -d)
+  compose_up
   printf 'Waiting for Nginx Proxy Manager'
   i=0
   until curl -fsS -o /dev/null http://127.0.0.1:81/api/ 2> /dev/null; do

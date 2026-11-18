@@ -236,6 +236,11 @@ pub struct Panel<B> {
 
 impl<B: Backend> Panel<B> {
     pub fn new(backend: B, config: Config, password: &str, two_factor: Arc<TwoFactor>) -> Self {
+        if config.webpanel_control == PanelControl::Public && !two_factor.enabled() {
+            tracing::warn!(
+                "web panel: RIFT_WEBPANEL_CONTROL=public without two-factor login; the password alone allows changes through the TLS proxy. Turn it on with `rift panel 2fa setup`"
+            );
+        }
         Self {
             backend,
             config,
@@ -401,12 +406,30 @@ impl<B: Backend> Panel<B> {
 
     /// Changes need an encrypted, local path: loopback without proxy headers (the VPS itself
     /// or an SSH tunnel) or a VPN device granted the panel. A reverse proxy on the same host
-    /// also connects from loopback, so any proxy header makes the request read-only.
+    /// also connects from loopback, so any proxy header makes the request read-only, unless
+    /// RIFT_WEBPANEL_CONTROL=public: then a request that a known TLS proxy (loopback or
+    /// RIFT_WEBPANEL_PROXIES) passes on as HTTPS may change things too.
     fn trusted(&self, request: &Request, source: IpAddr) -> bool {
         let source = source.to_canonical();
-        self.config.webpanel_control == PanelControl::Private
-            && !PROXY_HEADERS.iter().any(|h| request.header(h).is_some())
-            && (source.is_loopback() || self.backend.panel_peers().contains(&source))
+        let proxied = PROXY_HEADERS.iter().any(|h| request.header(h).is_some());
+        match self.config.webpanel_control {
+            PanelControl::Off => false,
+            PanelControl::Private => {
+                !proxied && (source.is_loopback() || self.backend.panel_peers().contains(&source))
+            }
+            PanelControl::Public => {
+                if !proxied {
+                    return source.is_loopback() || self.backend.panel_peers().contains(&source);
+                }
+                request.header("x-forwarded-proto") == Some("https")
+                    && (source.is_loopback()
+                        || self
+                            .config
+                            .webpanel_proxies
+                            .iter()
+                            .any(|net| net.contains(&source)))
+            }
+        }
     }
 
     /// Whether the password may be sent on this connection. A private panel is reached only
@@ -566,6 +589,8 @@ impl<B: Backend> Panel<B> {
             "enabled": self.two_factor.enabled(),
             "required": self.config.webpanel_2fa == PanelTwoFactor::Required,
         });
+        // Changes through the TLS proxy are allowed (RIFT_WEBPANEL_CONTROL=public).
+        overview["public_changes"] = (self.config.webpanel_control == PanelControl::Public).into();
         Ok(overview)
     }
 
@@ -576,7 +601,7 @@ impl<B: Backend> Panel<B> {
 
 const HTTPS_ONLY: &str = "this public panel accepts the password over HTTPS only: open it through a TLS proxy listed in RIFT_WEBPANEL_PROXIES, an SSH tunnel or a VPN device (rift panel connect). RIFT_WEBPANEL_INSECURE=true allows plain HTTP";
 const READ_ONLY: &str =
-    "read-only connection: changes need the VPS itself, an SSH tunnel or a panel VPN device";
+    "read-only connection: changes need the VPS itself, an SSH tunnel or a panel VPN device (through a TLS proxy only with RIFT_WEBPANEL_CONTROL=public, see deploy/publish-panel)";
 const PROXY_HEADERS: [&str; 5] = [
     "forwarded",
     "x-forwarded-for",
@@ -1957,6 +1982,60 @@ mod tests {
         let overview = panel.overview(true).await.unwrap();
         assert_eq!(overview["sites"]["sites"][0]["host"], "app.example.net");
         assert_eq!(overview["sites"]["sites"][0]["forward"], "missing");
+    }
+
+    #[tokio::test]
+    async fn public_control_lets_a_known_tls_proxy_change_things() {
+        let mut cfg = config(PanelAccess::Private, "10.255.13.0/24");
+        cfg.webpanel_proxies = crate::config::parse_allow_list("10.255.13.0/24").unwrap();
+        cfg.webpanel_control = PanelControl::Public;
+        let (public, _) = panel(cfg.clone());
+        let cookie = logged_in(&public).await;
+        let change = r#"{"action":"reload"}"#;
+        let https = "X-Forwarded-For: 198.51.100.9\r\nX-Forwarded-Proto: https\r\n";
+        let http = "X-Forwarded-For: 198.51.100.9\r\nX-Forwarded-Proto: http\r\n";
+        let status = |r: String| r[9..12].to_string();
+        // Through the proxy network over HTTPS: allowed.
+        assert_eq!(
+            status(act(&public, "10.255.13.2", &cookie, change, https).await),
+            "200"
+        );
+        // Plain HTTP behind the proxy, or a proxy header from the VPS itself without https: no.
+        assert_eq!(
+            status(act(&public, "10.255.13.2", &cookie, change, http).await),
+            "403"
+        );
+        // A loopback proxy over HTTPS is a known proxy too.
+        assert_eq!(
+            status(act(&public, "127.0.0.1", &cookie, change, https).await),
+            "200"
+        );
+        // An address outside the proxy list never gets in, whatever it claims.
+        assert_eq!(
+            status(act(&public, "198.51.100.9", &cookie, change, https).await),
+            "403"
+        );
+        // The trusted paths of the private mode stay.
+        assert_eq!(
+            status(act(&public, "127.0.0.1", &cookie, change, "").await),
+            "200"
+        );
+        assert_eq!(
+            status(act(&public, "10.14.0.2", &cookie, change, "").await),
+            "200"
+        );
+        // With the default control the same proxy request stays read-only.
+        cfg.webpanel_control = PanelControl::Private;
+        let (private, _) = panel(cfg);
+        let cookie = logged_in(&private).await;
+        assert_eq!(
+            status(act(&private, "10.255.13.2", &cookie, change, https).await),
+            "403"
+        );
+        assert_eq!(
+            private.overview(true).await.unwrap()["public_changes"],
+            false
+        );
     }
 
     #[tokio::test]

@@ -1328,7 +1328,7 @@ async fn admin_call_inner(s: &Server, r: AdminRequest) -> Result<serde_json::Val
                     .filter(|p| p.panel)
                     .map(|p| serde_json::json!({"name":p.name,"ipv4":p.ipv4,"enabled":p.enabled}))
                     .collect();
-                serde_json::json!({"enabled":true,"access":cfg.webpanel_access,"port":cfg.webpanel_port,"urls":crate::webpanel::urls(&cfg),"allow":cfg.webpanel_allow,"devices":devices,"password":if cfg.webpanel_password.is_some() {"RIFT_WEBPANEL_PASSWORD"} else {"generated; show it with `rift panel password`"}})
+                serde_json::json!({"enabled":true,"access":cfg.webpanel_access,"control":cfg.webpanel_control,"server_ipv4":cfg.server_ipv4,"port":cfg.webpanel_port,"urls":crate::webpanel::urls(&cfg),"allow":cfg.webpanel_allow,"devices":devices,"password":if cfg.webpanel_password.is_some() {"RIFT_WEBPANEL_PASSWORD"} else {"generated; show it with `rift panel password`"}})
             }
         }
         AdminRequest::PanelPassword => {

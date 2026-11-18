@@ -723,9 +723,10 @@ Once it is on, the login form has a code field, and a wrong password and a wrong
 **Who can change things.** Every logged-in session can read. Changes, and anything that shows a secret (invitation tokens, a device's private key), need a trusted connection as well:
 
 - a connection from loopback without proxy headers: on the server itself or through an SSH tunnel, or
-- a VPN device with panel access (`rift panel connect`, `rift panel allow`).
+- a VPN device with panel access (`rift panel connect`, `rift panel allow`), or
+- only with `RIFT_WEBPANEL_CONTROL=public`: a request that a known TLS proxy (on loopback or in `RIFT_WEBPANEL_PROXIES`) passes on with `X-Forwarded-Proto: https`; see [Reach the panel over HTTPS](#reach-the-panel-over-https).
 
-Everything else is read-only: public addresses, `RIFT_WEBPANEL_ALLOW` entries and any request carrying `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto` or `X-Real-IP`. That last rule exists because a reverse proxy on the same host also connects from loopback. A proxy that strips or never sends these headers would make its clients look local, so do not put such a proxy in front of the panel. `RIFT_WEBPANEL_CONTROL=off` makes the panel read-only for everyone; there is deliberately no setting that allows changes over the public path. A trusted device plus the password is administrator access to your network: it can publish ports, invite agents and create VPN devices. If such a device is lost, remove it with `rift remove device NAME` and change the password.
+Everything else is read-only: public addresses, `RIFT_WEBPANEL_ALLOW` entries and any other request carrying `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto` or `X-Real-IP`. That last rule exists because a reverse proxy on the same host also connects from loopback. A proxy that strips or never sends these headers would make its clients look local, so do not put such a proxy in front of the panel. `RIFT_WEBPANEL_CONTROL=off` makes the panel read-only for everyone. A trusted device plus the password is administrator access to your network: it can publish ports, invite agents and create VPN devices. If such a device is lost, remove it with `rift remove device NAME` and change the password.
 
 **Private mode from your own computer.** Either use an SSH tunnel and open `http://127.0.0.1:8090`:
 
@@ -750,7 +751,19 @@ Import the configuration into the WireGuard app, connect, and open `http://10.13
 
 If the host command is not installed, the card says that sites are managed on the host. If it is installed but the units are not active, a request ends with "The host service did not pick up the request; is `rift-site-queue.path` installed and active?". Run `sudo sh deploy/install-cli` (also after `git pull`) and check `systemctl status rift-site-queue.path`. It creates `/var/lib/rift-site` and `/var/lib/rift-site-queue`. If Docker creates them first (Compose v2 does for a missing bind source) the panel works the same once the units exist. `sudo sh deploy/uninstall-host` removes the units and `--purge` also the queue directory.
 
-**Public mode** opens the port in the host firewall (`host_firewall = "auto"`); open it in any upstream firewall or cloud security group yourself. The panel itself speaks plain HTTP, so in public mode it **takes the password over HTTPS only**: put a TLS reverse proxy in front (Traefik, Caddy, Nginx) that sends `X-Forwarded-Proto: https`, and list its address in `RIFT_WEBPANEL_PROXIES` unless it runs on the VPS itself (loopback). Logins also work from the VPS itself or an SSH tunnel, from panel VPN devices and through agent tunnels, all of which are encrypted. Anyone else sees the login page with a note instead of the form. `RIFT_WEBPANEL_INSECURE=true` allows the password over plain HTTP again, for a test setup. The session cookie is marked `Secure` behind the proxy. Public sessions stay read-only.
+**Public mode** opens the port in the host firewall (`host_firewall = "auto"`); open it in any upstream firewall or cloud security group yourself. The panel itself speaks plain HTTP, so in public mode it **takes the password over HTTPS only**: put a TLS reverse proxy in front (Traefik, Caddy, Nginx) that sends `X-Forwarded-Proto: https`, and list its address in `RIFT_WEBPANEL_PROXIES` unless it runs on the VPS itself (loopback). Logins also work from the VPS itself or an SSH tunnel, from panel VPN devices and through agent tunnels, all of which are encrypted. Anyone else sees the login page with a note instead of the form. `RIFT_WEBPANEL_INSECURE=true` allows the password over plain HTTP again, for a test setup. The session cookie is marked `Secure` behind the proxy. Public sessions stay read-only unless `RIFT_WEBPANEL_CONTROL=public`.
+
+### Reach the panel over HTTPS
+
+WireGuard needs UDP, which some networks (offices, hotels, some mobile networks) block. HTTPS on port 443 works almost everywhere. With a proxy from `deploy/setup-proxy`, one command puts the panel behind it:
+
+```sh
+sudo sh deploy/publish-panel panel.example.net
+```
+
+It sets `RIFT_WEBPANEL_CONTROL=public` in the server `.env`, and for a proxy in Docker `RIFT_WEBPANEL_PROXIES` and `RIFT_WEBPANEL_ALLOW` to the proxy's network (`10.255.13.0/24`, `RIFT_PROXY_SUBNET`, which `setup-proxy` gives every proxy it sets up), restarts the server and adds a route `https://panel.example.net` to the panel. Point the domain's A record at the server. The panel itself stays private: it listens on loopback and the server's tunnel address, a proxy in Docker reaches it on the tunnel address (UFW lets the proxy network through to that address only), a proxy on the host on loopback, and its port is never opened on the internet. Plain HTTP redirects to HTTPS. Changing proxies with `setup-proxy --migrate` moves the route too. `sudo sh deploy/publish-panel --off` removes the route and makes the proxy path read-only again.
+
+**What this means.** Through `https://panel.example.net` a logged-in session may change everything a trusted device may: publish ports, invite agents, create VPN devices and show their keys. Between the internet and that sits only the panel password, and the code if two-factor login is on. **Turn two-factor login on** (`rift panel 2fa setup`, or "Enable" in the panel): without it, a leaked or guessed password is full control of your network, and the server logs a warning at every start and the panel shows one. Failed logins are slowed down and, after several in a row, locked for a while; a backup still needs the password and code again. With `RIFT_WEBPANEL_CONTROL=private` (the default) the same route still works, but read-only.
 
 The panel port (default 8090, `RIFT_WEBPANEL_PORT`) must differ from the control and enrollment ports. Panel settings need a restart; `rift reload` refuses to change them.
 
@@ -964,9 +977,10 @@ The web panel runs `add site`, `remove site`, `export`, `import` and `backup` th
 | `RIFT_WEBPANEL` | `false` | Server. Serves the [web panel](#web-panel). Restart required. |
 | `RIFT_WEBPANEL_ACCESS` | `private` | Server. `private`: loopback and tunnel address only; `public`: every address. |
 | `RIFT_WEBPANEL_PORT` | `8090` | Server. TCP port of the panel. |
-| `RIFT_WEBPANEL_CONTROL` | `private` | Server. `private`: changes from loopback without proxy headers and from panel VPN devices; `off`: read-only everywhere. |
+| `RIFT_WEBPANEL_CONTROL` | `private` | Server. `private`: changes from loopback without proxy headers and from panel VPN devices; `public`: also through a TLS proxy (loopback or `RIFT_WEBPANEL_PROXIES`, `X-Forwarded-Proto: https`), see [Reach the panel over HTTPS](#reach-the-panel-over-https); `off`: read-only everywhere. |
 | `RIFT_WEBPANEL_ALLOW` | empty | Server. Extra allowed source addresses or networks, comma-separated. |
-| `RIFT_WEBPANEL_PROXIES` | empty | Server. Addresses of TLS reverse proxies in front of a public panel; from these, a login with `X-Forwarded-Proto: https` is accepted. A proxy on the VPS itself needs no entry. |
+| `RIFT_WEBPANEL_PROXIES` | empty | Server. Addresses of TLS reverse proxies in front of the panel; from these, a login with `X-Forwarded-Proto: https` is accepted, and with `RIFT_WEBPANEL_CONTROL=public` changes too. A proxy on the VPS itself needs no entry. |
+| `RIFT_PROXY_SUBNET` | `10.255.13.0/24` | Server host scripts. The Docker network of the proxies that `deploy/setup-proxy` sets up; `deploy/publish-panel` trusts it. |
 | `RIFT_WEBPANEL_INSECURE` | `false` | Server. `true` lets a public panel take the password over plain HTTP. |
 | `RIFT_WEBPANEL_2FA` | `optional` | Server. `optional`: one-time code at login once someone turned it on; `required`: no login until `rift panel 2fa setup` and `confirm` ran. Restart required. |
 | `RIFT_WEBPANEL_PASSWORD` | generated | Server. Panel password, at least 12 characters; `rift panel password` shows the effective one. |

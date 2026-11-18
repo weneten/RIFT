@@ -78,6 +78,9 @@ pub struct ServerSpec<'a> {
     /// The web panel's TCP port, when it is on. Who may connect is decided in the RIFT
     /// table and by the panel itself; UFW only has to let the port through.
     pub panel: Option<PanelSpec>,
+    /// TLS proxies in front of the panel (RIFT_WEBPANEL_PROXIES), for example a proxy in a
+    /// Docker network: they reach the panel on the server's tunnel address.
+    pub panel_proxies: &'a [ipnet::IpNet],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -267,6 +270,12 @@ pub fn plan_server(obs: &Observation, spec: &ServerSpec<'_>) -> Result<Plan> {
                     "iifname \"{}\" ip daddr {} tcp dport {} accept comment \"rift:panel\"",
                     spec.interface, spec.server_v4, panel.port
                 ));
+                for net in spec.panel_proxies.iter().filter(|net| net.addr().is_ipv4()) {
+                    rules.push(format!(
+                        "ip saddr {net} ip daddr {} tcp dport {} accept comment \"rift:panel\"",
+                        spec.server_v4, panel.port
+                    ));
+                }
             }
         }
         for prefix in iface_prefixes(spec.uplinks) {
@@ -728,6 +737,7 @@ mod tests {
             local_ingress: false,
             vpn: false,
             panel: None,
+            panel_proxies: &[],
             exit: false,
         }
     }
@@ -918,6 +928,18 @@ mod tests {
         assert!(public
             .fill
             .contains("iifname \"eth0\" tcp dport 8090 accept comment \"rift:panel\""));
+        // A proxy in a Docker network reaches the private panel on the tunnel address only.
+        let proxies = ["10.255.13.0/24".parse().unwrap()];
+        spec.panel_proxies = &proxies;
+        spec.panel = Some(PanelSpec {
+            port: 8090,
+            public: false,
+        });
+        let proxied = plan_server(&obs, &spec).unwrap();
+        assert!(proxied.fill.contains(
+            "ip saddr 10.255.13.0/24 ip daddr 10.88.0.1 tcp dport 8090 accept comment \"rift:panel\""
+        ));
+        assert!(!proxied.fill.contains("iifname \"eth0\" tcp dport 8090"));
     }
 
     #[test]

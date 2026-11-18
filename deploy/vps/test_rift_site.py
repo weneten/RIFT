@@ -1149,6 +1149,103 @@ class MigrateTests(unittest.TestCase):
         self.assertEqual(self.saved, [])
 
 
+class PanelRouteTests(unittest.TestCase):
+    STATUS = {"enabled": True, "port": 8090, "server_ipv4": "10.13.0.1", "control": "public"}
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        root = Path(self.dir.name)
+        self.state = rift_site.default_state("203.0.113.10")
+        self.state["traefik"]["dynamic_dir"] = str(root / "dynamic")
+        self.state["caddy"]["sites_dir"] = str(root / "caddy")
+        self.saved = []
+
+    def route(self, *args, **patches):
+        defaults = {
+            "load_state": mock.Mock(return_value=self.state),
+            "save_state": mock.Mock(side_effect=lambda s: self.saved.append(json.loads(json.dumps(s)))),
+            "sync_installation": mock.Mock(),
+            "capture_edge": mock.Mock(return_value=([], [])),
+            "require_edge": mock.Mock(),
+            "ensure_traefik_provider": mock.Mock(return_value=None),
+            "run": mock.Mock(return_value=""),
+            "rift": mock.Mock(return_value=dict(self.STATUS)),
+            "dns_check": mock.Mock(return_value="DNS: ok"),
+        }
+        defaults.update(patches)
+        out = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            for name, value in defaults.items():
+                stack.enter_context(mock.patch.object(rift_site, name, value))
+            stack.enter_context(contextlib.redirect_stdout(out))
+            rift_site.command_panel_route(list(args))
+        return out.getvalue()
+
+    def test_traefik_reaches_the_panel_on_the_tunnel_address_and_redirects_http(self):
+        out = self.route("panel.example.net")
+        text = (Path(self.state["traefik"]["dynamic_dir"]) / "panel.example.net.yml").read_text()
+        self.assertIn("url: http://10.13.0.1:8090", text)
+        self.assertIn("redirectScheme", text)
+        self.assertIn("certResolver: myresolver", text)
+        self.assertEqual(self.saved[-1]["panel"], {"host": "panel.example.net", "proxy": "traefik"})
+        self.assertIn("https://panel.example.net", out)
+
+    def test_caddy_on_the_host_uses_loopback_and_in_a_container_the_tunnel(self):
+        self.state["proxy"] = "caddy"
+        self.route("panel.example.net")
+        path = Path(self.state["caddy"]["sites_dir"]) / "panel.example.net.caddy"
+        self.assertIn("reverse_proxy 127.0.0.1:8090", path.read_text())
+        self.state["caddy"]["reload"] = ["docker", "exec", "rift-caddy", "caddy", "reload"]
+        self.route("panel.example.net")
+        self.assertIn("reverse_proxy 10.13.0.1:8090", path.read_text())
+
+    def test_nginx_proxy_manager_forwards_to_the_tunnel_address(self):
+        self.state["proxy"] = "npm"
+        publish = mock.Mock(return_value={"host_id": 9, "note": None})
+        self.route("panel.example.net", npm_publish=publish)
+        publish.assert_called_once_with(self.state, "panel.example.net", 8090, (), "10.13.0.1")
+        self.assertEqual(self.saved[-1]["panel"]["npm_host_id"], 9)
+
+    def test_off_removes_the_route(self):
+        self.route("panel.example.net")
+        path = Path(self.state["traefik"]["dynamic_dir"]) / "panel.example.net.yml"
+        self.assertTrue(path.exists())
+        self.state["panel"] = self.saved[-1]["panel"]
+        self.route("--off")
+        self.assertFalse(path.exists())
+        self.assertNotIn("panel", self.saved[-1])
+
+    def test_a_site_name_or_a_panel_that_is_off_is_refused(self):
+        self.state["sites"]["app.example.net"] = {"agent": "node1", "target": 80, "listen": 20000, "proxy": "traefik"}
+        with self.assertRaisesRegex(rift_site.SiteError, "is a site"):
+            self.route("app.example.net")
+        with self.assertRaisesRegex(rift_site.SiteError, "panel is off"):
+            self.route("panel.example.net", rift=mock.Mock(return_value={"enabled": False}))
+        with self.assertRaises(rift_site.SiteError):
+            self.route("not a domain")
+
+    def test_the_route_moves_with_the_sites(self):
+        self.state["panel"] = {"host": "panel.example.net", "proxy": "traefik"}
+        old = Path(self.state["traefik"]["dynamic_dir"]) / "panel.example.net.yml"
+        old.parent.mkdir(parents=True)
+        old.write_text("old")
+        out = io.StringIO()
+        with mock.patch.object(rift_site, "load_state", return_value=self.state), \
+                mock.patch.object(rift_site, "save_state", side_effect=lambda s: self.saved.append(json.loads(json.dumps(s)))), \
+                mock.patch.object(rift_site, "sync_installation"), \
+                mock.patch.object(rift_site, "capture_edge", return_value=([], [])), \
+                mock.patch.object(rift_site, "require_edge"), \
+                mock.patch.object(rift_site, "run", return_value=""), \
+                mock.patch.object(rift_site, "rift", return_value=dict(self.STATUS)), \
+                contextlib.redirect_stdout(out):
+            rift_site.command_migrate_sites("caddy")
+        self.assertFalse(old.exists())
+        self.assertIn("reverse_proxy 127.0.0.1:8090", (Path(self.state["caddy"]["sites_dir"]) / "panel.example.net.caddy").read_text())
+        self.assertEqual(self.saved[-1]["panel"], {"host": "panel.example.net", "proxy": "caddy"})
+        self.assertIn("panel panel.example.net (from traefik)", out.getvalue())
+
+
 class RemoveTests(unittest.TestCase):
     def test_remove_says_what_it_removed(self):
         state = {"sites": {"pd.example.net": {"agent": "PP", "proxy": "traefik", "forward_id": 9}}}

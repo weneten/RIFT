@@ -1,0 +1,128 @@
+#!/bin/sh
+# Make the web panel reachable at https://DOMAIN through the reverse proxy of
+# deploy/setup-proxy, for networks where WireGuard (UDP) is blocked:
+#
+#   sudo sh deploy/publish-panel panel.example.net [--yes]
+#   sudo sh deploy/publish-panel --off
+#
+# The panel itself stays private (loopback and the server's tunnel address); only the proxy
+# reaches it. Changes are allowed through the proxy (RIFT_WEBPANEL_CONTROL=public), so the
+# panel password, and the code if two-factor login is on, is all that protects your network
+# from the internet: turn two-factor login on (rift panel 2fa setup). --off removes the route
+# and makes the proxy path read-only again.
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+env_file=$repo_dir/.env
+site_helper=/usr/local/lib/rift/rift-site
+default_subnet=10.255.13.0/24
+
+fail() {
+  printf 'rift: %s\n' "$*" >&2
+  exit 1
+}
+
+domain=
+off=
+assume_yes=
+while [ "$#" -gt 0 ]; do
+  case $1 in
+    --off) off=1; shift ;;
+    --yes | -y) assume_yes=1; shift ;;
+    -h | --help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) fail "unknown option $1 (see sh deploy/publish-panel --help)" ;;
+    *) [ -z "$domain" ] || fail "name one domain"; domain=$1; shift ;;
+  esac
+done
+[ -n "$domain" ] || [ -n "$off" ] || fail "name the domain: sudo sh deploy/publish-panel panel.example.net"
+[ "$(id -u)" -eq 0 ] || fail "run as root: sudo sh deploy/publish-panel ..."
+[ -f "$env_file" ] && grep -Eq '^COMPOSE_PROFILES=server' "$env_file" \
+  || fail "no RIFT server here ($env_file); run sudo sh deploy/setup-server first"
+[ -x "$site_helper" ] || fail "the site helper is missing; run sudo sh deploy/install-cli first"
+docker info > /dev/null 2>&1 || fail "Docker does not answer; is the docker service running?"
+
+subnet=$(sed -n 's/^RIFT_PROXY_SUBNET=//p' "$env_file" | tail -n 1)
+subnet=${subnet:-$default_subnet}
+env_value() { sed -n "s/^$1=//p" "$env_file" | tail -n 1; }
+
+umask 077
+. "$script_dir/env.sh"
+
+restart_server() {
+  echo "Restarting the server with the new panel settings"
+  (cd "$repo_dir" && docker compose up -d > /dev/null)
+  i=0
+  until docker exec rift-server rift --config /etc/rift/config.toml status > /dev/null 2>&1; do
+    i=$((i + 1))
+    [ "$i" -lt 60 ] || fail "the server is not ready after two minutes; see: docker logs rift-server"
+    sleep 2
+  done
+}
+
+# Removes $subnet from a comma-separated list setting, if it is there.
+without_subnet() {
+  printf '%s' "$1" | tr ',' '\n' | grep -vx "$subnet" | paste -sd, -
+}
+
+if [ -n "$off" ]; then
+  "$site_helper" panel-route --off
+  put_env RIFT_WEBPANEL_CONTROL private
+  put_env RIFT_WEBPANEL_PROXIES "$(without_subnet "$(env_value RIFT_WEBPANEL_PROXIES)")"
+  put_env RIFT_WEBPANEL_ALLOW "$(without_subnet "$(env_value RIFT_WEBPANEL_ALLOW)")"
+  restart_server
+  echo "The panel is no longer published; through a proxy it is read-only again."
+  exit 0
+fi
+
+printf '%s\n' "$domain" | grep -Eq '^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$' \
+  || fail "not a domain name: $domain"
+
+# A proxy in a Docker container reaches the panel from its network, which must be the fixed
+# one deploy/setup-proxy gives it; a proxy on the host comes from loopback.
+holder=$(docker ps --format '{{.Names}} {{.Ports}}' | awk 'index($0, ":443->") {print $1; exit}')
+in_container=
+if [ -n "$holder" ]; then
+  in_container=1
+  address=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$holder" | awk '{print $1}')
+  python3 -c 'import ipaddress, sys; sys.exit(0 if ipaddress.ip_address(sys.argv[1]) in ipaddress.ip_network(sys.argv[2]) else 1)' \
+    "${address:-0.0.0.0}" "$subnet" 2> /dev/null \
+    || fail "the proxy container $holder is not in the proxy network $subnet. Run sudo sh deploy/setup-proxy for it once more (it gives the network that range), then this again"
+fi
+
+if [ -z "$assume_yes" ] && [ -t 0 ] && [ -t 1 ]; then
+  echo "This makes the panel reachable at https://$domain and allows changes there."
+  echo "Anyone with the panel password (and the code, if two-factor login is on) can then"
+  echo "publish ports, invite agents and create VPN devices from anywhere."
+  printf 'Go on? [y/N]: ' > /dev/tty
+  read -r reply < /dev/tty || reply=
+  case $reply in [yY]*) ;; *) fail "nothing changed" ;; esac
+fi
+
+add_subnet() {
+  case ",$1," in
+    *",$subnet,"*) printf '%s' "$1" ;;
+    ",,") printf '%s' "$subnet" ;;
+    *) printf '%s,%s' "$1" "$subnet" ;;
+  esac
+}
+put_env RIFT_WEBPANEL true
+put_env RIFT_WEBPANEL_CONTROL public
+if [ -n "$in_container" ]; then
+  put_env RIFT_WEBPANEL_PROXIES "$(add_subnet "$(env_value RIFT_WEBPANEL_PROXIES)")"
+  put_env RIFT_WEBPANEL_ALLOW "$(add_subnet "$(env_value RIFT_WEBPANEL_ALLOW)")"
+fi
+umask 022
+restart_server
+
+"$site_helper" panel-route "$domain"
+
+echo
+echo "The panel is at https://$domain once the domain's A record points at this server."
+if docker exec rift-server rift --config /etc/rift/config.toml --json panel 2fa status 2> /dev/null | grep -q '"enabled":true'; then
+  echo "Two-factor login is on."
+else
+  echo "WARNING: two-factor login is off. The panel password alone now allows changes from the"
+  echo "internet. Turn it on: rift panel 2fa setup"
+fi
+echo "Show the password with: rift panel password. Undo with: sudo sh deploy/publish-panel --off"

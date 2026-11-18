@@ -47,13 +47,17 @@ impl std::fmt::Display for EnrollmentMode {
 }
 
 /// Whether panel sessions may change anything. `private` allows changes only from loopback
-/// without proxy headers and from VPN devices granted the panel; `off` makes it read-only.
+/// without proxy headers and from VPN devices granted the panel; `off` makes it read-only;
+/// `public` also allows changes through a TLS proxy (`X-Forwarded-Proto: https` from loopback
+/// or `RIFT_WEBPANEL_PROXIES`), where a password, and a code if two-factor login is on, is all
+/// that stands between the internet and the network.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PanelControl {
     #[default]
     Private,
     Off,
+    Public,
 }
 impl std::str::FromStr for PanelControl {
     type Err = anyhow::Error;
@@ -61,7 +65,8 @@ impl std::str::FromStr for PanelControl {
         match s.trim() {
             "private" => Ok(Self::Private),
             "off" => Ok(Self::Off),
-            _ => bail!("web panel control must be private or off"),
+            "public" => Ok(Self::Public),
+            _ => bail!("web panel control must be private, public or off"),
         }
     }
 }
@@ -704,6 +709,10 @@ mod tests {
         );
         assert!("true".parse::<EnrollmentMode>().is_err());
         assert_eq!("off".parse::<PanelControl>().unwrap(), PanelControl::Off);
+        assert_eq!(
+            "public".parse::<PanelControl>().unwrap(),
+            PanelControl::Public
+        );
         assert!("none".parse::<PanelControl>().is_err());
         assert_eq!(
             "required".parse::<PanelTwoFactor>().unwrap(),

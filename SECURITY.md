@@ -29,7 +29,7 @@ In scope, among others:
 - bypassing an agent's own limits (`RIFT_AGENT_ALLOW_PORTS`, `RIFT_AGENT_ALLOW_SUBNETS`, `RIFT_AGENT_ALLOW_EXIT`);
 - enrolling without a valid invitation, or reusing one;
 - reading keys, tokens or the panel password, or finding them in logs, outputs or files other than their own;
-- logging in to the web panel without the password and code, or making changes from a read-only session;
+- logging in to the web panel without the password and code, or making changes from a read-only session (including a request through a proxy while `RIFT_WEBPANEL_CONTROL` is not `public`, or from a source outside `RIFT_WEBPANEL_PROXIES`);
 - the host scripts (`deploy/`) doing something other than they say.
 
 Out of scope:

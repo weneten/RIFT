@@ -1022,6 +1022,7 @@ function render() {
     el("span", { class: "muted" }, "Two-factor login: "),
     factor.enabled ? pill("on", "ok") : pill("off", "off"),
     factor.required ? el("span", { class: "muted small" }, factor.enabled ? " required by the server" : " required; set it up on the server with rift panel 2fa setup") : null,
+    data.public_changes && !factor.enabled ? el("span", { class: "error small" }, " Changes are allowed over the internet with the password alone. Turn two-factor login on.") : null,
     canWrite && !factor.required ? " " : null,
     canWrite && !factor.required ? (factor.enabled ? button("Disable", twoFactorOffDialog, "danger") : button("Enable", twoFactorDialog)) : null,
   ].filter(Boolean));
