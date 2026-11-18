@@ -2,14 +2,17 @@
 # Make the web panel reachable at https://DOMAIN through the reverse proxy of
 # deploy/setup-proxy, for networks where WireGuard (UDP) is blocked:
 #
-#   sudo sh deploy/publish-panel panel.example.net [--yes]
+#   sudo sh deploy/publish-panel panel.example.net [--read-only] [--yes]
 #   sudo sh deploy/publish-panel --off
 #
 # The panel itself stays private (loopback and the server's tunnel address); only the proxy
-# reaches it. Changes are allowed through the proxy (RIFT_WEBPANEL_CONTROL=public), so the
-# panel password, and the code if two-factor login is on, is all that protects your network
-# from the internet: turn two-factor login on (rift panel 2fa setup). --off removes the route
-# and makes the proxy path read-only again.
+# reaches it. By default changes are allowed through the proxy (RIFT_WEBPANEL_CONTROL=public),
+# so the panel password, and the code if two-factor login is on, is all that protects your
+# network from the internet: turn two-factor login on (rift panel 2fa setup).
+# --read-only keeps the route read-only (RIFT_WEBPANEL_CONTROL=private, or off if it was off):
+# logins work there, changes and secrets only on the VPS, through an SSH tunnel or from a
+# panel VPN device. Running it again with or without --read-only switches between the two.
+# --off removes the route and makes the proxy path read-only again.
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -25,17 +28,20 @@ fail() {
 
 domain=
 off=
+read_only=
 assume_yes=
 while [ "$#" -gt 0 ]; do
   case $1 in
     --off) off=1; shift ;;
+    --read-only) read_only=1; shift ;;
     --yes | -y) assume_yes=1; shift ;;
-    -h | --help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
     -*) fail "unknown option $1 (see sh deploy/publish-panel --help)" ;;
     *) [ -z "$domain" ] || fail "name one domain"; domain=$1; shift ;;
   esac
 done
 [ -n "$domain" ] || [ -n "$off" ] || fail "name the domain: sudo sh deploy/publish-panel panel.example.net"
+[ -z "$off" ] || [ -z "$read_only" ] || fail "--off removes the route; --read-only is for publishing one"
 [ "$(id -u)" -eq 0 ] || fail "run as root: sudo sh deploy/publish-panel ..."
 [ -f "$env_file" ] && grep -Eq '^COMPOSE_PROFILES=server' "$env_file" \
   || fail "no RIFT server here ($env_file); run sudo sh deploy/setup-server first"
@@ -91,9 +97,14 @@ if [ -n "$holder" ]; then
 fi
 
 if [ -z "$assume_yes" ] && [ -t 0 ] && [ -t 1 ]; then
-  echo "This makes the panel reachable at https://$domain and allows changes there."
-  echo "Anyone with the panel password (and the code, if two-factor login is on) can then"
-  echo "publish ports, invite agents and create VPN devices from anywhere."
+  if [ -n "$read_only" ]; then
+    echo "This makes the panel reachable at https://$domain, read-only: logins work there,"
+    echo "changes and secrets only on the VPS, through an SSH tunnel or from a panel VPN device."
+  else
+    echo "This makes the panel reachable at https://$domain and allows changes there."
+    echo "Anyone with the panel password (and the code, if two-factor login is on) can then"
+    echo "publish ports, invite agents and create VPN devices from anywhere."
+  fi
   printf 'Go on? [y/N]: ' > /dev/tty
   read -r reply < /dev/tty || reply=
   case $reply in [yY]*) ;; *) fail "nothing changed" ;; esac
@@ -107,7 +118,11 @@ add_subnet() {
   esac
 }
 put_env RIFT_WEBPANEL true
-put_env RIFT_WEBPANEL_CONTROL public
+if [ -z "$read_only" ]; then
+  put_env RIFT_WEBPANEL_CONTROL public
+elif [ "$(env_value RIFT_WEBPANEL_CONTROL)" != off ]; then
+  put_env RIFT_WEBPANEL_CONTROL private
+fi
 if [ -n "$in_container" ]; then
   put_env RIFT_WEBPANEL_PROXIES "$(add_subnet "$(env_value RIFT_WEBPANEL_PROXIES)")"
   put_env RIFT_WEBPANEL_ALLOW "$(add_subnet "$(env_value RIFT_WEBPANEL_ALLOW)")"
@@ -119,8 +134,11 @@ restart_server
 
 echo
 echo "The panel is at https://$domain once the domain's A record points at this server."
-if docker exec rift-server rift --config /etc/rift/config.toml --json panel 2fa status 2> /dev/null | grep -q '"enabled":true'; then
-  echo "Two-factor login is on."
+if [ -n "$read_only" ]; then
+  echo "It is read-only there; change things on the VPS, through an SSH tunnel or from a panel"
+  echo "VPN device (rift panel connect). Allow changes there with: sudo sh deploy/publish-panel $domain"
+elif docker exec rift-server rift --config /etc/rift/config.toml --json panel 2fa status 2> /dev/null | grep -q '"enabled":true'; then
+  echo "Changes are allowed there. Two-factor login is on."
 else
   echo "WARNING: two-factor login is off. The panel password alone now allows changes from the"
   echo "internet. Turn it on: rift panel 2fa setup"

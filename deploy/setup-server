@@ -23,7 +23,8 @@
 #   --caddy-sites-dir DIR   ... and reads the site files from this host directory
 #   --email ADDRESS         the Let's Encrypt address for that proxy
 #   --publish-panel DOMAIN  also reach the panel at https://DOMAIN through that proxy
-#                           (deploy/publish-panel); --publish-panel - unpublishes it
+#                           (deploy/publish-panel), read-only unless
+#                           --set RIFT_WEBPANEL_CONTROL=public; --publish-panel - unpublishes it
 #   --version VERSION       the image: latest or a release such as 1.0.0 (RIFT_VERSION)
 #   --set KEY=VALUE         any setting of .env.server.example, e.g. --set RIFT_WG_PORT=51900;
 #                           repeatable; an empty VALUE returns it to RIFT's default
@@ -421,7 +422,7 @@ note "  and through the reverse proxy if you give the panel a domain under Websi
 note "public: the panel itself on every address over plain HTTP (port $(current RIFT_WEBPANEL_PORT)); rarely needed."
 setting RIFT_WEBPANEL_ACCESS "Where the panel listens: private or public" check_access
 note "Who may change things: private (the VPS itself and panel VPN devices), public (also through"
-note "a TLS proxy over HTTPS; a panel domain under Websites sets this itself), off (read-only)."
+note "a TLS proxy over HTTPS; a panel domain under Websites asks again), off (read-only)."
 setting RIFT_WEBPANEL_CONTROL "Changes allowed from: private, public or off" check_control
 if [ -n "$asking" ]; then
   group "Change advanced panel settings (port $(current RIFT_WEBPANEL_PORT), allowed addresses, TLS proxies)?" \
@@ -658,8 +659,6 @@ if [ -z "$has_publish" ]; then
   elif [ "$panel" = true ] && [ "$proxy" != none ]; then
     if yes_no "Also reach the panel at https://DOMAIN through $proxy_name (for networks that block WireGuard)?" \
       "$([ -n "$current_route" ] && echo y || echo n)"; then
-      note "Changes are then allowed there: only the password (and the code, if two-factor login"
-      note "is on) protects your network from the internet. Turn two-factor login on."
       ask "Domain for the panel (its A record points at this server)" "$current_route" is_domain
       publish=$answer
     else
@@ -678,9 +677,19 @@ if [ -n "$publish" ]; then
   [ "$panel" = true ] || fail "publishing the panel needs the web panel on (--panel)"
   [ "$proxy" != none ] || [ "$publish" = "$current_route" ] \
     || fail "publishing the panel needs a proxy (--proxy traefik|caddy|npm|own)"
-  # deploy/publish-panel allows changes through the proxy.
-  put RIFT_WEBPANEL_CONTROL public
+  # Read-only through the domain unless changes are allowed there (RIFT_WEBPANEL_CONTROL=public).
+  note "Through https://$publish logins work. Read-only (recommended): changes and secrets stay on"
+  note "the VPS, SSH tunnels and panel VPN devices. With changes, only the password (and the code,"
+  note "if two-factor login is on) protects your network from the internet."
+  if yes_no "Allow changes through https://$publish?" "$([ "$(get RIFT_WEBPANEL_CONTROL)" = public ] && echo y || echo n)"; then
+    put RIFT_WEBPANEL_CONTROL public
+    [ "$(get RIFT_WEBPANEL_2FA)" = required ] || note "Turn two-factor login on: rift panel 2fa setup"
+  elif [ "$(get RIFT_WEBPANEL_CONTROL)" = public ]; then
+    put RIFT_WEBPANEL_CONTROL private
+  fi
 fi
+publish_mode=
+[ "$(get RIFT_WEBPANEL_CONTROL)" = public ] || publish_mode=--read-only
 
 # ---------- summary ----------
 version=$(get RIFT_VERSION)
@@ -722,7 +731,11 @@ if [ "$panel" = true ]; then
     line "" "http://$(get RIFT_SERVER_IPV4):$panel_port from VPN devices of 'rift panel connect'"
   fi
   if [ -n "$publish" ]; then
-    line "" "https://$publish through the proxy"
+    if [ "$(get RIFT_WEBPANEL_CONTROL)" = public ]; then
+      line "" "https://$publish through the proxy (changes allowed)"
+    else
+      line "" "https://$publish through the proxy (read-only)"
+    fi
   else
     line "" "(no HTTPS domain)"
   fi
@@ -828,8 +841,8 @@ fi
 if [ -n "$publish_step" ] && [ -z "$failed" ]; then
   if [ -n "$publish" ]; then
     echo "$publish_step/$steps Publishing the panel at https://$publish"
-    sh "$script_dir/publish-panel" "$publish" --yes \
-      || failed="the panel was not published (see above); run: sudo sh deploy/publish-panel $publish"
+    sh "$script_dir/publish-panel" "$publish" $publish_mode --yes \
+      || failed="the panel was not published (see above); run: sudo sh deploy/publish-panel $publish $publish_mode"
   else
     echo "$publish_step/$steps Removing the panel route https://$current_route"
     sh "$script_dir/publish-panel" --off --yes \
