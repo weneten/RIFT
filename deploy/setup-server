@@ -826,12 +826,17 @@ failed=
 if [ "$proxy" = own ]; then
   echo "6/$steps Making your $own_kind the proxy of 'rift add site'"
   if [ -n "$caddy_container" ]; then
-    rift proxy caddy --container "$caddy_container" --sites-dir "$caddy_sites_dir" \
-      || failed="'rift proxy' failed (see above); run: sudo rift proxy caddy --container $caddy_container --sites-dir $caddy_sites_dir"
+    set -- caddy --container "$caddy_container" --sites-dir "$caddy_sites_dir"
   elif [ "$own_kind" = caddy ]; then
-    rift proxy caddy --host || failed="'rift proxy' failed (see above); run: sudo rift proxy caddy --host"
+    set -- caddy --host
   else
-    rift proxy "$own_kind" || failed="'rift proxy' failed (see above); run: sudo rift proxy $own_kind"
+    set -- "$own_kind"
+  fi
+  # rift proxy prints the proxy name first, which says nothing here; the rest (moved routes) does.
+  if output=$(rift proxy "$@"); then
+    printf '%s\n' "$output" | sed '1d'
+  else
+    failed="'rift proxy' failed (see above); run: sudo rift proxy $*"
   fi
 elif [ "$proxy" != none ]; then
   echo "6/$steps Setting up $proxy"
@@ -864,9 +869,9 @@ echo
 echo "The RIFT server is running."
 echo "Open in your cloud firewall or security group: $ports"
 echo "and later the ports of your forwards."
-echo "Next: add an agent with   rift add agent NAME"
+echo "Next: add an agent with \"rift add agent NAME\""
 if [ "$panel" = true ]; then
-  echo "Web panel: connect a device with   rift panel connect laptop"
+  echo "Web panel: connect a device with \"rift panel connect laptop\""
   [ -z "$password_note" ] || echo "Panel password$password_note"
 fi
 if [ -n "$failed" ]; then

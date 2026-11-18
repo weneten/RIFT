@@ -293,4 +293,4 @@ if [ -n "$token" ]; then
 else
   echo "Agent $name is active with the new settings."
 fi
-echo "On the server, 'rift list agents' shows it; publish ports with 'rift add forward $name ...'."
+echo "On the server, \"rift list agents\" shows it; publish ports with \"rift add forward $name ...\"."
