@@ -75,6 +75,9 @@ enum Command {
         /// The host directory that Caddy in the container reads the site files from.
         #[arg(long, requires = "container")]
         sites_dir: Option<String>,
+        /// Caddy runs on the host itself (/etc/caddy/rift-sites); its sites move along.
+        #[arg(long, conflicts_with_all = ["container", "sites_dir"])]
+        host: bool,
     },
     /// Give phones and laptops private access to chosen agents through the VPS.
     Vpn {
