@@ -261,6 +261,12 @@ command -v docker > /dev/null 2>&1 \
 docker compose version > /dev/null 2>&1 || fail "Docker Compose v2 ('docker compose') is missing"
 docker info > /dev/null 2>&1 || fail "Docker does not answer; is the docker service running?"
 
+# Server and agent share the compose project "rift", its state volume and the host network: they
+# cannot run on one machine, even from two checkouts.
+if docker inspect rift-agent > /dev/null 2>&1; then
+  fail "this machine runs a RIFT agent (container rift-agent); the server needs its own machine"
+fi
+
 env_existed=
 if [ -f "$env_file" ]; then
   grep -Eq '^COMPOSE_PROFILES=agent' "$env_file" \

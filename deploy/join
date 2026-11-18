@@ -149,6 +149,12 @@ command -v docker > /dev/null 2>&1 \
 docker compose version > /dev/null 2>&1 || fail "Docker Compose v2 ('docker compose') is missing"
 docker info > /dev/null 2>&1 || fail "Docker does not answer; is the docker service running?"
 
+# Server and agent share the compose project "rift", its state volume and the host network: they
+# cannot run on one machine, even from two checkouts.
+if docker inspect rift-server > /dev/null 2>&1; then
+  fail "this machine runs a RIFT server (container rift-server); an agent needs its own machine"
+fi
+
 env_existed=
 if [ -f "$env_file" ]; then
   grep -Eq '^COMPOSE_PROFILES=server' "$env_file" \
@@ -277,6 +283,11 @@ while [ "$i" -lt 60 ]; do
     break
   fi
   i=$((i + 1))
+  if [ $((i % 5)) -eq 0 ]; then
+    # Every 10 s the agent's latest message, so a wrong address or a closed port shows early.
+    last=$(docker logs --tail 1 rift-agent 2>&1 | cut -c1-160)
+    printf '  %3d s: %s\n' $((i * 2)) "${last:-(no message yet)}"
+  fi
   sleep 2
 done
 if [ -z "$active" ]; then
