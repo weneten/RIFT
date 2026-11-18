@@ -3,7 +3,7 @@
   "agents": [
     {
       "id": "0b9b2c6e-7d1e-4b8a-9a53-1d2f3e4a5b6c",
-      "name": "PP",
+      "name": "node1",
       "public_key": "c2VydmVyLWtleS1wcC0wMDAwMDAwMDAwMDAwMDAwMDA=",
       "tunnel_ipv4": "10.13.0.2",
       "tunnel_ipv6": "fd88:5249:4654::2",

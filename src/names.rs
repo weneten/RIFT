@@ -604,22 +604,22 @@ mod tests {
             },
         }
     }
-    /// PP and core have names on, other does not. The phone reaches PP and other; the
-    /// laptop reaches nothing; the tablet reaches PP but turned names off.
+    /// node1 and node2 have names on, other does not. The phone reaches node1 and other;
+    /// the laptop reaches nothing; the tablet reaches node1 but turned names off.
     fn snap() -> StateSnapshot {
         let mut tablet = peer("tablet", 4);
         tablet.names_off = true;
         StateSnapshot {
             agents: vec![
-                agent("PP", 2, true),
-                agent("core", 3, true),
+                agent("node1", 2, true),
+                agent("node2", 3, true),
                 agent("other", 4, false),
             ],
             vpn_peers: vec![peer("phone", 2), peer("laptop", 3), tablet],
             vpn_grants: vec![
-                port("phone", "PP", 3000),
+                port("phone", "node1", 3000),
                 port("phone", "other", 22),
-                port("tablet", "PP", 3000),
+                port("tablet", "node1", 3000),
             ],
             ..Default::default()
         }
@@ -652,7 +652,7 @@ mod tests {
     fn a_device_resolves_the_named_agents_it_reaches() {
         let snap = snap();
         let phone = &snap.vpn_peers[0];
-        let q = query("PP.internal", TYPE_A);
+        let q = query("NODE1.internal", TYPE_A);
         let answer = local(decide(&q, &snap, phone));
         assert_eq!(&answer[..2], &[0x12, 0x34], "the ID is kept");
         assert_eq!(answer[2] & 0x80, 0x80, "it is a response");
@@ -668,8 +668,8 @@ mod tests {
     fn names_the_device_may_not_see_do_not_exist() {
         let snap = snap();
         let phone = &snap.vpn_peers[0];
-        // core has names on, but the phone has no grant on it; other has names off.
-        for name in ["core.internal", "other.internal", "nothing.internal"] {
+        // node2 has names on, but the phone has no grant on it; other has names off.
+        for name in ["node2.internal", "other.internal", "nothing.internal"] {
             let answer = local(decide(&query(name, TYPE_A), &snap, phone));
             assert_eq!(rcode(&answer), RCODE_NXDOMAIN, "{name}");
             assert_eq!(answers(&answer), 0, "{name}");
@@ -680,7 +680,7 @@ mod tests {
     fn only_ipv4_is_answered_and_other_names_are_passed_on() {
         let snap = snap();
         let phone = &snap.vpn_peers[0];
-        let aaaa = local(decide(&query("pp.internal", 28), &snap, phone));
+        let aaaa = local(decide(&query("node1.internal", 28), &snap, phone));
         assert_eq!(
             (rcode(&aaaa), answers(&aaaa)),
             (0, 0),
@@ -691,13 +691,13 @@ mod tests {
             Reply::Forward
         ));
         // A response or a strange opcode is not taken for a question.
-        let mut response = query("pp.internal", TYPE_A);
+        let mut response = query("node1.internal", TYPE_A);
         response[2] |= 0x80;
         assert_eq!(
             rcode(&local(decide(&response, &snap, phone))),
             RCODE_FORMERR
         );
-        let mut update = query("pp.internal", TYPE_A);
+        let mut update = query("node1.internal", TYPE_A);
         update[2] = 5 << 3;
         assert_eq!(rcode(&local(decide(&update, &snap, phone))), RCODE_NOTIMP);
         assert_eq!(
@@ -772,9 +772,9 @@ mod tests {
         phone.ipv4 = Ipv4Addr::LOCALHOST;
         state
             .mutate("test", |x| {
-                x.agents = vec![agent("PP", 2, true)];
+                x.agents = vec![agent("node1", 2, true)];
                 x.vpn_peers = vec![phone];
-                x.vpn_grants = vec![port("phone", "PP", 3000)];
+                x.vpn_grants = vec![port("phone", "node1", 3000)];
                 Ok(())
             })
             .unwrap();
@@ -785,7 +785,7 @@ mod tests {
         tokio::spawn(serve(config, state));
         let server: SocketAddr = (Ipv4Addr::LOCALHOST, DNS_PORT).into();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let q = query("pp.internal", TYPE_A);
+        let q = query("node1.internal", TYPE_A);
         let mut buf = [0u8; 512];
         let mut answer = None;
         for _ in 0..50 {
@@ -901,7 +901,7 @@ mod tests {
 
     #[test]
     fn agent_names_become_dns_labels() {
-        assert_eq!(vpn::dns_label("PP").as_deref(), Some("pp"));
+        assert_eq!(vpn::dns_label("Node1").as_deref(), Some("node1"));
         assert_eq!(
             vpn::dns_label("home_server").as_deref(),
             Some("home-server")

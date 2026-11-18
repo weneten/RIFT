@@ -21,22 +21,22 @@ loader.exec_module(rift_site)
 class RenderTests(unittest.TestCase):
     def test_traefik_matches_the_two_router_pattern(self):
         text = rift_site.render_traefik(
-            "app.makl.xyz", "http://181.214.231.165:20000", "myresolver", "web", "websecure"
+            "app.example.net", "http://203.0.113.10:20000", "myresolver", "web", "websecure"
         )
-        self.assertIn("rule: Host(`app.makl.xyz`)", text)
+        self.assertIn("rule: Host(`app.example.net`)", text)
         self.assertIn("certResolver: myresolver", text)
         self.assertIn("- web\n", text)
         self.assertIn("- websecure\n", text)
-        self.assertIn("url: http://181.214.231.165:20000", text)
+        self.assertIn("url: http://203.0.113.10:20000", text)
 
     def test_caddy_and_nginx_point_at_the_public_forward(self):
         self.assertEqual(
-            rift_site.render_caddy("app.makl.xyz", "http://181.214.231.165:20000"),
-            "app.makl.xyz {\n    reverse_proxy 181.214.231.165:20000\n}\n",
+            rift_site.render_caddy("app.example.net", "http://203.0.113.10:20000"),
+            "app.example.net {\n    reverse_proxy 203.0.113.10:20000\n}\n",
         )
-        nginx = rift_site.render_nginx("app.makl.xyz", "http://181.214.231.165:20000")
-        self.assertIn("server_name app.makl.xyz;", nginx)
-        self.assertIn("proxy_pass http://181.214.231.165:20000;", nginx)
+        nginx = rift_site.render_nginx("app.example.net", "http://203.0.113.10:20000")
+        self.assertIn("server_name app.example.net;", nginx)
+        self.assertIn("proxy_pass http://203.0.113.10:20000;", nginx)
 
     def test_allowed_sources_reach_every_proxy(self):
         nets = ["203.0.113.7/32", "2001:db8::/48"]

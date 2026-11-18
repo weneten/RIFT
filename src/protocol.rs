@@ -300,8 +300,8 @@ mod tests {
     }
 
     #[test]
-    fn a_sync_from_an_agent_before_0_2_is_read() {
-        // What a 0.1 agent sends: no rift_version.
+    fn a_sync_without_the_rift_version_is_read() {
+        // What an agent built before 1.0 sends: no rift_version.
         let old = br#"{"Sync":{"version":1,"agent_id":"a","applied_generation":4,"error":null,"limits":{"ports":null,"subnets":[],"exit":false},"exit":null}}"#;
         match serde_json::from_slice::<ControlRequest>(old) {
             Ok(ControlRequest::Sync {

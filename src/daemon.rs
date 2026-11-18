@@ -1601,12 +1601,6 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
     let data = match r {
         AdminRequest::VpnPeerAdd { name } => {
             validate_name(&name)?;
-            // `rift vpn config qr|export ...` was the form before 0.2 and is answered with the
-            // new one, so a device of that name could not be printed.
-            anyhow::ensure!(
-                name != "qr" && name != "export",
-                "the device names qr and export are reserved"
-            );
             cfg.check_vpn_pool()?;
             anyhow::ensure!(
                 !snap.vpn_peers.iter().any(|p| p.name == name),
@@ -2615,8 +2609,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identity_of_rift_0_1_is_read_and_a_newer_one_refused() {
-        // identity.json as RIFT 0.1 wrote it: no format number.
+    fn identity_from_before_1_0_is_read_and_a_newer_one_refused() {
+        // identity.json as builds before 1.0 wrote it: no format number.
         let old = br#"{"id":"a","attempt_id":"b","public_key":"k","welcome":null,"active":false,"applied_generation":3}"#;
         let identity = read_identity(old).unwrap();
         assert_eq!(identity.version, IDENTITY_VERSION);

@@ -778,15 +778,15 @@ mod tests {
         };
         let request = AdminRequest::VpnAllow {
             peer: "handy".into(),
-            agent: "core".into(),
+            agent: "node2".into(),
             access,
         };
-        let refused = json!({"warning": "the grant was added, but agent core will refuse it: the agent allows only ports 3000"});
+        let refused = json!({"warning": "the grant was added, but agent node2 will refuse it: the agent allows only ports 3000"});
         let text = render(&request, &refused, None);
         assert!(!text.contains("may now reach"), "{text}");
-        assert!(text.contains("cannot reach core"), "{text}");
+        assert!(text.contains("cannot reach node2"), "{text}");
         let ok = render(&request, &json!({"warning": null}), None);
-        assert!(ok.contains("handy may now reach core"), "{ok}");
+        assert!(ok.contains("handy may now reach node2"), "{ok}");
     }
 
     #[test]
@@ -794,13 +794,13 @@ mod tests {
         assert!(older("0.1.9", "0.2.0") && older("0.2.0", "1.0.0") && older("1.9.0", "1.10.0"));
         assert!(!older("0.2.0", "0.2.0") && !older("", "0.2.0") && !older("1.0.0", "0.9.9"));
         let data = json!({"rift_version": "0.3.0", "snapshot": {"agents": [
-            {"name": "core", "rift_version": "0.2.0"}, {"name": "PP", "rift_version": "0.3.0"}]}});
+            {"name": "node2", "rift_version": "0.2.0"}, {"name": "node1", "rift_version": "0.3.0"}]}});
         let text = status(&data);
         assert!(
-            text.contains("Agent core runs RIFT 0.2.0, the server 0.3.0"),
+            text.contains("Agent node2 runs RIFT 0.2.0, the server 0.3.0"),
             "{text}"
         );
-        assert!(!text.contains("Agent PP"), "{text}");
+        assert!(!text.contains("Agent node1"), "{text}");
     }
 
     #[test]

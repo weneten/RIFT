@@ -29,7 +29,7 @@ pub const OLD_STATE: &str =
     "the stored RIFT state comes from a different RIFT version and cannot be read";
 
 /// The format of the state database, kept in SQLite's `user_version`. A database written
-/// before formats were numbered has 0 and is format 1 (RIFT 0.1). Every change to what is
+/// before formats were numbered (builds before 1.0) has 0 and is format 1. Every change to what is
 /// stored adds a migration below and a fixture test, so an update never loses state.
 pub const STATE_VERSION: u32 = 2;
 
@@ -821,7 +821,7 @@ pub fn lowest_free_id(used: impl IntoIterator<Item = u64>) -> u64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
-    /// The tables as RIFT 0.1 created them, without a format number.
+    /// The tables as builds before 1.0 created them, without a format number.
     fn v1_database(path: &Path) {
         let c = Connection::open(path).unwrap();
         c.execute_batch("CREATE TABLE snapshot (id INTEGER PRIMARY KEY CHECK(id=1), generation INTEGER NOT NULL, body TEXT NOT NULL);
@@ -838,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn state_of_rift_0_1_is_migrated_with_a_copy_first() {
+    fn state_from_before_1_0_is_migrated_with_a_copy_first() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("state.db");
         v1_database(&path);
@@ -846,7 +846,7 @@ mod tests {
         assert_eq!(store.version().unwrap(), STATE_VERSION);
         let snap = store.snapshot().unwrap();
         assert_eq!(snap.generation, 7);
-        assert_eq!(snap.agents[0].name, "PP");
+        assert_eq!(snap.agents[0].name, "node1");
         assert!(!snap.agents[0].names, "names default to off");
         assert!(!snap.vpn_peers[0].names_off);
         assert_eq!(snap.forwards[0].listen_ports.start, 2222);

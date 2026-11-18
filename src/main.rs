@@ -531,9 +531,6 @@ async fn run() -> Result<()> {
                     export,
                 },
         } => {
-            if let Some(form) = old_config_form(&name, agent.as_deref(), export) {
-                bail!("{form}");
-            }
             return vpn_config(&config, cli.json, name, agent, !export).await;
         }
         Command::Panel {
@@ -1185,20 +1182,6 @@ async fn panel_connect(config: &Config, json: bool, name: String, export: bool) 
     }
     Ok(())
 }
-/// The answer to the form before 0.2 (`rift vpn config qr|export DEVICE [AGENT]`): the QR code
-/// is the default now and `--export` prints the file, as in `rift panel connect`.
-fn old_config_form(name: &str, agent: Option<&str>, export: bool) -> Option<String> {
-    let flag = match name {
-        "qr" => "",
-        "export" => " --export",
-        _ => return None,
-    };
-    let rest = agent.map_or("DEVICE".to_string(), String::from);
-    let flag = if export { " --export" } else { flag };
-    Some(format!(
-        "`rift vpn config {name} ...` is now `rift vpn config {rest} [AGENT]{flag}`: the QR code is the default and --export prints the file"
-    ))
-}
 /// Prints the new secret as a QR code, like `vpn config`. Codes are never shown here: a
 /// code readable on the server would not be a second factor.
 async fn two_factor_setup(config: &Config, json: bool) -> Result<()> {
@@ -1598,16 +1581,6 @@ mod tests {
         assert!(Cli::try_parse_from(["rift", "vpn", "config", "iphone", "a", "b"]).is_err());
     }
     #[test]
-    fn the_old_config_form_names_the_new_one() {
-        assert_eq!(old_config_form("iphone", None, false), None);
-        assert!(old_config_form("qr", Some("iphone"), false)
-            .unwrap()
-            .contains("rift vpn config iphone [AGENT]`"));
-        assert!(old_config_form("export", Some("iphone"), false)
-            .unwrap()
-            .contains("rift vpn config iphone [AGENT] --export`"));
-    }
-    #[test]
     fn vpn_targets_become_accesses() {
         let args = |extra: &[&str]| {
             let mut argv = vec!["rift", "vpn", "allow", "iphone", "node4"];
@@ -1900,7 +1873,7 @@ mod tests {
             vec!["rift", "enable", "forward", "3"],
             vec!["rift", "add", "ban", "3", "203.0.113.9", "--ttl", "1h"],
             vec!["rift", "add", "ban", "3", "203.0.113.9"],
-            vec!["rift", "vpn", "names", "agent", "PP", "on"],
+            vec!["rift", "vpn", "names", "agent", "node1", "on"],
             vec!["rift", "vpn", "names", "device", "handy", "off"],
             vec!["rift", "list", "sites"],
             vec!["rift", "add", "site", "node1", "app.example.org", "8080"],
@@ -1920,7 +1893,7 @@ mod tests {
             panic!("add ban");
         };
         assert_eq!((forward_id, ttl.as_str()), (3, "1h"));
-        assert!(Cli::try_parse_from(["rift", "vpn", "names", "agent", "PP", "maybe"]).is_err());
+        assert!(Cli::try_parse_from(["rift", "vpn", "names", "agent", "node1", "maybe"]).is_err());
         // The agent is no longer named: the forward ID says which one it is.
         assert!(Cli::try_parse_from(["rift", "add", "ban", "node1", "3", "203.0.113.9"]).is_err());
         let cli = Cli::try_parse_from(["rift", "remove", "forward", "7"]).unwrap();
@@ -1932,19 +1905,6 @@ mod tests {
         ));
         assert!(Cli::try_parse_from(["rift", "remove", "forward", "--id", "7"]).is_err());
         assert!(Cli::try_parse_from(["rift", "remove", "forward", "x"]).is_err());
-    }
-    #[test]
-    fn old_command_forms_are_gone() {
-        for args in [
-            vec!["rift", "forwards", "list"],
-            vec!["rift", "agents", "add", "x"],
-            vec!["rift", "agents", "list"],
-            vec!["rift", "bans", "list"],
-            vec!["rift", "vpn", "peer", "list"],
-            vec!["rift", "site", "list"],
-        ] {
-            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
-        }
     }
     #[test]
     fn export_import_backup_and_restore_parse() {
