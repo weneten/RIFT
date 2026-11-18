@@ -1244,22 +1244,7 @@ async fn show(
     if json {
         println!("{}", serde_json::to_string(&response.data)?);
     } else if invitation {
-        let (server, name, token) = (
-            response.data["server"].as_str().unwrap_or_default(),
-            response.data["name"].as_str().unwrap_or_default(),
-            response.data["token"].as_str().unwrap_or_default(),
-        );
-        eprintln!("On the agent, in a RIFT checkout (git clone https://github.com/weneten/RIFT.git && cd RIFT), run:");
-        println!("{}", rift::enrollment::join_command(server, name, token));
-        eprintln!("Or put these lines into the agent's .env yourself:");
-        println!("RIFT_SERVER={server}\nRIFT_AGENT_NAME={name}\nRIFT_ENROLLMENT_TOKEN={token}");
-        eprintln!("The token is a secret; it works once and expires.");
-        if response.data["replaces"].as_bool() == Some(true) {
-            eprintln!("{} already exists: the install that uses this invitation takes over its key and keeps its addresses, forwards, grants and exits. The old install stops working then.", response.data["name"].as_str().unwrap_or_default());
-        }
-        if response.data["enrollment"].as_str() == Some("auto") {
-            eprintln!("The enrollment port is open until the agent is active or the invitation expires or is cancelled.");
-        }
+        println!("{}", output::invitation(&response.data));
     } else {
         let agents = if matches!(
             request,

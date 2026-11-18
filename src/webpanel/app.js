@@ -253,6 +253,8 @@ function agentOptions(onlyActive) {
     .map((a) => [a.name, a.name]);
 }
 
+const CHECKOUT = "git clone https://github.com/weneten/RIFT.git\ncd RIFT";
+
 // `existing` re-invites an active agent: the new install takes over its key and settings.
 function inviteDialog(existing) {
   const name = el("input", { required: true, pattern: "[A-Za-z0-9_\\-]{1,63}", placeholder: "node2" });
@@ -267,11 +269,15 @@ function inviteDialog(existing) {
     const result = await act({ action: "agent_invite", name: name.value.trim(), ttl: ttl.value });
     await load();
     openModal(`Invitation for ${result.name}`,
-      el("p", { class: "hint" }, "Run this on the agent, in a RIFT checkout (git clone https://github.com/weneten/RIFT.git && cd RIFT). It prepares the host, starts the agent and removes the token once the agent is active. The token is a secret and works once."),
+      el("p", { class: "hint" }, "The token is a secret and works once."),
       result.replaces ? el("p", { class: "hint" }, `${result.name} keeps its addresses, forwards, grants and exits.`) : null,
+      el("p", { class: "hint" }, "1. On the agent host, with Docker installed, get RIFT:"),
+      el("pre", { class: "pre" }, CHECKOUT),
+      el("div", { class: "buttons" }, button("Copy", (e) => copy(CHECKOUT, e.currentTarget))),
+      el("p", { class: "hint" }, "2. In that folder, set up and start the agent. This prepares the host and removes the token once the agent is active:"),
       el("pre", { class: "pre" }, result.join),
       el("div", { class: "buttons" }, button("Copy command", (e) => copy(result.join, e.currentTarget), "primary")),
-      el("p", { class: "hint" }, "Or put these three lines into the agent's .env yourself, then start it:"),
+      el("p", { class: "hint" }, "Or set it up by hand (README, \"Manual setup of an agent\") with these three lines in the agent's .env:"),
       el("pre", { class: "pre" }, result.lines),
       el("div", { class: "form" }, el("div", { class: "buttons" }, button("Copy lines", (e) => copy(result.lines, e.currentTarget)), button("Done", closeModal))));
   }));

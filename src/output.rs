@@ -36,6 +36,47 @@ fn ban_expiry(value: &Value) -> String {
     }
 }
 
+/// What `rift add agent` prints: one block on stdout, because `docker exec` passes stdout and
+/// stderr on separately and would mix up the order of hints and commands.
+pub fn invitation(data: &Value) -> String {
+    let (server, name, token) = (
+        data["server"].as_str().unwrap_or_default(),
+        data["name"].as_str().unwrap_or_default(),
+        data["token"].as_str().unwrap_or_default(),
+    );
+    let minutes =
+        ((data["expires_at"].as_i64().unwrap_or(0) - rift::model::now()).max(0) + 59) / 60;
+    let mut out = vec![format!(
+        "Invitation for agent \"{name}\": works once, valid for {minutes} min. The token is a secret."
+    )];
+    if data["replaces"].as_bool() == Some(true) {
+        out.push(format!("{name} already exists: the install that uses this invitation takes over its key and keeps its addresses, forwards, grants and exits. The old install stops working then."));
+    }
+    out.push(String::new());
+    out.push("Set up the agent: on the agent host, with Docker installed, run".into());
+    out.push(String::new());
+    out.push("  git clone https://github.com/weneten/RIFT.git".into());
+    out.push("  cd RIFT".into());
+    out.push(format!(
+        "  {}",
+        rift::enrollment::join_command(server, name, token)
+    ));
+    out.push(String::new());
+    out.push(
+        "Or set it up by hand (README, \"Manual setup of an agent\") with these lines in".into(),
+    );
+    out.push("the agent's .env:".into());
+    out.push(String::new());
+    out.push(format!("RIFT_SERVER={server}"));
+    out.push(format!("RIFT_AGENT_NAME={name}"));
+    out.push(format!("RIFT_ENROLLMENT_TOKEN={token}"));
+    if data["enrollment"].as_str() == Some("auto") {
+        out.push(String::new());
+        out.push("The enrollment port is open until the agent is active or the invitation expires or is cancelled.".into());
+    }
+    out.join("\n")
+}
+
 fn table(headers: &[&str], rows: Vec<Vec<String>>, empty: &str) -> String {
     if rows.is_empty() {
         return empty.into();
@@ -766,6 +807,31 @@ mod tests {
     use super::*;
     use rift::model::{PortRange, Protocol, VpnAccess};
     use serde_json::json;
+
+    #[test]
+    fn an_invitation_lists_clone_cd_and_join_once_and_the_env_lines_once() {
+        let data = json!({"name":"core","token":"v1.TOKEN","server":"rift.example.net:8443",
+            "expires_at": rift::model::now() + 900, "enrollment":"auto","replaces":false});
+        let text = invitation(&data);
+        let clone = text
+            .find("  git clone https://github.com/weneten/RIFT.git")
+            .unwrap();
+        let cd = text.find("\n  cd RIFT\n").unwrap();
+        let join = text
+            .find("  sudo sh deploy/join rift.example.net:8443 core v1.TOKEN")
+            .unwrap();
+        let env = text
+            .find("\nRIFT_SERVER=rift.example.net:8443\nRIFT_AGENT_NAME=core\nRIFT_ENROLLMENT_TOKEN=v1.TOKEN")
+            .unwrap();
+        assert!(clone < cd && cd < join && join < env, "{text}");
+        assert_eq!(text.matches("v1.TOKEN").count(), 2, "{text}");
+        assert!(text.contains("valid for 15 min"), "{text}");
+        assert!(text.contains("enrollment port is open"), "{text}");
+        assert!(!text.contains("takes over its key"), "{text}");
+        let again = invitation(&json!({"name":"core","replaces":true,"enrollment":"off"}));
+        assert!(again.contains("core already exists"), "{again}");
+        assert!(!again.contains("enrollment port"), "{again}");
+    }
 
     #[test]
     fn a_refused_grant_or_forward_is_not_reported_as_working() {

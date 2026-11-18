@@ -140,17 +140,22 @@ On the **server**, create a short-lived, single-use invitation. Choose a unique 
 rift add agent node1 --ttl 15m
 ```
 
-The output starts with one command for the agent, for example `sudo sh deploy/join rift.example.net:8443 node1 v1.eyJ2...`, followed by the same values as three `.env` lines. Treat the token as a secret and transfer it securely.
+It prints two ways to set up the agent: the commands for the join script, and the same invitation as three `.env` lines for a manual setup. The token in both is a secret and works once; transfer it securely.
 
-**The short way.** On the **agent**, with Docker installed:
+**The short way.** On the **agent**, with Docker installed, get RIFT:
 
 ```sh
 git clone https://github.com/weneten/RIFT.git
 cd RIFT
+```
+
+Then, in that folder, run the `deploy/join` line that `rift add agent` printed, for example:
+
+```sh
 sudo sh deploy/join rift.example.net:8443 node1 v1.eyJ2...
 ```
 
-Paste the command exactly as `rift add agent` printed it; leave the token out to be asked for it without it landing in the shell history. The script then asks what the server may open on this host (see [Harden the agent](#harden-the-agent)): the allowed ports (`RIFT_AGENT_ALLOW_PORTS`), the LAN networks VPN devices may reach (`RIFT_AGENT_ALLOW_SUBNETS`; it shows the networks it finds on this host, the default stays no LAN access) and whether the host is an internet exit (`RIFT_AGENT_ALLOW_EXIT`), plus the image version. It runs `deploy/prepare-host`, writes `config.toml` and `.env`, installs the `rift` command, starts the agent, waits until the server has accepted it and then removes the used token from `.env`. Run `sudo sh deploy/join` again without a token to change these settings of an enrolled agent. Without questions: `--allow-ports LIST`, `--allow-subnets LIST`, `--exit`/`--no-exit`, `--version`, `--set KEY=VALUE` and `--yes`. The web panel's invitation dialog shows the same command.
+Paste the line exactly as printed; leave the token out to be asked for it without it landing in the shell history. The script then asks what the server may open on this host (see [Harden the agent](#harden-the-agent)): the allowed ports (`RIFT_AGENT_ALLOW_PORTS`), the LAN networks VPN devices may reach (`RIFT_AGENT_ALLOW_SUBNETS`; it shows the networks it finds on this host, the default stays no LAN access) and whether the host is an internet exit (`RIFT_AGENT_ALLOW_EXIT`), plus the image version. It runs `deploy/prepare-host`, writes `config.toml` and `.env`, installs the `rift` command, starts the agent, waits until the server has accepted it and then removes the used token from `.env`. Run `sudo sh deploy/join` again without a token to change these settings of an enrolled agent. Without questions: `--allow-ports LIST`, `--allow-subnets LIST`, `--exit`/`--no-exit`, `--version`, `--set KEY=VALUE` and `--yes`. The web panel's invitation dialog shows the same command.
 
 The enrollment port opens with the invitation. With the default `RIFT_ENROLLMENT=auto` the server listens on TCP 8443 (and RIFT's UFW rule for it exists) only while at least one invitation is open. It closes again as soon as the last agent is active or the last invitation has expired or been cancelled; expiry is noticed within one reconcile interval (10 s). RIFT can only close the port on the server itself: a rule in your cloud firewall or security group stays open, but nothing listens behind it. Set `RIFT_ENROLLMENT=always` to keep the port open permanently, or `off` to turn enrollment off. `rift status` shows the port's state and the open invitations.
 
@@ -164,7 +169,7 @@ cp .env.agent.example .env
 chmod 600 .env
 ```
 
-Edit `.env`: keep `COMPOSE_PROFILES=agent` and replace the three invitation values with the exact output. `RIFT_SERVER` includes the enrollment port.
+Edit `.env`: keep `COMPOSE_PROFILES=agent` and replace the three invitation values with the `RIFT_SERVER`, `RIFT_AGENT_NAME` and `RIFT_ENROLLMENT_TOKEN` lines that `rift add agent` printed. `RIFT_SERVER` includes the enrollment port.
 
 Install the host command, as on the server, so `rift status`, `rift doctor` and `rift logs` work here (they run inside `rift-agent`):
 
@@ -879,7 +884,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 
 | Command | What it does |
 | --- | --- |
-| `rift add agent NAME [--ttl 15m]` | Creates a single-use invitation and prints the three `.env` lines for the agent. Opens the enrollment port until the agent is active. |
+| `rift add agent NAME [--ttl 15m]` | Creates a single-use invitation and prints the `deploy/join` command for the agent, plus the same values as three `.env` lines for a manual setup. Opens the enrollment port until the agent is active. |
 | `rift list agents` | All agents with state and tunnel addresses. |
 | `rift show agent NAME` | Every stored detail of one agent. |
 | `rift remove invite NAME` | Cancels an open invitation. |
