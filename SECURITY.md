@@ -18,7 +18,7 @@ The maintainers aim to confirm a report within a week and to agree on a disclosu
 
 ## Supported versions
 
-Fixes go into the newest release. While RIFT is below 1.0, older releases get no separate fixes; update to the newest one (server first, then the agents, see the README).
+Fixes go into the newest release of the current major version (1.x). Older releases get no separate fixes; update to the newest one (server first, then the agents, see the README).
 
 ## Scope
 

@@ -4880,7 +4880,7 @@ SOFTWARE.
 
 Used by:
 
-- [rift 0.1.0](https://crates.io/crates/rift)
+- [rift 1.0.0](https://crates.io/crates/rift)
 
 ```text
 MIT License

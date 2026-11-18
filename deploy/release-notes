@@ -1,6 +1,6 @@
 #!/bin/sh
 # Prints the section of one version from CHANGELOG.md, for the release notes:
-#   sh deploy/release-notes 0.2.0
+#   sh deploy/release-notes 1.0.0
 # Fails when CHANGELOG.md has no "## [VERSION]" heading or the section is empty.
 set -eu
 version=${1:?usage: sh deploy/release-notes VERSION}

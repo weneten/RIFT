@@ -7,7 +7,7 @@
 name: rift
 
 x-rift: &rift
-  # RIFT_VERSION in .env pins a release, e.g. 0.1.0. Unset follows main (latest).
+  # RIFT_VERSION in .env pins a release, e.g. 1.0.0. Unset follows main (latest).
   image: weneten/rift:${RIFT_VERSION:-latest}
   network_mode: host
   cap_drop:

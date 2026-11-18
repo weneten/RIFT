@@ -11,7 +11,7 @@ Client ── TCP / UDP ──> RIFT server ── WireGuard ──> RIFT agent 
 
 The agent initiates the connection to the server. RIFT manages the tunnel, explicit forwarding grants and the necessary Linux networking rules. A separate reverse proxy can terminate HTTPS and route domain names to HTTP services through RIFT.
 
-> **Pre-release (0.x).** RIFT changes the host's firewall, routing and sysctls. The namespace test suite covers agent isolation, forwarding after a server crash or an interrupted start, a simulated 1:1 cloud NAT, expired invitations and a scan for plain-text secrets; a deployment on a real NAT cloud, host reboots and performance are still open. See the [functional test matrix](docs/deploy.md#functional-test-matrix). An update migrates the stored state by itself and first keeps a copy of the old one (`state-before-vN-TIME.db` in the state volume); configuration settings may still change between 0.x versions. Read the [changelog](CHANGELOG.md) before updating.
+> **Before you deploy.** RIFT changes the host's firewall, routing and sysctls. The namespace test suite covers agent isolation, forwarding after a server crash or an interrupted start, a simulated 1:1 cloud NAT, expired invitations and a scan for plain-text secrets; on real hosts, a server and agents on bare metal and in a VM came back alone after reboots. A real cloud NAT, firewalld, Proxmox LXC and throughput are not tested on real hosts yet. See the [functional test matrix](docs/deploy.md#functional-test-matrix). Within 1.x, configuration settings keep their meaning, a server serves agents of its own and of the previous release, and RIFT migrates the stored state by itself after keeping a copy of the old one (`state-before-vN-TIME.db` in the state volume). Read the [changelog](CHANGELOG.md) before updating.
 
 > The examples use Linux Docker Engine with host networking. Host networking and `CAP_NET_ADMIN` let RIFT change the host's networking. Test the deployment and firewall interaction on a disposable system before production. Docker Desktop on Windows or macOS is useful for builds, but does not reproduce this Linux host-network datapath.
 
@@ -957,7 +957,7 @@ Run the container-specific log command on the machine hosting that role.
 
 ### Updates, persistence and recovery
 
-**Order and compatibility.** Update the server first, then the agents, one at a time if you like: a server serves agents of its own release and of the previous one (from 0.2 on), so an agent that is updated later keeps working meanwhile. `rift list agents` shows each agent's RIFT version, and `rift status` names agents older than the server. An agent newer than its server is refused, so never update an agent before its server. Stored state is migrated on start; RIFT keeps a copy of the previous state (`state-before-vN-TIME.db`).
+**Order and compatibility.** Update the server first, then the agents, one at a time if you like: a server serves agents of its own release and of the previous one, so an agent that is updated later keeps working meanwhile. `rift list agents` shows each agent's RIFT version, and `rift status` names agents older than the server. An agent newer than its server is refused, so never update an agent before its server. Stored state is migrated on start; RIFT keeps a copy of the previous state (`state-before-vN-TIME.db`).
 
 To update the published image, on each host from its own checkout:
 
@@ -972,11 +972,11 @@ docker compose ps
 
 ```sh
 git fetch --tags
-git checkout v0.1.0
+git checkout v1.0.0
 ```
 
 ```sh
-echo RIFT_VERSION=0.1.0 >> .env
+echo RIFT_VERSION=1.0.0 >> .env
 ```
 
 Then run `docker compose pull` and `docker compose up -d`. Keep the checkout and `RIFT_VERSION` on the same release, because the `rift` command and the site helper come from the checkout. Releases and their changes are listed in [CHANGELOG.md](CHANGELOG.md).

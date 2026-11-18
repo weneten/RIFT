@@ -30,6 +30,4 @@ jobs:
         run: |
           set -eu
           version="${GITHUB_REF_NAME#v}"
-          flag=
-          case "$version" in 0.*) flag=--prerelease ;; esac
-          gh release create "$GITHUB_REF_NAME" --title "RIFT $version" --notes-file notes.md $flag
+          gh release create "$GITHUB_REF_NAME" --title "RIFT $version" --notes-file notes.md

@@ -1,6 +1,6 @@
 # Releasing RIFT
 
-A release is a version tag `vX.Y.Z` on `main`. Pushing it builds the images `weneten/rift:X.Y.Z` for amd64 and arm64 (`image.yml`) and creates the GitHub release with that version's notes from `CHANGELOG.md` (`release.yml`; a 0.x version is marked as a pre-release). `latest` keeps following `main`.
+A release is a version tag `vX.Y.Z` on `main`. Pushing it builds the images `weneten/rift:X.Y.Z` for amd64 and arm64 (`image.yml`) and creates the GitHub release with that version's notes from `CHANGELOG.md` (`release.yml`). `latest` keeps following `main`.
 
 ## Steps
 
