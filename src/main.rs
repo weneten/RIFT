@@ -983,6 +983,7 @@ async fn server_checks(config: &Config, checks: &mut rift::net::Checks) {
         }
     }
     exit_checks(config, &status, checks);
+    names_check(config, &status, checks).await;
     for refused in status["refused_forwards"].as_array().into_iter().flatten() {
         checks.push(
             WARN,
@@ -1041,6 +1042,47 @@ async fn server_checks(config: &Config, checks: &mut rift::net::Checks) {
         }
     }
 }
+/// RIFT's names (`NAME.internal`): whether the name server answers on the tunnel address,
+/// once a device uses them. A device that cannot reach it resolves nothing at all.
+async fn names_check(config: &Config, status: &serde_json::Value, checks: &mut rift::net::Checks) {
+    use rift::net::{FAIL, OK};
+    let Ok(snap) = serde_json::from_value::<rift::model::StateSnapshot>(status["snapshot"].clone())
+    else {
+        return;
+    };
+    let users: Vec<&str> = snap
+        .vpn_peers
+        .iter()
+        .filter(|p| rift::vpn::uses_names(&snap, p))
+        .map(|p| p.name.as_str())
+        .collect();
+    if users.is_empty() {
+        return;
+    }
+    let address = std::net::SocketAddr::new(config.server_ipv4.into(), rift::names::DNS_PORT);
+    let up = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::TcpStream::connect(address),
+    )
+    .await
+    .is_ok_and(|c| c.is_ok());
+    checks.push(
+        if up { OK } else { FAIL },
+        "Names (.internal)".into(),
+        if up {
+            format!(
+                "the name server answers on {address} for {}; their DNS goes through it",
+                users.join(", ")
+            )
+        } else {
+            format!(
+                "nothing answers on {address}, so {} resolve nothing while the tunnel is on; see the server's log",
+                users.join(", ")
+            )
+        },
+    );
+}
+
 /// The internet exits in use: how many devices, whether the VPS carries IPv6 for them, and
 /// whether each agent they use has what it needs.
 fn exit_checks(config: &Config, status: &serde_json::Value, checks: &mut rift::net::Checks) {

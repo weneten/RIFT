@@ -264,6 +264,18 @@ pub fn plan_server(obs: &Observation, spec: &ServerSpec<'_>) -> Result<Plan> {
                 spec.interface, spec.server_v6, spec.control_port
             ));
         }
+        // VPN devices that use RIFT's names send DNS to port 53 of the server's tunnel address;
+        // nftables redirects it to the name server's port, which is what this chain sees.
+        if spec.vpn && (chain.family == "ip" || chain.family == "inet") {
+            for protocol in ["udp", "tcp"] {
+                rules.push(format!(
+                    "iifname \"{}\" ip daddr {} {protocol} dport {} accept comment \"rift:names\"",
+                    spec.interface,
+                    spec.server_v4,
+                    crate::names::DNS_PORT
+                ));
+            }
+        }
         if let Some(panel) = spec.panel {
             if chain.family == "ip" || chain.family == "inet" {
                 rules.push(format!(
@@ -940,6 +952,30 @@ mod tests {
             "ip saddr 10.255.13.0/24 ip daddr 10.88.0.1 tcp dport 8090 accept comment \"rift:panel\""
         ));
         assert!(!proxied.fill.contains("iifname \"eth0\" tcp dport 8090"));
+    }
+
+    #[test]
+    fn vpn_devices_reach_the_name_server_through_a_closed_firewall() {
+        let obs = observe(&ruleset()).unwrap();
+        let uplinks = vec!["eth0".to_string()];
+        let mut spec = server_spec(&uplinks);
+        assert!(!plan_server(&obs, &spec)
+            .unwrap()
+            .fill
+            .contains("rift:names"));
+        spec.vpn = true;
+        let plan = plan_server(&obs, &spec).unwrap();
+        for protocol in ["udp", "tcp"] {
+            assert!(
+                plan.fill.contains(&format!(
+                    "iifname \"rift0\" ip daddr 10.88.0.1 {protocol} dport 53053 accept comment \"rift:names\""
+                )),
+                "{}",
+                plan.fill
+            );
+        }
+        // Only through the tunnel: the uplink stays closed.
+        assert!(!plan.fill.contains("iifname \"eth0\" udp dport 53053"));
     }
 
     #[test]

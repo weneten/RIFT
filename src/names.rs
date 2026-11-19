@@ -473,6 +473,7 @@ pub async fn serve(config: Config, state: Arc<StateStore>) {
         },
         limit: Arc::new(Semaphore::new(256)),
     });
+    let mut waited = 0u32;
     let (udp, tcp) = loop {
         match (
             UdpSocket::bind(address).await,
@@ -485,7 +486,13 @@ pub async fn serve(config: Config, state: Arc<StateStore>) {
                     .or(tcp.err())
                     .map(|e| e.to_string())
                     .unwrap_or_default();
-                tracing::debug!("names: waiting to listen on {address}: {error}");
+                // The tunnel address appears a moment after the start; longer than that, say it.
+                waited += 1;
+                if waited == 6 {
+                    tracing::warn!("names: cannot listen on {address} for 30 s: {error}; devices that use RIFT's names resolve nothing until it can");
+                } else {
+                    tracing::debug!("names: waiting to listen on {address}: {error}");
+                }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
