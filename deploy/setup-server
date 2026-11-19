@@ -161,16 +161,10 @@ check_bind() {
 check_enrollment() { one_of "$1" auto always off; }
 # The suffix of the agents' names: a domain name in lower case, none that devices resolve
 # another way (the rules of vpn::validate_suffix).
+# Any domain name: which one suits is the operator's choice (see the README).
 check_suffix() {
   why="a domain name in lower case without a leading or final dot, e.g. internal, home.arpa or home.example.net"
-  printf '%s\n' "$1" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$' || return 1
-  case $1 in
-    home.arpa | *.home.arpa) return 0 ;;
-    local | *.local | localhost | *.localhost | onion | *.onion | alt | *.alt | invalid | *.invalid | example | *.example | arpa | *.arpa)
-      why=".local goes to mDNS, .localhost to this machine, .onion to Tor, .alt outside the DNS; .invalid, .example and other .arpa names are reserved. Use internal, home.arpa or a domain of your own"
-      return 1
-      ;;
-  esac
+  printf '%s\n' "$1" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$' && [ ${#1} -le 200 ]
 }
 # The name server: TCP and UDP from 1024 (the container has no capability for lower ports),
 # apart from RIFT's other ports, and free on this host.
@@ -492,8 +486,10 @@ if ! has_preset RIFT_NAMES_PORT; then
 fi
 group "Change RIFT's names for VPN devices (NAME.$(current RIFT_NAMES_SUFFIX), name server port $names_port)?" \
   "$( { [ -n "$names_busy" ] || changed RIFT_NAMES_PORT RIFT_NAMES_SUFFIX; } && echo y)"
-note "Suffix: internal (default; Safari searches for such names, type http:// or a final /),"
-note "  home.arpa (also private; on the Public Suffix List browsers use), or a domain of your own (e.g. home.example.net)."
+note "Suffix: any domain name. Recommended: internal (default; Safari searches for such names,"
+note "  type http:// or a final /) or home.arpa (also private; on the Public Suffix List browsers use)."
+note "  A subdomain of your own works without any DNS record (e.g. home.example.net). Whether"
+note "  another one works on your devices is up to you: RIFT checks only that it is a domain name."
 setting RIFT_NAMES_SUFFIX "Suffix of the agents' names" check_suffix
 setting RIFT_NAMES_PORT "Name server port (TCP and UDP on the tunnel address; devices ask port 53)" check_names_port "$names_port"
 end_group

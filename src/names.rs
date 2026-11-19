@@ -41,7 +41,6 @@ const TYPE_A: u16 = 1;
 const CLASS_IN: u16 = 1;
 const RCODE_FORMERR: u8 = 1;
 const RCODE_SERVFAIL: u8 = 2;
-const RCODE_NXDOMAIN: u8 = 3;
 const RCODE_NOTIMP: u8 = 4;
 const RCODE_REFUSED: u8 = 5;
 
@@ -155,15 +154,9 @@ fn respond(
     let mut out = Vec::with_capacity(64);
     out.extend_from_slice(query.get(0..2).unwrap_or(&[0, 0]));
     let opcode_rd = query.get(2).copied().unwrap_or(0) & 0b0111_1001;
-    // QR, the query's opcode and RD, AA for our own names; RA; the response code.
-    out.push(
-        0x80 | opcode_rd
-            | if answer.is_some() || rcode == RCODE_NXDOMAIN {
-                0x04
-            } else {
-                0
-            },
-    );
+    // QR, the query's opcode and RD, AA for our own names (answers that repeat the question);
+    // RA; the response code.
+    out.push(0x80 | opcode_rd | if question_end.is_some() { 0x04 } else { 0 });
     out.push(0x80 | rcode);
     let question = question_end.and_then(|end| query.get(12..end));
     out.extend_from_slice(&[0, u8::from(question.is_some())]);
@@ -206,28 +199,29 @@ fn decide_under(query: &[u8], snap: &StateSnapshot, peer: &VpnPeer, names: &str)
     let Some(question) = read_question(query) else {
         return Reply::Local(respond(query, None, RCODE_FORMERR, None));
     };
-    let private = vpn::private_suffix(names);
     let Some(label) = question.name.strip_suffix(&format!(".{names}")) else {
-        if question.name == names && private {
-            return Reply::Local(respond(query, Some(question.end), 0, None));
-        }
         return Reply::Forward;
     };
     let agent: Option<&AgentRecord> = vpn::named_agents(snap, peer)
         .into_iter()
         .find(|a| vpn::dns_label(&a.name).as_deref() == Some(label));
-    // Under a domain of your own, other names are public ones: pass them on.
-    if agent.is_none() && !private {
+    // Every other name under the suffix goes on, as any name does: public ones of a domain of
+    // your own keep working, and for a private suffix the upstream answers that it does not
+    // exist. RIFT needs no list of which suffixes are which.
+    let Some(agent) = agent else {
         return Reply::Forward;
-    }
-    match agent {
+    };
+    if question.qtype == TYPE_A && question.qclass == CLASS_IN {
+        Reply::Local(respond(
+            query,
+            Some(question.end),
+            0,
+            Some(agent.tunnel_ipv4),
+        ))
+    } else {
         // The name exists; only an IPv4 address: grants reach agents over IPv4 only, and an
         // AAAA answer would send apps to an address the device does not route.
-        Some(agent) if question.qtype == TYPE_A && question.qclass == CLASS_IN => Reply::Local(
-            respond(query, Some(question.end), 0, Some(agent.tunnel_ipv4)),
-        ),
-        Some(_) => Reply::Local(respond(query, Some(question.end), 0, None)),
-        None => Reply::Local(respond(query, Some(question.end), RCODE_NXDOMAIN, None)),
+        Reply::Local(respond(query, Some(question.end), 0, None))
     }
 }
 
@@ -686,7 +680,6 @@ mod tests {
     fn other_suffixes_answer_the_agents_and_pass_on_public_names() {
         let snap = snap();
         let phone = &snap.vpn_peers[0];
-        // home.arpa is private like internal: unknown names do not exist.
         let a = local(decide_under(
             &query("node1.home.arpa", TYPE_A),
             &snap,
@@ -694,13 +687,16 @@ mod tests {
             "home.arpa",
         ));
         assert_eq!(&a[a.len() - 4..], &[10, 13, 0, 2]);
-        let none = local(decide_under(
-            &query("nothing.home.arpa", TYPE_A),
-            &snap,
-            phone,
-            "home.arpa",
+        // Unknown names under any suffix go to the upstream.
+        assert!(matches!(
+            decide_under(
+                &query("nothing.home.arpa", TYPE_A),
+                &snap,
+                phone,
+                "home.arpa"
+            ),
+            Reply::Forward
         ));
-        assert_eq!(rcode(&none), RCODE_NXDOMAIN);
         // A domain of your own: the agent is answered here, every other name goes on, so the
         // public www.example.net keeps working while the tunnel is on.
         let own = "home.example.net";
@@ -732,14 +728,16 @@ mod tests {
     }
 
     #[test]
-    fn names_the_device_may_not_see_do_not_exist() {
+    fn names_the_device_may_not_see_are_not_answered_here() {
         let snap = snap();
         let phone = &snap.vpn_peers[0];
-        // node2 has names on, but the phone has no grant on it; other has names off.
+        // node2 has names on, but the phone has no grant on it; other has names off. They go
+        // to the upstream like any unknown name, which does not know them.
         for name in ["node2.internal", "other.internal", "nothing.internal"] {
-            let answer = local(decide(&query(name, TYPE_A), &snap, phone));
-            assert_eq!(rcode(&answer), RCODE_NXDOMAIN, "{name}");
-            assert_eq!(answers(&answer), 0, "{name}");
+            assert!(
+                matches!(decide(&query(name, TYPE_A), &snap, phone), Reply::Forward),
+                "{name}"
+            );
         }
     }
 
@@ -868,7 +866,7 @@ mod tests {
         assert_eq!(&answer[answer.len() - 4..], &[10, 13, 0, 2]);
 
         let mut stream = TcpStream::connect(server).await.unwrap();
-        let q = query("nothing.internal", TYPE_A);
+        let q = query("NODE1.internal", TYPE_A);
         stream
             .write_all(&(q.len() as u16).to_be_bytes())
             .await
@@ -877,7 +875,7 @@ mod tests {
         let n = stream.read_u16().await.unwrap() as usize;
         let mut answer = vec![0u8; n];
         stream.read_exact(&mut answer).await.unwrap();
-        assert_eq!(rcode(&answer), RCODE_NXDOMAIN);
+        assert_eq!(&answer[answer.len() - 4..], &[10, 13, 0, 2], "over TCP too");
     }
 
     /// Other names are passed on unchanged and the upstream's answer comes back as it is.

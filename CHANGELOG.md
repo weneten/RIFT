@@ -23,7 +23,7 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ### Names for VPN devices
 
-- The suffix of the agents' names is configurable: `RIFT_NAMES_SUFFIX` (default `internal`). `home.arpa` is reserved for home networks like `internal` and, unlike it, on the Public Suffix List, which browsers use to tell addresses from searches (Safari searches for `core.internal`). A domain of your own works too (`home.example.net`): RIFT answers only the agents' names under it and passes every other name on, so the public names of that domain keep working while the tunnel is on; under `internal`, `home.arpa` and `test` it still answers unknown names as nonexistent itself. Suffixes that devices resolve another way (`.local`, `.localhost`, `.onion`, `.alt`) or that are reserved otherwise are refused. `deploy/setup-server` asks for it. Devices import nothing new when it changes.
+- The suffix of the agents' names is configurable: `RIFT_NAMES_SUFFIX` (default `internal`). `home.arpa` is reserved for home networks like `internal` and, unlike it, on the Public Suffix List, which browsers use to tell addresses from searches (Safari searches for `core.internal`). Any domain name is accepted, a subdomain of your own too (`home.example.net`, no DNS record needed); the README says which ones suit. RIFT answers only the agents' names under the suffix and passes every other name on, so the public names of your domain keep working while the tunnel is on. `deploy/setup-server` asks for it. Devices import nothing new when it changes.
 
 ### Commands
 

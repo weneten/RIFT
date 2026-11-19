@@ -113,11 +113,6 @@ pub fn effective(snap: &StateSnapshot) -> Vec<Effective<'_>> {
 /// `.internal` for private networks in 2024, so it never clashes with a public name.
 pub const NAMES_SUFFIX: &str = "internal";
 
-/// Suffixes that are guaranteed never to exist in the public DNS (IANA special-use names and
-/// ICANN's private-use TLD): under them RIFT answers "no such name" itself. Under any other
-/// suffix (a domain of your own) it passes unknown names on, so the public ones keep working.
-pub const PRIVATE_SUFFIXES: [&str; 3] = ["internal", "home.arpa", "test"];
-
 static SUFFIX: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
 /// The suffix in use (`RIFT_NAMES_SUFFIX`), set by `Config::load`; `internal` until then.
@@ -134,15 +129,8 @@ pub fn set_names_suffix(suffix: &str) {
     }
 }
 
-/// Whether `suffix` is one of the guaranteed private ones, or under one (`x.home.arpa`).
-pub fn private_suffix(suffix: &str) -> bool {
-    PRIVATE_SUFFIXES
-        .iter()
-        .any(|p| suffix == *p || suffix.ends_with(&format!(".{p}")))
-}
-
-/// Checks a names suffix: a lower-case domain name, and none that devices resolve another way
-/// (mDNS, loopback, Tor) or that is no domain at all.
+/// Checks a names suffix: a domain name in lower case. Which one suits is up to the operator
+/// (see the README): RIFT keeps no list of reserved or special names.
 pub fn validate_suffix(suffix: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         !suffix.is_empty()
@@ -157,20 +145,6 @@ pub fn validate_suffix(suffix: &str) -> anyhow::Result<()> {
                         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
             }),
         "RIFT_NAMES_SUFFIX must be a domain name in lower case without a leading or final dot, e.g. internal, home.arpa or home.example.net"
-    );
-    const OTHER_RESOLUTION: [&str; 7] = [
-        "local",
-        "localhost",
-        "onion",
-        "invalid",
-        "alt",
-        "example",
-        "arpa",
-    ];
-    let last = suffix.rsplit('.').next().unwrap_or(suffix);
-    anyhow::ensure!(
-        !(OTHER_RESOLUTION.contains(&last) && !private_suffix(suffix)),
-        "{suffix} cannot hold RIFT's names: .local goes to mDNS, .localhost to this machine, .onion to Tor, .alt outside the DNS, and .invalid, .example and other .arpa names are reserved; use internal, home.arpa or a domain of your own"
     );
     Ok(())
 }
@@ -756,14 +730,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn suffixes_are_domains_that_reach_the_dns() {
+    fn any_domain_name_is_a_suffix() {
         for ok in [
             "internal",
             "home.arpa",
-            "rift.home.arpa",
             "test",
             "home.example.net",
             "lan",
+            "local",
+            "onion",
         ] {
             validate_suffix(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
         }
@@ -773,25 +748,11 @@ mod tests {
             "internal.",
             "Home.arpa",
             "a b",
-            "local",
-            "x.local",
-            "localhost",
-            "onion",
-            "alt",
-            "invalid",
-            "example",
-            "arpa",
-            "in-addr.arpa",
             "-x.net",
+            "a..b",
         ] {
             assert!(validate_suffix(bad).is_err(), "{bad:?}");
         }
-        assert!(
-            private_suffix("internal")
-                && private_suffix("home.arpa")
-                && private_suffix("rift.home.arpa")
-        );
-        assert!(!private_suffix("home.example.net") && !private_suffix("lan"));
     }
 
     fn agent(id: &str, last: u8) -> AgentRecord {
