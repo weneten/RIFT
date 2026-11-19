@@ -21,6 +21,7 @@ The agent initiates the connection to the server. RIFT manages the tunnel, expli
 - [Requirements](#requirements)
 - [Install the server](#install-the-server)
 - [Connect an agent](#connect-an-agent)
+- [Update RIFT](#update-rift)
 - [Harden the agent](#harden-the-agent)
 - [Run in an LXC container (Proxmox VE)](#run-in-an-lxc-container-proxmox-ve)
 - [Supported protocols](#supported-protocols)
@@ -198,6 +199,19 @@ rift status
 ```
 
 Once active, the agent ignores the token (it was single-use anyway); `deploy/join` removes it from `.env` for you, by hand you may delete the line. Preserve the agent's state volume for reconnection. If the invitation expires or is lost, cancel it and create another on the server. Repeat this process with a different name for every additional agent.
+
+## Update RIFT
+
+Update the **server first**, then each agent. On each host, in the RIFT checkout:
+
+```sh
+git pull
+sudo sh deploy/install-cli
+docker compose pull
+docker compose up -d
+```
+
+`git pull` brings the host command and the site helper, `deploy/install-cli` installs them, `docker compose pull` fetches the new image and `docker compose up -d` restarts the container with it. Agents, keys, forwards, devices, sites, `.env` and `config.toml` stay. Wait until the image of the new commit is published (GitHub → Actions, "Build and Push to Docker Hub") before you run it. Check the result with `rift status`; on the server, `rift list agents` shows each agent's version. Never run `docker compose down -v`: `-v` deletes the state. Pinned releases, rollback and details: [Updates, persistence and recovery](#updates-persistence-and-recovery).
 
 ## Harden the agent
 
@@ -1082,6 +1096,7 @@ To update the published image, on each host from its own checkout:
 
 ```sh
 git pull
+sudo sh deploy/install-cli
 docker compose pull
 docker compose up -d
 docker compose ps
@@ -1100,7 +1115,7 @@ echo RIFT_VERSION=1.0.0 >> .env
 
 Then run `docker compose pull` and `docker compose up -d`. Keep the checkout and `RIFT_VERSION` on the same release, because the `rift` command and the site helper come from the checkout. Releases and their changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
-On each host, run `sudo sh deploy/install-cli` again after `git pull` to update the installed `rift` command (on the server, also the site helper). Check logs, agent status and representative services after the update. Review configuration changes before replacing your local `config.toml` or `.env`.
+`sudo sh deploy/install-cli` after `git pull` updates the installed `rift` command (on the server, also the site helper); without it, for example, `rift` alone does not open the terminal UI. Check logs, agent status and representative services after the update. Review configuration changes before replacing your local `config.toml` or `.env`.
 
 The `rift-state` volume contains identities, keys, certificates and dynamic configuration. Protect and back up the state on **both** server and agent, and test restoration. On the server, `rift backup` and `rift restore` do this for you; see [Back up, move or rebuild](#back-up-move-or-rebuild). The agent's state volume is backed up with your usual volume tools. A normal `docker compose down` asks RIFT to remove its owned networking configuration; a subsequent `docker compose up -d` recreates it from the retained volume. A crash, forced kill or cleanup error can leave network state behind; inspect the logs and use the ownership-aware recovery procedure in [docs/deploy.md](docs/deploy.md#rollout-and-rollback). `docker compose down -v` and volume pruning can delete the state; agents and invitations cannot be recovered merely by restarting. Host-wide sysctl settings installed by `deploy/prepare-host` remain in place.
 
