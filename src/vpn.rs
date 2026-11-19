@@ -372,6 +372,18 @@ fn destination(tunnel: Ipv4Addr, access: &VpnAccess) -> String {
     }
 }
 
+/// The protocol and ports of a grant on the agent host, matched on the connection's original
+/// direction (`ct original`), so that they hold after a destination NAT on the agent.
+fn original_protocols(access: &VpnAccess) -> String {
+    match access {
+        VpnAccess::Server => "meta l4proto { tcp, udp, icmp } ".into(),
+        VpnAccess::Port { protocol, ports } => format!(
+            "ct original protocol {protocol} meta l4proto {protocol} ct original proto-dst {ports} "
+        ),
+        _ => String::new(),
+    }
+}
+
 // Keep meta l4proto before the port match, as the other renderers do.
 fn protocols(access: &VpnAccess) -> String {
     match access {
@@ -534,6 +546,25 @@ pub fn agent_nft_rules(interface: &str, tunnel: Ipv4Addr, rules: &[AgentVpnRule]
     for rule in rules {
         let flow = flow_match(rule.source, tunnel, &rule.access);
         let (source, dest) = (rule.source, destination(tunnel, &rule.access));
+        if !matches!(rule.access, VpnAccess::Subnet { .. }) {
+            // Grants on the agent host match what the device sent, as conntrack keeps it:
+            // a published Docker port (`10.13.0.3:3000:3000`) rewrites the destination to the
+            // container before these hooks see the packet, which then is forwarded, not
+            // INPUT. Only a destination rewritten on this host forwards a packet whose
+            // original destination is the agent's own tunnel address.
+            let original = format!(
+                "ct original ip saddr {source} ct original ip daddr {tunnel} {}",
+                original_protocols(&rule.access)
+            );
+            out.input.push_str(&format!(
+                "add rule inet rift input iifname \"{interface}\" ct direction original {original}accept\n"
+            ));
+            out.forward.push_str(&format!(
+                "add rule inet rift forward iifname \"{interface}\" oifname != \"{interface}\" ct direction original {original}accept\n\
+                 add rule inet rift forward iifname != \"{interface}\" oifname \"{interface}\" ct direction reply {original}accept\n"
+            ));
+            continue;
+        }
         // Packets to the agent host itself (including its own LAN address) are INPUT.
         out.input.push_str(&format!(
             "add rule inet rift input iifname \"{interface}\" {flow}accept\n"
@@ -953,10 +984,19 @@ mod tests {
                 },
             }],
         );
-        assert!(rules.input.contains(
-            "ip saddr 10.14.0.2 ip daddr 10.13.0.2 meta l4proto tcp tcp dport 8000-8010 accept"
-        ));
-        assert!(rules.forward.is_empty() && rules.nat.is_empty());
+        let flow = "ct original ip saddr 10.14.0.2 ct original ip daddr 10.13.0.2 ct original protocol tcp meta l4proto tcp ct original proto-dst 8000-8010 accept";
+        assert!(rules.input.contains(&format!(
+            "input iifname \"rift0\" ct direction original {flow}"
+        )));
+        // A published Docker port on the tunnel address is forwarded to the container, in
+        // both directions.
+        assert!(rules.forward.contains(&format!(
+            "forward iifname \"rift0\" oifname != \"rift0\" ct direction original {flow}"
+        )));
+        assert!(rules.forward.contains(&format!(
+            "forward iifname != \"rift0\" oifname \"rift0\" ct direction reply {flow}"
+        )));
+        assert!(rules.nat.is_empty());
     }
 
     #[test]

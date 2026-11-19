@@ -3552,9 +3552,13 @@ mod tests {
             net(false),
         ]);
         let accept = plain
-            .find("input iifname \"rift0\" ip saddr 10.14.0.2 ip daddr 10.88.0.2")
+            .find("input iifname \"rift0\" ct direction original ct original ip saddr 10.14.0.2 ct original ip daddr 10.88.0.2")
             .unwrap();
         assert!(accept < plain.find("input iifname \"rift0\" drop").unwrap());
+        let docker = plain
+            .find("forward iifname \"rift0\" oifname != \"rift0\" ct direction original ct original ip saddr 10.14.0.2 ct original ip daddr 10.88.0.2")
+            .unwrap();
+        assert!(docker < plain.find("forward iifname \"rift0\" drop").unwrap());
         let lan = plain.find("forward iifname \"rift0\" oifname != \"rift0\" ip saddr 10.14.0.2 ip daddr 192.168.178.0/24 accept").unwrap();
         assert!(lan < plain.find("forward oifname \"rift0\" drop").unwrap());
         assert!(!plain.contains("masquerade") && !plain.contains("postrouting"));
