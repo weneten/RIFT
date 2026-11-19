@@ -1001,6 +1001,9 @@ fn attention(app: &App) -> Vec<Line<'static>> {
     if let Some(error) = status["apply_error"].as_str() {
         push(true, format!("Configuration not applied: {error}"));
     }
+    if let Some(error) = overview["panel"]["error"].as_str() {
+        push(true, format!("Web panel {error}"));
+    }
     for agent in app.unfiltered(Tab::Agents) {
         let name = s(&agent["name"]);
         if agent["status"] == "active" && agent["online"] != true {
@@ -1863,14 +1866,31 @@ fn draw_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     let [left, right] = Layout::horizontal([Constraint::Ratio(1, 2); 2]).areas(area);
+    let running = panel_status["error"].is_null();
     let mut lines = vec![
-        kv("Status", "on"),
+        Line::from(vec![
+            Span::styled(format!("{:<12}", "Status"), theme::muted()),
+            if !running {
+                Span::styled("on, but not running", theme::bad().bold())
+            } else if panel_status["listening"]
+                .as_array()
+                .is_some_and(|l| !l.is_empty())
+            {
+                Span::styled("running", theme::ok().bold())
+            } else {
+                Span::styled("starting", theme::warn())
+            },
+        ]),
         kv("Listens", s(&panel_status["access"])),
         kv("Changes", s(&panel_status["control"])),
         kv("Port", s(&panel_status["port"])),
-        Line::raw(""),
-        Line::styled("Addresses", theme::bold()),
     ];
+    if let Some(error) = panel_status["error"].as_str() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(format!("✗ {error}"), theme::bad()));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled("Addresses", theme::bold()));
     for url in panel_status["urls"].as_array().into_iter().flatten() {
         lines.push(Line::from(vec![
             Span::raw("  "),

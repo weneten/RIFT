@@ -1005,22 +1005,40 @@ async fn server_checks(config: &Config, checks: &mut rift::net::Checks) {
         );
     }
     if config.webpanel {
-        let address = std::net::SocketAddr::from(([127, 0, 0, 1], config.webpanel_port));
-        let up = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            tokio::net::TcpStream::connect(address),
-        )
-        .await
-        .is_ok_and(|c| c.is_ok());
-        checks.push(
-            if up { OK } else { FAIL },
-            "Web panel".into(),
-            if up {
-                format!("answers on port {}", config.webpanel_port)
-            } else {
-                format!("nothing answers on 127.0.0.1:{}", config.webpanel_port)
-            },
-        );
+        // The daemon knows whether the panel got its port; a connect to the port alone would
+        // also succeed when another program holds it.
+        let panel = admin_ok(config, AdminRequest::PanelStatus).await.ok();
+        match panel
+            .as_ref()
+            .map(|p| (p["error"].as_str(), &p["listening"]))
+        {
+            Some((Some(error), _)) => {
+                checks.push(FAIL, "Web panel".into(), error.to_string());
+            }
+            Some((None, listening)) if listening.as_array().is_some_and(|l| !l.is_empty()) => {
+                let addresses: Vec<&str> = listening
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|a| a.as_str())
+                    .collect();
+                checks.push(
+                    OK,
+                    "Web panel".into(),
+                    format!("listens on {}", addresses.join(", ")),
+                );
+            }
+            Some((None, _)) => checks.push(
+                WARN,
+                "Web panel".into(),
+                "starting; it has no port yet".into(),
+            ),
+            None => checks.push(
+                FAIL,
+                "Web panel".into(),
+                "no answer from the daemon about the panel".into(),
+            ),
+        }
     }
 }
 /// The internet exits in use: how many devices, whether the VPS carries IPv6 for them, and

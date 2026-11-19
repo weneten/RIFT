@@ -159,17 +159,10 @@ impl Form {
             KeyCode::Esc => return Outcome::Cancel,
             KeyCode::Tab | KeyCode::Down => self.focus = (self.focus + 1) % n,
             KeyCode::BackTab | KeyCode::Up => self.focus = (self.focus + n - 1) % n,
+            // Enter submits from every field; Space ticks a box.
             KeyCode::Enter => {
                 if self.focus == self.buttons() + 1 {
                     return Outcome::Cancel;
-                }
-                if let Some(Field {
-                    kind: Kind::Check { on },
-                    ..
-                }) = self.fields.get_mut(self.focus)
-                {
-                    *on = !*on;
-                    return Outcome::None;
                 }
                 return Outcome::Submit;
             }
@@ -566,8 +559,13 @@ mod tests {
         form.key(key(KeyCode::Left));
         assert_eq!(form.text("mode"), "b");
         form.key(key(KeyCode::Tab));
-        assert!(matches!(form.key(key(KeyCode::Enter)), Outcome::None));
+        form.key(key(KeyCode::Char(' ')));
         assert!(form.on("snat"));
+        assert!(
+            matches!(form.key(key(KeyCode::Enter)), Outcome::Submit),
+            "Enter on a box submits"
+        );
+        assert!(form.on("snat"), "and leaves the box as it was");
         form.key(key(KeyCode::Tab));
         assert!(matches!(form.key(key(KeyCode::Enter)), Outcome::Submit));
         form.key(key(KeyCode::Tab));

@@ -13,6 +13,7 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 - Open invitations appear on the Agents tab as rows of their own, with how long the token is valid, until the agent enrolls; `t` replaces the invitation with a new token, `c` cancels it. The invitation dialog copies the whole setup (`git clone`, `cd RIFT`, `deploy/join`), only the `deploy/join` line, or the three `.env` lines.
 - `/` filters the Forwards, Agents, VPN devices, Sites and Bans tabs, `s` sorts the forwards by ID, agent, port or state, and `F` focuses on one agent: forwards, devices, sites and bans then show only what concerns it.
 - When `rift` alone prints the help, or `rift tui` finds no terminal, the message names the usual cause: a host command older than the image (`sudo sh deploy/install-cli`).
+- After adding a VPN device, the terminal UI says what to do next in its own keys (g grants access, c shows the configuration) instead of the CLI's commands, and no longer asks to import again the configuration of a device that was just created. Enter submits a dialog from any field; Space ticks a box (Enter used to tick it, so Space then Enter undid the choice).
 - The host command `rift` starts the container command with a terminal (`docker exec -it`, passing `TERM` and `COLORTERM`) when it is called without a command, or with `tui`, on a terminal.
 
 ### Commands
@@ -21,6 +22,7 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ### Setup
 
+- `deploy/setup-server` checks whether another program listens on the web panel port or the enrollment port (TCP; RIFT's own listeners do not count), names it and offers the next free port as the default, opening the question group for it. An explicit `--set` of a taken port is refused with the same message.
 - `deploy/join`, `deploy/setup-server`, `deploy/setup-proxy` and `deploy/publish-panel` give `.env` to the user who ran them with `sudo` (mode 0600 as before), so that user's `docker compose` reads it without `sudo`. Before, every run left it owned by root, and an agent host needed `sudo docker compose` after `deploy/join`. Run as root without `sudo`, the file keeps its owner. The temporary copy written on the way is no longer readable by others for a moment.
 - `deploy/setup-server` asks for every setting of the server `.env` (image version, ports and enrollment, tunnel and VPN pools, VPN DNS, every web panel setting including the password and two-factor login, the reverse proxy with its Let's Encrypt settings and the panel route of `deploy/publish-panel`; besides a proxy in Docker, `own` takes over a proxy that already runs on the server: it detects what holds port 443, asks what `rift add site` needs for it, such as the Caddy container and site directory or the Nginx Proxy Manager login, and sets it with `rift proxy`), in the order of `.env.server.example`. Rarely changed groups are asked only after a yes. Defaults come from the existing `.env`, so running it again changes settings in place; values are checked before anything is written; `--set KEY=VALUE`, `--version` and `--publish-panel` set them without questions. A setting at RIFT's default stays a comment in `.env`, and `RIFT_ALLOW_PRIVATE_LISTENERS` is reset when the address is no longer private.
 - `deploy/join` also asks for the agent's limits (`RIFT_AGENT_ALLOW_PORTS`, `RIFT_AGENT_ALLOW_SUBNETS` with the LAN networks it finds, `RIFT_AGENT_ALLOW_EXIT`) and the image version, asks for a missing server, name or token, and changes the settings of an enrolled agent when run again without a token. Options: `--allow-ports`, `--allow-subnets`, `--exit`/`--no-exit`, `--version`, `--set KEY=VALUE`, `--yes`.
@@ -36,6 +38,7 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ### Fixes
 
+- A web panel whose port another program holds no longer fails silently. Before, the server logged one line and ran without it, while `rift panel status` and the terminal UI showed it as on, and `rift doctor` reported it as answering because the other program answered. Now `rift panel status`, `rift doctor` and the terminal UI (Web panel tab, Overview) say that it is not running, why, and how to find the program (`sudo ss -ltnp 'sport = :PORT'`); the server tries the port again every 30 seconds and starts the panel once it is free.
 - Websites (`rift add site`) failed with the nftables 1.0.6 of the image: the output NAT chain of local-ingress forwards used the priority name `dstnat`, which nftables before 1.0.7 accepts only on the prerouting hook, so the server rejected the whole configuration ("invalid priority expression value in this context") and kept the previous one. The chain now uses the number -100.
 
 ## [1.0.0]

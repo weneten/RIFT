@@ -108,6 +108,32 @@ check_public_ip() {
 }
 check_public_ips() { is_list check_public_ip "$1"; }
 check_endpoint() { is_host "$1"; }
+# port_user PORT: the programs other than RIFT that listen on this TCP port, comma-separated;
+# empty when the port is free, used by RIFT itself (running again on a set-up server) or `ss`
+# is missing.
+port_user() {
+  command -v ss > /dev/null 2>&1 || return 0
+  ss -ltnp "sport = :$1" 2> /dev/null | tail -n +2 | grep -v '"rift"' \
+    | sed -n 's/.*users:(("\([^"]*\)".*/\1/p; t; s/.*/an unknown program/p' | sort -u | paste -sd, - || true
+}
+# free_port PORT: the next TCP port above PORT that nothing listens on and RIFT does not use.
+free_port() {
+  _p=$1
+  while [ "$_p" -lt 65535 ]; do
+    _p=$((_p + 1))
+    case $_p in "$control_port" | 8443 | 8090) continue ;; esac
+    if ! command -v ss > /dev/null 2>&1 || [ -z "$(ss -ltn "sport = :$_p" 2> /dev/null | tail -n +2)" ]; then
+      echo "$_p"
+      return 0
+    fi
+  done
+}
+# A port another program holds: said once, before the question that offers a free one.
+port_taken() {
+  printf '  %s\n' "Port $1 ($2) is in use by $3. Suggested instead: $4." 2> /dev/null > /dev/tty \
+    || printf '%s\n' "rift: port $1 ($2) is in use by $3; using $4 instead."
+}
+
 check_wg_port() {
   is_port "$1" || return 1
   if [ "$1" -ge "$exit_ports_min" ] && [ "$1" -le "$exit_ports_max" ]; then
@@ -125,6 +151,8 @@ check_bind() {
   esac
   is_port "${1##*:}" || return 1
   [ "${1##*:}" -ne "$control_port" ] || { why="$control_port is the tunnel control port; choose another"; return 1; }
+  _u=$(port_user "${1##*:}")
+  [ -z "$_u" ] || { why="port ${1##*:} is in use by $_u; choose another, for example ${1%:*}:$(free_port "${1##*:}")"; return 1; }
 }
 check_enrollment() { one_of "$1" auto always off; }
 check_pool4() {
@@ -192,7 +220,11 @@ check_panel_port() {
   is_port "$1" || return 1
   _e=$(get RIFT_ENROLLMENT_BIND)
   why="must differ from the control port $control_port and the enrollment port ${_e##*:}"
-  [ "$1" -ne "$control_port" ] && [ "$1" -ne "${_e##*:}" ]
+  [ "$1" -ne "$control_port" ] && [ "$1" -ne "${_e##*:}" ] || return 1
+  # Only a panel that is on needs its port.
+  [ "$(get RIFT_WEBPANEL)" = true ] || return 0
+  _u=$(port_user "$1")
+  [ -z "$_u" ] || { why="port $1 is in use by $_u; choose another, for example $(free_port "$1")"; return 1; }
 }
 check_addr_list() { is_list is_net_or_ip "$1" empty-ok; }
 check_proxy() { one_of "$1" traefik caddy npm own none; }
@@ -355,10 +387,22 @@ setting RIFT_PUBLIC_ENDPOINT "DNS name or public address agents dial (a name is 
 
 # ---------- ports and enrollment ----------
 heading "Ports and enrollment"
-group "Change the ports (WireGuard UDP $(current RIFT_WG_PORT), enrollment $(current RIFT_ENROLLMENT_BIND))?" \
-  "$(changed RIFT_WG_PORT RIFT_ENROLLMENT_BIND && echo y)"
+# Another program on the enrollment port: offer a free one (only without --set for it).
+enrollment_default=$(current RIFT_ENROLLMENT_BIND)
+enrollment_busy=
+if ! has_preset RIFT_ENROLLMENT_BIND && [ "$(current RIFT_ENROLLMENT)" != off ]; then
+  _u=$(port_user "${enrollment_default##*:}")
+  if [ -n "$_u" ]; then
+    _free="${enrollment_default%:*}:$(free_port "${enrollment_default##*:}")"
+    port_taken "${enrollment_default##*:}" "agent enrollment" "$_u" "$_free"
+    enrollment_default=$_free
+    enrollment_busy=y
+  fi
+fi
+group "Change the ports (WireGuard UDP $(current RIFT_WG_PORT), enrollment $enrollment_default)?" \
+  "$( { [ -n "$enrollment_busy" ] || changed RIFT_WG_PORT RIFT_ENROLLMENT_BIND; } && echo y)"
 setting RIFT_WG_PORT "WireGuard UDP port" check_wg_port
-setting RIFT_ENROLLMENT_BIND "Enrollment listener, ADDRESS:PORT (TCP)" check_bind
+setting RIFT_ENROLLMENT_BIND "Enrollment listener, ADDRESS:PORT (TCP)" check_bind "$enrollment_default"
 end_group
 note "The enrollment port: auto opens it only while an invitation from \"rift add agent\" is open,"
 note "always keeps it open, off turns enrollment off."
@@ -436,11 +480,23 @@ setting RIFT_WEBPANEL_ACCESS "Where the panel listens: private or public" check_
 note "Who may change things: private (the VPS itself and panel VPN devices), public (also through"
 note "a TLS proxy over HTTPS; a panel domain under Websites asks again), off (read-only)."
 setting RIFT_WEBPANEL_CONTROL "Changes allowed from: private, public or off" check_control
-if [ -n "$asking" ]; then
-  group "Change advanced panel settings (port $(current RIFT_WEBPANEL_PORT), allowed addresses, TLS proxies)?" \
-    "$(changed RIFT_WEBPANEL_PORT RIFT_WEBPANEL_ALLOW RIFT_WEBPANEL_PROXIES RIFT_WEBPANEL_INSECURE && echo y)"
+# Another program on the panel port: offer a free one (only without --set for it).
+panel_port=$(current RIFT_WEBPANEL_PORT)
+panel_busy=
+if [ "$panel" = true ] && ! has_preset RIFT_WEBPANEL_PORT; then
+  _u=$(port_user "$panel_port")
+  if [ -n "$_u" ]; then
+    _free=$(free_port "$panel_port")
+    port_taken "$panel_port" "web panel" "$_u" "$_free"
+    panel_port=$_free
+    panel_busy=y
+  fi
 fi
-setting RIFT_WEBPANEL_PORT "Panel TCP port" check_panel_port
+if [ -n "$asking" ]; then
+  group "Change advanced panel settings (port $panel_port, allowed addresses, TLS proxies)?" \
+    "$( { [ -n "$panel_busy" ] || changed RIFT_WEBPANEL_PORT RIFT_WEBPANEL_ALLOW RIFT_WEBPANEL_PROXIES RIFT_WEBPANEL_INSECURE; } && echo y)"
+fi
+setting RIFT_WEBPANEL_PORT "Panel TCP port" check_panel_port "$panel_port"
 note "Extra addresses that may open the panel read-only (rarely needed; public mode: restricts the panel to them)."
 setting RIFT_WEBPANEL_ALLOW "Allowed addresses or networks (comma-separated, empty for none)" check_addr_list
 setting RIFT_WEBPANEL_PROXIES "TLS proxies in front of the panel (comma-separated; empty if the proxy runs on this VPS)" check_addr_list

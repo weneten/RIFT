@@ -698,6 +698,9 @@ fn panel_status(data: &Value) -> String {
         field(data, "access"),
         field(data, "port")
     )];
+    if let Some(error) = data["error"].as_str() {
+        lines.push(format!("It does not run: {error}."));
+    }
     for url in data["urls"].as_array().into_iter().flatten() {
         lines.push(format!("  {}  {}", field(url, "url"), field(url, "via")));
     }

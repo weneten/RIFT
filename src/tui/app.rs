@@ -2645,6 +2645,33 @@ fn complete(input: &str) -> Option<String> {
     }
 }
 
+/// What the terminal UI says after a request where the CLI's message names CLI commands as the
+/// next step; `None` keeps the CLI's message.
+fn in_ui(request: &AdminRequest, data: &Value) -> Option<String> {
+    Some(match request {
+        AdminRequest::VpnPeerAdd { name } => format!(
+            "VPN device {name} added ({}, {}).\n\
+             It reaches nothing yet. Next, on the VPN devices tab with {name} selected:\n  \
+             g  grant access: ports, a LAN, the whole host of an agent, or an internet exit\n  \
+             c  show its WireGuard configuration as a QR code to scan (or as text)",
+            data["ipv4"].as_str().unwrap_or("-"),
+            data["ipv6"].as_str().unwrap_or("-"),
+        ),
+        AdminRequest::PanelAllow {
+            name,
+            allowed: true,
+        } => {
+            let url = data["urls"]
+                .as_array()
+                .and_then(|u| u.get(1))
+                .and_then(|u| u["url"].as_str())
+                .unwrap_or("the panel");
+            format!("{name} may open the web panel at {url} once its WireGuard tunnel is up.")
+        }
+        _ => return None,
+    })
+}
+
 /// A QR code in half blocks with a two-module margin instead of the standard four, so a
 /// WireGuard configuration fits a terminal of about 40 rows; phone scanners read it.
 ///
@@ -2734,6 +2761,13 @@ async fn execute(config: &Config, op: Op) -> anyhow::Result<Done> {
             let mut text = Vec::new();
             let mut warn = false;
             let mut reimport: Vec<Value> = Vec::new();
+            let created: Vec<Value> = requests
+                .iter()
+                .filter_map(|r| match r {
+                    AdminRequest::VpnPeerAdd { name } => Some(Value::from(name.clone())),
+                    _ => None,
+                })
+                .collect();
             let total = requests.len();
             for (i, request) in requests.into_iter().enumerate() {
                 let data = admin(config, request.clone()).await.map_err(|e| {
@@ -2747,7 +2781,8 @@ async fn execute(config: &Config, op: Op) -> anyhow::Result<Done> {
                     warn = true;
                     text.push(format!("Warning: {warning}"));
                 }
-                let mut shown = output::render(&request, &data, agents.as_ref());
+                let mut shown = in_ui(&request, &data)
+                    .unwrap_or_else(|| output::render(&request, &data, agents.as_ref()));
                 if let AdminRequest::ForwardAdd(_) = request {
                     // The table header is noise in a notification; keep the first line.
                     shown = shown.lines().next().unwrap_or_default().to_string();
@@ -2761,11 +2796,15 @@ async fn execute(config: &Config, op: Op) -> anyhow::Result<Done> {
                     }
                 }
             }
-            // One note for all parts: which devices must import their configuration again.
-            if let Some(note) =
-                output::reimport_note(&AdminRequest::Reload, &json!({ "reimport": reimport }))
-            {
-                text.push(note);
+            // One note for all parts: which devices must import their configuration again. A
+            // device created right now has nothing imported yet.
+            reimport.retain(|device| !created.contains(device));
+            let names: Vec<&str> = reimport.iter().filter_map(Value::as_str).collect();
+            if !names.is_empty() {
+                text.push(format!(
+                    "Import the configuration of {} again on the device: VPN devices → c (it changed).",
+                    names.join(", ")
+                ));
             }
             Done::Message {
                 text: text.join("\n"),

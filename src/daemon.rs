@@ -39,7 +39,16 @@ struct Server {
     enrollment: Mutex<Option<tokio::task::JoinHandle<()>>>,
     enrollment_open: Arc<std::sync::atomic::AtomicBool>,
     listen_notes: std::sync::Mutex<ListenNotes>,
+    /// Where the web panel listens, or why it could not start.
+    panel_state: std::sync::Mutex<PanelState>,
 }
+#[derive(Default)]
+struct PanelState {
+    listening: Vec<String>,
+    error: Option<String>,
+}
+/// How often a panel whose port was taken tries again.
+const PANEL_RETRY: Duration = Duration::from_secs(30);
 /// What the repair of forward addresses did, for `rift status`.
 #[derive(Default)]
 struct ListenNotes {
@@ -101,6 +110,7 @@ pub async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
         enrollment: Mutex::new(None),
         enrollment_open,
         listen_notes: std::sync::Mutex::new(ListenNotes::default()),
+        panel_state: std::sync::Mutex::new(PanelState::default()),
     });
     reconcile(&server).await?;
     let admin = bind_admin(config.socket_path()).await?;
@@ -138,28 +148,62 @@ pub async fn run_server(config: Config, config_path: PathBuf) -> Result<()> {
         );
     }
     if let Some(password) = &server.panel_password {
-        // The tunnel and forwards must not depend on the panel: without its port, run without it.
-        let listeners = match crate::webpanel::bind(&config).await {
-            Ok(listeners) => listeners,
-            Err(error) => {
-                tracing::error!("web panel not started: {error:#}; RIFT runs without it. Free the port or set RIFT_WEBPANEL_PORT, then recreate the container");
-                Vec::new()
-            }
-        };
         let panel = Arc::new(crate::webpanel::Panel::new(
             PanelBackend(server.clone()),
             config.clone(),
             password,
             server.two_factor.clone(),
         ));
-        for listener in listeners {
-            let address = listener.local_addr()?;
-            tracing::info!(
-                "web panel ({}) listening on {address}",
-                config.webpanel_access
-            );
-            tasks.push(tokio::spawn(panel.clone().serve(listener)));
-        }
+        // The tunnel and forwards must not depend on the panel: without its port, RIFT runs
+        // without it, says why (`rift panel status`, `rift doctor`, the terminal UI) and tries
+        // again until the port is free.
+        let (s, panel_config) = (server.clone(), config.clone());
+        tasks.push(tokio::spawn(async move {
+            let config = &panel_config;
+            let mut logged = false;
+            loop {
+                match crate::webpanel::bind(config).await {
+                    Ok(listeners) => {
+                        let mut addresses = Vec::new();
+                        // Aborted together with this task when the server stops.
+                        let mut serving = tokio::task::JoinSet::new();
+                        for listener in listeners {
+                            if let Ok(address) = listener.local_addr() {
+                                tracing::info!(
+                                    "web panel ({}) listening on {address}",
+                                    config.webpanel_access
+                                );
+                                addresses.push(address.to_string());
+                            }
+                            serving.spawn(panel.clone().serve(listener));
+                        }
+                        if let Ok(mut state) = s.panel_state.lock() {
+                            *state = PanelState {
+                                listening: addresses,
+                                error: None,
+                            };
+                        }
+                        while serving.join_next().await.is_some() {}
+                        return;
+                    }
+                    Err(error) => {
+                        let message = format!(
+                            "not started: {error:#}. Another program probably uses port {port}: `sudo ss -ltnp 'sport = :{port}'` on the server shows which. Free the port or set RIFT_WEBPANEL_PORT and recreate the container; RIFT tries again every {retry} seconds",
+                            port = config.webpanel_port,
+                            retry = PANEL_RETRY.as_secs()
+                        );
+                        if !logged {
+                            tracing::error!("web panel {message}");
+                            logged = true;
+                        }
+                        if let Ok(mut state) = s.panel_state.lock() {
+                            state.error = Some(message);
+                        }
+                    }
+                }
+                tokio::time::sleep(PANEL_RETRY).await;
+            }
+        }));
         if config.webpanel_access == crate::config::PanelAccess::Public {
             tracing::warn!("the web panel is public over plain HTTP; its password crosses the network unencrypted unless a TLS proxy is in front of it");
         }
@@ -1330,7 +1374,12 @@ async fn admin_call_inner(s: &Server, r: AdminRequest) -> Result<serde_json::Val
                     .filter(|p| p.panel)
                     .map(|p| serde_json::json!({"name":p.name,"ipv4":p.ipv4,"enabled":p.enabled}))
                     .collect();
-                serde_json::json!({"enabled":true,"access":cfg.webpanel_access,"control":cfg.webpanel_control,"server_ipv4":cfg.server_ipv4,"port":cfg.webpanel_port,"urls":crate::webpanel::urls(&cfg),"allow":cfg.webpanel_allow,"devices":devices,"password":if cfg.webpanel_password.is_some() {"RIFT_WEBPANEL_PASSWORD"} else {"generated; show it with `rift panel password`"}})
+                let (listening, error) = s
+                    .panel_state
+                    .lock()
+                    .map(|p| (p.listening.clone(), p.error.clone()))
+                    .unwrap_or_default();
+                serde_json::json!({"enabled":true,"listening":listening,"error":error,"access":cfg.webpanel_access,"control":cfg.webpanel_control,"server_ipv4":cfg.server_ipv4,"port":cfg.webpanel_port,"urls":crate::webpanel::urls(&cfg),"allow":cfg.webpanel_allow,"devices":devices,"password":if cfg.webpanel_password.is_some() {"RIFT_WEBPANEL_PASSWORD"} else {"generated; show it with `rift panel password`"}})
             }
         }
         AdminRequest::PanelPassword => {
