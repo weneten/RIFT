@@ -1248,11 +1248,14 @@ def vpn_device_test(server_cfg):
 
     # A published Docker port on the agent's tunnel address (ports: "A3:19083:19082"): Docker
     # rewrites the destination to the container, so the packet is forwarded, not INPUT. The
-    # backend namespace behind agent3 stands in for the container.
+    # backend namespace behind agent3 stands in for the container. Its answers must go back
+    # through the tunnel: a LAN gateway knows nothing of the VPN, so every other way drops.
     ns(AGENTS[2], "nft", "-f", str(write(WORK / "docker-nat.nft", (
         "add table ip rifttest_docker\n"
         "add chain ip rifttest_docker pre { type nat hook prerouting priority dstnat; }\n"
-        f"add rule ip rifttest_docker pre ip daddr {a3} tcp dport 19083 dnat to 10.77.0.2:19082\n"))))
+        f"add rule ip rifttest_docker pre ip daddr {a3} tcp dport 19083 dnat to 10.77.0.2:19082\n"
+        "add chain ip rifttest_docker lan { type filter hook forward priority filter; }\n"
+        f"add rule ip rifttest_docker lan ip daddr {me} oifname != \"rift0\" drop\n"))))
     ns(BACKEND, "ip", "route", "replace", "10.14.0.0/16", "via", "10.77.0.1")
     assert not device_reaches(a3, 19083), "a published container port answered without a grant"
     docker = json.loads(cli(VPS, server_cfg, "vpn", "allow", "phone", "agent3", "19083/tcp").stdout)

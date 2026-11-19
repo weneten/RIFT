@@ -72,6 +72,10 @@ pub struct Rules {
     pub nat: String,
     /// Rules for the server's `prerouting_nat` chain: RIFT's names (port 53 to the DNS port).
     pub prerouting: String,
+    /// Agent: matches (original direction) of connections whose replies must leave through
+    /// the tunnel. The renderer marks them as it marks forwards, so that the agent's routing
+    /// rule sends their replies back to the server.
+    pub reply_via_tunnel: Vec<String>,
 }
 
 /// The DNS grant is enforced as port 53 over UDP and TCP, so firewall rules and agents only
@@ -538,6 +542,7 @@ impl Rules {
         self.forward.push_str(&other.forward);
         self.nat.push_str(&other.nat);
         self.prerouting.push_str(&other.prerouting);
+        self.reply_via_tunnel.extend(other.reply_via_tunnel);
     }
 }
 
@@ -562,6 +567,11 @@ pub fn agent_nft_rules(interface: &str, tunnel: Ipv4Addr, rules: &[AgentVpnRule]
             out.forward.push_str(&format!(
                 "add rule inet rift forward iifname \"{interface}\" oifname != \"{interface}\" ct direction original {original}accept\n\
                  add rule inet rift forward iifname != \"{interface}\" oifname \"{interface}\" ct direction reply {original}accept\n"
+            ));
+            // The container answers from its own address, which the agent's routing rule for
+            // the tunnel address does not cover, and the LAN gateway does not know the VPN.
+            out.reply_via_tunnel.push(format!(
+                "iifname \"{interface}\" ct direction original {original}"
             ));
             continue;
         }
@@ -996,6 +1006,14 @@ mod tests {
         assert!(rules.forward.contains(&format!(
             "forward iifname != \"rift0\" oifname \"rift0\" ct direction reply {flow}"
         )));
+        // Its replies go back through the tunnel, not to the LAN gateway.
+        assert_eq!(
+            rules.reply_via_tunnel,
+            [format!(
+                "iifname \"rift0\" ct direction original {}",
+                flow.trim_end_matches("accept")
+            )]
+        );
         assert!(rules.nat.is_empty());
     }
 

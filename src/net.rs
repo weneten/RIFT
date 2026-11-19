@@ -2214,6 +2214,12 @@ fn render_agent_rules(
             ));
         }
     }
+    for flow in &vpn.reply_via_tunnel {
+        out.push_str(&format!(
+            "add rule inet rift prerouting_mark {flow}ct mark set (ct mark & {:#x}) | {mark:#x}\n",
+            !mask
+        ));
+    }
     out.push_str(&vpn.input);
     out.push_str(&vpn.forward);
     out.push_str(&vpn.nat);
@@ -3559,6 +3565,8 @@ mod tests {
             .find("forward iifname \"rift0\" oifname != \"rift0\" ct direction original ct original ip saddr 10.14.0.2 ct original ip daddr 10.88.0.2")
             .unwrap();
         assert!(docker < plain.find("forward iifname \"rift0\" drop").unwrap());
+        // Replies of a published Docker port follow the mark back into the tunnel.
+        assert!(plain.contains("add rule inet rift prerouting_mark iifname \"rift0\" ct direction original ct original ip saddr 10.14.0.2 ct original ip daddr 10.88.0.2 meta l4proto { tcp, udp, icmp } ct mark set (ct mark & 0xffff) | 0x52490000\n"));
         let lan = plain.find("forward iifname \"rift0\" oifname != \"rift0\" ip saddr 10.14.0.2 ip daddr 192.168.178.0/24 accept").unwrap();
         assert!(lan < plain.find("forward oifname \"rift0\" drop").unwrap());
         assert!(!plain.contains("masquerade") && !plain.contains("postrouting"));
