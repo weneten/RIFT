@@ -1610,7 +1610,7 @@ impl App {
                     "Invite an agent",
                     "Create invitation",
                     vec![
-                        Field::text("name", "Agent name", "", "node1")
+                        Field::text("name", "Agent name", "", "e.g. node1")
                             .hint("letters, digits, - and _; an existing name re-invites it"),
                         Field::text("ttl", "Valid for", "15m", "15m"),
                     ],
@@ -1698,7 +1698,7 @@ impl App {
                 (act == Act::ForwardBan).then_some(id),
             ),
             Act::DeviceAdd => {
-                let mut fields = vec![Field::text("name", "Device name", "", "phone")];
+                let mut fields = vec![Field::text("name", "Device name", "", "e.g. phone")];
                 if self.overview()["panel"]["enabled"] == true {
                     fields.push(Field::check("panel", "May open the web panel", false));
                 }
@@ -1932,7 +1932,7 @@ impl App {
                 Form::new(
                     "Confirm two-factor login",
                     "Turn on",
-                    vec![Field::text("code", "Code from the app", "", "123456")],
+                    vec![Field::text("code", "Code from the app", "", "six digits")],
                 )
                 .intro("After setting it up (s), type the current six-digit code to turn two-factor login on."),
                 Submit::TwoFactorConfirm,
@@ -2153,8 +2153,13 @@ impl App {
             "Add",
             vec![
                 Field::select("agent", "Agent", agents).selected(agent.unwrap_or_default()),
-                Field::text("specs", "Ports", "", "8080:80/tcp 53/both 5000-5002/udp")
-                    .hint("LISTEN[:TARGET]/tcp|udp|both, several separated by spaces"),
+                Field::text(
+                    "specs",
+                    "Ports",
+                    "",
+                    "e.g. 8080:80/tcp 53/both 5000-5002/udp",
+                )
+                .hint("LISTEN[:TARGET]/tcp|udp|both, several separated by spaces"),
                 Field::select("on", "Listen on", on),
                 Field::select(
                     "mode",
@@ -2179,7 +2184,7 @@ impl App {
                     "allow_from",
                     "Only from",
                     "",
-                    "everyone, or 203.0.113.7 198.51.100.0/24",
+                    "everyone, or e.g. 203.0.113.7 198.51.100.0/24",
                 ),
             ],
         );
@@ -2205,7 +2210,7 @@ impl App {
             vec![
                 Field::select("forward", "Forward", forwards)
                     .selected(&forward.map(|f| f.to_string()).unwrap_or_default()),
-                Field::text("ip", "Client address", "", "198.51.100.7"),
+                Field::text("ip", "Client address", "", "e.g. 198.51.100.7"),
                 Field::text("ttl", "For", "1h", "1h"),
             ],
         )
@@ -2226,10 +2231,20 @@ impl App {
             "Grant",
             vec![
                 Field::select("agent", "Agent", agents),
-                Field::text("ports", "Ports", "", "22/tcp 53/both 8000-8010/tcp"),
+                Field::text(
+                    "ports",
+                    "Ports",
+                    "",
+                    "none, or e.g. 22/tcp 53/both 8000-8010/tcp",
+                ),
                 Field::check("server", "Whole host (TCP, UDP, ping)", false),
                 Field::check("full", "All protocols", false),
-                Field::text("subnets", "LAN networks", "", "192.168.178.0/24"),
+                Field::text(
+                    "subnets",
+                    "LAN networks",
+                    "",
+                    "none, or e.g. 192.168.178.0/24",
+                ),
                 Field::check("snat", "Masquerade (SNAT) in the LAN", false)
                     .hint("when the LAN has no route back to the VPN"),
                 Field::check("exit", "Internet exit through it", false)
@@ -2252,8 +2267,8 @@ impl App {
             "Add site",
             vec![
                 Field::select("agent", "Agent", agents),
-                Field::text("host", "Domain", "", "app.example.net"),
-                Field::text("port", "Port on the agent", "", "8080"),
+                Field::text("host", "Domain", "", "e.g. app.example.net"),
+                Field::text("port", "Port on the agent", "", "e.g. 8080"),
                 Field::select(
                     "proxy",
                     "Proxy",
@@ -2265,7 +2280,7 @@ impl App {
                         ("npm".into(), "Nginx Proxy Manager".into()),
                     ],
                 ),
-                Field::text("allow_from", "Only from", "", "everyone, or 203.0.113.7 198.51.100.0/24"),
+                Field::text("allow_from", "Only from", "", "everyone, or e.g. 203.0.113.7 198.51.100.0/24"),
             ],
         )
         .intro("Publishes https://DOMAIN through the reverse proxy to this port. The domain must already point at this server.");

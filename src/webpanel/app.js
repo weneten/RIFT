@@ -1249,7 +1249,7 @@ ${result.join}`;
 
 // `existing` re-invites an active agent: the new install takes over its key and settings.
 function inviteDialog(existing) {
-  const name = el("input", { required: true, pattern: "[A-Za-z0-9_\\-]{1,63}", placeholder: "node2" });
+  const name = el("input", { required: true, pattern: "[A-Za-z0-9_\\-]{1,63}", placeholder: "e.g. node2" });
   if (existing) Object.assign(name, { value: existing, readOnly: true });
   const ttl = select([["15m", "15 minutes"], ["30m", "30 minutes"], ["1h", "1 hour"], ["24h", "24 hours"]], "15m");
   openModal(existing ? `Invite ${existing} again` : "Invite agent", form([
@@ -1271,13 +1271,13 @@ function forwardDialog(preset) {
     return;
   }
   const agent = select(agents, typeof preset === "string" ? preset : agents[0][0]);
-  const specs = el("input", { required: true, placeholder: "8080:80/tcp 53/both 5000-5002/udp" });
+  const specs = el("input", { required: true, placeholder: "e.g. 8080:80/tcp 53/both 5000-5002/udp" });
   const ips = data.public_ips || [];
   const hasV6 = ips.some((ip) => ip.includes(":"));
   const on = select([["v4", "IPv4"], ...(hasV6 ? [["v6", "IPv6"], ["all", "IPv4 and IPv6"]] : [])], "v4");
   const mode = select([["", "automatic"], ["transparent", "transparent (client IP visible)"], ["translate", "translate (IPv4 ↔ IPv6)"]], "");
   const ingress = select([["public", "public"], ["local", "local (for a proxy on this server)"]], "public");
-  const allowFrom = el("input", { placeholder: "everyone, or 203.0.113.7 198.51.100.0/24" });
+  const allowFrom = el("input", { placeholder: "everyone, or e.g. 203.0.113.7 198.51.100.0/24" });
   openModal("Add forwards", form([
     row("Agent", agent),
     row("Ports", specs),
@@ -1298,7 +1298,7 @@ function forwardDialog(preset) {
 }
 
 function banDialog(forward) {
-  const ip = el("input", { required: true, placeholder: "198.51.100.23" });
+  const ip = el("input", { required: true, placeholder: "e.g. 198.51.100.23" });
   const ttl = select([["10m", "10 minutes"], ["1h", "1 hour"], ["6h", "6 hours"], ["24h", "24 hours"]], "1h");
   openModal(`Ban a client on forward ${forward.id}`, form([
     row("Client address", ip),
@@ -1333,10 +1333,10 @@ async function namesChange(body) {
 function deviceDialog() {
   const peers = data.vpn_peers || [];
   const list = el("datalist", { id: "device-names" }, ...peers.map((p) => el("option", { value: p.name })));
-  const name = el("input", { required: true, pattern: "[A-Za-z0-9_\\-]{1,63}", placeholder: "phone", list: "device-names" });
+  const name = el("input", { required: true, pattern: "[A-Za-z0-9_\\-]{1,63}", placeholder: "e.g. phone", list: "device-names" });
   const agents = agentOptions(true);
   const agent = select([["", "none"], ...agents], agents.length ? agents[0][0] : "");
-  const ports = el("input", { placeholder: "3000/tcp 8080/tcp" });
+  const ports = el("input", { placeholder: "e.g. 3000/tcp 8080/tcp" });
   const panel = el("input", { type: "checkbox" });
   openModal("Connect a VPN device", form([
     list,
@@ -1434,7 +1434,7 @@ async function twoFactorDialog() {
     return;
   }
   const image = el("img", { alt: "Authenticator QR code", src: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(result.qr_svg)}` });
-  const code = el("input", { required: true, inputmode: "numeric", autocomplete: "one-time-code", pattern: "[0-9 ]{6,7}", maxlength: "7", placeholder: "123456" });
+  const code = el("input", { required: true, inputmode: "numeric", autocomplete: "one-time-code", pattern: "[0-9 ]{6,7}", maxlength: "7", placeholder: "six digits" });
   openModal("Enable two-factor login",
     el("p", { class: "hint" }, "Scan the code with an authenticator app, or type the secret in. Then enter the current code to turn it on."),
     el("div", { class: "qr" }, image),
@@ -1447,7 +1447,7 @@ async function twoFactorDialog() {
 }
 
 function twoFactorOffDialog() {
-  const code = el("input", { required: true, inputmode: "numeric", autocomplete: "one-time-code", pattern: "[0-9 ]{6,7}", maxlength: "7", placeholder: "123456" });
+  const code = el("input", { required: true, inputmode: "numeric", autocomplete: "one-time-code", pattern: "[0-9 ]{6,7}", maxlength: "7", placeholder: "six digits" });
   openModal("Disable two-factor login", form([
     row("Current code", code),
     el("p", { class: "hint" }, "All sessions end, including this one."),
@@ -1551,7 +1551,7 @@ function grantsDialog(name, notes) {
     const update = () => {
       valueRow.hidden = kind.value === "server" || kind.value === "full";
       value.required = !valueRow.hidden;
-      value.placeholder = kind.value === "ports" ? "22/tcp 53/both" : "192.168.178.0/24";
+      value.placeholder = kind.value === "ports" ? "e.g. 22/tcp 53/both" : "e.g. 192.168.178.0/24";
       snatRow.hidden = kind.value !== "subnet";
     };
     kind.addEventListener("change", update);
@@ -1658,10 +1658,10 @@ function siteDialog() {
     return;
   }
   const agent = select(agents, agents[0][0]);
-  const host = el("input", { required: true, placeholder: "app.example.net", maxlength: 253 });
-  const port = el("input", { required: true, type: "number", min: 1, max: 65535, placeholder: "8080" });
+  const host = el("input", { required: true, placeholder: "e.g. app.example.net", maxlength: 253 });
+  const port = el("input", { required: true, type: "number", min: 1, max: 65535, placeholder: "e.g. 8080" });
   const proxy = select([["", "default"], ["traefik", "Traefik"], ["caddy", "Caddy"], ["nginx", "Nginx"], ["npm", "Nginx Proxy Manager"]], "");
-  const allowFrom = el("input", { placeholder: "everyone, or 203.0.113.7 198.51.100.0/24" });
+  const allowFrom = el("input", { placeholder: "everyone, or e.g. 203.0.113.7 198.51.100.0/24" });
   openModal("Add site", form([
     row("Agent", agent),
     row("Domain", host),
