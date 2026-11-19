@@ -8,9 +8,19 @@ on:
 permissions:
   contents: read
 
+# Every job runs on self-hosted runners (labels below; setup: docs/release.md, "CI runners").
+# Pull requests from forks never reach them: on a public repository anyone could otherwise run
+# code on these machines. Fork pull requests are checked once a maintainer pushes them to a
+# branch of this repository.
+#
+# The netns and Docker integration jobs change the host's network (sysctls, nftables, Docker's
+# firewall rules) and run only on runners labelled `disposable`, and only when the repository
+# variable RIFT_DISPOSABLE_RUNNER is `true`; without it they are skipped.
+
 jobs:
   rust:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -22,7 +32,8 @@ jobs:
       - run: cargo test --all-targets
 
   linux-netns:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64, disposable]
+    if: vars.RIFT_DISPOSABLE_RUNNER == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     needs: rust
     steps:
       - uses: actions/checkout@v7
@@ -32,7 +43,8 @@ jobs:
       - run: sudo env RIFT_NETNS_DISPOSABLE_VM=1 bash tests/netns/run.sh
 
   docker-bridge:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64, disposable]
+    if: vars.RIFT_DISPOSABLE_RUNNER == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -42,7 +54,8 @@ jobs:
       - run: sudo env RIFT_DOCKER_PUBLISHED_VM=1 bash tests/docker/published-port-e2e.sh
 
   licenses:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -53,7 +66,8 @@ jobs:
       - run: git diff --exit-code THIRD_PARTY_LICENSES.md
 
   site-helper:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v7
       - run: python3 -m unittest discover -s deploy/vps -p 'test_*.py'

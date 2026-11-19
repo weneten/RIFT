@@ -15,9 +15,12 @@ concurrency:
   group: docker-hub-publish-${{ github.ref }}
   cancel-in-progress: true
 
+# Self-hosted runners (setup: docs/release.md, "CI runners"). Only pushes to main, tags and
+# manual runs start this, never pull requests, so code from forks never sees the Docker Hub
+# login.
 jobs:
   build-amd64:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
@@ -64,7 +67,7 @@ jobs:
   build-arm64:
     # Native arm64. QEMU emulation recompiles Rust for hours, and the layer
     # cache cannot skip that once src changes.
-    runs-on: ubuntu-24.04-arm
+    runs-on: [self-hosted, linux, arm64]
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
@@ -109,7 +112,7 @@ jobs:
           exit 1
 
   merge:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64]
     needs: [build-amd64, build-arm64]
     steps:
       - uses: docker/setup-buildx-action@v4

@@ -11,7 +11,8 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-24.04
+    # Self-hosted, with the GitHub CLI (gh) installed; see docs/release.md, "CI runners".
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v7
       - name: Check the version and take its notes from CHANGELOG.md
