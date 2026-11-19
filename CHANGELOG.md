@@ -4,6 +4,11 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ## [Unreleased]
 
+### Web panel
+
+- The panel is laid out like the terminal UI: tabs for the overview (stat cards, a live traffic graph, the agents, what needs attention, the latest log), agents (open invitations as rows with their time left; new token, cancel), forwards (filter and sort as in `rift list forwards`), VPN devices, sites (with the proxy `rift proxy` shows), bans, the panel itself (whether it runs, two-factor login, devices with access), the log (follow, level, text filter), health and backup. A table with the selected row's details beside it, the row's actions in a bar at the bottom and on right click, an agent focus, and keys (`1`–`0`, `/`, `F`, letters, `?`). It works on phones and in light and dark mode, still without any external resource. The invitation dialog copies the whole setup, the join line or the `.env` lines; renaming an agent says that its `.internal` name follows.
+- The overview the panel loads also carries what each agent allows (`RIFT_AGENT_ALLOW_*`), its public key, the WireGuard byte counters (not the endpoints) and the RIFT version.
+
 ### Terminal UI
 
 - `rift` without a command opens a full-screen terminal UI on the server and on agents (`rift tui` does too). It covers what the CLI and the web panel do: an overview with live traffic and what needs attention; agents with invitations, enable/disable, rename, key rotation and names; forwards (add in the short form, enable/disable, ban, remove); VPN devices with grants, withdrawals, exits, DNS, names, panel access and their WireGuard configuration as a QR code; sites through the panel's host queue; bans; the web panel's password and two-factor login; the log with follow, text and level filters; and `rift doctor`. It works by keyboard and mouse (tabs, rows, buttons, form fields, wheel, right click and double click for the actions of a row), and `:` runs any `rift` command inside it. It talks to the daemon over the same admin socket as the CLI and shows the same messages.

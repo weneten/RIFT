@@ -708,7 +708,7 @@ Pools, DNS and ports in the configuration: see the [Configuration](#configuratio
 
 ## Web panel
 
-The server can serve a web panel with what the CLI does: agents and invitations, forwards and bans, VPN devices with their grants, internet exit and WireGuard configuration (as QR code or file; "Connect device" creates a device, grants ports on an agent and shows its QR code in one step), panel access, sites, reconcile, the recent log and diagnostics. Only printing the panel password stays in the CLI. The panel is **off** by default. Enable it in the server `.env` and recreate the container:
+The server can serve a web panel with what the CLI does, laid out like the [terminal UI](#terminal-ui): tabs (Overview with live traffic and what needs attention, Agents, Forwards, VPN devices, Sites, Bans, Web panel, Logs, Health, Backup), a table with the details of the selected row beside it, and its actions in a bar at the bottom, by mouse (click, right click for a menu) or by key (`1`–`0` tabs, `/` filter, `F` focus on an agent, letters for actions, `?` lists them). It shows agents and invitations, forwards and bans, VPN devices with their grants, internet exit and WireGuard configuration (as QR code or file; "Connect device" creates a device, grants ports on an agent and shows its QR code in one step), panel access, sites, reconcile, the recent log and diagnostics. Only printing the panel password stays in the CLI. The panel is **off** by default. Enable it in the server `.env` and recreate the container:
 
 ```dotenv
 RIFT_WEBPANEL=true

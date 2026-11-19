@@ -11,9 +11,9 @@
 </head>
 <body>
 <main id="login" class="login" hidden>
-  <form id="login-form" class="card login-card">
-    <h1 class="brand"><img src="/logo.svg" class="logo" alt="">RIFT</h1>
-    <p class="muted">Server panel</p>
+  <form id="login-form" class="login-card">
+    <h1 class="brand"><img src="/logo.svg" class="logo" alt=""><span class="brand-text">RIFT</span></h1>
+    <p class="muted">Rust Internet Forwarding Tunnel · server panel</p>
     <label for="password">Password</label>
     <input id="password" type="password" autocomplete="current-password" required autofocus>
     <div id="code-row" hidden>
@@ -27,107 +27,42 @@
   </form>
 </main>
 
-<div id="app" hidden>
+<div id="app" class="app" hidden>
   <header class="topbar">
     <div class="brand-row">
-      <span class="brand"><img src="/logo.svg" class="logo" alt="">RIFT</span>
+      <span class="brand"><img src="/logo.svg" class="logo" alt=""><span class="brand-text">RIFT</span></span>
+      <span id="server" class="server"></span>
+    </div>
+    <div class="top-status">
       <span id="state" class="pill">…</span>
       <span id="access" class="pill off">…</span>
-    </div>
-    <div class="top-actions">
+      <span id="version" class="muted small"></span>
       <span id="updated" class="muted small"></span>
-      <button id="reload" type="button" class="write" title="Re-read config.toml and reconcile">Reconcile</button>
-      <button id="refresh" type="button">Refresh</button>
-      <button id="logout" type="button">Log out</button>
+      <button id="reload" type="button" class="ghost write" title="Apply the desired state again (R)">Reconcile</button>
+      <button id="logout" type="button" class="ghost">Log out</button>
     </div>
   </header>
 
-  <main class="content">
+  <nav id="tabs" class="tabs" aria-label="Sections"></nav>
+
+  <div class="notices">
     <p id="banner" class="banner" role="alert" hidden></p>
     <div id="reimport" class="notice reimport" role="status" hidden></div>
     <p id="readonly" class="notice" hidden>Read-only connection. Changes need the server itself (or an SSH tunnel) or a VPN device with panel access, and <code>RIFT_WEBPANEL_CONTROL=private</code>.</p>
+  </div>
 
-    <section class="tiles">
-      <div class="tile"><span class="tile-label">Agents online</span><span id="t-agents" class="tile-value">–</span></div>
-      <div class="tile"><span class="tile-label">Forwards active</span><span id="t-forwards" class="tile-value">–</span></div>
-      <div class="tile"><span class="tile-label">VPN devices</span><span id="t-vpn" class="tile-value">–</span></div>
-      <div class="tile"><span class="tile-label">Enrollment port</span><span id="t-enroll" class="tile-value">–</span><span id="t-enroll-sub" class="tile-sub muted"></span></div>
-    </section>
+  <div id="toolbar" class="toolbar"></div>
+  <main id="view" class="view"></main>
 
-    <section class="card">
-      <div class="card-head"><h2>Agents</h2><button id="add-agent" type="button" class="primary write">Invite agent</button></div>
-      <ul id="invites" class="plain invites"></ul>
-      <div class="table-wrap"><table>
-        <thead><tr><th>Name</th><th>Connection</th><th>State</th><th>Tunnel</th><th>DNS name</th><th>Last handshake</th><th></th></tr></thead>
-        <tbody id="agents"></tbody>
-      </table></div>
-    </section>
-
-    <section class="card">
-      <div class="card-head"><h2>Forwards</h2><button id="add-forward" type="button" class="primary write">Add forwards</button></div>
-      <div class="table-wrap"><table>
-        <thead><tr><th>ID</th><th>Agent</th><th>Proto</th><th>Listen</th><th>Target</th><th>Mode</th><th>State</th><th></th></tr></thead>
-        <tbody id="forwards"></tbody>
-      </table></div>
-      <ul id="refused" class="plain refused"></ul>
-    </section>
-
-    <section id="bans-card" class="card" hidden>
-      <h2>Bans</h2>
-      <div class="table-wrap"><table>
-        <thead><tr><th>Forward</th><th>Agent</th><th>Address</th><th>Expires</th></tr></thead>
-        <tbody id="bans"></tbody>
-      </table></div>
-    </section>
-
-    <section class="card">
-      <div class="card-head"><h2>VPN devices</h2><button id="add-device" type="button" class="primary write">Connect device</button></div>
-      <div class="table-wrap"><table>
-        <thead><tr><th>Name</th><th>Address</th><th>State</th><th>Last handshake</th><th>Access</th><th></th></tr></thead>
-        <tbody id="vpn"></tbody>
-      </table></div>
-    </section>
-
-    <section class="card">
-      <div class="card-head"><h2>Sites</h2><button id="add-site" type="button" class="primary write">Add site</button></div>
-      <p id="sites-hint" class="hint" hidden>Sites are managed on the host; install the host command (<code>sudo sh deploy/install-cli</code>).</p>
-      <div class="table-wrap"><table>
-        <thead><tr><th>Domain</th><th>Agent</th><th>Target port</th><th>Proxy</th><th>Forward</th><th></th></tr></thead>
-        <tbody id="sites"></tbody>
-      </table></div>
-    </section>
-
-    <section class="card write">
-      <h2>Settings and backup</h2>
-      <p class="muted">An <strong>export</strong> holds agent names, forwards, VPN devices with their grants, names and sites, but no keys: import it here or on another server. A <strong>backup</strong> holds everything with every key, to move or recover this server with <code>sudo rift restore FILE</code>.</p>
-      <div class="btns">
-        <button id="export-settings" type="button">Export settings</button>
-        <button id="import-settings" type="button">Import settings</button>
-        <button id="download-backup" type="button" class="danger">Download backup</button>
-      </div>
-    </section>
-
-    <section class="card">
-      <h2>Panel</h2>
-      <ul id="panel-urls" class="plain"></ul>
-      <p id="two-factor" class="two-factor"></p>
-    </section>
-
-    <details id="logs-box" class="card">
-      <summary>Recent log</summary>
-      <pre id="logs" class="pre"></pre>
-    </details>
-
-    <details id="diag-box" class="card">
-      <summary>Diagnostics</summary>
-      <pre id="diag" class="pre"></pre>
-    </details>
-  </main>
+  <footer id="actionbar" class="actionbar" aria-label="Actions"></footer>
 </div>
+
+<div id="menu" class="menu" role="menu" hidden></div>
+<div id="toast" class="toast" role="status" hidden></div>
 
 <div id="modal" class="modal" hidden>
   <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="modal-title">
-    <div class="dialog-head"><h3 id="modal-title"></h3><button id="modal-close" type="button" aria-label="Close">✕</button></div>
+    <div class="dialog-head"><h3 id="modal-title"></h3><button id="modal-close" type="button" class="ghost" aria-label="Close">✕</button></div>
     <div id="modal-body"></div>
   </div>
 </div>

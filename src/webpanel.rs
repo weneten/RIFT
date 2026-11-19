@@ -585,6 +585,7 @@ impl<B: Backend> Panel<B> {
         let forwards = overview["forwards"].as_array().cloned().unwrap_or_default();
         overview["sites"] = crate::sites::overview(&self.sites_dir, &self.queue_dir, &forwards);
         overview["public_ips"] = json!(self.config.public_ips);
+        overview["endpoint"] = self.config.public_endpoint.clone().into();
         overview["two_factor"] = json!({
             "enabled": self.two_factor.enabled(),
             "required": self.config.webpanel_2fa == PanelTwoFactor::Required,
@@ -1150,6 +1151,10 @@ pub(crate) fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> 
                 "configuration_ready": h.map(|h| h["configuration_ready"].clone()).unwrap_or(Value::Bool(false)),
                 "last_handshake": h.map(|h| h["last_handshake"].clone()).unwrap_or(Value::Null),
                 "last_error": a["last_error"],
+                // What the agent itself allows (RIFT_AGENT_ALLOW_*), and the key the traffic
+                // counters below are keyed by.
+                "limits": a["limits"],
+                "public_key": a["public_key"],
             })
         })
         .collect();
@@ -1195,6 +1200,14 @@ pub(crate) fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> 
         "forwards": forwards,
         "vpn_peers": peers,
         "panel": panel,
+        // WireGuard byte counters for the traffic graphs; the endpoints (home addresses) stay out.
+        "peers": status["peers"].as_array().unwrap_or(&empty).iter().map(|p| json!({
+            "public_key": p["public_key"],
+            "rx_bytes": p["rx_bytes"],
+            "tx_bytes": p["tx_bytes"],
+            "last_handshake": p["last_handshake"],
+        })).collect::<Vec<_>>(),
+        "rift_version": status["rift_version"],
         "time": now(),
     })
 }
