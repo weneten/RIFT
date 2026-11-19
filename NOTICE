@@ -10,7 +10,7 @@ their licenses and sources are. None of them changes RIFT's own license.
 
 The binary contains the Rust crates listed with their full license texts in
 THIRD_PARTY_LICENSES.md (in the Docker image: /usr/share/doc/rift/). They are
-licensed under the MIT, Apache-2.0, ISC, BSD-3-Clause and Unicode-3.0
+licensed under the MIT, Apache-2.0, ISC, BSD-3-Clause, Unicode-3.0 and Zlib
 licenses, all of which permit use in an MIT-licensed program.
 
 The crate libsqlite3-sys embeds the SQLite library, which its authors have

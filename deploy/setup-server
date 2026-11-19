@@ -4,7 +4,8 @@
 #   sudo sh deploy/setup-server
 #
 # It goes through every setting of the server .env, in the order of .env.server.example:
-# image, addresses, ports and enrollment, tunnel pools, VPN devices, web panel, websites.
+# image, addresses, ports and enrollment, tunnel pools, VPN devices, web panel, terminal UI,
+# websites.
 # Each question offers a default (Enter takes it, - clears an optional value): what it
 # detects on this machine, else the value of the existing .env, else RIFT's default. Groups
 # that are rarely changed (ports, address pools, advanced panel settings) are asked only
@@ -15,6 +16,7 @@
 #   --endpoint NAME_OR_IP   the DNS name or address agents dial (RIFT_PUBLIC_ENDPOINT)
 #   --public-ips LIST       addresses on this machine that forwards listen on (RIFT_PUBLIC_IPS)
 #   --panel / --no-panel    turn the web panel on (private: over the VPN only) or off
+#   --tui / --no-tui        whether `rift` alone opens the terminal UI (RIFT_TUI, default on)
 #   --proxy NAME            the reverse proxy for websites (rift add site): traefik, caddy or
 #                           npm (Nginx Proxy Manager) are set up in Docker (deploy/setup-proxy);
 #                           own uses one that already runs here; none sets up nothing
@@ -55,7 +57,7 @@ RIFT_WG_PORT RIFT_ENROLLMENT_BIND RIFT_ENROLLMENT
 RIFT_IPV4_POOL RIFT_SERVER_IPV4 RIFT_IPV6_POOL RIFT_SERVER_IPV6
 RIFT_VPN_POOL RIFT_VPN_POOL6 RIFT_VPN_DNS
 RIFT_WEBPANEL RIFT_WEBPANEL_PASSWORD RIFT_WEBPANEL_2FA RIFT_WEBPANEL_ACCESS RIFT_WEBPANEL_CONTROL
-RIFT_WEBPANEL_PORT RIFT_WEBPANEL_ALLOW RIFT_WEBPANEL_PROXIES RIFT_WEBPANEL_INSECURE
+RIFT_WEBPANEL_PORT RIFT_WEBPANEL_ALLOW RIFT_WEBPANEL_PROXIES RIFT_WEBPANEL_INSECURE RIFT_TUI
 RIFT_NPM_EMAIL RIFT_NPM_PASSWORD RIFT_LETSENCRYPT_EMAIL RIFT_REQUEST_CERTIFICATE RIFT_PROXY_SUBNET"
 builtin() {
   case $1 in
@@ -77,6 +79,7 @@ builtin() {
     RIFT_WEBPANEL_2FA) echo optional ;;
     RIFT_WEBPANEL_CONTROL) echo private ;;
     RIFT_WEBPANEL_INSECURE) echo false ;;
+    RIFT_TUI) echo true ;;
     RIFT_PROXY_SUBNET) echo 10.255.13.0/24 ;;
     RIFT_REQUEST_CERTIFICATE) echo true ;;
     *) echo ;;
@@ -230,6 +233,8 @@ while [ "$#" -gt 0 ]; do
     --public-ips) [ "$#" -ge 2 ] || fail "--public-ips needs a value"; preset RIFT_PUBLIC_IPS "$2"; shift 2 ;;
     --panel) preset RIFT_WEBPANEL true; shift ;;
     --no-panel) preset RIFT_WEBPANEL false; shift ;;
+    --tui) preset RIFT_TUI true; shift ;;
+    --no-tui) preset RIFT_TUI false; shift ;;
     --proxy) [ "$#" -ge 2 ] || fail "--proxy needs a value"; proxy=$2; shift 2 ;;
     --proxy-kind) [ "$#" -ge 2 ] || fail "--proxy-kind needs a value"; own_kind=$2; shift 2 ;;
     --caddy-container) [ "$#" -ge 2 ] || fail "--caddy-container needs a value"; caddy_container=$2; has_caddy_container=1; shift 2 ;;
@@ -445,6 +450,12 @@ else
   put RIFT_WEBPANEL_INSECURE "$(current RIFT_WEBPANEL_INSECURE)"
 fi
 end_group
+
+# ---------- terminal UI ----------
+heading "Terminal UI"
+note "\"rift\" without a command opens a full-screen terminal UI here (keyboard and mouse) for"
+note "everything the commands and the panel do. Every rift command keeps working either way."
+flag RIFT_TUI "Turn on the terminal UI?"
 
 # ---------- websites ----------
 heading "Websites (rift add site)"
@@ -749,6 +760,8 @@ if [ "$panel" = true ]; then
 else
   line "Reachable at" "nowhere (the panel is off; its other settings are kept)"
 fi
+echo "  Terminal UI"
+show RIFT_TUI
 echo "  Websites"
 case $proxy in
   own) proxy_line="your own $own_kind${caddy_container:+ in Docker ($caddy_container, $caddy_sites_dir)}" ;;
@@ -880,6 +893,9 @@ fi
 [ "$proxy" = none ] || port_line "TCP 80, 443" "websites"
 echo "  and later the ports of your forwards"
 next_steps
+if [ "$(get RIFT_TUI)" = true ]; then
+  next_step "Manage everything in the terminal UI (keyboard and mouse)" "rift"
+fi
 next_step "Add an agent (prints the command to run on the agent host)" "rift add agent NAME"
 if [ "$proxy" != none ]; then
   next_step "Publish a website of an agent (its domain's A record points at this server)" "sudo rift add site AGENT DOMAIN PORT"

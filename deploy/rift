@@ -1,7 +1,8 @@
 #!/bin/sh
 # Host-side entry point for RIFT. It runs `rift` in this host's RIFT container: rift-server on the
 # VPS, rift-agent on a home server. Only the server has the site commands and the helper-backed
-# admin commands, which read or write files on the host.
+# admin commands, which read or write files on the host. `rift` alone (or `rift tui`) on a
+# terminal opens the terminal UI in the container (RIFT_TUI=false in .env turns it off).
 set -eu
 
 site=/usr/local/lib/rift/rift-site
@@ -27,13 +28,25 @@ require_running() {
     esac
 }
 
+# Runs rift in a container. The terminal UI needs a terminal inside the container too: a TTY
+# (-t), input (-i) and the host's terminal type, so colours and the mouse work.
+in_container() {
+    _container=$1
+    shift
+    if { [ "$#" -eq 0 ] || [ "$1" = tui ]; } && [ -t 0 ] && [ -t 1 ]; then
+        exec docker exec -it -e TERM="${TERM:-xterm-256color}" -e COLORTERM="${COLORTERM:-}" \
+            "$_container" rift --config /etc/rift/config.toml "$@"
+    fi
+    exec docker exec "$_container" rift --config /etc/rift/config.toml "$@"
+}
+
 if [ -z "$(state rift-server)" ]; then
     if [ -z "$(state rift-agent)" ]; then
         echo "rift: there is no rift-server or rift-agent container; start it with 'docker compose up -d' in the RIFT directory" >&2
         exit 1
     fi
     require_running rift-agent
-    exec docker exec rift-agent rift --config /etc/rift/config.toml "$@"
+    in_container rift-agent "$@"
 fi
 
 # Server only from here on.
@@ -90,4 +103,5 @@ if [ "${1-}" = list ] && [ "${2-}" = forwards ] && [ "$#" -eq 2 ] && [ -x "$site
 fi
 
 require_running rift-server
-exec docker exec rift-server rift --config /etc/rift/config.toml $json "$@"
+# shellcheck disable=SC2086 # $json is empty or one word.
+in_container rift-server $json "$@"

@@ -4,6 +4,12 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ## [Unreleased]
 
+### Terminal UI
+
+- `rift` without a command opens a full-screen terminal UI on the server and on agents (`rift tui` does too). It covers what the CLI and the web panel do: an overview with live traffic and what needs attention; agents with invitations, enable/disable, rename, key rotation and names; forwards (add in the short form, enable/disable, ban, remove); VPN devices with grants, withdrawals, exits, DNS, names, panel access and their WireGuard configuration as a QR code; sites through the panel's host queue; bans; the web panel's password and two-factor login; the log with follow, text and level filters; and `rift doctor`. It works by keyboard and mouse (tabs, rows, buttons, form fields, wheel, right click and double click for the actions of a row), and `:` runs any `rift` command inside it. It talks to the daemon over the same admin socket as the CLI and shows the same messages.
+- `RIFT_TUI` (default `true`) in the server and agent `.env` turns it off: `rift` alone then prints the help, as before. `deploy/setup-server` and `deploy/join` ask for it and take `--tui`/`--no-tui`. The commands are unaffected either way.
+- The host command `rift` starts the container command with a terminal (`docker exec -it`, passing `TERM` and `COLORTERM`) when it is called without a command, or with `tui`, on a terminal.
+
 ### Setup
 
 - `deploy/setup-server` asks for every setting of the server `.env` (image version, ports and enrollment, tunnel and VPN pools, VPN DNS, every web panel setting including the password and two-factor login, the reverse proxy with its Let's Encrypt settings and the panel route of `deploy/publish-panel`; besides a proxy in Docker, `own` takes over a proxy that already runs on the server: it detects what holds port 443, asks what `rift add site` needs for it, such as the Caddy container and site directory or the Nginx Proxy Manager login, and sets it with `rift proxy`), in the order of `.env.server.example`. Rarely changed groups are asked only after a yes. Defaults come from the existing `.env`, so running it again changes settings in place; values are checked before anything is written; `--set KEY=VALUE`, `--version` and `--publish-panel` set them without questions. A setting at RIFT's default stays a comment in `.env`, and `RIFT_ALLOW_PRIVATE_LISTENERS` is reset when the address is no longer private.

@@ -30,6 +30,7 @@ The agent initiates the connection to the server. RIFT manages the tunnel, expli
 - [Private VPN access](#private-vpn-access)
 - [Use RIFT as a VPN (exit)](#use-rift-as-a-vpn-exit)
 - [Web panel](#web-panel)
+- [Terminal UI](#terminal-ui)
 - [Back up, move or rebuild](#back-up-move-or-rebuild)
 - [Command reference](#command-reference)
 - [Configuration](#configuration)
@@ -775,6 +776,38 @@ Without `--read-only` it sets `RIFT_WEBPANEL_CONTROL=public` in the server `.env
 
 The panel port (default 8090, `RIFT_WEBPANEL_PORT`) must differ from the control and enrollment ports. Panel settings need a restart; `rift reload` refuses to change them.
 
+## Terminal UI
+
+Type `rift` without a command on the server or an agent host and a full-screen terminal UI opens (in the RIFT container, through `docker exec -it`, so SSH is enough). It shows and does what the CLI and the web panel do, by keyboard and by mouse:
+
+| Tab | Shows | Actions |
+| --- | --- | --- |
+| Overview | agents online, forwards, devices, sites and bans at a glance; live traffic through the tunnel; what needs attention (apply errors, offline agents, refused forwards, open invitations); the latest log entries | invite an agent, add a forward or device, reconcile |
+| Agents | state, tunnel address, last handshake, live traffic and version of each agent; beside it the details: limits the agent reported, its `.internal` name, errors, open invitation | invite (shows the `deploy/join` line; `y` copies it), enable/disable, rename, rotate key, names on/off, add a forward, cancel an invitation, remove |
+| Forwards | listen address and ports, target, protocol, mode, who may connect, state (active, disabled, pending, refused with the reason) | add (the short form `8080:80/tcp 53/both`, address family, mode, ingress, allowed clients), enable/disable, ban a client of a translated forward, remove |
+| VPN devices | address, handshake, grants, exits, panel access; beside it the grants (refused ones with the reason) and exits | add, grant access (ports, host, all protocols, LAN networks with SNAT, exit), withdraw, WireGuard configuration as a QR code to scan or as text, internet exits, DNS, names, panel access, enable/disable, remove |
+| Sites | domains with agent, target port, proxy, the state of their forward and the allowed clients | add, remove (through the same host service as the web panel) |
+| Bans | blocked client addresses and when they expire | ban an address |
+| Web panel | whether it is on, its addresses, the password (on request), two-factor state, the devices that may open it | show the password, set up / confirm / reset two-factor login (QR code), grant or withdraw devices |
+| Logs | the daemon's recent log, coloured by level, following new entries | pause, filter by text, filter by level |
+| Health | `rift doctor` as a list | run the checks again |
+
+On an agent host the UI has Overview (tunnel, server, traffic, identity), Forwards (ban a client), Logs and Health.
+
+**Keys and mouse.** `1`–`9`, `Tab` or a click switch tabs; `↑`/`↓`, `PgUp`/`PgDn` or the wheel move in tables and the log; the letters in the footer start the actions of the selected row, and `Enter`, a right click or a double click opens them as a menu. Dialogs take `Tab` and clicks between fields, `←`/`→` or a click to change a choice, `Space` or a click to tick a box. `:` runs any `rift` command inside the UI, for example `:list forwards` (with `Tab` completion and `↑` history); the host commands (`export`, `import`, `backup`, `restore`, `proxy`, sites) run outside it. `?` lists every key, `q` quits. To select text with the mouse, hold `Shift` while dragging.
+
+Every `rift ...` command keeps working as before; the UI is only what `rift` alone does on a terminal, and without a terminal (in scripts, through a pipe) `rift` alone prints the help as before. It is **on** by default and needs no port: it runs with the same rights as the CLI, only for whoever can run `docker exec` on the host. To turn it off, set it in `.env` (or answer the question of `deploy/setup-server` or `deploy/join`, or pass `--no-tui` to them) and recreate the container:
+
+```dotenv
+RIFT_TUI=false
+```
+
+```sh
+docker compose up -d --force-recreate
+```
+
+`rift tui` opens it explicitly. The UI uses colours (24-bit), Unicode box drawing and mouse reporting; it needs a window of at least 60 × 16 characters, and about 45 rows to show a WireGuard QR code (smaller windows show the configuration as text).
+
 ## Back up, move or rebuild
 
 RIFT has two ways to save a server. Pick by what you want to keep.
@@ -876,6 +909,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 
 | Command | What it does |
 | --- | --- |
+| `rift` | On a terminal: opens the [terminal UI](#terminal-ui) (`rift tui` does too; `RIFT_TUI=false` turns it off). Otherwise prints the help. Server and agent. |
 | `rift status` | Health of the server, agents, enrollment port, open invitations and refused forwards. |
 | `rift doctor` | Checks kernel tools, WireGuard, nftables and the host firewall. |
 | `rift logs [--lines N]` | Recent log entries of the running server or agent (default 100). |
@@ -988,6 +1022,7 @@ The web panel runs `add site`, `remove site`, `export`, `import` and `backup` th
 | `RIFT_WEBPANEL_CONTROL` | `private` | Server. `private`: changes from loopback without proxy headers and from panel VPN devices; `public`: also through a TLS proxy (loopback or `RIFT_WEBPANEL_PROXIES`, `X-Forwarded-Proto: https`), see [Reach the panel over HTTPS](#reach-the-panel-over-https); `off`: read-only everywhere. |
 | `RIFT_WEBPANEL_ALLOW` | empty | Server. Extra allowed source addresses or networks, comma-separated. |
 | `RIFT_WEBPANEL_PROXIES` | empty | Server. Addresses of TLS reverse proxies in front of the panel; from these, a login with `X-Forwarded-Proto: https` is accepted, and with `RIFT_WEBPANEL_CONTROL=public` changes too. A proxy on the VPS itself needs no entry. |
+| `RIFT_TUI` | `true` | Server and agent. `rift` without a command opens the [terminal UI](#terminal-ui) on a terminal; `false` prints the help instead. The commands are unaffected. |
 | `RIFT_PROXY_SUBNET` | `10.255.13.0/24` | Server host scripts. The Docker network of the proxies that `deploy/setup-proxy` sets up; `deploy/publish-panel` trusts it. |
 | `RIFT_WEBPANEL_INSECURE` | `false` | Server. `true` lets a public panel take the password over plain HTTP. |
 | `RIFT_WEBPANEL_2FA` | `optional` | Server. `optional`: one-time code at login once someone turned it on; `required`: no login until `rift panel 2fa setup` and `confirm` ran. Restart required. |

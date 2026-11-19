@@ -7,7 +7,8 @@
 #
 # It asks for what is missing (SERVER, NAME, the hidden TOKEN, so it stays out of the shell
 # history) and then for every setting of the agent .env, in the order of .env.agent.example:
-# the image and what the server may open on this host (ports, LAN networks, internet exit).
+# the image, what the server may open on this host (ports, LAN networks, internet exit) and the
+# terminal UI.
 # Each question offers the value of an existing .env, else RIFT's default (Enter takes it,
 # - clears an optional value). An agent that is already enrolled needs no new token: run it
 # without one to change its settings. Without a terminal, or with --yes, it takes the
@@ -18,6 +19,7 @@
 #   --allow-subnets LIST    LAN networks VPN devices may reach, e.g. 192.168.178.0/24
 #                           (RIFT_AGENT_ALLOW_SUBNETS; empty: no LAN access)
 #   --exit / --no-exit      offer this host's internet connection as an exit for VPN devices
+#   --tui / --no-tui        whether `rift` alone opens the terminal UI (RIFT_TUI, default on)
 #   --version VERSION       the image: latest or a release such as 1.0.0 (RIFT_VERSION)
 #   --set KEY=VALUE         any setting of .env.agent.example; an empty VALUE returns it to
 #                           RIFT's default
@@ -43,11 +45,12 @@ usage() {
 
 # The settings in the order of .env.agent.example, and RIFT's default of each.
 keys="RIFT_VERSION RIFT_SERVER RIFT_AGENT_NAME RIFT_ENROLLMENT_TOKEN
-RIFT_AGENT_ALLOW_PORTS RIFT_AGENT_ALLOW_SUBNETS RIFT_AGENT_ALLOW_EXIT"
+RIFT_AGENT_ALLOW_PORTS RIFT_AGENT_ALLOW_SUBNETS RIFT_AGENT_ALLOW_EXIT RIFT_TUI"
 builtin() {
   case $1 in
     RIFT_VERSION) echo latest ;;
     RIFT_AGENT_ALLOW_EXIT) echo false ;;
+    RIFT_TUI) echo true ;;
     *) echo ;;
   esac
 }
@@ -114,6 +117,8 @@ while [ "$#" -gt 0 ]; do
     --allow-subnets) [ "$#" -ge 2 ] || fail "--allow-subnets needs a value"; preset RIFT_AGENT_ALLOW_SUBNETS "$2"; shift 2 ;;
     --exit) preset RIFT_AGENT_ALLOW_EXIT true; shift ;;
     --no-exit) preset RIFT_AGENT_ALLOW_EXIT false; shift ;;
+    --tui) preset RIFT_TUI true; shift ;;
+    --no-tui) preset RIFT_TUI false; shift ;;
     --version) [ "$#" -ge 2 ] || fail "--version needs a value"; preset RIFT_VERSION "$2"; shift 2 ;;
     --set)
       [ "$#" -ge 2 ] || fail "--set needs KEY=VALUE"
@@ -222,6 +227,12 @@ note "An internet exit lets VPN devices use this host's internet connection; the
 note "and reach no private network except the ones above."
 flag RIFT_AGENT_ALLOW_EXIT "Offer this host as an internet exit for VPN devices?"
 
+# ---------- terminal UI ----------
+heading "Terminal UI"
+note "\"rift\" without a command opens a full-screen terminal UI here (tunnel, traffic,"
+note "forwards, log, health checks). Every rift command keeps working either way."
+flag RIFT_TUI "Turn on the terminal UI?"
+
 # ---------- summary ----------
 server=$(get RIFT_SERVER)
 name=$(get RIFT_AGENT_NAME)
@@ -234,6 +245,7 @@ printf '  %-26s %s\n' RIFT_ENROLLMENT_TOKEN "$([ -n "$token" ] && echo '(new inv
 printf '  %-26s %s\n' RIFT_AGENT_ALLOW_PORTS "${val_RIFT_AGENT_ALLOW_PORTS:-(no limit)}"
 printf '  %-26s %s\n' RIFT_AGENT_ALLOW_SUBNETS "${val_RIFT_AGENT_ALLOW_SUBNETS:-(no LAN access)}"
 printf '  %-26s %s\n' RIFT_AGENT_ALLOW_EXIT "$(get RIFT_AGENT_ALLOW_EXIT)"
+printf '  %-26s %s\n' RIFT_TUI "$(get RIFT_TUI)"
 if [ "$version" != latest ]; then
   echo "The image is pinned to $version; check out the matching tag too: git checkout v$version"
 fi
@@ -322,4 +334,7 @@ next_step "Publish a port of this host, for example 8080 over TCP" "rift add for
 next_step "Or publish a website of this host with HTTPS" "sudo rift add site $name DOMAIN PORT"
 next_steps "On this host:"
 next_step "Check the agent" "rift status"
+if [ "$(get RIFT_TUI)" = true ]; then
+  next_step "Watch it in the terminal UI (tunnel, traffic, forwards, log)" "rift"
+fi
 next_step "Change its settings (allowed ports, LAN networks, exit)" "sudo sh deploy/join"

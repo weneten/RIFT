@@ -64,6 +64,7 @@ services:
       RIFT_WEBPANEL_PROXIES: ${RIFT_WEBPANEL_PROXIES:-}
       RIFT_WEBPANEL_INSECURE: ${RIFT_WEBPANEL_INSECURE:-}
       RIFT_WEBPANEL_PASSWORD: ${RIFT_WEBPANEL_PASSWORD:-}
+      RIFT_TUI: ${RIFT_TUI:-}
     command: ["--config", "/etc/rift/config.toml", "server"]
   agent:
     <<: *rift
@@ -76,6 +77,7 @@ services:
       RIFT_AGENT_ALLOW_PORTS: ${RIFT_AGENT_ALLOW_PORTS:-}
       RIFT_AGENT_ALLOW_SUBNETS: ${RIFT_AGENT_ALLOW_SUBNETS:-}
       RIFT_AGENT_ALLOW_EXIT: ${RIFT_AGENT_ALLOW_EXIT:-}
+      RIFT_TUI: ${RIFT_TUI:-}
     command: ["--config", "/etc/rift/config.toml", "agent"]
 
 volumes:

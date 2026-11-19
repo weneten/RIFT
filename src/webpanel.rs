@@ -613,14 +613,14 @@ const PROXY_HEADERS: [&str; 5] = [
 fn default_lines() -> usize {
     200
 }
-fn seconds(text: &str) -> Result<u64> {
+pub(crate) fn seconds(text: &str) -> Result<u64> {
     let seconds = humantime::parse_duration(text.trim())
         .with_context(|| format!("invalid duration {text:?}; use e.g. 15m or 1h"))?
         .as_secs();
     ensure!(seconds > 0, "duration must be positive");
     Ok(seconds)
 }
-fn words(text: &str) -> Vec<String> {
+pub(crate) fn words(text: &str) -> Vec<String> {
     text.split(|c: char| c.is_whitespace() || c == ',')
         .filter(|w| !w.is_empty())
         .map(String::from)
@@ -1121,7 +1121,7 @@ impl Action {
 }
 
 /// The subset of status the panel shows, with agent names resolved.
-fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> Value {
+pub(crate) fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> Value {
     let snapshot = &status["snapshot"];
     let empty = Vec::new();
     let health = status["agent_health"].as_array().unwrap_or(&empty);

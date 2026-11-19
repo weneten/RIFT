@@ -214,6 +214,9 @@ pub struct Config {
     /// From the environment only. Without it a generated password lives in the state directory.
     #[serde(skip)]
     pub webpanel_password: Option<String>,
+    /// Whether `rift` without a command opens the terminal UI (`RIFT_TUI`). On by default:
+    /// it runs only through `docker exec` on the host, with the same rights as the CLI.
+    pub tui: bool,
     pub agent_name: Option<String>,
     /// Agent only. When set, the agent refuses forwards and VPN port grants outside these
     /// ports, and VPN grants of the whole host, whatever the server asks for.
@@ -269,6 +272,7 @@ impl Default for Config {
             webpanel_proxies: vec![],
             webpanel_insecure: false,
             webpanel_password: None,
+            tui: true,
             agent_name: None,
             agent_allow_ports: None,
             agent_allow_subnets: vec![],
@@ -345,6 +349,7 @@ impl Config {
         env_parse!("RIFT_WEBPANEL_CONTROL", webpanel_control);
         env_parse!("RIFT_WEBPANEL_2FA", webpanel_2fa);
         env_parse!("RIFT_WEBPANEL_INSECURE", webpanel_insecure);
+        env_parse!("RIFT_TUI", tui);
         if let Ok(v) = std::env::var("RIFT_WEBPANEL_PROXIES") {
             config.webpanel_proxies =
                 parse_allow_list(&v).context("invalid RIFT_WEBPANEL_PROXIES")?;

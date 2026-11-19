@@ -1,5 +1,6 @@
-use rift::model::Exit;
-use rift::protocol::AdminRequest;
+//! Human-readable output of the CLI, shared with the terminal UI.
+use crate::model::Exit;
+use crate::protocol::AdminRequest;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -45,7 +46,7 @@ pub fn invitation(data: &Value) -> String {
         data["token"].as_str().unwrap_or_default(),
     );
     let minutes =
-        ((data["expires_at"].as_i64().unwrap_or(0) - rift::model::now()).max(0) + 59) / 60;
+        ((data["expires_at"].as_i64().unwrap_or(0) - crate::model::now()).max(0) + 59) / 60;
     let mut out = vec![format!(
         "Invitation for agent \"{name}\": works once, valid for {minutes} min. The token is a secret."
     )];
@@ -59,7 +60,7 @@ pub fn invitation(data: &Value) -> String {
     out.push("  cd RIFT".into());
     out.push(format!(
         "  {}",
-        rift::enrollment::join_command(server, name, token)
+        crate::enrollment::join_command(server, name, token)
     ));
     out.push(String::new());
     out.push(
@@ -240,9 +241,9 @@ fn agents(data: &Value) -> String {
         .map(|a| {
             let dns = match (
                 a["names"].as_bool(),
-                a["name"].as_str().and_then(rift::vpn::dns_label),
+                a["name"].as_str().and_then(crate::vpn::dns_label),
             ) {
-                (Some(true), Some(label)) => format!("{label}.{}", rift::vpn::NAMES_SUFFIX),
+                (Some(true), Some(label)) => format!("{label}.{}", crate::vpn::NAMES_SUFFIX),
                 _ => "-".into(),
             };
             let version = a["rift_version"]
@@ -343,7 +344,7 @@ pub fn doctor(data: &Value) -> String {
 /// The result of `rift import`: what was created, what was there, what was skipped and what
 /// failed. The host command prints the same layout after adding the sites.
 pub fn import_report(data: &Value) -> anyhow::Result<String> {
-    use rift::portable::{Report, Status};
+    use crate::portable::{Report, Status};
     let report: Report = serde_json::from_value(data.clone())?;
     let mut lines = Vec::new();
     if report.dry_run {
@@ -496,7 +497,7 @@ fn status(data: &Value) -> String {
             .into_iter()
             .flatten()
             .map(|i| {
-                let left = i["expires_at"].as_i64().unwrap_or(0) - rift::model::now();
+                let left = i["expires_at"].as_i64().unwrap_or(0) - crate::model::now();
                 format!("{} ({}m left)", field(i, "name"), (left.max(0) + 59) / 60)
             })
             .collect();
@@ -513,7 +514,7 @@ fn status(data: &Value) -> String {
         let id = &data["identity"];
         let connected = data["peers"].as_array().into_iter().flatten().any(|p| {
             let handshake = p["last_handshake"].as_i64().unwrap_or(0);
-            handshake > 0 && rift::model::now().saturating_sub(handshake) <= 180
+            handshake > 0 && crate::model::now().saturating_sub(handshake) <= 180
         });
         format!("Agent: {}\nEnrollment: {}\nConnection: {}\nTunnel: {} / {}\nUse 'rift --json status' for full diagnostics.",
             field(&id["welcome"], "name"), if id["active"].as_bool() == Some(true) { "active" } else { "pending" },
@@ -526,7 +527,7 @@ fn status(data: &Value) -> String {
     }
 }
 
-fn vpn_access(value: &Value) -> String {
+pub fn vpn_access(value: &Value) -> String {
     match value {
         Value::String(kind) => kind.clone(),
         _ if value["port"].is_object() => format!(
@@ -805,13 +806,13 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rift::model::{PortRange, Protocol, VpnAccess};
+    use crate::model::{PortRange, Protocol, VpnAccess};
     use serde_json::json;
 
     #[test]
     fn an_invitation_lists_clone_cd_and_join_once_and_the_env_lines_once() {
         let data = json!({"name":"core","token":"v1.TOKEN","server":"rift.example.net:8443",
-            "expires_at": rift::model::now() + 900, "enrollment":"auto","replaces":false});
+            "expires_at": crate::model::now() + 900, "enrollment":"auto","replaces":false});
         let text = invitation(&data);
         let clone = text
             .find("  git clone https://github.com/weneten/RIFT.git")

@@ -4,20 +4,27 @@ use ipnet::Ipv4Net;
 use rift::{config::Config, model::*, protocol::AdminRequest};
 use std::{net::IpAddr, path::PathBuf};
 
-mod output;
+use rift::output;
 
 #[derive(Parser)]
-#[command(name = "rift", version, about = "Rust Internet Forwarding Tunnel")]
+#[command(
+    name = "rift",
+    version,
+    about = "Rust Internet Forwarding Tunnel",
+    after_help = "Without a command, on a terminal, rift opens the terminal UI (RIFT_TUI=false turns it off)."
+)]
 struct Cli {
     #[arg(long, global = true, default_value = "/etc/rift/config.toml")]
     config: PathBuf,
     #[arg(long, global = true, help = "Machine-readable JSON output")]
     json: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Open the terminal UI (also what `rift` without a command does on a terminal).
+    Tui,
     /// Run the public VPS server.
     Server,
     /// Enroll or reconnect this home-server agent.
@@ -481,6 +488,24 @@ async fn main() {
 }
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+    // The terminal UI owns the screen: it starts before the log goes to stderr.
+    let command = match cli.command {
+        Some(Command::Tui) => {
+            return rift::tui::run(Config::load(&cli.config)?, cli.config).await;
+        }
+        Some(command) => command,
+        None => {
+            let config = Config::load(&cli.config)?;
+            if rift::tui::wanted(&config) {
+                return rift::tui::run(config, cli.config).await;
+            }
+            <Cli as clap::CommandFactory>::command().print_help()?;
+            if !config.tui {
+                eprintln!("\nThe terminal UI is off (RIFT_TUI=false).");
+            }
+            std::process::exit(2);
+        }
+    };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "rift=info".into());
     tracing_subscriber::fmt()
@@ -490,14 +515,15 @@ async fn run() -> Result<()> {
         .init();
     let config = Config::load(&cli.config)?;
     let invitation = matches!(
-        &cli.command,
+        &command,
         Command::Add {
             what: AddWhat::Agent { .. }
         }
     );
     // Further forwards of one short-form `add forward`, sent after the first one.
     let mut more: Vec<AdminRequest> = Vec::new();
-    let request = match cli.command {
+    let request = match command {
+        Command::Tui => unreachable!("handled above"),
         Command::Server => return rift::daemon::run_server(config, cli.config).await,
         Command::Export { file } => return export_command(&config, cli.json, file).await,
         Command::Import(args) => return import_command(&config, cli.json, args).await,
@@ -1322,7 +1348,7 @@ mod tests {
         .unwrap();
         let Command::Vpn {
             command: Vpn::Allow(args),
-        } = snat.command
+        } = snat.command.unwrap()
         else {
             unreachable!()
         };
@@ -1331,7 +1357,7 @@ mod tests {
         assert!(Cli::try_parse_from(["rift", "vpn", "deny", "iphone", "node4", "--snat"]).is_err());
     }
     fn vpn_plan(argv: &[&str]) -> Option<Result<VpnPlan>> {
-        match Cli::try_parse_from(argv).map(|c| c.command) {
+        match Cli::try_parse_from(argv).map(|c| c.command.unwrap()) {
             Ok(Command::Vpn {
                 command: Vpn::Allow(args),
             }) => Some(args.into_access().plan()),
@@ -1342,7 +1368,7 @@ mod tests {
         }
     }
     fn vpn_requests(argv: &[&str]) -> Result<Vec<AdminRequest>> {
-        match Cli::try_parse_from(argv).unwrap().command {
+        match Cli::try_parse_from(argv).unwrap().command.unwrap() {
             Command::Vpn {
                 command: Vpn::Allow(args),
             } => vpn_allow_requests(&args.into_access()),
@@ -1360,7 +1386,7 @@ mod tests {
         .unwrap();
         let Command::Vpn {
             command: Vpn::Connect { access, export },
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             unreachable!()
         };
@@ -1378,7 +1404,7 @@ mod tests {
         let bad = Cli::try_parse_from(["rift", "vpn", "connect", "phone", "pp", "web"]).unwrap();
         let Command::Vpn {
             command: Vpn::Connect { access, .. },
-        } = bad.command
+        } = bad.command.unwrap()
         else {
             unreachable!()
         };
@@ -1555,7 +1581,7 @@ mod tests {
         );
         // The profiles: the main one, or that of an agent's exit.
         // QR code by default, the file with --export, as in `rift panel connect`.
-        let config = |argv: &[&str]| match Cli::try_parse_from(argv).unwrap().command {
+        let config = |argv: &[&str]| match Cli::try_parse_from(argv).unwrap().command.unwrap() {
             Command::Vpn {
                 command:
                     Vpn::Config {
@@ -1664,7 +1690,7 @@ mod tests {
     }
     #[test]
     fn vpn_dns_names_an_agent_or_the_default() {
-        let request = |argv: &[&str]| match Cli::try_parse_from(argv).unwrap().command {
+        let request = |argv: &[&str]| match Cli::try_parse_from(argv).unwrap().command.unwrap() {
             Command::Vpn {
                 command: Vpn::Dns { peer, agent },
             } => (peer, agent),
@@ -1842,7 +1868,7 @@ mod tests {
         .unwrap();
         let Command::Add {
             what: AddWhat::Forward { ingress, .. },
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("add forward");
         };
@@ -1884,7 +1910,7 @@ mod tests {
             what: AddWhat::Ban {
                 forward_id, ttl, ..
             },
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("add ban");
         };
@@ -1894,7 +1920,7 @@ mod tests {
         assert!(Cli::try_parse_from(["rift", "add", "ban", "node1", "3", "203.0.113.9"]).is_err());
         let cli = Cli::try_parse_from(["rift", "remove", "forward", "7"]).unwrap();
         assert!(matches!(
-            cli.command,
+            cli.command.unwrap(),
             Command::Remove {
                 what: RemoveWhat::Forward { id: 7 }
             }
@@ -1933,7 +1959,7 @@ mod tests {
             "--dry-run",
         ])
         .unwrap();
-        let Command::Import(args) = cli.command else {
+        let Some(Command::Import(args)) = cli.command else {
             panic!("import");
         };
         assert_eq!(args.agents, ["node1", "node3"]);
