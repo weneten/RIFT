@@ -300,7 +300,13 @@ fn draw_toast(frame: &mut Frame, app: &App, body: Rect) {
         Level::Warn => ("!", theme::WARN),
         Level::Error => ("✗", theme::BAD),
     };
-    let width = (toast.text.chars().count() as u16 + 6)
+    let longest = toast
+        .text
+        .lines()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0);
+    let width = (longest as u16 + 6)
         .min(body.width.saturating_sub(4))
         .min(90)
         .max(20.min(body.width));
@@ -312,19 +318,31 @@ fn draw_toast(frame: &mut Frame, app: &App, body: Rect) {
         height.min(body.height),
     );
     frame.render_widget(Clear, area);
+    // One line per line of the text: a line break inside a span is not drawn, which ran the
+    // sentences of a message together.
+    let lines: Vec<Line> = toast
+        .text
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            let lead = if i == 0 {
+                Span::styled(format!("{icon} "), Style::new().fg(color).bold())
+            } else {
+                Span::raw("  ")
+            };
+            Line::from(vec![lead, Span::raw(line.to_string())])
+        })
+        .collect();
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(format!("{icon} "), Style::new().fg(color).bold()),
-            Span::raw(toast.text.clone()),
-        ]))
-        .wrap(Wrap { trim: false })
-        .style(theme::popup())
-        .block(
-            Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::new().fg(color))
-                .style(theme::popup()),
-        ),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .style(theme::popup())
+            .block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::new().fg(color))
+                    .style(theme::popup()),
+            ),
         area,
     );
 }
@@ -614,7 +632,8 @@ fn details(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>
 fn kv(key: &str, value: impl Into<String>) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{key:<12}"), theme::muted()),
-        Span::raw(value.into()),
+        // A value is one line; a line break inside a span would run its lines together.
+        Span::raw(value.into().replace('\n', " ")),
     ])
 }
 
@@ -995,7 +1014,7 @@ fn attention(app: &App) -> Vec<Line<'static>> {
             } else {
                 Span::styled("! ", theme::warn())
             },
-            Span::raw(text),
+            Span::raw(text.replace('\n', " ")),
         ]))
     };
     if let Some(error) = status["apply_error"].as_str() {

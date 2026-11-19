@@ -343,6 +343,7 @@ ul.grants li { padding: 3px 0; }
   border: 1px solid var(--border);
   border-left: 4px solid var(--ok);
   box-shadow: 0 10px 30px rgba(0, 0, 0, .2);
+  white-space: pre-line;
 }
 .toast.bad { border-left-color: var(--bad); }
 
