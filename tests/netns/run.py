@@ -1212,10 +1212,16 @@ def vpn_device_test(server_cfg):
 
     def ask(name):
         return ns(DEVICE, "python3", "-c", DNS_QUERY, dns, name).stdout.split()
+
+    def not_answered_here(name):
+        # RIFT passes the name on; the upstream (RIFT_VPN_DNS) is out of reach in this test
+        # network, so there is no answer or SERVFAIL, and never an address.
+        result = ns(DEVICE, "python3", "-c", DNS_QUERY, dns, name, check=False).stdout.split()
+        return result[:1] != ["0"]
     assert wait_until(lambda: ask("agent1.internal") == ["0", a1], "agent1.internal through the tunnel", timeout=30)
     assert ask("AGENT1.internal") == ["0", a1], "names are case-insensitive"
-    assert ask("agent2.internal") == ["3", "-"], "an agent without names resolved"
-    assert ask("agent3.internal") == ["3", "-"], "an agent without a grant resolved"
+    assert not_answered_here("agent2.internal"), "an agent without names resolved"
+    assert not_answered_here("agent3.internal"), "an agent without a grant resolved"
     # Turning names on for agent2, which the device already uses names for: same DNS line.
     second = json.loads(cli(VPS, server_cfg, "vpn", "names", "agent", "agent2", "on").stdout)
     assert second["reimport"] == [], second
@@ -1233,7 +1239,12 @@ def vpn_device_test(server_cfg):
     # so a Pi-hole shows the device instead of the server.
     assert wait_until(lambda: ask("example.com") == ["0", me],
                       "example.com through RIFT to the home DNS server, naming the device", timeout=40)
-    print("PASS names: NAME.internal only for agents with names and a grant, other names relayed to the device's DNS agent with the device's address")
+    # Names under the suffix that are no agent with names go there too (agent3 has names off),
+    # so a home DNS server can answer names of its own under it; agent1 stays RIFT's answer.
+    assert ask("nas.internal") == ["0", me], "a name under the suffix did not reach the home DNS server"
+    assert ask("agent3.internal") == ["0", me], "an agent without names was not passed on"
+    assert ask("agent1.internal") == ["0", a1], "the home DNS server answered an agent's name"
+    print("PASS names: NAME.internal only for agents with names and a grant, every other name relayed to the device's DNS agent with the device's address")
 
     # The device opts out: its configuration changes, and the server no longer answers it.
     off = json.loads(cli(VPS, server_cfg, "vpn", "names", "device", "phone", "off").stdout)
