@@ -62,6 +62,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Tab::Panel => draw_panel(frame, app, body),
             Tab::Logs => draw_logs(frame, app, body),
             Tab::Health => draw_health(frame, app, body),
+            Tab::Backup => draw_backup(frame, app, body),
         }
     }
     draw_footer(frame, app, footer);
@@ -194,7 +195,7 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, area: Rect) {
         let rect = Rect::new(x, y, width, 1);
         frame.render_widget(
             Line::from(vec![
-                Span::styled(format!(" {} ", i + 1), number),
+                Span::styled(format!(" {} ", (i + 1) % 10), number),
                 Span::styled(tab.title(), title.add_modifier(Modifier::BOLD)),
                 Span::styled(format!("{count} "), extra),
             ]),
@@ -406,6 +407,7 @@ fn table(
     title: &str,
     header: &[&str],
     widths: &[Constraint],
+    drop: &[usize],
     rows: Vec<Vec<Line<'static>>>,
     empty: &str,
 ) {
@@ -423,7 +425,14 @@ fn table(
         .right_aligned(),
     );
     let inner = block.inner(area);
-    let widths = fit_columns(header, widths, &rows, inner.width.saturating_sub(1));
+    let available = inner.width.saturating_sub(1);
+    // Narrow windows: leave out whole columns, least important first, before squeezing the
+    // rest. The details beside or below the table still show what they held.
+    let keep = kept_columns(header, widths, &rows, drop, available);
+    let header: Vec<&str> = pick(header, &keep);
+    let widths: Vec<Constraint> = pick(widths, &keep);
+    let rows: Vec<Vec<Line<'static>>> = rows.into_iter().map(|r| pick(&r, &keep)).collect();
+    let widths = fit_columns(&header, &widths, &rows, available);
     let rows: Vec<Row<'static>> = rows
         .into_iter()
         .map(|cells| Row::new(cells.into_iter().map(Cell::from)))
@@ -477,17 +486,50 @@ fn table(
     }
 }
 
-/// Column widths from the content: `Length(n)` caps a column at n, `Min(n)` keeps at least n
-/// where possible. When the columns do not fit, the widest give way first, down to a few
-/// characters, so every column stays visible.
-fn fit_columns(
+const SPACING: u16 = 2;
+
+/// Which columns stay: all that fit, dropping those in `drop` in its order while they do not.
+fn kept_columns(
     header: &[&str],
     limits: &[Constraint],
     rows: &[Vec<Line<'static>>],
+    drop: &[usize],
     available: u16,
-) -> Vec<Constraint> {
-    const SPACING: u16 = 2;
-    let mut widths: Vec<u16> = limits
+) -> Vec<bool> {
+    let natural = natural_widths(header, limits, rows);
+    let mut keep = vec![true; header.len()];
+    let need = |keep: &[bool]| -> u16 {
+        let kept: Vec<u16> = natural
+            .iter()
+            .zip(keep)
+            .filter(|(_, k)| **k)
+            .map(|(w, _)| *w)
+            .collect();
+        kept.iter().sum::<u16>() + SPACING * kept.len().saturating_sub(1) as u16
+    };
+    for &column in drop {
+        if need(&keep) <= available {
+            break;
+        }
+        if let Some(k) = keep.get_mut(column) {
+            *k = false;
+        }
+    }
+    keep
+}
+
+fn pick<T: Clone>(items: &[T], keep: &[bool]) -> Vec<T> {
+    items
+        .iter()
+        .zip(keep)
+        .filter(|(_, k)| **k)
+        .map(|(item, _)| item.clone())
+        .collect()
+}
+
+/// Each column as wide as its content, within its limit.
+fn natural_widths(header: &[&str], limits: &[Constraint], rows: &[Vec<Line<'static>>]) -> Vec<u16> {
+    limits
         .iter()
         .enumerate()
         .map(|(c, limit)| {
@@ -504,7 +546,19 @@ fn fit_columns(
                 _ => content,
             }
         })
-        .collect();
+        .collect()
+}
+
+/// Column widths from the content: `Length(n)` caps a column at n, `Min(n)` keeps at least n
+/// where possible. When the columns do not fit, the widest give way first, down to a few
+/// characters, so every column stays visible.
+fn fit_columns(
+    header: &[&str],
+    limits: &[Constraint],
+    rows: &[Vec<Line<'static>>],
+    available: u16,
+) -> Vec<Constraint> {
+    let mut widths = natural_widths(header, limits, rows);
     let floor: Vec<u16> = header
         .iter()
         .map(|h| (h.chars().count() as u16).clamp(1, 6))
@@ -1055,6 +1109,7 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(34),
             Constraint::Length(10),
         ],
+        &[5, 4, 3],
         rows,
         "No agents yet. Press a to invite the first one.",
     );
@@ -1172,38 +1227,19 @@ fn forward_state(f: &Value) -> (&'static str, String) {
 fn draw_forwards(frame: &mut Frame, app: &mut App, area: Rect) {
     let forwards = app.items(Tab::Forwards);
     let agent_role = app.role == Role::Agent;
+    // Narrow windows leave out columns; a strip below the table then shows the selected
+    // forward in full.
+    let (list, strip) = if area.width < 140 && area.height >= 16 {
+        let [list, strip] =
+            Layout::vertical([Constraint::Min(6), Constraint::Length(4)]).areas(area);
+        (list, Some(strip))
+    } else {
+        (area, None)
+    };
     let rows: Vec<Vec<Line<'static>>> = forwards
         .iter()
         .map(|f| {
-            let (state, label) = if agent_role {
-                if f["enabled"] == true {
-                    ("active", "enabled".to_string())
-                } else {
-                    ("off", "disabled".to_string())
-                }
-            } else {
-                forward_state(f)
-            };
-            let mut access = s(&f["ingress"]);
-            let allow: Vec<String> = f["allow_from"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(s)
-                .collect();
-            if !allow.is_empty() {
-                access = format!("{access}, only {}", allow.join(" "));
-            }
-            let purpose = if f["purpose"] == "exit" {
-                " (exit)"
-            } else {
-                ""
-            };
-            // The family only matters where it changes: translated forwards.
-            let target_family = match (f["mode"].as_str(), f["target_family"].as_str()) {
-                (Some("translate"), Some(family)) => format!(" {family}"),
-                _ => String::new(),
-            };
+            let (state, label) = forward_label(f, agent_role);
             vec![
                 cell(Span::styled(s(&f["id"]), theme::muted())),
                 cell(Span::styled(
@@ -1214,14 +1250,14 @@ fn draw_forwards(frame: &mut Frame, app: &mut App, area: Rect) {
                     },
                     theme::bold(),
                 )),
-                cell(listen(&f["listen_ip"], &f["listen_ports"])),
                 cell(format!(
-                    "→ {}{target_family}{purpose}",
-                    range(&f["target_ports"])
+                    "{}/{}",
+                    listen(&f["listen_ip"], &f["listen_ports"]),
+                    s(&f["protocol"])
                 )),
-                cell(s(&f["protocol"])),
+                cell(forward_target(f)),
                 cell(s(&f["mode"])),
-                cell(access),
+                cell(forward_access(f)),
                 cell(Line::from(vec![
                     dot(state),
                     Span::raw(" "),
@@ -1233,22 +1269,20 @@ fn draw_forwards(frame: &mut Frame, app: &mut App, area: Rect) {
     table(
         frame,
         app,
-        area,
+        list,
         Tab::Forwards,
         "Forwards",
-        &[
-            "ID", "AGENT", "LISTEN", "TARGET", "PROTO", "MODE", "ACCESS", "STATE",
-        ],
+        &["ID", "AGENT", "LISTEN", "TARGET", "MODE", "ACCESS", "STATE"],
         &[
             Constraint::Length(5),
             Constraint::Length(20),
-            Constraint::Length(48),
-            Constraint::Length(28),
-            Constraint::Length(5),
+            Constraint::Length(52),
+            Constraint::Length(24),
             Constraint::Length(11),
-            Constraint::Min(8),
+            Constraint::Length(40),
             Constraint::Min(10),
         ],
+        &[5, 4],
         rows,
         if agent_role {
             "The server has published no ports of this host."
@@ -1256,6 +1290,90 @@ fn draw_forwards(frame: &mut Frame, app: &mut App, area: Rect) {
             "No forwards yet. Press a to publish a port of an agent."
         },
     );
+    let Some(strip) = strip else {
+        return;
+    };
+    let lines = match app.selected() {
+        Some(f) => {
+            let (state, label) = forward_label(&f, agent_role);
+            vec![
+                Line::from(vec![
+                    Span::styled(format!("#{} ", s(&f["id"])), theme::muted()),
+                    Span::styled(
+                        format!(
+                            "{}/{} ",
+                            listen(&f["listen_ip"], &f["listen_ports"]),
+                            s(&f["protocol"])
+                        ),
+                        theme::bold(),
+                    ),
+                    Span::raw(format!(
+                        "{} on {} · {} · ",
+                        forward_target(&f),
+                        if agent_role {
+                            "this host".into()
+                        } else {
+                            s(&f["agent"])
+                        },
+                        s(&f["mode"])
+                    )),
+                    dot(state),
+                    Span::raw(format!(" {label}")),
+                ]),
+                Line::from(vec![
+                    Span::styled("access ", theme::muted()),
+                    Span::raw(forward_access(&f)),
+                ]),
+            ]
+        }
+        None => vec![Line::styled("Nothing selected.", theme::muted())],
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(panel("Selected forward")),
+        strip,
+    );
+}
+
+fn forward_label(f: &Value, agent_role: bool) -> (&'static str, String) {
+    if !agent_role {
+        return forward_state(f);
+    }
+    if f["enabled"] == true {
+        ("active", "enabled".into())
+    } else {
+        ("off", "disabled".into())
+    }
+}
+
+/// `→ 80`, with the target's address family where it changes (translated forwards).
+fn forward_target(f: &Value) -> String {
+    let family = match (f["mode"].as_str(), f["target_family"].as_str()) {
+        (Some("translate"), Some(family)) => format!(" {family}"),
+        _ => String::new(),
+    };
+    let exit = if f["purpose"] == "exit" {
+        " (exit)"
+    } else {
+        ""
+    };
+    format!("→ {}{family}{exit}", range(&f["target_ports"]))
+}
+
+/// The ingress and the clients that may connect.
+fn forward_access(f: &Value) -> String {
+    let allow: Vec<String> = f["allow_from"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(s)
+        .collect();
+    if allow.is_empty() {
+        format!("{}, every client", s(&f["ingress"]))
+    } else {
+        format!("{}, only {}", s(&f["ingress"]), allow.join(" "))
+    }
 }
 
 fn draw_devices(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -1335,6 +1453,7 @@ fn draw_devices(frame: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Min(6),
             Constraint::Length(5),
         ],
+        &[6, 5, 4, 3],
         rows,
         "No VPN devices yet. Press a to add a phone or laptop.",
     );
@@ -1431,7 +1550,7 @@ fn draw_sites(frame: &mut Frame, app: &mut App, area: Rect) {
                 cell(s(&site["proxy"])),
                 cell(Line::from(vec![
                     dot(match state.as_str() {
-                        "active" => "active",
+                        "ok" | "active" => "active",
                         "missing" | "refused" => "bad",
                         _ => "warn",
                     }),
@@ -1455,7 +1574,11 @@ fn draw_sites(frame: &mut Frame, app: &mut App, area: Rect) {
         app,
         area,
         Tab::Sites,
-        "Sites",
+        &if area.width >= 100 {
+            sites_title(&overview)
+        } else {
+            format!("Sites · proxy {}", s(&overview["sites"]["proxy"]["name"]))
+        },
         &["DOMAIN", "AGENT", "TARGET", "PROXY", "FORWARD", "ONLY FROM"],
         &[
             Constraint::Length(48),
@@ -1465,8 +1588,97 @@ fn draw_sites(frame: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(10),
             Constraint::Min(10),
         ],
+        &[5, 3],
         rows,
         empty,
+    );
+}
+
+/// "Sites · proxy caddy (container rift-caddy)": what `rift proxy` shows.
+fn sites_title(overview: &Value) -> String {
+    let proxy = &overview["sites"]["proxy"];
+    match proxy["name"].as_str() {
+        None => "Sites".into(),
+        Some("caddy") => match (
+            proxy["caddy_container"].as_str(),
+            proxy["caddy_sites_dir"].as_str(),
+        ) {
+            (Some(container), Some(dir)) => {
+                format!("Sites · proxy caddy in container {container}, sites in {dir}")
+            }
+            (None, Some(dir)) => format!("Sites · proxy caddy on the host, sites in {dir}"),
+            _ => "Sites · proxy caddy".into(),
+        },
+        Some(name) => format!("Sites · proxy {name}"),
+    }
+}
+
+fn draw_backup(frame: &mut Frame, app: &mut App, area: Rect) {
+    let [intro, list] = Layout::vertical([Constraint::Length(5), Constraint::Min(5)]).areas(area);
+    let dir = crate::sites::FILES_DIR;
+    let ready = app.overview()["sites"]["queue"] == true;
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("e", theme::accent().bold()),
+            Span::raw(" saves the settings (no keys) and "),
+            Span::styled("b", theme::accent().bold()),
+            Span::raw(" a backup with every key, on the host in "),
+            Span::styled(dir, theme::bold()),
+            Span::raw("."),
+        ]),
+        Line::from(vec![
+            Span::styled("i", theme::accent().bold()),
+            Span::raw(" imports an export from there; copy a file into that directory to import it. Restoring a backup stops this server: "),
+            Span::styled("sudo rift restore FILE", theme::bold()),
+            Span::raw(" on the host."),
+        ]),
+    ];
+    if !ready {
+        lines.push(Line::styled(
+            "The host helper is not installed: run sudo sh deploy/install-cli on the server and recreate the container.",
+            theme::warn(),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(panel("Export, backup and import")),
+        intro,
+    );
+    let rows: Vec<Vec<Line<'static>>> = app
+        .items(Tab::Backup)
+        .iter()
+        .map(|f| {
+            let kind = match f["kind"].as_str() {
+                Some("export") => Span::styled("settings", Style::new().fg(theme::SKY)),
+                Some("backup") => Span::styled("backup, with keys", theme::warn()),
+                _ => Span::styled("other", theme::muted()),
+            };
+            let age = now() - f["modified"].as_i64().unwrap_or(0);
+            vec![
+                cell(Span::styled(s(&f["name"]), theme::bold())),
+                cell(kind),
+                cell(bytes(f["size"].as_u64().unwrap_or(0))),
+                cell(format!("{} ago", duration(age))),
+            ]
+        })
+        .collect();
+    table(
+        frame,
+        app,
+        list,
+        Tab::Backup,
+        &format!("Files in {dir}"),
+        &["FILE", "KIND", "SIZE", "SAVED"],
+        &[
+            Constraint::Min(30),
+            Constraint::Length(18),
+            Constraint::Length(10),
+            Constraint::Length(16),
+        ],
+        &[2, 3],
+        rows,
+        "No files yet. e exports the settings, b saves a backup.",
     );
 }
 
@@ -1499,6 +1711,7 @@ fn draw_bans(frame: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Min(18),
             Constraint::Length(14),
         ],
+        &[0],
         rows,
         "No active bans. Bans block client addresses on translated forwards.",
     );
@@ -1778,6 +1991,7 @@ fn draw_health(frame: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(28),
             Constraint::Min(20),
         ],
+        &[],
         rows,
         "No results yet.",
     );
@@ -2040,7 +2254,43 @@ fn draw_one(frame: &mut Frame, app: &mut App, area: Rect, mut modal: Modal) -> M
                 .map(|l| l.chars().count())
                 .max()
                 .unwrap_or(0) as u16;
-            let fits = qr_width + 4 <= area.width && qr_lines.len() as u16 + 4 <= area.height;
+            let qr_height = qr_lines.len() as u16;
+            let fits = qr_width + 4 <= area.width && qr_height + 4 <= area.height;
+            // Too small for the dialog: the code alone on the whole screen, one line below it.
+            let bare = !fits && qr_width <= area.width && qr_height < area.height;
+            if bare && !*show_text {
+                frame.render_widget(Clear, area);
+                app.hits.push((area, Hit::ModalArea));
+                let top = area.y + (area.height - 1 - qr_height) / 2;
+                let x = area.x + (area.width - qr_width) / 2;
+                for (i, line) in qr_lines.iter().enumerate() {
+                    frame.render_widget(
+                        Span::styled(
+                            line.to_string(),
+                            Style::new()
+                                .fg(ratatui::style::Color::Black)
+                                .bg(ratatui::style::Color::White),
+                        ),
+                        Rect::new(x, top + i as u16, qr_width, 1),
+                    );
+                }
+                let row = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+                frame.render_widget(
+                    Span::styled(format!(" {title} "), theme::accent().bold()),
+                    row,
+                );
+                buttons(
+                    frame,
+                    app,
+                    row,
+                    &[
+                        ("Text (t)", theme::button(), Hit::QrToggle),
+                        ("Copy (y)", theme::button(), Hit::Copy),
+                        ("Close", theme::button_focus(), Hit::Close),
+                    ],
+                );
+                return modal;
+            }
             let showing_text = *show_text || !fits;
             let content: Vec<Line> = if showing_text {
                 text.lines().map(|l| Line::raw(l.to_string())).collect()
@@ -2131,6 +2381,7 @@ fn draw_one(frame: &mut Frame, app: &mut App, area: Rect, mut modal: Modal) -> M
             title,
             started,
             result,
+            scroll,
             ..
         } => {
             let (text, color) = match result {
@@ -2148,23 +2399,35 @@ fn draw_one(frame: &mut Frame, app: &mut App, area: Rect, mut modal: Modal) -> M
                     theme::BAD,
                 ),
             };
-            let width = 76.min(area.width.saturating_sub(4));
-            let height = (wrapped_lines(&text, width.saturating_sub(6)) + 5).min(area.height - 2);
+            let width = 90.min(area.width.saturating_sub(4));
+            let rows = wrapped_lines(&text, width.saturating_sub(6));
+            let height = (rows + 5).min(area.height.saturating_sub(2));
             let rect = popup(area, width, height);
             frame.render_widget(Clear, rect);
             let block = popup_block(title, color);
             let inner = block.inner(rect);
             frame.render_widget(block, rect);
             app.hits.push((rect, Hit::ModalArea));
-            frame.render_widget(
-                Paragraph::new(text).wrap(Wrap { trim: false }),
-                Rect::new(
-                    inner.x,
-                    inner.y,
-                    inner.width,
-                    inner.height.saturating_sub(2),
-                ),
+            let body = Rect::new(
+                inner.x,
+                inner.y,
+                inner.width,
+                inner.height.saturating_sub(2),
             );
+            let max = rows.saturating_sub(body.height);
+            *scroll = (*scroll).min(max);
+            frame.render_widget(
+                Paragraph::new(text)
+                    .wrap(Wrap { trim: false })
+                    .scroll((*scroll, 0)),
+                body,
+            );
+            if max > 0 {
+                frame.render_widget(
+                    Span::styled(format!("↑↓ scroll {}/{max}", *scroll), theme::muted()),
+                    Rect::new(inner.x, inner.y + inner.height.saturating_sub(1), 24, 1),
+                );
+            }
             let row = Rect::new(
                 inner.x,
                 inner.y + inner.height.saturating_sub(1),
@@ -2209,7 +2472,10 @@ fn help(app: &App) -> Vec<Line<'static>> {
     };
     let mut lines = vec![
         Line::styled("Everywhere", theme::bold()),
-        key("1-9 Tab ←→", "switch tabs (or click a tab)"),
+        key(
+            "1-9 0 Tab ←→",
+            "switch tabs (0 is the tenth; or click a tab)",
+        ),
         key("↑↓ j k PgUp", "move in tables, scroll the log"),
         key(
             "Enter",

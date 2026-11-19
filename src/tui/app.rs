@@ -32,6 +32,8 @@ const LOG_REFRESH: Duration = Duration::from_secs(1);
 const HISTORY: usize = 120;
 /// How long a site request may wait for the host service.
 const SITE_WAIT: Duration = Duration::from_secs(30);
+/// How long a picked-up request (an import or backup can be slow) may take.
+const SITE_RUN: Duration = Duration::from_secs(180);
 const HOST_MISSING: &str = "The host service did not pick up the request; is rift-site-queue.path installed and active? (sudo sh deploy/install-cli)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -51,6 +53,7 @@ pub enum Tab {
     Panel,
     Logs,
     Health,
+    Backup,
 }
 impl Tab {
     pub fn title(self) -> &'static str {
@@ -64,11 +67,13 @@ impl Tab {
             Self::Panel => "Web panel",
             Self::Logs => "Logs",
             Self::Health => "Health",
+            Self::Backup => "Backup",
         }
     }
     /// The title on narrow windows.
     pub fn short(self) -> &'static str {
         match self {
+            Self::Overview => "Home",
             Self::Devices => "Devices",
             Self::Panel => "Panel",
             other => other.title(),
@@ -86,6 +91,7 @@ impl Tab {
                 Self::Panel,
                 Self::Logs,
                 Self::Health,
+                Self::Backup,
             ],
             Role::Agent => vec![Self::Overview, Self::Forwards, Self::Logs, Self::Health],
         }
@@ -164,6 +170,7 @@ pub enum Submit {
     Site,
     TwoFactorConfirm,
     LogFilter,
+    Import,
 }
 
 /// Actions on the current tab, reachable by key, footer button and the Enter/right-click menu.
@@ -205,6 +212,9 @@ pub enum Act {
     LogFilter,
     LogLevel,
     HealthRun,
+    Export,
+    Backup,
+    Import,
     Reconcile,
     Refresh,
     Command,
@@ -266,6 +276,7 @@ pub enum Modal {
         id: String,
         started: Instant,
         result: Option<(bool, String)>,
+        scroll: u16,
     },
     Help {
         scroll: u16,
@@ -459,6 +470,7 @@ impl App {
             Tab::Devices => list(&self.overview()["vpn_peers"]),
             Tab::Sites => list(&self.overview()["sites"]["sites"]),
             Tab::Bans => list(&self.overview()["bans"]),
+            Tab::Backup => list(&self.overview()["files"]),
             Tab::Health => match &self.health {
                 Some(Ok(data)) => list(&data["checks"]),
                 _ => Vec::new(),
@@ -751,6 +763,7 @@ impl App {
                         id,
                         started: Instant::now(),
                         result: None,
+                        scroll: 0,
                     }),
                     Ok(Done::Password(password)) => self.password = Some(password),
                     Err(e) => self.notify(e, Level::Error),
@@ -790,16 +803,26 @@ impl App {
                 ..
             } = modal
             {
-                match sites::result(std::path::Path::new(sites::QUEUE_DIR), id) {
+                let queue = std::path::Path::new(sites::QUEUE_DIR);
+                // Still queued: nobody picked it up. Picked up: an import or backup may run long.
+                let waiting = queue.join(format!("{id}.json")).exists();
+                match sites::result(queue, id) {
                     Ok(answer) if answer["done"] == true => {
-                        *result = Some((
-                            answer["ok"] == true,
-                            answer["message"].as_str().unwrap_or_default().to_string(),
-                        ));
+                        let mut message = answer["message"].as_str().unwrap_or_default().to_string();
+                        if message.contains("request has exactly the keys") {
+                            message.push_str("\n\nThe host helper is older than this RIFT: update it with sudo sh deploy/install-cli on the server.");
+                        }
+                        *result = Some((answer["ok"] == true, message));
                         refresh = true;
                     }
-                    Ok(_) if started.elapsed() > SITE_WAIT => {
+                    Ok(_) if waiting && started.elapsed() > SITE_WAIT => {
                         *result = Some((false, HOST_MISSING.into()))
+                    }
+                    Ok(_) if started.elapsed() > SITE_RUN => {
+                        *result = Some((
+                            false,
+                            "The host service took the request but has not answered after three minutes; see journalctl -u rift-site-queue on the server.".into(),
+                        ))
                     }
                     Ok(_) => {}
                     Err(e) => *result = Some((false, format!("{e:#}"))),
@@ -856,8 +879,9 @@ impl App {
             KeyCode::BackTab | KeyCode::Left => {
                 self.switch((self.tab + self.tabs.len() - 1) % self.tabs.len())
             }
-            KeyCode::Char(c @ '1'..='9') => {
-                let i = c as usize - '1' as usize;
+            KeyCode::Char(c @ '0'..='9') => {
+                // 1 is the first tab, 0 the tenth.
+                let i = (c as usize - '0' as usize + 9) % 10;
                 if i < self.tabs.len() {
                     self.switch(i);
                 }
@@ -1069,11 +1093,16 @@ impl App {
                 }
                 _ => {}
             },
-            Modal::Site { result, .. } => {
-                if result.is_some() || key.code == KeyCode::Esc {
+            Modal::Site { result, scroll, .. } => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => *scroll = scroll.saturating_add(1),
+                KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+                KeyCode::PageDown => *scroll = scroll.saturating_add(10),
+                _ if result.is_some() || key.code == KeyCode::Esc => {
                     self.modals.pop();
                 }
-            }
+                _ => {}
+            },
             Modal::Help { scroll } => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => *scroll = scroll.saturating_add(1),
@@ -1099,6 +1128,7 @@ impl App {
                     match modal {
                         Modal::Text { scroll, .. }
                         | Modal::Qr { scroll, .. }
+                        | Modal::Site { scroll, .. }
                         | Modal::Help { scroll } => {
                             *scroll = if down {
                                 scroll.saturating_add(3)
@@ -1425,6 +1455,13 @@ impl App {
                 add("v", "Level", Act::LogLevel);
             }
             (_, Tab::Health) => add("r", "Run checks", Act::HealthRun),
+            (Role::Server, Tab::Backup) => {
+                add("e", "Export settings", Act::Export);
+                add("b", "Backup with keys", Act::Backup);
+                if item.is_some_and(|f| f["kind"] == "export") {
+                    add("i", "Import this file", Act::Import);
+                }
+            }
             _ => {}
         }
         out
@@ -1834,6 +1871,51 @@ impl App {
             ),
             Act::LogLevel => self.logs.level = (self.logs.level + 1) % 4,
             Act::HealthRun => self.spawn_health(),
+            Act::Export => self.spawn_op(
+                Op::Site {
+                    request: sites::export_kept(),
+                    title: "Exporting the settings".into(),
+                },
+                false,
+            ),
+            Act::Backup => self.ask(
+                "Backup",
+                &format!("Save a backup with every key of this server (WireGuard, enrollment CA, VPN devices, panel password) in {} on the host? Copy it somewhere safe afterwards.", sites::FILES_DIR),
+                Op::Site {
+                    request: sites::backup_kept(),
+                    title: "Saving a backup".into(),
+                },
+                false,
+            ),
+            Act::Import => {
+                let files: Vec<(String, String)> = self
+                    .items(Tab::Backup)
+                    .iter()
+                    .filter(|f| f["kind"] == "export")
+                    .filter_map(|f| f["name"].as_str().map(|n| (n.to_string(), n.to_string())))
+                    .collect();
+                if files.is_empty() {
+                    return self.notify(
+                        format!("No export file in {} on the host.", sites::FILES_DIR),
+                        Level::Warn,
+                    );
+                }
+                let selected = item["name"].as_str().unwrap_or_default().to_string();
+                self.open_form(
+                    Form::new(
+                        "Import settings",
+                        "Import",
+                        vec![
+                            Field::select("file", "File", files).selected(&selected),
+                            Field::text("map", "Agent names", "", "OLD=NEW, e.g. node2=node1")
+                                .hint("put the entries of agent OLD on agent NEW"),
+                            Field::check("dry_run", "Only show what would happen", true),
+                        ],
+                    )
+                    .intro("Creates what the file holds and this server lacks: forwards, devices with their grants, sites. Agents are never created; add and enroll them first. Run it once as a dry run."),
+                    Submit::Import,
+                );
+            }
         }
     }
 
@@ -2169,6 +2251,19 @@ impl App {
                 code: form.text("code").replace(' ', ""),
             }]),
             Submit::LogFilter => unreachable!("applied without an operation"),
+            Submit::Import => {
+                let file = form.text("file");
+                let dry_run = form.on("dry_run");
+                let document = sites::read_export(std::path::Path::new(sites::FILES_DIR), &file)?;
+                Op::Site {
+                    request: sites::import(document, dry_run, &form.text("map"))?,
+                    title: if dry_run {
+                        format!("Import of {file} (dry run)")
+                    } else {
+                        format!("Import of {file}")
+                    },
+                }
+            }
         })
     }
 }
@@ -2331,9 +2426,18 @@ fn complete(input: &str) -> Option<String> {
 
 /// A QR code in half blocks with a two-module margin instead of the standard four, so a
 /// WireGuard configuration fits a terminal of about 40 rows; phone scanners read it.
+///
+/// What it encodes is smaller than the text, so the code needs fewer rows: comment lines and
+/// blank lines go (WireGuard ignores them; the text view keeps them), and the error correction
+/// is level L, enough for a code read off a screen, which nothing smudges.
 fn qr(text: &str) -> anyhow::Result<String> {
-    use qrcode::{render::unicode::Dense1x2, QrCode};
-    let code = QrCode::new(text.as_bytes())?
+    use qrcode::{render::unicode::Dense1x2, EcLevel, QrCode};
+    let payload: String = text
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let code = QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::L)?
         .render::<Dense1x2>()
         .quiet_zone(false)
         .build();
@@ -2375,6 +2479,7 @@ async fn fetch(config: &Config, role: Role) -> anyhow::Result<Snapshot> {
                 std::path::Path::new(sites::QUEUE_DIR),
                 &forwards,
             );
+            overview["files"] = Value::Array(sites::files(std::path::Path::new(sites::FILES_DIR)));
             overview["two_factor"] = admin(config, AdminRequest::PanelTwoFactorStatus)
                 .await
                 .unwrap_or_default();
@@ -2534,13 +2639,24 @@ mod tests {
         let config = "[Interface]\nPrivateKey = cGhvbmUtcHJpdmF0ZS1rZXktZm9yLXRlc3Rpbmc=\nAddress = 10.14.0.2/32, fd88:5249:4655::2/128\nDNS = 9.9.9.9\n\n[Peer]\nPublicKey = c2VydmVyLXB1YmxpYy1rZXktZm9yLXRlc3Rpbmc=\nEndpoint = rift.example.net:51820\nAllowedIPs = 10.13.0.2/32, 192.168.178.0/24\nPersistentKeepalive = 25\n";
         let code = qr(config).unwrap();
         let lines: Vec<&str> = code.lines().collect();
-        assert!(lines.len() <= 38, "{} rows", lines.len());
+        assert!(lines.len() <= 35, "{} rows", lines.len());
         assert!(lines[0].trim().is_empty() && lines.last().unwrap().trim().is_empty());
         assert!(lines
             .iter()
             .all(|l| l.starts_with("  ") && l.ends_with("  ")));
         let width = lines[0].chars().count();
         assert!(lines.iter().all(|l| l.chars().count() == width));
+    }
+
+    #[test]
+    fn qr_codes_leave_out_comments_and_stay_small() {
+        let exit = "# Internet exit via agent homelab. This profile carries all traffic through homelab's\n# connection; the web panel and other RIFT grants are not reachable with it.\n[Interface]\nPrivateKey = cGhvbmUtcHJpdmF0ZS1rZXktZm9yLXRlc3Rpbmc=\nAddress = 10.14.0.2/32, fd88:5249:4655::2/128\nDNS = 9.9.9.9, 2620:fe::fe\nMTU = 1300\n\n[Peer]\nPublicKey = c2VydmVyLXB1YmxpYy1rZXktZm9yLXRlc3Rpbmc=\nEndpoint = homelab.example.net:51821\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n";
+        let with_comments = crate::vpn::qr(exit).unwrap().lines().count();
+        let rows = qr(exit).unwrap().lines().count();
+        assert!(
+            rows + 6 <= with_comments,
+            "{rows} rows here, {with_comments} with comments"
+        );
     }
 
     #[test]

@@ -39,6 +39,8 @@ printf '%s\n' 'Installed /usr/local/bin/rift and /usr/local/lib/rift/rift-site.'
 # (read-write); only the queue is writable from the container. Created before the first
 # `docker compose up`, with the modes the host service expects.
 install -d -m 755 /var/lib/rift-site
+# Exports and backups the terminal UI asks for (rift-site FILES_DIR); exports to import go here too.
+install -d -m 700 /var/lib/rift-site/files
 install -d -m 700 /var/lib/rift-site-queue
 chmod 700 /var/lib/rift-site-queue
 

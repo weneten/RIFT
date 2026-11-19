@@ -786,15 +786,18 @@ Type `rift` without a command on the server or an agent host and a full-screen t
 | Agents | state, tunnel address, last handshake, live traffic and version of each agent; beside it the details: limits the agent reported, its `.internal` name, errors, open invitation | invite (shows the `deploy/join` line; `y` copies it), enable/disable, rename, rotate key, names on/off, add a forward, cancel an invitation, remove |
 | Forwards | listen address and ports, target, protocol, mode, who may connect, state (active, disabled, pending, refused with the reason) | add (the short form `8080:80/tcp 53/both`, address family, mode, ingress, allowed clients), enable/disable, ban a client of a translated forward, remove |
 | VPN devices | address, handshake, grants, exits, panel access; beside it the grants (refused ones with the reason) and exits | add, grant access (ports, host, all protocols, LAN networks with SNAT, exit), withdraw, WireGuard configuration as a QR code to scan or as text, internet exits, DNS, names, panel access, enable/disable, remove |
-| Sites | domains with agent, target port, proxy, the state of their forward and the allowed clients | add, remove (through the same host service as the web panel) |
+| Sites | domains with agent, target port, proxy, the state of their forward and the allowed clients; in the title the proxy `rift proxy` shows (for Caddy: host or container, and the site directory) | add, remove (through the same host service as the web panel) |
 | Bans | blocked client addresses and when they expire | ban an address |
 | Web panel | whether it is on, its addresses, the password (on request), two-factor state, the devices that may open it | show the password, set up / confirm / reset two-factor login (QR code), grant or withdraw devices |
 | Logs | the daemon's recent log, coloured by level, following new entries | pause, filter by text, filter by level |
 | Health | `rift doctor` as a list | run the checks again |
+| Backup | the files in `/var/lib/rift-site/files` on the host | export the settings, save a backup with every key (both land in that directory), import an export file from it (dry run first, `OLD=NEW` agent names) |
 
 On an agent host the UI has Overview (tunnel, server, traffic, identity), Forwards (ban a client), Logs and Health.
 
-**Keys and mouse.** `1`–`9`, `Tab` or a click switch tabs; `↑`/`↓`, `PgUp`/`PgDn` or the wheel move in tables and the log; the letters in the footer start the actions of the selected row, and `Enter`, a right click or a double click opens them as a menu. Dialogs take `Tab` and clicks between fields, `←`/`→` or a click to change a choice, `Space` or a click to tick a box. `:` runs any `rift` command inside the UI, for example `:list forwards` (with `Tab` completion and `↑` history); the host commands (`export`, `import`, `backup`, `restore`, `proxy`, sites) run outside it. `?` lists every key, `q` quits. To select text with the mouse, hold `Shift` while dragging.
+**Keys and mouse.** `1`–`9`, `Tab` or a click switch tabs; `↑`/`↓`, `PgUp`/`PgDn` or the wheel move in tables and the log; the letters in the footer start the actions of the selected row, and `Enter`, a right click or a double click opens them as a menu. Dialogs take `Tab` and clicks between fields, `←`/`→` or a click to change a choice, `Space` or a click to tick a box. `:` runs any `rift` command inside the UI, for example `:list forwards` (with `Tab` completion and `↑` history); the host commands (`export`, `import`, `backup`, `restore`, `proxy`, sites) run outside it, but the Backup and Sites tabs cover export, backup, import, sites and showing the proxy. `restore` stays a host command: it stops the server container the UI runs in.
+
+**Exports and backups.** The UI cannot write files outside its container, so the host service of the web panel (`rift-site-queue.path`, installed by `deploy/install-cli`) saves them on the host in `/var/lib/rift-site/files` (mode 0700, files 0600), named by date and time, and keeps the newest 20 of each kind. To import a file, copy it into that directory. The container sees the directory read-only. `?` lists every key, `q` quits. To select text with the mouse, hold `Shift` while dragging.
 
 Every `rift ...` command keeps working as before; the UI is only what `rift` alone does on a terminal, and without a terminal (in scripts, through a pipe) `rift` alone prints the help as before. It is **on** by default and needs no port: it runs with the same rights as the CLI, only for whoever can run `docker exec` on the host. To turn it off, set it in `.env` (or answer the question of `deploy/setup-server` or `deploy/join`, or pass `--no-tui` to them) and recreate the container:
 
@@ -806,7 +809,7 @@ RIFT_TUI=false
 docker compose up -d --force-recreate
 ```
 
-`rift tui` opens it explicitly. The UI uses colours (24-bit), Unicode box drawing and mouse reporting; it needs a window of at least 60 × 16 characters, and about 45 rows to show a WireGuard QR code (smaller windows show the configuration as text).
+`rift tui` opens it explicitly. The UI uses colours (24-bit), Unicode box drawing and mouse reporting; it needs a window of at least 60 × 16 characters. A WireGuard QR code takes about 33 rows: the code leaves out the configuration's comment lines and uses the lowest error correction, which is enough on a screen. Below about 37 rows it fills the screen without its dialog; below 34 the configuration is shown as text. On narrow windows tables leave out their least important columns; the Forwards tab then shows the selected forward in full below the table.
 
 ## Back up, move or rebuild
 

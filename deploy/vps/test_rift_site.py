@@ -1568,6 +1568,57 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(result["file"], f"rift-backup-{rift_site.today()}.tar.gz")
         self.assertEqual((self.queue / f"{name}.data").read_bytes(), b"archive")
 
+    def kept_files(self):
+        files = Path(self.dir.name) / "files"
+        return files, mock.patch.object(rift_site, "FILES_DIR", files)
+
+    def test_an_export_with_keep_is_saved_on_the_host(self):
+        document = {"format": 2, "agents": [], "forwards": [], "devices": [], "sites": []}
+        data = b"{}\n"
+        files, patch = self.kept_files()
+        name = self.request({"action": "export", "keep": True})
+        with patch, mock.patch.object(rift_site, "export_file", return_value=(document, data)):
+            self.process()
+        result = self.result(name)
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("file", result)
+        self.assertFalse((self.queue / f"{name}.data").exists())
+        saved = list(files.iterdir())
+        self.assertEqual(len(saved), 1)
+        self.assertRegex(saved[0].name, r"^rift-export-\d{4}-\d{2}-\d{2}-\d{6}\.json$")
+        self.assertEqual(saved[0].read_bytes(), data)
+        self.assertEqual(saved[0].stat().st_mode & 0o777, 0o600)
+        self.assertEqual(files.stat().st_mode & 0o777, 0o700)
+        self.assertIn(f"Saved on the host: {saved[0]}", result["message"])
+
+    def test_a_backup_with_keep_is_saved_and_old_ones_are_pruned(self):
+        files, patch = self.kept_files()
+        files.mkdir()
+        for day in range(1, 26):
+            (files / f"rift-backup-2026-01-{day:02d}-120000.tar.gz").write_bytes(b"old")
+        (files / "my-own.tar.gz").write_bytes(b"mine")
+
+        def backup(path):
+            Path(path).write_bytes(b"archive")
+
+        name = self.request({"action": "backup", "keep": True})
+        with patch, mock.patch.object(rift_site, "write_backup", side_effect=backup):
+            self.process()
+        self.assertTrue(self.result(name)["ok"])
+        backups = sorted(p.name for p in files.iterdir() if p.name.startswith("rift-backup-"))
+        self.assertEqual(len(backups), rift_site.FILES_KEPT)
+        self.assertNotIn("rift-backup-2026-01-01-120000.tar.gz", backups)
+        self.assertTrue((files / "my-own.tar.gz").exists())
+
+    def test_keep_must_be_a_boolean(self):
+        files, patch = self.kept_files()
+        name = self.request({"action": "export", "keep": "yes"})
+        with patch, mock.patch.object(rift_site, "export_file") as export:
+            self.process()
+        export.assert_not_called()
+        self.assertFalse(self.result(name)["ok"])
+        self.assertFalse(files.exists())
+
     def test_a_failed_backup_leaves_no_file(self):
         def backup(path):
             Path(path).write_bytes(b"half")

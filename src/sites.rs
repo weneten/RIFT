@@ -6,7 +6,9 @@
 //! mounted read-write). A systemd path unit on the host runs `rift-site process-queue`, which
 //! validates every request again and writes `<id>.result.json` next to it. A request adds or
 //! removes one site, or runs `rift export`, `rift import` or `rift backup` on the host; the
-//! host leaves their file as `<id>.data`, which the panel fetches once.
+//! host leaves their file as `<id>.data`, which the panel fetches once. With `keep` (the terminal
+//! UI, which cannot write host files) the host saves an export or backup in `FILES_DIR`
+//! instead; the container sees that directory read-only and lists it with [`files`].
 
 use crate::config::validate_name;
 use anyhow::{bail, ensure, Context, Result};
@@ -20,6 +22,8 @@ use std::{
 
 pub const SITES_DIR: &str = "/var/lib/rift-site";
 pub const QUEUE_DIR: &str = "/var/lib/rift-site-queue";
+/// Exports and backups saved on the host (rift-site FILES_DIR), read-only in the container.
+pub const FILES_DIR: &str = "/var/lib/rift-site/files";
 /// Requests that may wait for the host at the same time.
 pub const MAX_PENDING: usize = 20;
 const PROXIES: [&str; 4] = ["traefik", "caddy", "nginx", "npm"];
@@ -48,13 +52,17 @@ pub enum Request {
         id: String,
         host: String,
     },
-    /// `rift export` on the host, with its sites.
+    /// `rift export` on the host, with its sites. `keep` saves it in `FILES_DIR`.
     Export {
         id: String,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        keep: bool,
     },
-    /// `rift backup` on the host: every key of the server.
+    /// `rift backup` on the host: every key of the server. `keep` saves it in `FILES_DIR`.
     Backup {
         id: String,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        keep: bool,
     },
     /// `rift import` on the host; `map` holds `OLD=NEW` agent names.
     Import {
@@ -139,11 +147,91 @@ pub fn remove(host: &str) -> Result<Request> {
 }
 
 pub fn export() -> Request {
-    Request::Export { id: new_id() }
+    Request::Export {
+        id: new_id(),
+        keep: false,
+    }
 }
 
 pub fn backup() -> Request {
-    Request::Backup { id: new_id() }
+    Request::Backup {
+        id: new_id(),
+        keep: false,
+    }
+}
+
+/// An export the host saves in `FILES_DIR` instead of handing it over.
+pub fn export_kept() -> Request {
+    Request::Export {
+        id: new_id(),
+        keep: true,
+    }
+}
+
+/// A backup the host saves in `FILES_DIR` instead of handing it over.
+pub fn backup_kept() -> Request {
+    Request::Backup {
+        id: new_id(),
+        keep: true,
+    }
+}
+
+/// The files in `dir` (FILES_DIR), newest first: name, size, modification time and kind
+/// (`export` for JSON files, `backup` for archives). Hidden files (partial writes) and
+/// anything but regular files are left out.
+pub fn files(dir: &Path) -> Vec<Value> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut list: Vec<Value> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            let meta = entry.metadata().ok()?;
+            if name.starts_with('.') || !entry.file_type().ok()?.is_file() {
+                return None;
+            }
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            let kind = if name.ends_with(".json") {
+                "export"
+            } else if name.ends_with(".tar.gz") {
+                "backup"
+            } else {
+                "other"
+            };
+            Some(json!({"name": name, "size": meta.len(), "modified": modified, "kind": kind}))
+        })
+        .collect();
+    list.sort_by(|a, b| {
+        b["modified"]
+            .as_u64()
+            .cmp(&a["modified"].as_u64())
+            .then_with(|| b["name"].as_str().cmp(&a["name"].as_str()))
+    });
+    list
+}
+
+/// Reads an export file from `dir` for an import: only a plain name of a regular file there,
+/// at most `MAX_IMPORT` bytes, parsed as JSON.
+pub fn read_export(dir: &Path, name: &str) -> Result<Value> {
+    ensure!(
+        !name.is_empty() && !name.starts_with('.') && !name.contains('/'),
+        "not a file name: {name:?}"
+    );
+    let path = dir.join(name);
+    let meta = std::fs::symlink_metadata(&path).with_context(|| format!("{}", path.display()))?;
+    ensure!(meta.is_file(), "{} is not a regular file", path.display());
+    ensure!(
+        meta.len() <= MAX_IMPORT as u64,
+        "{name} is larger than {} KB; import it with sudo rift import on the server",
+        MAX_IMPORT / 1024
+    );
+    let text = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_slice(&text).with_context(|| format!("{name} is not a JSON export file"))
 }
 
 /// An import of `document` (an export file); `map` is `OLD=NEW` agent names, separated by
@@ -183,8 +271,8 @@ impl Request {
         match self {
             Self::Add { id, .. }
             | Self::Remove { id, .. }
-            | Self::Export { id }
-            | Self::Backup { id }
+            | Self::Export { id, .. }
+            | Self::Backup { id, .. }
             | Self::Import { id, .. } => id,
         }
     }
@@ -326,8 +414,9 @@ pub fn overview(sites: &Path, queue: &Path, forwards: &[Value]) -> Value {
         serde_json::from_str::<Value>(&text).ok()
     });
     let Some(document) = document else {
-        return json!({"available": false, "queue": queue_ready, "sites": []});
+        return json!({"available": false, "queue": queue_ready, "sites": [], "proxy": Value::Null});
     };
+    let proxy = proxy_of(&document);
     let mut list: Vec<Value> = document["sites"]
         .as_object()
         .into_iter()
@@ -348,7 +437,28 @@ pub fn overview(sites: &Path, queue: &Path, forwards: &[Value]) -> Value {
         })
         .collect();
     list.sort_by(|a, b| a["host"].as_str().cmp(&b["host"].as_str()));
-    json!({"available": true, "queue": queue_ready, "sites": list})
+    json!({"available": true, "queue": queue_ready, "sites": list, "proxy": proxy})
+}
+
+/// The proxy `rift add site` uses by default, as `rift proxy` shows it, and where Caddy runs.
+fn proxy_of(document: &Value) -> Value {
+    let name = document["proxy"].as_str().unwrap_or("traefik");
+    let caddy = &document["caddy"];
+    let reload: Vec<&str> = caddy["reload"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let container = match reload.as_slice() {
+        ["docker", "exec", container, ..] => Some(*container),
+        _ => None,
+    };
+    json!({
+        "name": name,
+        "caddy_container": container,
+        "caddy_sites_dir": caddy["sites_dir"],
+    })
 }
 
 #[cfg(test)]
@@ -518,6 +628,83 @@ mod tests {
         assert_eq!(
             overview(dir.path(), queue.path(), &forwards)["available"],
             false
+        );
+    }
+
+    #[test]
+    fn keep_is_sent_only_when_asked_for() {
+        let plain = serde_json::to_value(export()).unwrap();
+        assert_eq!(plain["action"], "export");
+        assert!(
+            plain.get("keep").is_none(),
+            "the panel's requests stay as they were"
+        );
+        let kept = serde_json::to_value(backup_kept()).unwrap();
+        assert_eq!(
+            (kept["action"].as_str(), kept["keep"].as_bool()),
+            (Some("backup"), Some(true))
+        );
+    }
+
+    #[test]
+    fn saved_files_are_listed_newest_first_and_read_for_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rift-export-a.json"), br#"{"format":2}"#).unwrap();
+        std::fs::write(dir.path().join("rift-backup-b.tar.gz"), b"x").unwrap();
+        std::fs::write(dir.path().join(".partial"), b"x").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.path().join("rift-export-a.json"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let list = files(dir.path());
+        let names: Vec<&str> = list.iter().map(|f| f["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["rift-backup-b.tar.gz", "rift-export-a.json"]);
+        assert_eq!(list[1]["kind"], "export");
+        assert_eq!(list[0]["kind"], "backup");
+        assert!(files(&dir.path().join("missing")).is_empty());
+
+        assert_eq!(
+            read_export(dir.path(), "rift-export-a.json").unwrap()["format"],
+            2
+        );
+        for bad in [
+            "",
+            "../etc/passwd",
+            ".partial",
+            "sub",
+            "missing.json",
+            "rift-backup-b.tar.gz",
+        ] {
+            assert!(read_export(dir.path(), bad).is_err(), "{bad:?}");
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/hostname", dir.path().join("link.json")).unwrap();
+            assert!(read_export(dir.path(), "link.json").is_err());
+        }
+    }
+
+    #[test]
+    fn the_overview_names_the_proxy_and_where_caddy_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("sites.json"),
+            json!({"proxy": "caddy", "caddy": {"sites_dir": "/opt/caddy/sites", "reload": ["docker", "exec", "rift-caddy", "caddy", "reload"]}, "sites": {}}).to_string(),
+        )
+        .unwrap();
+        let proxy = &overview(dir.path(), dir.path(), &[])["proxy"];
+        assert_eq!(proxy["name"], "caddy");
+        assert_eq!(proxy["caddy_container"], "rift-caddy");
+        assert_eq!(proxy["caddy_sites_dir"], "/opt/caddy/sites");
+        std::fs::write(dir.path().join("sites.json"), r#"{"sites": {}}"#).unwrap();
+        let proxy = &overview(dir.path(), dir.path(), &[])["proxy"];
+        assert_eq!(
+            (proxy["name"].as_str(), proxy["caddy_container"].is_null()),
+            (Some("traefik"), true)
         );
     }
 }

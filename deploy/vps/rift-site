@@ -2220,11 +2220,19 @@ QUEUE_MAX_MESSAGE = 4000
 # A file the panel fetches (export, import report, backup) is removed after it, or after
 # this many seconds: a backup holds every key.
 QUEUE_DATA_AGE = 15 * 60
+# Where an export or backup with "keep" is saved on the host (the terminal UI asks for this;
+# it cannot write files outside its container). The server container sees it read-only,
+# below its mount of /var/lib/rift-site, which is how the terminal UI lists the files and reads
+# an export to import. A backup holds keys the container has anyway.
+FILES_DIR = Path(os.environ.get("RIFT_SITE_FILES", "/var/lib/rift-site/files"))
+# Saved files of each kind that are kept; older ones go. A request from the container cannot
+# fill the disk this way.
+FILES_KEPT = 20
 QUEUE_KEYS = {
     "add": ({"id", "action", "agent", "host", "port"}, {"proxy", "allow_from"}),
     "remove": ({"id", "action", "host"}, set()),
-    "export": ({"id", "action"}, set()),
-    "backup": ({"id", "action"}, set()),
+    "export": ({"id", "action"}, {"keep"}),
+    "backup": ({"id", "action"}, {"keep"}),
     "import": ({"id", "action", "document", "dry_run"}, {"map"}),
 }
 
@@ -2253,7 +2261,10 @@ def parse_queue_request(name, raw):
     if action != "import" and len(raw) > QUEUE_MAX_BYTES:
         raise SiteError("the request is too large")
     if action in ("export", "backup"):
-        return action, ()
+        keep = request.get("keep", False)
+        if not isinstance(keep, bool):
+            raise SiteError("keep must be true or false")
+        return action, (keep,)
     if action == "import":
         document, dry_run = request["document"], request["dry_run"]
         if not isinstance(document, dict):
@@ -2327,13 +2338,27 @@ def run_queue_request(action, args, queue=None, name=None):
             elif action == "remove":
                 command_rm(*args)
             elif action == "export":
+                (keep,) = args
                 document, data = export_file()
-                file = f"rift-export-{today()}.json"
-                write_queue_data(queue, name, data)
+                if keep:
+                    path = kept_path("rift-export", "json")
+                    write_file(path, data, 0o600)
+                    prune_kept("rift-export", "json")
+                    print(f"Saved on the host: {path}")
+                else:
+                    file = f"rift-export-{today()}.json"
+                    write_queue_data(queue, name, data)
                 print(f"Exported {export_summary(document)}. The file holds no keys or tokens.")
             elif action == "backup":
-                file = f"rift-backup-{today()}.tar.gz"
-                write_backup(queue / f"{name}.data")
+                (keep,) = args
+                if keep:
+                    path = kept_path("rift-backup", "tar.gz")
+                    write_backup(path)
+                    prune_kept("rift-backup", "tar.gz")
+                    print(f"Saved on the host: {path}")
+                else:
+                    file = f"rift-backup-{today()}.tar.gz"
+                    write_backup(queue / f"{name}.data")
                 print("The backup holds every key of this server. Keep it private.")
             else:
                 raw, options = args
@@ -2349,6 +2374,38 @@ def run_queue_request(action, args, queue=None, name=None):
         discard_queue_data(queue, name)
         return False, join_message(output.getvalue(), f"{type(error).__name__}: {error}"), None
     return True, output.getvalue().strip(), file
+
+
+KEPT_NAME = re.compile(r"^(rift-export|rift-backup)-\d{4}-\d{2}-\d{2}-\d{6}(-\d+)?\.(json|tar\.gz)$")
+
+
+def kept_path(prefix, suffix):
+    """A new file name in FILES_DIR (mode 0700), dated to the second."""
+    FILES_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if FILES_DIR.is_symlink() or not FILES_DIR.is_dir():
+        raise SiteError(f"{FILES_DIR} is not a directory")
+    os.chmod(FILES_DIR, 0o700)
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    path = FILES_DIR / f"{prefix}-{stamp}.{suffix}"
+    number = 2
+    while path.exists() or path.is_symlink():
+        path = FILES_DIR / f"{prefix}-{stamp}-{number}.{suffix}"
+        number += 1
+    return path
+
+
+def prune_kept(prefix, suffix):
+    """Removes all but the newest FILES_KEPT saved files of this kind; other files stay."""
+    mine = sorted(
+        (entry for entry in os.scandir(FILES_DIR)
+         if entry.is_file(follow_symlinks=False)
+         and KEPT_NAME.fullmatch(entry.name)
+         and entry.name.startswith(prefix + "-")
+         and entry.name.endswith("." + suffix)),
+        key=lambda entry: entry.name,
+    )
+    for entry in mine[:-FILES_KEPT]:
+        os.unlink(entry.path)
 
 
 def write_queue_data(queue, name, data):
