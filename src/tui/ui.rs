@@ -204,6 +204,15 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, area: Rect) {
         app.hits.push((rect, Hit::Tab(i)));
         x += width + 1;
     }
+    if let Some(agent) = &app.focus {
+        let label = format!(" ◉ agent {agent} · F ");
+        let width = label.chars().count() as u16;
+        if x + width < area.x + area.width {
+            let rect = Rect::new(area.x + area.width - width, y, width, 1);
+            frame.render_widget(Span::styled(label, theme::key()), rect);
+            app.hits.push((rect, Hit::Act(Act::Focus)));
+        }
+    }
     // A thin rule under the tabs.
     frame.render_widget(
         Paragraph::new("─".repeat(area.width as usize)).style(theme::border()),
@@ -612,7 +621,10 @@ fn kv(key: &str, value: impl Into<String>) -> Line<'static> {
 // -------------------------------------------------------------------- overview
 
 fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
-    let rows = app.items(Tab::Agents).len().max(attention(app).len() + 1) as u16;
+    let rows = app
+        .unfiltered(Tab::Agents)
+        .len()
+        .max(attention(app).len() + 1) as u16;
     let [cards, traffic, lists, logs] = Layout::vertical([
         Constraint::Length(4),
         Constraint::Length(7),
@@ -621,10 +633,11 @@ fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
     ])
     .areas(area);
     let overview = app.overview().clone();
-    let agents = app.items(Tab::Agents);
-    let forwards = app.items(Tab::Forwards);
-    let devices = app.items(Tab::Devices);
+    let agents = app.unfiltered(Tab::Agents);
+    let forwards = app.all_forwards();
+    let devices = app.unfiltered(Tab::Devices);
     let online = agents.iter().filter(|a| a["online"] == true).count();
+    let enrolled = agents.iter().filter(|a| a["invite"] != true).count();
     let active_forwards = forwards
         .iter()
         .filter(|f| f["enabled"] == true && f["pending"] != true && f["refused"].is_null())
@@ -641,8 +654,8 @@ fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
                 .is_some_and(|h| h > 0 && now() - h <= 180)
         })
         .count();
-    let sites = app.items(Tab::Sites).len();
-    let bans = app.items(Tab::Bans).len();
+    let sites = app.unfiltered(Tab::Sites).len();
+    let bans = app.unfiltered(Tab::Bans).len();
     let [a, b, c, d] = Layout::horizontal([Constraint::Ratio(1, 4); 4]).areas(cards);
     let big = |n: String, total: String, color: ratatui::style::Color| {
         Line::from(vec![
@@ -656,8 +669,8 @@ fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
         "Agents",
         big(
             online.to_string(),
-            format!(" / {} online", agents.len()),
-            if online == agents.len() {
+            format!(" / {enrolled} online"),
+            if online == enrolled {
                 theme::OK
             } else {
                 theme::WARN
@@ -737,7 +750,9 @@ fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut lines = Vec::new();
     for agent in &agents {
         let name = s(&agent["name"]);
-        let state = if agent["status"] != "active" {
+        let state = if agent["invite"] == true {
+            "invited".to_string()
+        } else if agent["status"] != "active" {
             agent["status"].as_str().unwrap_or("?").to_string()
         } else if agent["online"] == true {
             "online".into()
@@ -753,6 +768,13 @@ fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
             ),
             Span::styled(format!("{state:<8}"), theme::muted()),
         ];
+        if agent["invite"] == true {
+            let left = agent["expires_at"].as_i64().unwrap_or(0) - now();
+            spans.push(Span::styled(
+                format!("token valid {}", duration(left)),
+                theme::accent(),
+            ));
+        }
         if let Some((rx, tx)) = rates.get(agent["id"].as_str().unwrap_or_default()) {
             spans.push(Span::styled(
                 format!("↓{:>10} ", rate(*rx)),
@@ -841,7 +863,7 @@ fn draw_agent_overview(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
         Line::styled(s(&welcome["tunnel_ipv6"]), theme::muted()),
     );
-    let forwards = app.items(Tab::Forwards);
+    let forwards = app.all_forwards();
     card(
         frame,
         d,
@@ -979,7 +1001,7 @@ fn attention(app: &App) -> Vec<Line<'static>> {
     if let Some(error) = status["apply_error"].as_str() {
         push(true, format!("Configuration not applied: {error}"));
     }
-    for agent in app.items(Tab::Agents) {
+    for agent in app.unfiltered(Tab::Agents) {
         let name = s(&agent["name"]);
         if agent["status"] == "active" && agent["online"] != true {
             push(false, format!("Agent {name} is offline"));
@@ -993,7 +1015,7 @@ fn attention(app: &App) -> Vec<Line<'static>> {
             push(false, format!("Agent {name}: {error}"));
         }
     }
-    for forward in app.items(Tab::Forwards) {
+    for forward in app.all_forwards() {
         if let Some(reason) = forward["refused"].as_str() {
             push(
                 false,
@@ -1063,13 +1085,31 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|a| {
             let name = s(&a["name"]);
+            if a["invite"] == true {
+                let left = a["expires_at"].as_i64().unwrap_or(0) - now();
+                return vec![
+                    cell(Line::from(vec![
+                        dot("pending"),
+                        Span::raw(" "),
+                        Span::styled(name, theme::bold()),
+                    ])),
+                    cell("invited"),
+                    cell(Span::styled("-", theme::muted())),
+                    cell(Span::styled("-", theme::muted())),
+                    cell(Span::styled(
+                        format!("token valid {}", duration(left)),
+                        theme::accent(),
+                    )),
+                    cell(Span::styled("-", theme::muted())),
+                ];
+            }
             let (state, label) = match a["status"].as_str() {
                 Some("active") if a["online"] == true && a["configuration_ready"] == true => {
                     ("online", "online".to_string())
                 }
                 Some("active") if a["online"] == true => ("waiting", "syncing".to_string()),
                 Some("active") => ("offline", "offline".to_string()),
-                Some("pending") => ("pending", "invited".to_string()),
+                Some("pending") => ("pending", "enrolling".to_string()),
                 Some(other) => ("off", other.to_string()),
                 None => ("off", "?".to_string()),
             };
@@ -1099,7 +1139,7 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
         app,
         list,
         Tab::Agents,
-        "Agents",
+        &list_title(app, Tab::Agents, "Agents"),
         &["NAME", "STATE", "TUNNEL", "HANDSHAKE", "TRAFFIC", "VERSION"],
         &[
             Constraint::Min(12),
@@ -1124,6 +1164,42 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
             vec![Line::styled("Nothing selected.", theme::muted())],
         );
     };
+    if agent["invite"] == true {
+        let name = s(&agent["name"]);
+        let expires = agent["expires_at"].as_i64().unwrap_or(0);
+        let enrollment = &app.overview()["enrollment"];
+        let mut lines = vec![
+            Line::styled("◷ Invitation open, not enrolled yet", theme::accent()),
+            Line::raw(""),
+            kv("Valid for", duration(expires - now())),
+            kv("Until", clock_at(expires)),
+            kv(
+                "Enrollment",
+                format!(
+                    "{} on {}",
+                    if enrollment["open"] == true {
+                        "open"
+                    } else {
+                        "closed"
+                    },
+                    s(&enrollment["bind"])
+                ),
+            ),
+            Line::raw(""),
+            Line::styled(
+                "On the agent host, run the deploy/join line shown when the invitation was created. The token is shown only then; t makes a new one (the old one stops working), c cancels the invitation.",
+                theme::muted(),
+            ),
+        ];
+        if enrollment["open"] != true {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "The enrollment port is closed: the agent cannot enroll (RIFT_ENROLLMENT).",
+                theme::warn(),
+            ));
+        }
+        return details(frame, side, &name, lines);
+    }
     let name = s(&agent["name"]);
     let record = app.status()["snapshot"]["agents"]
         .as_array()
@@ -1200,7 +1276,7 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
         lines.push(Line::styled(format!("✗ {error}"), theme::bad()));
     }
     let forwards = app
-        .items(Tab::Forwards)
+        .all_forwards()
         .iter()
         .filter(|f| f["agent"] == agent["name"])
         .count();
@@ -1271,7 +1347,7 @@ fn draw_forwards(frame: &mut Frame, app: &mut App, area: Rect) {
         app,
         list,
         Tab::Forwards,
-        "Forwards",
+        &forwards_title(app),
         &["ID", "AGENT", "LISTEN", "TARGET", "MODE", "ACCESS", "STATE"],
         &[
             Constraint::Length(5),
@@ -1334,6 +1410,49 @@ fn draw_forwards(frame: &mut Frame, app: &mut App, area: Rect) {
             .block(panel("Selected forward")),
         strip,
     );
+}
+
+/// "Forwards · "nas 80" 2 of 11 · by port" when filtered or sorted.
+fn forwards_title(app: &App) -> String {
+    let mut title = "Forwards".to_string();
+    if !app.forward_query.is_empty() || app.focus.is_some() {
+        if let Some(agent) = &app.focus {
+            title.push_str(&format!(" · agent {agent}"));
+        }
+        if !app.forward_query.is_empty() {
+            title.push_str(&format!(" · \"{}\"", app.forward_filter));
+        }
+        title.push_str(&format!(
+            " · {} of {}",
+            app.items(Tab::Forwards).len(),
+            app.all_forwards().len()
+        ));
+    }
+    if app.forward_query.sort != crate::query::ForwardSort::Id {
+        title.push_str(&format!(" · by {}", app.forward_query.sort.name()));
+    }
+    title
+}
+
+/// A list's title with its focus and filter: "VPN devices · agent nas · "phone" 1 of 4".
+fn list_title(app: &App, tab: Tab, base: &str) -> String {
+    let mut title = base.to_string();
+    let focused = app.focus.as_ref().filter(|_| tab != Tab::Agents);
+    let filter = app.filters.get(&tab);
+    if let Some(agent) = focused {
+        title.push_str(&format!(" · agent {agent}"));
+    }
+    if let Some(words) = filter {
+        title.push_str(&format!(" · \"{words}\""));
+    }
+    if focused.is_some() || filter.is_some() {
+        title.push_str(&format!(
+            " · {} of {}",
+            app.items(tab).len(),
+            app.unfiltered(tab).len()
+        ));
+    }
+    title
 }
 
 fn forward_label(f: &Value, agent_role: bool) -> (&'static str, String) {
@@ -1434,7 +1553,7 @@ fn draw_devices(frame: &mut Frame, app: &mut App, area: Rect) {
         app,
         list,
         Tab::Devices,
-        "VPN devices",
+        &list_title(app, Tab::Devices, "VPN devices"),
         &[
             "NAME",
             "ADDRESS",
@@ -1574,11 +1693,15 @@ fn draw_sites(frame: &mut Frame, app: &mut App, area: Rect) {
         app,
         area,
         Tab::Sites,
-        &if area.width >= 100 {
-            sites_title(&overview)
-        } else {
-            format!("Sites · proxy {}", s(&overview["sites"]["proxy"]["name"]))
-        },
+        &list_title(
+            app,
+            Tab::Sites,
+            &if area.width >= 100 {
+                sites_title(&overview)
+            } else {
+                format!("Sites · proxy {}", s(&overview["sites"]["proxy"]["name"]))
+            },
+        ),
         &["DOMAIN", "AGENT", "TARGET", "PROXY", "FORWARD", "ONLY FROM"],
         &[
             Constraint::Length(48),
@@ -1702,7 +1825,7 @@ fn draw_bans(frame: &mut Frame, app: &mut App, area: Rect) {
         app,
         area,
         Tab::Bans,
-        "Bans",
+        &list_title(app, Tab::Bans, "Bans"),
         &["ID", "AGENT", "FORWARD", "ADDRESS", "EXPIRES"],
         &[
             Constraint::Length(5),
@@ -2233,9 +2356,13 @@ fn draw_one(frame: &mut Frame, app: &mut App, area: Rect, mut modal: Modal) -> M
                     row,
                 );
             }
-            let mut list = Vec::new();
-            if copy.is_some() {
-                list.push(("Copy command (y)", theme::button(), Hit::Copy));
+            let mut list: Vec<(&str, Style, Hit)> = copy
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.label, theme::button(), Hit::Copy(i)))
+                .collect();
+            if !copy.is_empty() && max == 0 {
+                frame.render_widget(Span::styled("Copy:", theme::muted()), row);
             }
             list.push(("Close", theme::button_focus(), Hit::Close));
             buttons(frame, app, row, &list);
@@ -2285,7 +2412,7 @@ fn draw_one(frame: &mut Frame, app: &mut App, area: Rect, mut modal: Modal) -> M
                     row,
                     &[
                         ("Text (t)", theme::button(), Hit::QrToggle),
-                        ("Copy (y)", theme::button(), Hit::Copy),
+                        ("Copy (y)", theme::button(), Hit::Copy(0)),
                         ("Close", theme::button_focus(), Hit::Close),
                     ],
                 );
@@ -2372,7 +2499,7 @@ fn draw_one(frame: &mut Frame, app: &mut App, area: Rect, mut modal: Modal) -> M
                         theme::button(),
                         Hit::QrToggle,
                     ),
-                    ("Copy (y)", theme::button(), Hit::Copy),
+                    ("Copy (y)", theme::button(), Hit::Copy(0)),
                     ("Close", theme::button_focus(), Hit::Close),
                 ],
             );
@@ -2483,6 +2610,11 @@ fn help(app: &App) -> Vec<Line<'static>> {
         ),
         key(":", "run any rift command, e.g. :list forwards"),
         key("R", "reconcile: apply the desired state again"),
+        key(
+            "F",
+            "focus on one agent: its forwards, devices, sites, bans",
+        ),
+        key("/  s", "filter a list; sort the forwards"),
         key("F5  Ctrl-L", "refresh now (also every 3 s by itself)"),
         key("q  Ctrl-C", "quit; Esc closes dialogs"),
         Line::raw(""),
@@ -2490,7 +2622,10 @@ fn help(app: &App) -> Vec<Line<'static>> {
         key("Tab ↑↓", "next / previous field"),
         key("← →  Space", "change a choice, tick a box"),
         key("Enter", "submit (or click the button)"),
-        key("y", "copy a command or configuration (OSC 52)"),
+        key(
+            "y  1 2 3",
+            "copy a configuration, or what an invitation's buttons say (OSC 52)",
+        ),
         Line::raw(""),
         Line::styled("Mouse", theme::bold()),
         Line::raw(" Click tabs, rows, buttons and fields; scroll with the wheel."),
@@ -2523,6 +2658,19 @@ fn clock() -> String {
         secs / 60 % 60,
         secs % 60
     )
+}
+
+/// A Unix time as `HH:MM UTC` (today) or `YYYY-MM-DD HH:MM UTC`.
+fn clock_at(timestamp: i64) -> String {
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp.max(0) as u64);
+    let text = humantime::format_rfc3339_seconds(at).to_string();
+    let (date, time) = text.split_once('T').unwrap_or((&text, ""));
+    let today = humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string();
+    if today.starts_with(date) {
+        format!("{} UTC", &time[..5.min(time.len())])
+    } else {
+        format!("{date} {} UTC", &time[..5.min(time.len())])
+    }
 }
 
 fn ago(timestamp: i64) -> String {

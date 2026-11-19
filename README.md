@@ -783,8 +783,8 @@ Type `rift` without a command on the server or an agent host and a full-screen t
 | Tab | Shows | Actions |
 | --- | --- | --- |
 | Overview | agents online, forwards, devices, sites and bans at a glance; live traffic through the tunnel; what needs attention (apply errors, offline agents, refused forwards, open invitations); the latest log entries | invite an agent, add a forward or device, reconcile |
-| Agents | state, tunnel address, last handshake, live traffic and version of each agent; beside it the details: limits the agent reported, its `.internal` name, errors, open invitation | invite (shows the `deploy/join` line; `y` copies it), enable/disable, rename, rotate key, names on/off, add a forward, cancel an invitation, remove |
-| Forwards | listen address and ports, target, protocol, mode, who may connect, state (active, disabled, pending, refused with the reason) | add (the short form `8080:80/tcp 53/both`, address family, mode, ingress, allowed clients), enable/disable, ban a client of a translated forward, remove |
+| Agents | state, tunnel address, last handshake, live traffic and version of each agent; open invitations as rows of their own with how long the token is valid; beside it the details: limits the agent reported, its `.internal` name, errors, open invitation | invite (copy buttons: the whole setup with `git clone`, only the `deploy/join` line, or the three `.env` lines), new token for an open invitation, cancel it, enable/disable, rename, rotate key, names on/off, add a forward, remove |
+| Forwards | listen address and ports, target, protocol, mode, who may connect, state (active, disabled, pending, refused with the reason) | add (the short form `8080:80/tcp 53/both`, address family, mode, ingress, allowed clients), enable/disable, ban a client of a translated forward, remove, filter (`/`), sort by ID, agent, port or state (`s`) |
 | VPN devices | address, handshake, grants, exits, panel access; beside it the grants (refused ones with the reason) and exits | add, grant access (ports, host, all protocols, LAN networks with SNAT, exit), withdraw, WireGuard configuration as a QR code to scan or as text, internet exits, DNS, names, panel access, enable/disable, remove |
 | Sites | domains with agent, target port, proxy, the state of their forward and the allowed clients; in the title the proxy `rift proxy` shows (for Caddy: host or container, and the site directory) | add, remove (through the same host service as the web panel) |
 | Bans | blocked client addresses and when they expire | ban an address |
@@ -794,6 +794,8 @@ Type `rift` without a command on the server or an agent host and a full-screen t
 | Backup | the files in `/var/lib/rift-site/files` on the host | export the settings, save a backup with every key (both land in that directory), import an export file from it (dry run first, `OLD=NEW` agent names) |
 
 On an agent host the UI has Overview (tunnel, server, traffic, identity), Forwards (ban a client), Logs and Health.
+
+**Filter and focus.** `/` filters the Forwards, Agents, VPN devices, Sites and Bans tabs: every word must match. On Forwards a number matches the ID or a listen or target port, also inside a range, and `agent:NAME`, `port:N`, `proto:tcp|udp` and `state:WORD` match one field. `F` focuses on one agent: Forwards, VPN devices (with a grant on it or an exit through it), Sites and Bans then show only what concerns it, until `F` → All agents. The tab titles say what is filtered.
 
 **Keys and mouse.** `1`–`9`, `Tab` or a click switch tabs; `↑`/`↓`, `PgUp`/`PgDn` or the wheel move in tables and the log; the letters in the footer start the actions of the selected row, and `Enter`, a right click or a double click opens them as a menu. Dialogs take `Tab` and clicks between fields, `←`/`→` or a click to change a choice, `Space` or a click to tick a box. `:` runs any `rift` command inside the UI, for example `:list forwards` (with `Tab` completion and `↑` history); the host commands (`export`, `import`, `backup`, `restore`, `proxy`, sites) run outside it, but the Backup and Sites tabs cover export, backup, import, sites and showing the proxy. `restore` stays a host command: it stops the server container the UI runs in.
 
@@ -924,7 +926,7 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | Command | What it does |
 | --- | --- |
 | `rift add agent NAME [--ttl DURATION]` | Creates a single-use invitation, valid for 15 minutes unless `--ttl` says otherwise, and prints the `deploy/join` command for the agent, plus the same values as three `.env` lines for a manual setup. Opens the enrollment port until the agent is active. |
-| `rift list agents` | All agents with state and tunnel addresses. |
+| `rift list agents [FILTER...]` | All agents with state and tunnel addresses; FILTER words must all appear. |
 | `rift show agent NAME` | Every stored detail of one agent. |
 | `rift remove invite NAME` | Cancels an open invitation. |
 | `rift remove agent NAME` | Deletes an agent with its forwards and VPN grants. |
@@ -941,18 +943,18 @@ All commands run on the **server** unless noted. `rift COMMAND --help` shows the
 | … `--ingress local` | Only for a reverse proxy on the server; not reachable from the Internet. |
 | … `--listen-ip ADDRESS` | A specific server address, only needed with several addresses of the same IP version. |
 | … `--allow-from ADDRESS[,NETWORK...]` | Only these clients reach the forward; see [Limit a forward to known clients](#limit-a-forward-to-known-clients). |
-| `rift list forwards` | All forwards with ID, purpose (`user`, or `exit` for the managed forward of an [internet exit](#use-rift-as-a-vpn-exit)) and state (`enabled`, `disabled`, `pending`, `refused`); on the server with a SITE column. |
+| `rift list forwards [FILTER...] [--agent NAME] [--port N] [--protocol tcp\|udp] [--sort id\|agent\|port\|state]` | All forwards with ID, purpose (`user`, or `exit` for the managed forward of an [internet exit](#use-rift-as-a-vpn-exit)) and state (`enabled`, `disabled`, `pending`, `refused`); on the server with a SITE column. FILTER words must all match: a number matches the ID or a listen or target port (also inside a range), `agent:NAME`, `port:N`, `proto:tcp` and `state:WORD` one field, other words part of the agent, address, protocol, mode, ingress, state or allowed clients. Example: `rift list forwards nas 8080 --sort port`. With a filter or sort the SITE column is left out. |
 | `rift remove forward ID` | Deletes a forward. Refuses an `exit` forward. |
 | `rift disable forward ID` / `rift enable forward ID` | Switches a forward off and on again. |
 | `rift add ban FORWARD_ID IP [--ttl 1h]` | Blocks a client address on a translated forward for a while. |
-| `rift list bans` | Active bans with their expiry time (UTC). |
+| `rift list bans [FILTER...] [--agent NAME]` | Active bans with their expiry time (UTC), optionally only those of an agent or matching every FILTER word. |
 
 **Websites (host commands, run with `sudo` on the server)**
 
 | Command | What it does |
 | --- | --- |
 | `rift add site AGENT DOMAIN PORT [traefik\|caddy\|nginx\|npm] [--allow-from ADDRESS[,NETWORK...]]` | Publishes `https://DOMAIN` through your reverse proxy to `PORT` on the agent. Without a proxy word the default is used. With `--allow-from` the proxy answers other clients with 403. |
-| `rift list sites` | All sites with their forward state (`ok`, `missing`, `refused`). |
+| `rift list sites [FILTER...] [--agent NAME]` | All sites with their forward state (`ok`, `missing`, `refused`), optionally only those of an agent or matching every FILTER word (domain, ports, proxy, allowed clients). |
 | `rift remove site DOMAIN` | Removes the site, its proxy configuration and its forward. |
 | `rift proxy [traefik\|caddy\|nginx\|npm] [--container NAME --sites-dir DIR \| --host]` | Shows or sets the default proxy; with the options, Caddy runs in that container and reads the site files from that host directory, with `--host` on the host itself (its sites move along). `sudo sh deploy/setup-proxy traefik\|caddy\|npm [--migrate]` sets up a proxy in Docker, or switches to it and moves every site. |
 
@@ -964,7 +966,7 @@ The web panel runs `add site`, `remove site`, `export`, `import` and `backup` th
 | --- | --- |
 | `rift vpn connect DEVICE AGENT TARGET... [--snat] [--export]` | Creates the device if needed, grants the targets (as `vpn allow`) and prints its configuration as a QR code with the addresses to open. Example: `rift vpn connect phone node1 3000/tcp`. |
 | `rift add device NAME` | Registers a device with a key and an address. It reaches nothing yet. |
-| `rift list devices` | All devices with state, last handshake and access, including the exits (`exit via server; exit via node1; exit via node2`). |
+| `rift list devices [FILTER...] [--agent NAME]` | All devices with state, last handshake and access, including the exits (`exit via server; exit via node1; exit via node2`); `--agent` keeps devices with a grant on that agent or an exit through it. |
 | `rift vpn allow DEVICE AGENT TARGET... [--snat]` | Grants access. `TARGET` is `22/tcp` (port or range), `server` (the agent host), `full` (all protocols to the host), a network such as `192.168.178.30/32` (`--snat` for networks whose router has no route back), or `exit`: adds an internet exit through that agent, as an extra profile of the device. |
 | `rift vpn allow DEVICE exit` | Adds the server as an internet exit of the device (main profile). Other exits stay; import the profile RIFT names. |
 | `rift vpn deny DEVICE AGENT [TARGET...]` | Withdraws access; without a target everything on that agent, including the exit through it. |

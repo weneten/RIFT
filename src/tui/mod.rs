@@ -32,7 +32,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     );
     ensure!(
         std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
-        "the terminal UI needs a terminal; through Docker use docker exec -it, or the host command rift"
+        "the terminal UI needs a terminal. Typed on a terminal, through the host command rift? Then that command is older than this image: run sudo sh deploy/install-cli in the RIFT directory. Directly through Docker, use docker exec -it"
     );
     let mut terminal = ratatui::try_init()?;
     // ratatui's panic hook restores the screen; mouse reporting has to go first.

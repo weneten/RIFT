@@ -376,15 +376,50 @@ enum ConfigCommand {
 }
 #[derive(Subcommand)]
 enum ListWhat {
-    /// Agents with their state and tunnel addresses.
-    Agents,
-    /// Forwards with their state (enabled, disabled, pending or refused).
-    Forwards,
-    /// Active bans of translated forwards.
-    Bans,
-    /// VPN devices.
-    Devices,
-    /// Sites (host command only).
+    /// Agents with their state and tunnel addresses; FILTER words must all appear.
+    Agents {
+        #[arg(value_name = "FILTER")]
+        filter: Vec<String>,
+    },
+    /// Forwards with their state (enabled, disabled, pending or refused), optionally filtered
+    /// and sorted: `rift list forwards node1 8080`, `rift list forwards --agent nas --sort port`.
+    Forwards {
+        /// Words that must all match: a number matches the ID or a listen or target port
+        /// (also inside a range); other words match part of the agent, address, protocol,
+        /// mode, ingress, state or allowed clients. `agent:NAME`, `port:N`, `proto:tcp|udp` and
+        /// `state:WORD` match one field.
+        #[arg(value_name = "FILTER")]
+        filter: Vec<String>,
+        /// Only forwards of this agent; repeatable.
+        #[arg(long, value_name = "NAME")]
+        agent: Vec<String>,
+        /// Only forwards whose listen or target ports contain this port.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Only TCP or UDP forwards.
+        #[arg(long, value_parser = ["tcp", "udp"])]
+        protocol: Option<String>,
+        /// Order of the list.
+        #[arg(long, default_value = "id", value_parser = ["id", "agent", "port", "state"])]
+        sort: String,
+    },
+    /// Active bans of translated forwards; FILTER words must all appear.
+    Bans {
+        #[arg(value_name = "FILTER")]
+        filter: Vec<String>,
+        /// Only bans on forwards of this agent; repeatable.
+        #[arg(long, value_name = "NAME")]
+        agent: Vec<String>,
+    },
+    /// VPN devices; FILTER words must all appear (names, addresses, grants, exits).
+    Devices {
+        #[arg(value_name = "FILTER")]
+        filter: Vec<String>,
+        /// Only devices with a grant on this agent or an exit through it; repeatable.
+        #[arg(long, value_name = "NAME")]
+        agent: Vec<String>,
+    },
+    /// Sites (host command only); FILTER words and --agent work there too.
     Sites,
 }
 #[derive(Subcommand)]
@@ -502,6 +537,10 @@ async fn run() -> Result<()> {
             <Cli as clap::CommandFactory>::command().print_help()?;
             if !config.tui {
                 eprintln!("\nThe terminal UI is off (RIFT_TUI=false).");
+            } else {
+                // No terminal here. Typed by hand, the usual cause is a host command from
+                // before the terminal UI, which runs `docker exec` without -it.
+                eprintln!("\nNo terminal, so no terminal UI. If you typed rift on a terminal, the host command is older than this image: run sudo sh deploy/install-cli in the RIFT directory.");
             }
             std::process::exit(2);
         }
@@ -637,10 +676,35 @@ async fn run() -> Result<()> {
             lines: lines.min(1000),
         },
         Command::List { what } => match what {
-            ListWhat::Agents => AdminRequest::AgentsList,
-            ListWhat::Forwards => AdminRequest::ForwardsList,
-            ListWhat::Bans => AdminRequest::BansList,
-            ListWhat::Devices => AdminRequest::VpnPeerList,
+            ListWhat::Agents { filter } if !filter.is_empty() => {
+                return list_filtered(&config, cli.json, AdminRequest::AgentsList, &filter, &[])
+                    .await;
+            }
+            ListWhat::Agents { .. } => AdminRequest::AgentsList,
+            ListWhat::Forwards {
+                filter,
+                agent,
+                port,
+                protocol,
+                sort,
+            } => {
+                let mut query = rift::query::ForwardQuery::parse(&filter.join(" "))?;
+                query.agents.extend(agent.iter().map(|a| a.to_lowercase()));
+                query.port = port.or(query.port);
+                query.protocol = protocol.or(query.protocol);
+                query.sort = sort.parse().map_err(anyhow::Error::msg)?;
+                return list_forwards(&config, cli.json, &query).await;
+            }
+            ListWhat::Bans { filter, agent } if !filter.is_empty() || !agent.is_empty() => {
+                return list_filtered(&config, cli.json, AdminRequest::BansList, &filter, &agent)
+                    .await;
+            }
+            ListWhat::Bans { .. } => AdminRequest::BansList,
+            ListWhat::Devices { filter, agent } if !filter.is_empty() || !agent.is_empty() => {
+                return list_filtered(&config, cli.json, AdminRequest::VpnPeerList, &filter, &agent)
+                    .await;
+            }
+            ListWhat::Devices { .. } => AdminRequest::VpnPeerList,
             ListWhat::Sites => bail!("sites are managed by the host command; run it on the server, not inside the container"),
         },
         Command::Show { what: ShowWhat::Agent { name } } => AdminRequest::AgentsShow { name },
@@ -1028,6 +1092,104 @@ fn exit_checks(config: &Config, status: &serde_json::Value, checks: &mut rift::n
         }
     }
 }
+/// `rift list forwards` with its filter and order applied to the daemon's list.
+async fn list_forwards(
+    config: &Config,
+    json: bool,
+    query: &rift::query::ForwardQuery,
+) -> Result<()> {
+    let forwards = admin_ok(config, AdminRequest::ForwardsList).await?;
+    // An agent's own list has no agent list to resolve names with.
+    let agents = admin_ok(config, AdminRequest::AgentsList).await.ok();
+    let name_of = |forward: &serde_json::Value| {
+        agents
+            .as_ref()
+            .and_then(|a| a.as_array())
+            .into_iter()
+            .flatten()
+            .find(|a| a["id"] == forward["agent_id"])
+            .and_then(|a| a["name"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let all = forwards.as_array().cloned().unwrap_or_default();
+    let shown = query.apply(&all, name_of);
+    let data = serde_json::Value::Array(shown.clone());
+    if json {
+        println!("{}", serde_json::to_string(&data)?);
+        return Ok(());
+    }
+    if !query.is_empty() && shown.is_empty() {
+        println!("No forward matches ({} configured).", all.len());
+        return Ok(());
+    }
+    println!(
+        "{}",
+        output::render(&AdminRequest::ForwardsList, &data, agents.as_ref())
+    );
+    if !query.is_empty() {
+        eprintln!("{} of {} forward(s).", shown.len(), all.len());
+    }
+    Ok(())
+}
+
+/// `rift list agents|devices|bans` with filter words and agents: the daemon's list, narrowed
+/// down, in the usual table. Agent IDs are matched by name.
+async fn list_filtered(
+    config: &Config,
+    json: bool,
+    request: AdminRequest,
+    filter: &[String],
+    agents: &[String],
+) -> Result<()> {
+    let data = admin_ok(config, request.clone()).await?;
+    let agent_list = admin_ok(config, AdminRequest::AgentsList).await.ok();
+    let name_of = |id: &serde_json::Value| {
+        agent_list
+            .as_ref()
+            .and_then(|a| a.as_array())
+            .into_iter()
+            .flatten()
+            .find(|a| a["id"] == *id)
+            .and_then(|a| a["name"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let words = rift::query::words(&filter.join(" "));
+    let all = data.as_array().cloned().unwrap_or_default();
+    let shown: Vec<serde_json::Value> = all
+        .iter()
+        .filter(|item| {
+            // Search the agent's name too, not only its ID.
+            let mut searchable = (*item).clone();
+            if let Some(id) = item.get("agent_id") {
+                searchable["agent"] = name_of(id).into();
+            }
+            let agent_ok = agents.is_empty()
+                || agents.iter().any(|agent| match &request {
+                    AdminRequest::VpnPeerList => rift::query::device_uses(item, agent),
+                    _ => searchable["agent"]
+                        .as_str()
+                        .is_some_and(|a| a.eq_ignore_ascii_case(agent)),
+                });
+            agent_ok && rift::query::matches_words(&searchable, &words)
+        })
+        .cloned()
+        .collect();
+    let data = serde_json::Value::Array(shown.clone());
+    if json {
+        println!("{}", serde_json::to_string(&data)?);
+        return Ok(());
+    }
+    if shown.is_empty() {
+        println!("Nothing matches ({} in all).", all.len());
+        return Ok(());
+    }
+    println!("{}", output::render(&request, &data, agent_list.as_ref()));
+    eprintln!("{} of {} shown.", shown.len(), all.len());
+    Ok(())
+}
+
 async fn admin_ok(config: &Config, request: AdminRequest) -> Result<serde_json::Value> {
     let response = rift::daemon::admin_call(config, request).await?;
     if !response.ok {
@@ -1303,6 +1465,39 @@ fn duration(s: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn list_commands_take_filters() {
+        for args in [
+            vec!["rift", "list", "forwards"],
+            vec!["rift", "list", "forwards", "node1", "8080", "agent:nas"],
+            vec![
+                "rift", "list", "forwards", "--agent", "nas", "--agent", "core", "--port", "80",
+            ],
+            vec![
+                "rift",
+                "list",
+                "forwards",
+                "--protocol",
+                "udp",
+                "--sort",
+                "port",
+            ],
+            vec!["rift", "list", "agents", "home"],
+            vec!["rift", "list", "devices", "phone", "--agent", "nas"],
+            vec!["rift", "list", "bans", "--agent", "nas"],
+        ] {
+            Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        }
+        for args in [
+            vec!["rift", "list", "forwards", "--sort", "name"],
+            vec!["rift", "list", "forwards", "--protocol", "icmp"],
+            vec!["rift", "list", "forwards", "--port", "70000"],
+            vec!["rift", "list", "agents", "--agent", "x"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+        }
+    }
+
     #[test]
     fn vpn_cli_parses() {
         for args in [

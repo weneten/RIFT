@@ -39,6 +39,9 @@ fn ban_expiry(value: &Value) -> String {
 
 /// What `rift add agent` prints: one block on stdout, because `docker exec` passes stdout and
 /// stderr on separately and would mix up the order of hints and commands.
+/// The checkout an agent host needs before `deploy/join`.
+pub const CHECKOUT: &str = "git clone https://github.com/weneten/RIFT.git\ncd RIFT";
+
 pub fn invitation(data: &Value) -> String {
     let (server, name, token) = (
         data["server"].as_str().unwrap_or_default(),
@@ -56,8 +59,9 @@ pub fn invitation(data: &Value) -> String {
     out.push(String::new());
     out.push("Set up the agent: on the agent host, with Docker installed, run".into());
     out.push(String::new());
-    out.push("  git clone https://github.com/weneten/RIFT.git".into());
-    out.push("  cd RIFT".into());
+    for line in CHECKOUT.lines() {
+        out.push(format!("  {line}"));
+    }
     out.push(format!(
         "  {}",
         crate::enrollment::join_command(server, name, token)

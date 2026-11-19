@@ -10,7 +10,14 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 - `RIFT_TUI` (default `true`) in the server and agent `.env` turns it off: `rift` alone then prints the help, as before. `deploy/setup-server` and `deploy/join` ask for it and take `--tui`/`--no-tui`. The commands are unaffected either way.
 - The Backup tab exports the settings, saves a backup with every key and imports an export file (dry run first, with `OLD=NEW` agent names). The UI cannot write host files, so the web panel's host service saves exports and backups in `/var/lib/rift-site/files` (created by `deploy/install-cli`, mode 0700; the newest 20 of each kind are kept) when a queued request carries `"keep": true`; files to import go there too. An older host helper refuses such requests; the UI then says to run `deploy/install-cli` again. The Sites tab names the proxy `rift proxy` shows.
 - QR codes in the UI leave out the configuration's comment and blank lines and use error correction level L: a typical main profile takes 33 rows instead of 39, an exit profile 33 instead of 47. Windows too small for the dialog show the code alone on the screen. Narrow tables leave out their least important columns, and the Forwards tab shows the selected forward in full below the table.
+- Open invitations appear on the Agents tab as rows of their own, with how long the token is valid, until the agent enrolls; `t` replaces the invitation with a new token, `c` cancels it. The invitation dialog copies the whole setup (`git clone`, `cd RIFT`, `deploy/join`), only the `deploy/join` line, or the three `.env` lines.
+- `/` filters the Forwards, Agents, VPN devices, Sites and Bans tabs, `s` sorts the forwards by ID, agent, port or state, and `F` focuses on one agent: forwards, devices, sites and bans then show only what concerns it.
+- When `rift` alone prints the help, or `rift tui` finds no terminal, the message names the usual cause: a host command older than the image (`sudo sh deploy/install-cli`).
 - The host command `rift` starts the container command with a terminal (`docker exec -it`, passing `TERM` and `COLORTERM`) when it is called without a command, or with `tui`, on a terminal.
+
+### Commands
+
+- `rift list forwards` takes filter words and options: `rift list forwards nas 8080`, `--agent NAME` (repeatable), `--port N` (inside ranges too), `--protocol tcp|udp`, `--sort id|agent|port|state`; `agent:NAME`, `port:N`, `proto:tcp` and `state:WORD` as words. `rift list agents`, `list devices`, `list bans` and `list sites` take filter words, and all but agents `--agent NAME`; for devices that means a grant on the agent or an exit through it. `--json` gives the filtered list.
 
 ### Setup
 

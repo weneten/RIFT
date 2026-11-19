@@ -12,6 +12,7 @@ pub mod net;
 pub mod output;
 pub mod portable;
 pub mod protocol;
+pub mod query;
 pub mod sites;
 pub mod state;
 pub mod tls_material;

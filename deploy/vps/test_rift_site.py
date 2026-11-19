@@ -1709,3 +1709,29 @@ class QueueTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ListFilterTests(unittest.TestCase):
+    def test_words_and_agents_narrow_the_sites(self):
+        sites = {
+            "cloud.example.net": {"agent": "homelab", "target": 8080, "listen": 20001, "proxy": "caddy"},
+            "git.example.net": {"agent": "NAS", "target": 3000, "listen": 20002, "proxy": "caddy",
+                                "allow_from": ["203.0.113.0/24"]},
+        }
+
+        def shown(*args):
+            words, agents = rift_site.parse_list_args(args)
+            return sorted(h for h, s in sites.items() if rift_site.site_matches(h, s, words, agents))
+
+        self.assertEqual(shown(), ["cloud.example.net", "git.example.net"])
+        self.assertEqual(shown("git"), ["git.example.net"])
+        self.assertEqual(shown("--agent", "nas"), ["git.example.net"])
+        self.assertEqual(shown("--agent=homelab"), ["cloud.example.net"])
+        self.assertEqual(shown("8080"), ["cloud.example.net"])
+        self.assertEqual(shown("203.0.113", "caddy"), ["git.example.net"])
+        self.assertEqual(shown("example", "--agent", "core"), [])
+        with self.assertRaises(rift_site.SiteError):
+            rift_site.parse_list_args(["--sort"])
+        with self.assertRaises(rift_site.SiteError):
+            rift_site.parse_list_args(["--agent"])
+

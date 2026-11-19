@@ -1435,13 +1435,45 @@ def command_forwards():
     print_table(forward_rows(forwards, agents, state.get("sites") or {}))
 
 
-def command_list():
+def parse_list_args(args):
+    """`rift list sites [FILTER...] [--agent NAME]...`: words that must all appear in a site's
+    domain, agent, ports, proxy or allowed clients, and agents of which the sites are shown."""
+    words, agents = [], []
+    rest = list(args)
+    while rest:
+        word = rest.pop(0)
+        if word == "--agent":
+            if not rest:
+                raise SiteError("--agent needs a name")
+            agents.append(rest.pop(0).lower())
+        elif word.startswith("--agent="):
+            agents.append(word.split("=", 1)[1].lower())
+        elif word.startswith("-"):
+            raise SiteError(f"unknown option {word}; usage: rift list sites [FILTER...] [--agent NAME]")
+        else:
+            words.extend(w.lower() for w in re.split(r"[\s,]+", word) if w)
+    return words, agents
+
+
+def site_matches(host, site, words, agents):
+    if agents and str(site.get("agent", "")).lower() not in agents:
+        return False
+    text = "\n".join(
+        [host, str(site.get("agent", "")), str(site.get("target", "")), str(site.get("listen", "")),
+         str(site.get("proxy", "")), *(site.get("allow_from") or [])]
+    ).lower()
+    return all(word in text for word in words)
+
+
+def command_list(args=()):
+    words, agents = parse_list_args(args)
     state = load_state()
     if state is not None:
         sync_installation(state)
-    sites = (state or {}).get("sites") or {}
+    every = (state or {}).get("sites") or {}
+    sites = {host: site for host, site in every.items() if site_matches(host, site, words, agents)}
     if not sites:
-        print("No sites.")
+        print("No sites." if not every else f"No site matches ({len(every)} in all).")
         return
     try:
         forwards = rift(state, "list", "forwards") or []
@@ -1471,6 +1503,8 @@ def command_list():
             )
         )
     print_table(rows)
+    if len(sites) != len(every):
+        print(f"{len(sites)} of {len(every)} sites shown.", file=sys.stderr)
     if any(row[6].endswith("missing") for row in rows[1:]):
         print("A missing forward is created again by 'rift add site AGENT HOST PORT'.")
     if any(row[6].endswith("refused") for row in rows[1:]):
@@ -2495,7 +2529,7 @@ def usage():
     return (
         "usage: rift add site AGENT HOST PORT [traefik|caddy|nginx|npm] [--allow-from ADDRESS[,NETWORK...]]\n"
         "       rift remove site HOST\n"
-        "       rift list sites\n"
+        "       rift list sites [FILTER...] [--agent NAME]\n"
         "       rift proxy [traefik|caddy|nginx|npm] [--container NAME --sites-dir DIR | --host]\n"
         "       rift export [FILE]\n"
         "       rift import FILE [--agent NAME]... [--skip-agent NAME]... [--map OLD=NEW]... [--dry-run]\n"
@@ -2545,8 +2579,8 @@ def main(argv):
     if command == "remove" and len(argv) == 3:
         command_rm(argv[2])
         return
-    if command == "list" and len(argv) == 2:
-        command_list()
+    if command == "list":
+        command_list(argv[2:])
         return
     if command == "forwards" and len(argv) == 2:
         command_forwards()

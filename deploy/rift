@@ -67,7 +67,8 @@ if [ -z "$help" ]; then
             exec "$site" "$cmd" "$@"
             ;;
         "list sites")
-            exec "$site" list
+            shift 2
+            exec "$site" list "$@"
             ;;
     esac
 fi

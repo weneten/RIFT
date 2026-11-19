@@ -141,9 +141,11 @@ impl Done {
 pub enum Op {
     /// Admin requests in order; the first failure stops the rest.
     Requests(Vec<AdminRequest>),
+    /// `replace`: withdraw the open invitation of that name first (a new token).
     Invite {
         name: String,
         ttl_seconds: u64,
+        replace: bool,
     },
     Config {
         name: String,
@@ -171,6 +173,8 @@ pub enum Submit {
     TwoFactorConfirm,
     LogFilter,
     Import,
+    ForwardFilter,
+    Filter(Tab),
 }
 
 /// Actions on the current tab, reachable by key, footer button and the Enter/right-click menu.
@@ -184,6 +188,7 @@ pub enum Act {
     AgentForward,
     AgentDetails,
     CancelInvite,
+    NewToken,
     AgentRemove,
     ForwardAdd,
     ForwardToggle,
@@ -211,6 +216,11 @@ pub enum Act {
     LogFollow,
     LogFilter,
     LogLevel,
+    ForwardFilter,
+    ForwardSort,
+    /// The word filter of the current tab (agents, devices, sites, bans).
+    Filter,
+    Focus,
     HealthRun,
     Export,
     Backup,
@@ -227,6 +237,8 @@ pub enum MenuWhat {
     Op(Box<Op>),
     /// Shown but not selectable, e.g. an exit an agent refuses.
     Disabled,
+    /// Show only this agent's rows (None: every agent).
+    Focus(Option<String>),
 }
 impl MenuWhat {
     fn op(op: Op) -> Self {
@@ -260,8 +272,8 @@ pub enum Modal {
         title: String,
         lines: Vec<Line<'static>>,
         scroll: u16,
-        /// What `y` copies to the clipboard (OSC 52).
-        copy: Option<String>,
+        /// What the copy buttons (keys 1, 2, … and y for the first) put on the clipboard.
+        copy: Vec<Copyable>,
     },
     Qr {
         title: String,
@@ -283,6 +295,14 @@ pub enum Modal {
     },
 }
 
+/// One text a dialog offers to copy (OSC 52), with its button label.
+pub struct Copyable {
+    pub label: &'static str,
+    /// Says what was copied, after "Copied ".
+    pub what: &'static str,
+    pub text: String,
+}
+
 /// What a mouse click hit, recorded while drawing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
@@ -297,7 +317,8 @@ pub enum Hit {
     Yes,
     No,
     Close,
-    Copy,
+    /// Copy button `n` of a text dialog; 0 also copies a QR dialog's text.
+    Copy(usize),
     QrToggle,
     LogScroll,
 }
@@ -400,6 +421,13 @@ pub struct App {
     pub health_loading: bool,
     pub busy: usize,
     pub password: Option<String>,
+    /// Filter words and order of the Forwards tab (`crate::query`).
+    pub forward_filter: String,
+    pub forward_query: crate::query::ForwardQuery,
+    /// Word filters of the Agents, VPN devices, Sites and Bans tabs.
+    pub filters: HashMap<Tab, String>,
+    /// The agent whose forwards, devices, sites and bans alone are shown (F).
+    pub focus: Option<String>,
     pub quit: bool,
     pub frame: usize,
     tx: UnboundedSender<Msg>,
@@ -442,6 +470,10 @@ impl App {
             health_loading: false,
             busy: 0,
             password: None,
+            forward_filter: String::new(),
+            forward_query: crate::query::ForwardQuery::default(),
+            filters: HashMap::new(),
+            focus: None,
             quit: false,
             frame: 0,
             tx,
@@ -463,10 +495,58 @@ impl App {
 
     /// The rows of a table tab.
     pub fn items(&self, tab: Tab) -> Vec<Value> {
+        let mut items = self.unfiltered(tab);
+        // The agent in focus (F): only what concerns it.
+        if let Some(agent) = &self.focus {
+            let named = |v: &Value| {
+                v["agent"]
+                    .as_str()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(agent))
+            };
+            match tab {
+                Tab::Forwards | Tab::Sites | Tab::Bans => items.retain(named),
+                Tab::Devices => items.retain(|d| crate::query::device_uses(d, agent)),
+                _ => {}
+            }
+        }
+        if let Some(words) = self.filters.get(&tab) {
+            let words = crate::query::words(words);
+            items.retain(|item| crate::query::matches_words(item, &words));
+        }
+        items
+    }
+
+    /// The rows of a tab before the focus and the word filter.
+    pub fn unfiltered(&self, tab: Tab) -> Vec<Value> {
         let list = |v: &Value| v.as_array().cloned().unwrap_or_default();
         match tab {
-            Tab::Agents => list(&self.overview()["agents"]),
-            Tab::Forwards => list(&self.overview()["forwards"]),
+            Tab::Agents => {
+                // Agents exist only once enrolled; an open invitation of a new name is a row
+                // of its own until then.
+                let mut agents = list(&self.overview()["agents"]);
+                for invite in self.overview()["invites"].as_array().into_iter().flatten() {
+                    let name = &invite["name"];
+                    if !agents.iter().any(|a| a["name"] == *name) {
+                        agents.push(json!({
+                            "name": name,
+                            "status": "invited",
+                            "invite": true,
+                            "expires_at": invite["expires_at"],
+                        }));
+                    }
+                }
+                agents
+            }
+            Tab::Forwards => {
+                let agent_role = self.role == Role::Agent;
+                self.forward_query.apply(&self.all_forwards(), |f| {
+                    if agent_role {
+                        String::new()
+                    } else {
+                        f["agent"].as_str().unwrap_or_default().to_string()
+                    }
+                })
+            }
             Tab::Devices => list(&self.overview()["vpn_peers"]),
             Tab::Sites => list(&self.overview()["sites"]["sites"]),
             Tab::Bans => list(&self.overview()["bans"]),
@@ -477,6 +557,13 @@ impl App {
             },
             _ => Vec::new(),
         }
+    }
+    /// Every forward, whatever the Forwards tab's filter shows.
+    pub fn all_forwards(&self) -> Vec<Value> {
+        self.overview()["forwards"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
     }
     pub fn table(&mut self, tab: Tab) -> &mut TableState {
         self.tables.entry(tab).or_default()
@@ -501,7 +588,7 @@ impl App {
     }
 
     fn agent_names(&self, active_only: bool) -> Vec<String> {
-        self.items(Tab::Agents)
+        self.unfiltered(Tab::Agents)
             .iter()
             .filter(|a| !active_only || a["status"] == "active")
             .filter_map(|a| a["name"].as_str().map(String::from))
@@ -728,7 +815,7 @@ impl App {
                     title: format!("rift {line}"),
                     lines,
                     scroll: 0,
-                    copy: None,
+                    copy: Vec::new(),
                 });
                 self.spawn_fetch();
             }
@@ -1066,9 +1153,15 @@ impl App {
                 KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
                 KeyCode::PageDown | KeyCode::Char(' ') => *scroll = scroll.saturating_add(10),
                 KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
-                KeyCode::Char('y') => {
-                    if let Some(text) = copy.clone() {
-                        self.copy(&text);
+                KeyCode::Char(c @ ('y' | '1'..='9')) => {
+                    let index = if c == 'y' {
+                        0
+                    } else {
+                        c as usize - '1' as usize
+                    };
+                    if let Some(item) = copy.get(index) {
+                        let (text, what) = (item.text.clone(), item.what);
+                        self.copy(&text, what);
                     }
                 }
                 _ => {}
@@ -1088,7 +1181,7 @@ impl App {
                 KeyCode::Char('y') => {
                     if let Some(Modal::Qr { text, .. }) = self.modals.last() {
                         let text = text.clone();
-                        self.copy(&text);
+                        self.copy(&text, "the text");
                     }
                 }
                 _ => {}
@@ -1206,14 +1299,16 @@ impl App {
             Hit::Close => {
                 self.modals.pop();
             }
-            Hit::Copy => {
-                let text = match self.modals.last() {
-                    Some(Modal::Text { copy: Some(c), .. }) => Some(c.clone()),
-                    Some(Modal::Qr { text, .. }) => Some(text.clone()),
+            Hit::Copy(index) => {
+                let found = match self.modals.last() {
+                    Some(Modal::Text { copy, .. }) => {
+                        copy.get(index).map(|c| (c.text.clone(), c.what))
+                    }
+                    Some(Modal::Qr { text, .. }) => Some((text.clone(), "the text")),
                     _ => None,
                 };
-                if let Some(text) = text {
-                    self.copy(&text);
+                if let Some((text, what)) = found {
+                    self.copy(&text, what);
                 }
             }
             Hit::QrToggle => {
@@ -1231,7 +1326,7 @@ impl App {
 
     /// Copies text to the clipboard of the terminal (OSC 52), which works over SSH and
     /// `docker exec` in most terminals.
-    fn copy(&mut self, text: &str) {
+    fn copy(&mut self, text: &str, what: &str) {
         use base64::Engine;
         use std::io::Write;
         let encoded = base64::engine::general_purpose::STANDARD.encode(text);
@@ -1239,7 +1334,7 @@ impl App {
         let _ = write!(out, "\x1b]52;c;{encoded}\x07");
         let _ = out.flush();
         self.notify(
-            "Copied to the clipboard (if your terminal allows OSC 52); otherwise select the text with Shift held down.".into(),
+            format!("Copied {what} to the clipboard (if your terminal allows OSC 52); otherwise select the text with Shift held down."),
             Level::Info,
         );
     }
@@ -1266,6 +1361,13 @@ impl App {
             MenuWhat::Act(act) => self.act(act),
             MenuWhat::Op(op) => self.spawn_op(*op, false),
             MenuWhat::Disabled => {}
+            MenuWhat::Focus(agent) => {
+                self.focus = agent;
+                for tab in [Tab::Forwards, Tab::Devices, Tab::Sites, Tab::Bans] {
+                    self.table(tab).select(Some(0));
+                }
+                self.clamp_selections();
+            }
         }
     }
 
@@ -1318,7 +1420,11 @@ impl App {
             }
             (Role::Server, Tab::Agents) => {
                 add("a", "Invite", Act::Invite);
-                if let Some(agent) = item {
+                add("/", "Filter", Act::Filter);
+                if item.is_some_and(|a| a["invite"] == true) {
+                    add("t", "New token", Act::NewToken);
+                    add("c", "Cancel invitation", Act::CancelInvite);
+                } else if let Some(agent) = item {
                     let name = agent["name"].as_str().unwrap_or_default();
                     let invited = self.invite_left(name).is_some();
                     match agent["status"].as_str() {
@@ -1353,6 +1459,8 @@ impl App {
             }
             (Role::Server, Tab::Forwards) => {
                 add("a", "Add", Act::ForwardAdd);
+                add("/", "Filter", Act::ForwardFilter);
+                add("s", "Sort", Act::ForwardSort);
                 if let Some(forward) = item {
                     if forward["purpose"] != "exit" {
                         add(
@@ -1377,9 +1485,12 @@ impl App {
                 if item.is_some_and(|f| f["mode"] == "translate") {
                     add("b", "Ban address", Act::ForwardBan);
                 }
+                add("/", "Filter", Act::ForwardFilter);
+                add("s", "Sort", Act::ForwardSort);
             }
             (Role::Server, Tab::Devices) => {
                 add("a", "Add", Act::DeviceAdd);
+                add("/", "Filter", Act::Filter);
                 if let Some(device) = item {
                     add("g", "Grant access", Act::DeviceGrant);
                     if device["grants"].as_array().is_some_and(|g| !g.is_empty()) {
@@ -1422,11 +1533,15 @@ impl App {
             }
             (Role::Server, Tab::Sites) => {
                 add("a", "Add", Act::SiteAdd);
+                add("/", "Filter", Act::Filter);
                 if item.is_some() {
                     add("x", "Remove", Act::SiteRemove);
                 }
             }
-            (Role::Server, Tab::Bans) => add("a", "Ban address", Act::BanAdd),
+            (Role::Server, Tab::Bans) => {
+                add("a", "Ban address", Act::BanAdd);
+                add("/", "Filter", Act::Filter);
+            }
             (Role::Server, Tab::Panel) => {
                 if self.overview()["panel"]["enabled"] == true {
                     add(
@@ -1547,6 +1662,16 @@ impl App {
                 &format!("Cancel the open invitation for {name}?"),
                 requests(vec![AdminRequest::CancelInvite { name: name.clone() }]),
                 true,
+            ),
+            Act::NewToken => self.ask(
+                "New token",
+                &format!("Replace the invitation for {name} with a new one, valid for 15 minutes? The old token stops working."),
+                Op::Invite {
+                    name: name.clone(),
+                    ttl_seconds: 15 * 60,
+                    replace: true,
+                },
+                false,
             ),
             Act::AgentRemove => self.ask(
                 "Remove agent",
@@ -1821,7 +1946,7 @@ impl App {
             Act::PanelGrant | Act::PanelWithdraw => {
                 let grant = act == Act::PanelGrant;
                 let items: Vec<MenuItem> = self
-                    .items(Tab::Devices)
+                    .unfiltered(Tab::Devices)
                     .iter()
                     .filter(|d| (d["panel"] == true) != grant)
                     .filter_map(|d| d["name"].as_str())
@@ -1870,6 +1995,66 @@ impl App {
                 Submit::LogFilter,
             ),
             Act::LogLevel => self.logs.level = (self.logs.level + 1) % 4,
+            Act::ForwardFilter => self.open_form(
+                Form::new(
+                    "Filter forwards",
+                    "Apply",
+                    vec![Field::text(
+                        "filter",
+                        "Show",
+                        &self.forward_filter,
+                        "everything, or e.g. homelab 8080 udp",
+                    )
+                    .hint("all words must match; agent:NAME port:N proto:tcp state:pending")],
+                )
+                .intro("A number matches the ID or a listen or target port, also inside a range; other words match part of the agent, address, protocol, mode, ingress, state or allowed clients. Empty shows everything."),
+                Submit::ForwardFilter,
+            ),
+            Act::Filter => {
+                let tab = self.current();
+                let current = self.filters.get(&tab).cloned().unwrap_or_default();
+                self.open_form(
+                    Form::new(
+                        &format!("Filter {}", tab.title().to_lowercase()),
+                        "Apply",
+                        vec![Field::text("filter", "Show", &current, "everything, or words that must all appear")
+                            .hint("matches names, addresses, ports, agents, states; empty shows everything")],
+                    ),
+                    Submit::Filter(tab),
+                );
+            }
+            Act::Focus => {
+                let mut items = vec![MenuItem {
+                    label: "All agents".into(),
+                    hint: if self.focus.is_none() { "shown".into() } else { String::new() },
+                    what: MenuWhat::Focus(None),
+                }];
+                for name in self
+                    .unfiltered(Tab::Agents)
+                    .iter()
+                    .filter(|a| a["invite"] != true)
+                    .filter_map(|a| a["name"].as_str())
+                {
+                    items.push(MenuItem {
+                        label: name.to_string(),
+                        hint: if self.focus.as_deref() == Some(name) {
+                            "shown".into()
+                        } else {
+                            String::new()
+                        },
+                        what: MenuWhat::Focus(Some(name.to_string())),
+                    });
+                }
+                self.menu("Show forwards, devices, sites and bans of", items);
+            }
+            Act::ForwardSort => {
+                self.forward_query.sort = self.forward_query.sort.next();
+                self.table(Tab::Forwards).select(Some(0));
+                self.notify(
+                    format!("Forwards sorted by {}.", self.forward_query.sort.name()),
+                    Level::Info,
+                );
+            }
             Act::HealthRun => self.spawn_health(),
             Act::Export => self.spawn_op(
                 Op::Site {
@@ -2003,7 +2188,7 @@ impl App {
 
     fn ban_form(&mut self, forward: Option<u64>) {
         let forwards: Vec<(String, String)> = self
-            .items(Tab::Forwards)
+            .all_forwards()
             .iter()
             .filter(|f| f["mode"] == "translate")
             .map(|f| (f["id"].to_string(), describe(Tab::Forwards, f)))
@@ -2097,6 +2282,33 @@ impl App {
             self.modals.pop();
             return;
         }
+        if let Submit::Filter(tab) = submit {
+            let (tab, text) = (*tab, form.text("filter"));
+            if text.is_empty() {
+                self.filters.remove(&tab);
+            } else {
+                self.filters.insert(tab, text);
+            }
+            self.modals.pop();
+            self.table(tab).select(Some(0));
+            self.clamp_selections();
+            return;
+        }
+        if let Submit::ForwardFilter = submit {
+            let text = form.text("filter");
+            match crate::query::ForwardQuery::parse(&text) {
+                Ok(query) => {
+                    let sort = self.forward_query.sort;
+                    self.forward_query = crate::query::ForwardQuery { sort, ..query };
+                    self.forward_filter = text;
+                    self.modals.pop();
+                    self.table(Tab::Forwards).select(Some(0));
+                    self.clamp_selections();
+                }
+                Err(e) => form.error = Some(format!("{e:#}")),
+            }
+            return;
+        }
         let submit = submit.clone();
         let form_copy = form.clone();
         match self.build(&submit, &form_copy) {
@@ -2120,9 +2332,15 @@ impl App {
             Submit::Invite => {
                 let name = form.text("name");
                 validate_name(&name)?;
+                // An open invitation of that name is replaced; the old token stops working.
+                let replace = self
+                    .unfiltered(Tab::Agents)
+                    .iter()
+                    .any(|a| a["invite"] == true && a["name"].as_str() == Some(name.as_str()));
                 Op::Invite {
                     name,
                     ttl_seconds: webpanel::seconds(&form.text("ttl"))?,
+                    replace,
                 }
             }
             Submit::Rename(old) => {
@@ -2250,7 +2468,9 @@ impl App {
             Submit::TwoFactorConfirm => Op::Requests(vec![AdminRequest::PanelTwoFactorConfirm {
                 code: form.text("code").replace(' ', ""),
             }]),
-            Submit::LogFilter => unreachable!("applied without an operation"),
+            Submit::LogFilter | Submit::ForwardFilter | Submit::Filter(_) => {
+                unreachable!("applied without an operation")
+            }
             Submit::Import => {
                 let file = form.text("file");
                 let dry_run = form.on("dry_run");
@@ -2310,7 +2530,7 @@ pub fn text_modal(title: &str, text: &str) -> Modal {
         title: title.into(),
         lines: text.lines().map(|l| Line::raw(l.to_string())).collect(),
         scroll: 0,
-        copy: None,
+        copy: Vec::new(),
     }
 }
 
@@ -2322,6 +2542,7 @@ fn global_actions(role: Role) -> Vec<(&'static str, String, Act)> {
     // Reconciling is the server's; an agent applies what the server sends.
     if role == Role::Server {
         actions.push(("R", "Reconcile".into(), Act::Reconcile));
+        actions.push(("F", "Focus on an agent".into(), Act::Focus));
     }
     actions
 }
@@ -2551,13 +2772,40 @@ async fn execute(config: &Config, op: Op) -> anyhow::Result<Done> {
                 warn,
             }
         }
-        Op::Invite { name, ttl_seconds } => {
+        Op::Invite {
+            name,
+            ttl_seconds,
+            replace,
+        } => {
+            if replace {
+                admin(config, AdminRequest::CancelInvite { name: name.clone() }).await?;
+            }
             let data = admin(config, AdminRequest::Invite { name, ttl_seconds }).await?;
-            let join = crate::enrollment::join_command(
+            let (server, agent, token) = (
                 data["server"].as_str().unwrap_or_default(),
                 data["name"].as_str().unwrap_or_default(),
                 data["token"].as_str().unwrap_or_default(),
             );
+            let join = crate::enrollment::join_command(server, agent, token);
+            let copy = vec![
+                Copyable {
+                    label: "Setup (1)",
+                    what: "the setup commands (git clone, cd RIFT, deploy/join)",
+                    text: format!("{}\n{join}\n", output::CHECKOUT),
+                },
+                Copyable {
+                    label: "Join only (2)",
+                    what: "the deploy/join line",
+                    text: format!("{join}\n"),
+                },
+                Copyable {
+                    label: ".env lines (3)",
+                    what: "the three .env lines",
+                    text: format!(
+                        "RIFT_SERVER={server}\nRIFT_AGENT_NAME={agent}\nRIFT_ENROLLMENT_TOKEN={token}\n"
+                    ),
+                },
+            ];
             let mut lines: Vec<Line<'static>> = Vec::new();
             for line in output::invitation(&data).lines() {
                 let style = if line.starts_with("  ") || line.starts_with("RIFT_") {
@@ -2574,7 +2822,7 @@ async fn execute(config: &Config, op: Op) -> anyhow::Result<Done> {
                 ),
                 lines,
                 scroll: 0,
-                copy: Some(join),
+                copy,
             })
         }
         Op::Config { name, agent } => {
