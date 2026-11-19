@@ -247,7 +247,7 @@ fn agents(data: &Value) -> String {
                 a["names"].as_bool(),
                 a["name"].as_str().and_then(crate::vpn::dns_label),
             ) {
-                (Some(true), Some(label)) => format!("{label}.{}", crate::vpn::NAMES_SUFFIX),
+                (Some(true), Some(label)) => format!("{label}.{}", crate::vpn::names_suffix()),
                 _ => "-".into(),
             };
             let version = a["rift_version"]

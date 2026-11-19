@@ -555,7 +555,7 @@ function renameDialog(agent) {
   const name = el("input", { required: true, pattern: "[A-Za-z0-9_\\-]{1,63}", value: agent.name });
   openModal(`Rename ${agent.name}`, form([
     row("New name", name),
-    el("p", { class: "hint" }, `Its DNS name follows: ${String(agent.name).toLowerCase()}.internal becomes NEW.internal. Devices need nothing new.`),
+    el("p", { class: "hint" }, `Its DNS name follows: ${agent.dns_name || "NAME"} becomes NEW.${data.names_suffix || "internal"}. Devices need nothing new.`),
   ], "Rename", async () => {
     await act({ action: "agent_rename", name: agent.id, new_name: name.value.trim() });
     closeModal();
@@ -1608,7 +1608,7 @@ function grantsDialog(name, notes) {
   const namesBox = el("input", { type: "checkbox", checked: !peer.names_off });
   namesBox.addEventListener("change", () => namesChange({ action: "vpn_peer_names", name, on: namesBox.checked }));
   content.push(el("hr", { class: "sep" }), el("h4", {}, "Names"),
-    check("Use RIFT's names (NAME.internal) for agents that have them on", namesBox),
+    check(`Use RIFT's names (NAME.${data.names_suffix || "internal"}) for agents that have them on`, namesBox),
     el("p", { class: "hint" }, (peer.names || []).length
       ? `Resolves: ${peer.names.join(", ")}. While the tunnel is on, every lookup of the device goes through this server.`
       : "No agent this device reaches has names on. Turn them on per agent in the Agents card."));

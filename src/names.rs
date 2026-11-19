@@ -192,6 +192,11 @@ enum Reply {
 }
 
 fn decide(query: &[u8], snap: &StateSnapshot, peer: &VpnPeer) -> Reply {
+    decide_under(query, snap, peer, &vpn::names_suffix())
+}
+
+/// `decide` for the names under `names` (`internal`, `home.arpa`, a domain of your own).
+fn decide_under(query: &[u8], snap: &StateSnapshot, peer: &VpnPeer, names: &str) -> Reply {
     if query.len() < 12 || query[2] & 0x80 != 0 {
         return Reply::Local(respond(query, None, RCODE_FORMERR, None));
     }
@@ -201,9 +206,9 @@ fn decide(query: &[u8], snap: &StateSnapshot, peer: &VpnPeer) -> Reply {
     let Some(question) = read_question(query) else {
         return Reply::Local(respond(query, None, RCODE_FORMERR, None));
     };
-    let suffix = format!(".{}", vpn::NAMES_SUFFIX);
-    let Some(label) = question.name.strip_suffix(&suffix) else {
-        if question.name == vpn::NAMES_SUFFIX {
+    let private = vpn::private_suffix(names);
+    let Some(label) = question.name.strip_suffix(&format!(".{names}")) else {
+        if question.name == names && private {
             return Reply::Local(respond(query, Some(question.end), 0, None));
         }
         return Reply::Forward;
@@ -211,6 +216,10 @@ fn decide(query: &[u8], snap: &StateSnapshot, peer: &VpnPeer) -> Reply {
     let agent: Option<&AgentRecord> = vpn::named_agents(snap, peer)
         .into_iter()
         .find(|a| vpn::dns_label(&a.name).as_deref() == Some(label));
+    // Under a domain of your own, other names are public ones: pass them on.
+    if agent.is_none() && !private {
+        return Reply::Forward;
+    }
     match agent {
         // The name exists; only an IPv4 address: grants reach agents over IPv4 only, and an
         // AAAA answer would send apps to an address the device does not route.
@@ -501,7 +510,7 @@ pub async fn serve(config: Config, state: Arc<StateStore>) {
     };
     tracing::info!(
         "names (.{}) for VPN devices on {address}",
-        vpn::NAMES_SUFFIX
+        vpn::names_suffix()
     );
     let udp = Arc::new(udp);
     let tcp_ctx = ctx.clone();
@@ -671,6 +680,55 @@ mod tests {
         // The question is echoed and the record points back to it.
         assert_eq!(&answer[12..q.len()], &q[12..]);
         assert_eq!(&answer[q.len()..q.len() + 2], &[0xc0, 0x0c]);
+    }
+
+    #[test]
+    fn other_suffixes_answer_the_agents_and_pass_on_public_names() {
+        let snap = snap();
+        let phone = &snap.vpn_peers[0];
+        // home.arpa is private like internal: unknown names do not exist.
+        let a = local(decide_under(
+            &query("node1.home.arpa", TYPE_A),
+            &snap,
+            phone,
+            "home.arpa",
+        ));
+        assert_eq!(&a[a.len() - 4..], &[10, 13, 0, 2]);
+        let none = local(decide_under(
+            &query("nothing.home.arpa", TYPE_A),
+            &snap,
+            phone,
+            "home.arpa",
+        ));
+        assert_eq!(rcode(&none), RCODE_NXDOMAIN);
+        // A domain of your own: the agent is answered here, every other name goes on, so the
+        // public www.example.net keeps working while the tunnel is on.
+        let own = "home.example.net";
+        let a = local(decide_under(
+            &query("node1.home.example.net", TYPE_A),
+            &snap,
+            phone,
+            own,
+        ));
+        assert_eq!(&a[a.len() - 4..], &[10, 13, 0, 2]);
+        for name in [
+            "nothing.home.example.net",
+            "home.example.net",
+            "www.example.net",
+        ] {
+            assert!(
+                matches!(
+                    decide_under(&query(name, TYPE_A), &snap, phone, own),
+                    Reply::Forward
+                ),
+                "{name}"
+            );
+        }
+        // The old suffix is an ordinary name then.
+        assert!(matches!(
+            decide_under(&query("node1.internal", TYPE_A), &snap, phone, own),
+            Reply::Forward
+        ));
     }
 
     #[test]

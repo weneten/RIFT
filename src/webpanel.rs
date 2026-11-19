@@ -586,6 +586,7 @@ impl<B: Backend> Panel<B> {
         overview["sites"] = crate::sites::overview(&self.sites_dir, &self.queue_dir, &forwards);
         overview["public_ips"] = json!(self.config.public_ips);
         overview["endpoint"] = self.config.public_endpoint.clone().into();
+        overview["names_suffix"] = crate::vpn::names_suffix().into();
         overview["two_factor"] = json!({
             "enabled": self.two_factor.enabled(),
             "required": self.config.webpanel_2fa == PanelTwoFactor::Required,
@@ -1146,7 +1147,7 @@ pub(crate) fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> 
                 "tunnel_ipv6": a["tunnel_ipv6"],
                 "names": a["names"].as_bool().unwrap_or(false),
                 "rift_version": a["rift_version"],
-                "dns_name": a["name"].as_str().and_then(crate::vpn::dns_label).map(|l| format!("{l}.{}", crate::vpn::NAMES_SUFFIX)),
+                "dns_name": a["name"].as_str().and_then(crate::vpn::dns_label).map(|l| format!("{l}.{}", crate::vpn::names_suffix())),
                 "online": h.map(|h| h["online"].clone()).unwrap_or(Value::Bool(false)),
                 "configuration_ready": h.map(|h| h["configuration_ready"].clone()).unwrap_or(Value::Bool(false)),
                 "last_handshake": h.map(|h| h["last_handshake"].clone()).unwrap_or(Value::Null),

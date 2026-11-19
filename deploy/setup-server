@@ -55,7 +55,7 @@ usage() {
 keys="RIFT_VERSION RIFT_PUBLIC_IPS RIFT_ALLOW_PRIVATE_LISTENERS RIFT_PUBLIC_ENDPOINT
 RIFT_WG_PORT RIFT_ENROLLMENT_BIND RIFT_ENROLLMENT
 RIFT_IPV4_POOL RIFT_SERVER_IPV4 RIFT_IPV6_POOL RIFT_SERVER_IPV6
-RIFT_VPN_POOL RIFT_VPN_POOL6 RIFT_VPN_DNS RIFT_NAMES_PORT
+RIFT_VPN_POOL RIFT_VPN_POOL6 RIFT_VPN_DNS RIFT_NAMES_PORT RIFT_NAMES_SUFFIX
 RIFT_WEBPANEL RIFT_WEBPANEL_PASSWORD RIFT_WEBPANEL_2FA RIFT_WEBPANEL_ACCESS RIFT_WEBPANEL_CONTROL
 RIFT_WEBPANEL_PORT RIFT_WEBPANEL_ALLOW RIFT_WEBPANEL_PROXIES RIFT_WEBPANEL_INSECURE RIFT_TUI
 RIFT_NPM_EMAIL RIFT_NPM_PASSWORD RIFT_LETSENCRYPT_EMAIL RIFT_REQUEST_CERTIFICATE RIFT_PROXY_SUBNET"
@@ -74,6 +74,7 @@ builtin() {
     RIFT_VPN_POOL6) echo fd88:5249:4655::/64 ;;
     RIFT_VPN_DNS) echo 9.9.9.9,2620:fe::fe ;;
     RIFT_NAMES_PORT) echo 53053 ;;
+    RIFT_NAMES_SUFFIX) echo internal ;;
     RIFT_WEBPANEL) echo false ;;
     RIFT_WEBPANEL_ACCESS) echo private ;;
     RIFT_WEBPANEL_PORT) echo 8090 ;;
@@ -158,6 +159,19 @@ check_bind() {
   [ -z "$_u" ] || { why="port ${1##*:} is in use by $_u; choose another, for example ${1%:*}:$(free_port "${1##*:}")"; return 1; }
 }
 check_enrollment() { one_of "$1" auto always off; }
+# The suffix of the agents' names: a domain name in lower case, none that devices resolve
+# another way (the rules of vpn::validate_suffix).
+check_suffix() {
+  why="a domain name in lower case without a leading or final dot, e.g. internal, home.arpa or home.example.net"
+  printf '%s\n' "$1" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$' || return 1
+  case $1 in
+    home.arpa | *.home.arpa) return 0 ;;
+    local | *.local | localhost | *.localhost | onion | *.onion | alt | *.alt | invalid | *.invalid | example | *.example | arpa | *.arpa)
+      why=".local goes to mDNS, .localhost to this machine, .onion to Tor, .alt outside the DNS; .invalid, .example and other .arpa names are reserved. Use internal, home.arpa or a domain of your own"
+      return 1
+      ;;
+  esac
+}
 # The name server: TCP and UDP from 1024 (the container has no capability for lower ports),
 # apart from RIFT's other ports, and free on this host.
 check_names_port() {
@@ -476,8 +490,11 @@ if ! has_preset RIFT_NAMES_PORT; then
     names_busy=y
   fi
 fi
-group "Change the port of RIFT's name server (NAME.internal for VPN devices, $names_port)?" \
-  "$( { [ -n "$names_busy" ] || changed RIFT_NAMES_PORT; } && echo y)"
+group "Change RIFT's names for VPN devices (NAME.$(current RIFT_NAMES_SUFFIX), name server port $names_port)?" \
+  "$( { [ -n "$names_busy" ] || changed RIFT_NAMES_PORT RIFT_NAMES_SUFFIX; } && echo y)"
+note "Suffix: internal (default; Safari searches for such names, type http:// or a final /),"
+note "  home.arpa (also private; on the Public Suffix List browsers use), or a domain of your own (e.g. home.example.net)."
+setting RIFT_NAMES_SUFFIX "Suffix of the agents' names" check_suffix
 setting RIFT_NAMES_PORT "Name server port (TCP and UDP on the tunnel address; devices ask port 53)" check_names_port "$names_port"
 end_group
 
@@ -820,7 +837,7 @@ show RIFT_WG_PORT RIFT_ENROLLMENT_BIND RIFT_ENROLLMENT
 echo "  Tunnel addresses"
 show RIFT_IPV4_POOL RIFT_SERVER_IPV4 RIFT_IPV6_POOL RIFT_SERVER_IPV6
 echo "  VPN devices"
-show RIFT_VPN_POOL RIFT_VPN_POOL6 RIFT_VPN_DNS RIFT_NAMES_PORT
+show RIFT_VPN_POOL RIFT_VPN_POOL6 RIFT_VPN_DNS RIFT_NAMES_SUFFIX RIFT_NAMES_PORT
 echo "  Web panel"
 show RIFT_WEBPANEL
 if [ "$panel" = true ]; then

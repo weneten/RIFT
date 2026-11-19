@@ -1699,7 +1699,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                     let agent = snap.agents.iter().find(|a| a.id == g.agent_id).map(|a| a.name.clone());
                     serde_json::json!({"agent":agent,"access":g.access,"refused":grant_refusal(snap, g)})
                 }).collect();
-                let names: Vec<String> = crate::vpn::named_agents(snap, p).iter().filter_map(|a| crate::vpn::dns_label(&a.name)).map(|l| format!("{l}.{}", crate::vpn::NAMES_SUFFIX)).collect();
+                let names: Vec<String> = crate::vpn::named_agents(snap, p).iter().filter_map(|a| crate::vpn::dns_label(&a.name)).map(|l| format!("{l}.{}", crate::vpn::names_suffix())).collect();
                 serde_json::json!({"name":p.name,"ipv4":p.ipv4,"ipv6":p.ipv6,"enabled":p.enabled,"panel":p.panel,"public_key":p.public_key,"last_handshake":handshake,"grants":grants,"exits":exits_json(snap, p),"names":names,"names_off":p.names_off})
             }).collect();
             serde_json::Value::Array(rows)
@@ -1718,7 +1718,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                 Ok(())
             })?;
             reconcile(s).await?;
-            serde_json::json!({"name":name,"on":on,"dns_name":format!("{label}.{}", crate::vpn::NAMES_SUFFIX)})
+            serde_json::json!({"name":name,"on":on,"dns_name":format!("{label}.{}", crate::vpn::names_suffix())})
         }
         AdminRequest::VpnPeerNames { name, on } => {
             find_peer(&name)?;

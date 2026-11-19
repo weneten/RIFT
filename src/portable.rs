@@ -758,7 +758,7 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
         plan.steps.push(Step {
             op: Op::AgentNames(agent_id),
             what,
-            detail: Some(format!("{label}.{}", vpn::NAMES_SUFFIX)),
+            detail: Some(format!("{label}.{}", vpn::names_suffix())),
         });
     }
     plan.items.extend(skips.items());

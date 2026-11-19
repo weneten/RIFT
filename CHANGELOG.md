@@ -21,6 +21,10 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 - After adding a VPN device, the terminal UI says what to do next in its own keys (g grants access, c shows the configuration) instead of the CLI's commands, and no longer asks to import again the configuration of a device that was just created. Enter submits a dialog from any field; Space ticks a box (Enter used to tick it, so Space then Enter undid the choice).
 - The host command `rift` starts the container command with a terminal (`docker exec -it`, passing `TERM` and `COLORTERM`) when it is called without a command, or with `tui`, on a terminal.
 
+### Names for VPN devices
+
+- The suffix of the agents' names is configurable: `RIFT_NAMES_SUFFIX` (default `internal`). `home.arpa` is reserved for home networks like `internal` and, unlike it, on the Public Suffix List, which browsers use to tell addresses from searches (Safari searches for `core.internal`). A domain of your own works too (`home.example.net`): RIFT answers only the agents' names under it and passes every other name on, so the public names of that domain keep working while the tunnel is on; under `internal`, `home.arpa` and `test` it still answers unknown names as nonexistent itself. Suffixes that devices resolve another way (`.local`, `.localhost`, `.onion`, `.alt`) or that are reserved otherwise are refused. `deploy/setup-server` asks for it. Devices import nothing new when it changes.
+
 ### Commands
 
 - `rift list forwards` takes filter words and options: `rift list forwards nas 8080`, `--agent NAME` (repeatable), `--port N` (inside ranges too), `--protocol tcp|udp`, `--sort id|agent|port|state`; `agent:NAME`, `port:N`, `proto:tcp` and `state:WORD` as words. `rift list agents`, `list devices`, `list bans` and `list sites` take filter words, and all but agents `--agent NAME`; for devices that means a grant on the agent or an exit through it. `--json` gives the filtered list.

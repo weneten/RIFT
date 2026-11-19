@@ -1068,7 +1068,7 @@ async fn names_check(config: &Config, status: &serde_json::Value, checks: &mut r
     .is_ok_and(|c| c.is_ok());
     checks.push(
         if up { OK } else { FAIL },
-        "Names (.internal)".into(),
+        format!("Names (.{})", rift::vpn::names_suffix()),
         if up {
             format!(
                 "the name server answers on {address} for {}; their DNS goes through it",

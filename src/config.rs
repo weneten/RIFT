@@ -217,6 +217,9 @@ pub struct Config {
     /// Server only. The port RIFT's name server (`NAME.internal` for VPN devices) listens on,
     /// on the server's tunnel address; devices reach it as port 53 through a redirect.
     pub names_port: u16,
+    /// Server only. The suffix of the agents' names (`RIFT_NAMES_SUFFIX`): `NAME.internal` by
+    /// default; `home.arpa` or a domain of your own work too (see `vpn::validate_suffix`).
+    pub names_suffix: String,
     /// Whether `rift` without a command opens the terminal UI (`RIFT_TUI`). On by default:
     /// it runs only through `docker exec` on the host, with the same rights as the CLI.
     pub tui: bool,
@@ -276,6 +279,7 @@ impl Default for Config {
             webpanel_insecure: false,
             webpanel_password: None,
             names_port: crate::names::DNS_PORT,
+            names_suffix: crate::vpn::NAMES_SUFFIX.into(),
             tui: true,
             agent_name: None,
             agent_allow_ports: None,
@@ -355,6 +359,12 @@ impl Config {
         env_parse!("RIFT_WEBPANEL_INSECURE", webpanel_insecure);
         env_parse!("RIFT_TUI", tui);
         env_parse!("RIFT_NAMES_PORT", names_port);
+        if let Ok(v) = std::env::var("RIFT_NAMES_SUFFIX") {
+            let v = v.trim().trim_matches('.').to_ascii_lowercase();
+            if !v.is_empty() {
+                config.names_suffix = v;
+            }
+        }
         if let Ok(v) = std::env::var("RIFT_WEBPANEL_PROXIES") {
             config.webpanel_proxies =
                 parse_allow_list(&v).context("invalid RIFT_WEBPANEL_PROXIES")?;
@@ -396,6 +406,7 @@ impl Config {
             }
         }
         config.validate()?;
+        crate::vpn::set_names_suffix(&config.names_suffix);
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
@@ -518,6 +529,7 @@ impl Config {
         for net in &self.agent_allow_subnets {
             check_allowed_subnet(net)?;
         }
+        crate::vpn::validate_suffix(&self.names_suffix)?;
         // The name server needs no capability: a port from 1024, apart from RIFT's other ports.
         ensure!(
             self.names_port >= 1024
