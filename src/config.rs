@@ -214,6 +214,9 @@ pub struct Config {
     /// From the environment only. Without it a generated password lives in the state directory.
     #[serde(skip)]
     pub webpanel_password: Option<String>,
+    /// Server only. The port RIFT's name server (`NAME.internal` for VPN devices) listens on,
+    /// on the server's tunnel address; devices reach it as port 53 through a redirect.
+    pub names_port: u16,
     /// Whether `rift` without a command opens the terminal UI (`RIFT_TUI`). On by default:
     /// it runs only through `docker exec` on the host, with the same rights as the CLI.
     pub tui: bool,
@@ -272,6 +275,7 @@ impl Default for Config {
             webpanel_proxies: vec![],
             webpanel_insecure: false,
             webpanel_password: None,
+            names_port: crate::names::DNS_PORT,
             tui: true,
             agent_name: None,
             agent_allow_ports: None,
@@ -350,6 +354,7 @@ impl Config {
         env_parse!("RIFT_WEBPANEL_2FA", webpanel_2fa);
         env_parse!("RIFT_WEBPANEL_INSECURE", webpanel_insecure);
         env_parse!("RIFT_TUI", tui);
+        env_parse!("RIFT_NAMES_PORT", names_port);
         if let Ok(v) = std::env::var("RIFT_WEBPANEL_PROXIES") {
             config.webpanel_proxies =
                 parse_allow_list(&v).context("invalid RIFT_WEBPANEL_PROXIES")?;
@@ -513,6 +518,16 @@ impl Config {
         for net in &self.agent_allow_subnets {
             check_allowed_subnet(net)?;
         }
+        // The name server needs no capability: a port from 1024, apart from RIFT's other ports.
+        ensure!(
+            self.names_port >= 1024
+                && self.names_port != self.control_port
+                && self.names_port != self.enrollment_bind.port()
+                && self.names_port != self.wg_port
+                && !(self.exit_port_min..=self.exit_port_max).contains(&self.names_port)
+                && !(self.webpanel && self.names_port == self.webpanel_port),
+            "RIFT_NAMES_PORT must be 1024 or higher and differ from the control, enrollment, WireGuard, exit and panel ports"
+        );
         if self.webpanel {
             ensure!(
                 self.webpanel_port != 0
@@ -655,6 +670,23 @@ mod tests {
             ..Default::default()
         };
         assert!(inside.validate().is_err());
+    }
+    #[test]
+    fn the_name_server_port_is_free_of_rifts_other_ports() {
+        assert_eq!(Config::default().names_port, 53053);
+        let config: Config = toml::from_str("names_port = 5353\n").unwrap();
+        assert_eq!(config.names_port, 5353);
+        config.validate().unwrap();
+        let with = |names_port, webpanel| Config {
+            names_port,
+            webpanel,
+            ..Default::default()
+        };
+        for port in [53, 1023, 8444, 8443, 51820, 51850] {
+            assert!(with(port, false).validate().is_err(), "{port}");
+        }
+        assert!(with(8090, false).validate().is_ok());
+        assert!(with(8090, true).validate().is_err(), "the panel's port");
     }
     #[test]
     fn host_firewall_defaults_to_auto_and_parses_off() {

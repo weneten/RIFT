@@ -28,7 +28,8 @@ use tokio::{
     time::timeout,
 };
 
-/// The port the server answers on; devices reach it as port 53 through a redirect.
+/// The default port the server answers on (`RIFT_NAMES_PORT`); devices reach it as port 53
+/// through a redirect.
 pub const DNS_PORT: u16 = 53053;
 /// Seconds a device may cache an answer; short, so a moved agent is found again quickly.
 const TTL: u32 = 30;
@@ -50,13 +51,14 @@ pub fn server_rules(config: &Config, snap: &StateSnapshot) -> vpn::Rules {
     let mut rules = vpn::Rules::default();
     let interface = &config.interface;
     let server = config.server_ipv4;
+    let port = config.names_port;
     for peer in snap.vpn_peers.iter().filter(|p| vpn::uses_names(snap, p)) {
         let source = peer.ipv4;
         rules.prerouting.push_str(&format!(
-            "add rule inet rift prerouting_nat iifname \"{interface}\" ip saddr {source} ip daddr {server} meta l4proto {{ tcp, udp }} th dport 53 redirect to :{DNS_PORT}\n"
+            "add rule inet rift prerouting_nat iifname \"{interface}\" ip saddr {source} ip daddr {server} meta l4proto {{ tcp, udp }} th dport 53 redirect to :{port}\n"
         ));
         rules.input.push_str(&format!(
-            "add rule inet rift input iifname \"{interface}\" ip saddr {source} ip daddr {server} meta l4proto {{ tcp, udp }} th dport {DNS_PORT} accept\n"
+            "add rule inet rift input iifname \"{interface}\" ip saddr {source} ip daddr {server} meta l4proto {{ tcp, udp }} th dport {port} accept\n"
         ));
     }
     rules
@@ -464,7 +466,7 @@ struct Names {
 /// Serves the names on the server's tunnel address until the process ends. Binding waits for
 /// the tunnel address, which appears once the WireGuard interface is up.
 pub async fn serve(config: Config, state: Arc<StateStore>) {
-    let address = SocketAddr::new(config.server_ipv4.into(), DNS_PORT);
+    let address = SocketAddr::new(config.server_ipv4.into(), config.names_port);
     let ctx = Arc::new(Names {
         config,
         snapshots: Snapshots {

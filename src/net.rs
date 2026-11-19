@@ -916,6 +916,7 @@ impl Kernel {
                         public: self.config.webpanel_access == crate::config::PanelAccess::Public,
                     }),
                 panel_proxies: &self.config.webpanel_proxies,
+                names_port: self.config.names_port,
             },
         )?;
         self.apply_host_plan(&plan).await

@@ -55,7 +55,7 @@ usage() {
 keys="RIFT_VERSION RIFT_PUBLIC_IPS RIFT_ALLOW_PRIVATE_LISTENERS RIFT_PUBLIC_ENDPOINT
 RIFT_WG_PORT RIFT_ENROLLMENT_BIND RIFT_ENROLLMENT
 RIFT_IPV4_POOL RIFT_SERVER_IPV4 RIFT_IPV6_POOL RIFT_SERVER_IPV6
-RIFT_VPN_POOL RIFT_VPN_POOL6 RIFT_VPN_DNS
+RIFT_VPN_POOL RIFT_VPN_POOL6 RIFT_VPN_DNS RIFT_NAMES_PORT
 RIFT_WEBPANEL RIFT_WEBPANEL_PASSWORD RIFT_WEBPANEL_2FA RIFT_WEBPANEL_ACCESS RIFT_WEBPANEL_CONTROL
 RIFT_WEBPANEL_PORT RIFT_WEBPANEL_ALLOW RIFT_WEBPANEL_PROXIES RIFT_WEBPANEL_INSECURE RIFT_TUI
 RIFT_NPM_EMAIL RIFT_NPM_PASSWORD RIFT_LETSENCRYPT_EMAIL RIFT_REQUEST_CERTIFICATE RIFT_PROXY_SUBNET"
@@ -73,6 +73,7 @@ builtin() {
     RIFT_VPN_POOL) echo 10.14.0.0/24 ;;
     RIFT_VPN_POOL6) echo fd88:5249:4655::/64 ;;
     RIFT_VPN_DNS) echo 9.9.9.9,2620:fe::fe ;;
+    RIFT_NAMES_PORT) echo 53053 ;;
     RIFT_WEBPANEL) echo false ;;
     RIFT_WEBPANEL_ACCESS) echo private ;;
     RIFT_WEBPANEL_PORT) echo 8090 ;;
@@ -108,12 +109,14 @@ check_public_ip() {
 }
 check_public_ips() { is_list check_public_ip "$1"; }
 check_endpoint() { is_host "$1"; }
-# port_user PORT: the programs other than RIFT that listen on this TCP port, comma-separated;
-# empty when the port is free, used by RIFT itself (running again on a set-up server) or `ss`
-# is missing.
+# port_user PORT [udp]: the programs other than RIFT that listen on this TCP (or UDP) port,
+# comma-separated; empty when the port is free, used by RIFT itself (running again on a set-up
+# server) or `ss` is missing.
 port_user() {
   command -v ss > /dev/null 2>&1 || return 0
-  ss -ltnp "sport = :$1" 2> /dev/null | tail -n +2 | grep -v '"rift"' \
+  _flags=-ltnp
+  [ "${2-}" != udp ] || _flags=-lunp
+  ss "$_flags" "sport = :$1" 2> /dev/null | tail -n +2 | grep -v '"rift"' \
     | sed -n 's/.*users:(("\([^"]*\)".*/\1/p; t; s/.*/an unknown program/p' | sort -u | paste -sd, - || true
 }
 # free_port PORT: the next TCP port above PORT that nothing listens on and RIFT does not use.
@@ -155,6 +158,17 @@ check_bind() {
   [ -z "$_u" ] || { why="port ${1##*:} is in use by $_u; choose another, for example ${1%:*}:$(free_port "${1##*:}")"; return 1; }
 }
 check_enrollment() { one_of "$1" auto always off; }
+# The name server: TCP and UDP from 1024 (the container has no capability for lower ports),
+# apart from RIFT's other ports, and free on this host.
+check_names_port() {
+  is_port "$1" || return 1
+  _e=$(get RIFT_ENROLLMENT_BIND)
+  why="1024 or higher, apart from the control port $control_port, the enrollment port ${_e##*:}, the WireGuard port $(get RIFT_WG_PORT) and the exit ports $exit_ports_min-$exit_ports_max"
+  [ "$1" -ge 1024 ] && [ "$1" -ne "$control_port" ] && [ "$1" -ne "${_e##*:}" ] && [ "$1" -ne "$(get RIFT_WG_PORT)" ] || return 1
+  [ "$1" -lt "$exit_ports_min" ] || [ "$1" -gt "$exit_ports_max" ] || return 1
+  _u=$( { port_user "$1"; port_user "$1" udp; } | sed '/^$/d' | paste -sd, -)
+  [ -z "$_u" ] || { why="port $1 is in use by $_u; choose another, for example $(free_port "$1")"; return 1; }
+}
 check_pool4() {
   is_net4 "$1" || return 1
   why="the pool must be a private network (10/8, 172.16/12, 192.168/16) from /8 to /29"
@@ -450,6 +464,22 @@ setting RIFT_VPN_POOL "IPv4 pool of VPN devices (private, not overlapping the tu
 setting RIFT_VPN_POOL6 "IPv6 pool of VPN devices (ULA, not overlapping the IPv6 tunnel pool)" check_vpn_pool6
 end_group
 setting RIFT_VPN_DNS "DNS servers for devices with an internet exit (comma-separated, one IPv4 at least)" check_dns
+# Another program on the name server's port: offer a free one (only without --set for it).
+names_port=$(current RIFT_NAMES_PORT)
+names_busy=
+if ! has_preset RIFT_NAMES_PORT; then
+  _u=$( { port_user "$names_port"; port_user "$names_port" udp; } | sed '/^$/d' | paste -sd, -)
+  if [ -n "$_u" ]; then
+    _free=$(free_port "$names_port")
+    port_taken "$names_port" "RIFT's name server, TCP and UDP" "$_u" "$_free"
+    names_port=$_free
+    names_busy=y
+  fi
+fi
+group "Change the port of RIFT's name server (NAME.internal for VPN devices, $names_port)?" \
+  "$( { [ -n "$names_busy" ] || changed RIFT_NAMES_PORT; } && echo y)"
+setting RIFT_NAMES_PORT "Name server port (TCP and UDP on the tunnel address; devices ask port 53)" check_names_port "$names_port"
+end_group
 
 # ---------- web panel ----------
 heading "Web panel"
@@ -790,7 +820,7 @@ show RIFT_WG_PORT RIFT_ENROLLMENT_BIND RIFT_ENROLLMENT
 echo "  Tunnel addresses"
 show RIFT_IPV4_POOL RIFT_SERVER_IPV4 RIFT_IPV6_POOL RIFT_SERVER_IPV6
 echo "  VPN devices"
-show RIFT_VPN_POOL RIFT_VPN_POOL6 RIFT_VPN_DNS
+show RIFT_VPN_POOL RIFT_VPN_POOL6 RIFT_VPN_DNS RIFT_NAMES_PORT
 echo "  Web panel"
 show RIFT_WEBPANEL
 if [ "$panel" = true ]; then

@@ -81,6 +81,8 @@ pub struct ServerSpec<'a> {
     /// TLS proxies in front of the panel (RIFT_WEBPANEL_PROXIES), for example a proxy in a
     /// Docker network: they reach the panel on the server's tunnel address.
     pub panel_proxies: &'a [ipnet::IpNet],
+    /// The name server's port (`RIFT_NAMES_PORT`), opened on the tunnel while `vpn` is set.
+    pub names_port: u16,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -270,9 +272,7 @@ pub fn plan_server(obs: &Observation, spec: &ServerSpec<'_>) -> Result<Plan> {
             for protocol in ["udp", "tcp"] {
                 rules.push(format!(
                     "iifname \"{}\" ip daddr {} {protocol} dport {} accept comment \"rift:names\"",
-                    spec.interface,
-                    spec.server_v4,
-                    crate::names::DNS_PORT
+                    spec.interface, spec.server_v4, spec.names_port
                 ));
             }
         }
@@ -750,6 +750,7 @@ mod tests {
             vpn: false,
             panel: None,
             panel_proxies: &[],
+            names_port: 53053,
             exit: false,
         }
     }

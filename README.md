@@ -1035,6 +1035,7 @@ The web panel runs `add site`, `remove site`, `export`, `import` and `backup` th
 | `RIFT_VPN_POOL` | `10.14.0.0/24` | Server. IPv4 addresses for [private VPN devices](#private-vpn-access); must not overlap the IPv4 tunnel pool or a granted LAN; restart required. The first host is reserved for the exit interface of agents. |
 | `RIFT_VPN_POOL6` | `fd88:5249:4655::/64` | Server. IPv6 addresses of VPN devices; a ULA network that must not overlap `RIFT_IPV6_POOL`; restart required. The first host is reserved. |
 | `RIFT_VPN_DNS` | `9.9.9.9,2620:fe::fe` | Server. DNS servers written into configurations that have an [internet exit](#use-rift-as-a-vpn-exit), unless the device has its own (`rift vpn dns`); needs one IPv4 address, IPv6 ones are used only where the exit carries IPv6. |
+| `RIFT_NAMES_PORT` | `53053` | Server. TCP and UDP port of RIFT's name server (`NAME.internal` for VPN devices) on the server's tunnel address; devices ask port 53 and RIFT redirects it there, and the host firewall integration opens it on the tunnel. Change it only if another program uses it on every address; `deploy/setup-server` checks it. 1024 or higher; restart required. |
 | `RIFT_WEBPANEL` | `false` | Server. Serves the [web panel](#web-panel). Restart required. |
 | `RIFT_WEBPANEL_ACCESS` | `private` | Server. `private`: loopback and tunnel address only; `public`: every address. |
 | `RIFT_WEBPANEL_PORT` | `8090` | Server. TCP port of the panel. |

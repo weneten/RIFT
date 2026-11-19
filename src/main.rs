@@ -1059,7 +1059,7 @@ async fn names_check(config: &Config, status: &serde_json::Value, checks: &mut r
     if users.is_empty() {
         return;
     }
-    let address = std::net::SocketAddr::new(config.server_ipv4.into(), rift::names::DNS_PORT);
+    let address = std::net::SocketAddr::new(config.server_ipv4.into(), config.names_port);
     let up = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         tokio::net::TcpStream::connect(address),
