@@ -991,6 +991,13 @@ async fn server_checks(config: &Config, checks: &mut rift::net::Checks) {
             refused["reason"].as_str().unwrap_or("refused").to_string(),
         );
     }
+    for refused in status["refused_grants"].as_array().into_iter().flatten() {
+        checks.push(
+            WARN,
+            format!("Access of {}", refused["device"].as_str().unwrap_or("?")),
+            rift::output::refused_grant(refused),
+        );
+    }
     for stuck in status["inapplicable_forwards"]
         .as_array()
         .into_iter()

@@ -424,6 +424,7 @@ function attention() {
     if (a.last_error) push("warn", `Agent ${a.name}: ${a.last_error}`);
   }
   for (const f of data.forwards || []) if (f.refused && f.enabled) push("warn", `Forward ${f.id} refused by ${f.agent}: ${f.refused}`);
+  for (const g of data.refused_grants || []) push("warn", `Access of ${g.device} to ${g.agent} (${access(g.access)}) refused by the agent: ${g.reason}`);
   for (const i of data.invites || []) push("info", `Invitation for ${i.name} open, ${duration(i.expires_at - now)} left`);
   if ((data.sites || {}).available === false && (data.sites || {}).queue === false) push("muted", "Sites: the host helper is not installed (sudo sh deploy/install-cli)");
   return items;
@@ -899,7 +900,11 @@ function drawDevices() {
     { title: "Address", cell: (d) => el("code", {}, d.ipv4) },
     { title: "State", cls: "hide-s", cell: (d) => (d.enabled ? "enabled" : "disabled") },
     { title: "Handshake", cls: "hide-s", cell: (d) => ago(d.last_handshake, now) },
-    { title: "Access", cls: "hide-m wrap", cell: (d) => { const g = (d.grants || []).map((x) => `${x.agent}: ${access(x.access)}`); if (d.panel) g.unshift("panel"); return g.join("; ") || el("span", { class: "muted" }, "none"); } },
+    { title: "Access", cls: "hide-m wrap", cell: (d) => {
+      const g = (d.grants || []).map((x) => x.refused ? el("span", { class: "error", title: x.refused }, `${x.agent}: ${access(x.access)} ✗`) : `${x.agent}: ${access(x.access)}`);
+      if (d.panel) g.unshift("panel");
+      return g.length ? g.flatMap((x, i) => (i ? ["; ", x] : [x])) : el("span", { class: "muted" }, "none");
+    } },
   ];
   return table("devices", columns, rows("devices"), "No VPN devices yet. Connect a phone or laptop with a.", (d) => [
     el("h2", {}, d.name),
@@ -1277,7 +1282,7 @@ function forwardDialog(preset) {
   const on = select([["v4", "IPv4"], ...(hasV6 ? [["v6", "IPv6"], ["all", "IPv4 and IPv6"]] : [])], "v4");
   const mode = select([["", "automatic"], ["transparent", "transparent (client IP visible)"], ["translate", "translate (IPv4 ↔ IPv6)"]], "");
   const ingress = select([["public", "public"], ["local", "local (for a proxy on this server)"]], "public");
-  const allowFrom = el("input", { placeholder: "everyone, or e.g. 203.0.113.7 198.51.100.0/24" });
+  const allowFrom = el("input", { placeholder: "empty for everyone, or e.g. 203.0.113.7 198.51.100.0/24" });
   openModal("Add forwards", form([
     row("Agent", agent),
     row("Ports", specs),
@@ -1661,7 +1666,7 @@ function siteDialog() {
   const host = el("input", { required: true, placeholder: "e.g. app.example.net", maxlength: 253 });
   const port = el("input", { required: true, type: "number", min: 1, max: 65535, placeholder: "e.g. 8080" });
   const proxy = select([["", "default"], ["traefik", "Traefik"], ["caddy", "Caddy"], ["nginx", "Nginx"], ["npm", "Nginx Proxy Manager"]], "");
-  const allowFrom = el("input", { placeholder: "everyone, or e.g. 203.0.113.7 198.51.100.0/24" });
+  const allowFrom = el("input", { placeholder: "empty for everyone, or e.g. 203.0.113.7 198.51.100.0/24" });
   openModal("Add site", form([
     row("Agent", agent),
     row("Domain", host),

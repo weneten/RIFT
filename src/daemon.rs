@@ -1093,6 +1093,17 @@ async fn admin_call_inner(s: &Server, r: AdminRequest) -> Result<serde_json::Val
                     _ => None,
                 })
                 .collect();
+            // VPN grants the agent refuses (outside RIFT_AGENT_ALLOW_*): the device keeps the
+            // grant, but reaches nothing through it until the agent allows it.
+            let refused_grants: Vec<_> = snap
+                .vpn_grants
+                .iter()
+                .filter_map(|g| {
+                    let why = grant_refusal(&snap, g)?;
+                    let agent = snap.agents.iter().find(|a| a.id == g.agent_id)?;
+                    Some(serde_json::json!({"device":g.peer,"agent":agent.name,"access":g.access,"reason":why}))
+                })
+                .collect();
             let fully_applied =
                 error.is_none() && applied == Some(snap.generation) && pending_forwards.is_empty();
             let cfg = s.config.read().await.clone();
@@ -1109,7 +1120,7 @@ async fn admin_call_inner(s: &Server, r: AdminRequest) -> Result<serde_json::Val
                 .map(|n| n.moved.clone())
                 .unwrap_or_default();
             let inapplicable_forwards = inapplicable(&snap, &cfg.public_ips);
-            serde_json::json!({"moved_forwards":moved_forwards,"inapplicable_forwards":inapplicable_forwards,"snapshot":snap,"enrollment":enrollment,"invites":invites,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"refused_forwards":refused_forwards,"fully_applied":fully_applied,"connection_history":s.state.health()?,"rift_version":protocol::RIFT_VERSION})
+            serde_json::json!({"moved_forwards":moved_forwards,"inapplicable_forwards":inapplicable_forwards,"snapshot":snap,"enrollment":enrollment,"invites":invites,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"refused_forwards":refused_forwards,"refused_grants":refused_grants,"fully_applied":fully_applied,"connection_history":s.state.health()?,"rift_version":protocol::RIFT_VERSION})
         }
         AdminRequest::AgentsList => serde_json::to_value(snap.agents)?,
         AdminRequest::AgentsShow { name } => {

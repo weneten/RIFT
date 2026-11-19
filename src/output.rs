@@ -429,6 +429,9 @@ fn status(data: &Value) -> String {
                 field(refused, "reason")
             ));
         }
+        for refused in data["refused_grants"].as_array().into_iter().flatten() {
+            lines.push(refused_grant(refused));
+        }
         for moved in data["moved_forwards"].as_array().into_iter().flatten() {
             lines.push(format!(
                 "Forward {} moved from {} to {}: the server no longer has the first address (RIFT_PUBLIC_IPS).",
@@ -550,6 +553,17 @@ pub fn vpn_access(value: &Value) -> String {
         ),
         _ => text(value),
     }
+}
+
+/// One VPN grant the agent refuses, as `rift status`, `rift doctor` and the UIs say it.
+pub fn refused_grant(refused: &Value) -> String {
+    format!(
+        "Access of {} to {} ({}) refused by the agent: {}",
+        field(refused, "device"),
+        field(refused, "agent"),
+        vpn_access(&refused["access"]),
+        field(refused, "reason")
+    )
 }
 
 /// "exit via server" or "exit via node1 (refused by agent)", one per exit of a device.

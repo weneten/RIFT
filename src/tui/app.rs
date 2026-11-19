@@ -2003,7 +2003,7 @@ impl App {
                         "filter",
                         "Show",
                         &self.forward_filter,
-                        "everything, or e.g. homelab 8080 udp",
+                        "empty for everything, or e.g. homelab 8080 udp",
                     )
                     .hint("all words must match; agent:NAME port:N proto:tcp state:pending")],
                 )
@@ -2017,7 +2017,7 @@ impl App {
                     Form::new(
                         &format!("Filter {}", tab.title().to_lowercase()),
                         "Apply",
-                        vec![Field::text("filter", "Show", &current, "everything, or words that must all appear")
+                        vec![Field::text("filter", "Show", &current, "empty for everything, or words that must all appear")
                             .hint("matches names, addresses, ports, agents, states; empty shows everything")],
                     ),
                     Submit::Filter(tab),
@@ -2184,7 +2184,7 @@ impl App {
                     "allow_from",
                     "Only from",
                     "",
-                    "everyone, or e.g. 203.0.113.7 198.51.100.0/24",
+                    "empty for everyone, or e.g. 203.0.113.7 198.51.100.0/24",
                 ),
             ],
         );
@@ -2235,7 +2235,7 @@ impl App {
                     "ports",
                     "Ports",
                     "",
-                    "none, or e.g. 22/tcp 53/both 8000-8010/tcp",
+                    "optional, e.g. 22/tcp 53/both 8000-8010/tcp",
                 ),
                 Field::check("server", "Whole host (TCP, UDP, ping)", false),
                 Field::check("full", "All protocols", false),
@@ -2243,7 +2243,7 @@ impl App {
                     "subnets",
                     "LAN networks",
                     "",
-                    "none, or e.g. 192.168.178.0/24",
+                    "optional, e.g. 192.168.178.0/24",
                 ),
                 Field::check("snat", "Masquerade (SNAT) in the LAN", false)
                     .hint("when the LAN has no route back to the VPN"),
@@ -2280,7 +2280,7 @@ impl App {
                         ("npm".into(), "Nginx Proxy Manager".into()),
                     ],
                 ),
-                Field::text("allow_from", "Only from", "", "everyone, or e.g. 203.0.113.7 198.51.100.0/24"),
+                Field::text("allow_from", "Only from", "", "empty for everyone, or e.g. 203.0.113.7 198.51.100.0/24"),
             ],
         )
         .intro("Publishes https://DOMAIN through the reverse proxy to this port. The domain must already point at this server.");

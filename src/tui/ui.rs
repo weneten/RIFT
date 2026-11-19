@@ -1045,6 +1045,9 @@ fn attention(app: &App) -> Vec<Line<'static>> {
             );
         }
     }
+    for refused in status["refused_grants"].as_array().into_iter().flatten() {
+        push(false, crate::output::refused_grant(refused));
+    }
     for stuck in status["inapplicable_forwards"]
         .as_array()
         .into_iter()
@@ -1533,6 +1536,12 @@ fn draw_devices(frame: &mut Frame, app: &mut App, area: Rect) {
                 "idle"
             };
             let grants = d["grants"].as_array().map_or(0, Vec::len);
+            let refused = d["grants"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|g| g["refused"].is_string())
+                .count();
             let exits: Vec<String> = d["exits"]
                 .as_array()
                 .into_iter()
@@ -1556,7 +1565,14 @@ fn draw_devices(frame: &mut Frame, app: &mut App, area: Rect) {
                 } else {
                     "never".into()
                 }),
-                cell(grants.to_string()),
+                cell(if refused > 0 {
+                    Line::from(vec![
+                        Span::raw(format!("{grants} ")),
+                        Span::styled(format!("✗{refused}"), theme::bad()),
+                    ])
+                } else {
+                    Line::raw(grants.to_string())
+                }),
                 cell(if exits.is_empty() {
                     "-".into()
                 } else {
