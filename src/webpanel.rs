@@ -748,6 +748,26 @@ enum Action {
         #[serde(default)]
         access: Option<VpnAccess>,
     },
+    /// `rift link allow`: what agent `from` may reach on agent `to`; `both` also back.
+    LinkAllow {
+        from: String,
+        to: String,
+        #[serde(default)]
+        server: bool,
+        #[serde(default)]
+        full: bool,
+        #[serde(default)]
+        ports: String,
+        #[serde(default)]
+        both: bool,
+    },
+    /// `rift link deny`; without `access`, every link from `from` to `to`.
+    LinkDeny {
+        from: String,
+        to: String,
+        #[serde(default)]
+        access: Option<VpnAccess>,
+    },
     /// The DNS server of the device's main profile: an agent, or `null` for the default.
     VpnDns {
         peer: String,
@@ -1066,6 +1086,45 @@ impl Action {
                 }
                 json!({"agent": agent, "warnings": warnings})
             }
+            Self::LinkAllow {
+                from,
+                to,
+                server,
+                full,
+                ports,
+                both,
+            } => {
+                let accesses = crate::vpn::accesses(server, full, &words(&ports), &[], false)?;
+                ensure!(
+                    !accesses.is_empty(),
+                    "choose what to allow: the host, all protocols or ports"
+                );
+                let mut directions = vec![(from.clone(), to.clone())];
+                if both {
+                    directions.push((to.clone(), from.clone()));
+                }
+                let mut warnings = Vec::new();
+                for (from, to) in directions {
+                    for access in &accesses {
+                        let added = panel
+                            .admin(AdminRequest::LinkAllow {
+                                from: from.clone(),
+                                to: to.clone(),
+                                access: access.clone(),
+                            })
+                            .await?;
+                        if let Some(warning) = added.get("warning").filter(|w| w.is_string()) {
+                            warnings.push(warning.clone());
+                        }
+                    }
+                }
+                json!({"from": from, "to": to, "warnings": warnings})
+            }
+            Self::LinkDeny { from, to, access } => {
+                panel
+                    .admin(AdminRequest::LinkDeny { from, to, access })
+                    .await?
+            }
             Self::HostDeny { agent, access } => {
                 panel
                     .admin(AdminRequest::HostDeny { agent, access })
@@ -1198,6 +1257,42 @@ pub(crate) fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> 
             })
             .collect()
     };
+    let refused_links = status["refused_links"].as_array().unwrap_or(&empty);
+    // Links between agents (`rift link allow`): those an agent opens and those it accepts, each
+    // with the other agent's name and why it does not work, if it does not.
+    let links_of = |a: &Value, outgoing: bool| -> Vec<Value> {
+        let (mine, other) = if outgoing {
+            ("from_agent_id", "to_agent_id")
+        } else {
+            ("to_agent_id", "from_agent_id")
+        };
+        snapshot["agent_links"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter(|l| l[mine] == a["id"])
+            .map(|l| {
+                let peer = agent_list.iter().find(|x| x["id"] == l[other]);
+                let peer_name = name_of(&l[other]);
+                let (from, to) = if outgoing {
+                    (&a["name"], &peer_name)
+                } else {
+                    (&peer_name, &a["name"])
+                };
+                let refused = refused_links
+                    .iter()
+                    .find(|r| r["from"] == *from && r["to"] == *to && r["access"] == l["access"])
+                    .map_or(Value::Null, |r| r["reason"].clone());
+                json!({
+                    "agent": peer_name,
+                    "tunnel_ipv4": peer.map_or(Value::Null, |p| p["tunnel_ipv4"].clone()),
+                    "status": peer.map_or(Value::Null, |p| p["status"].clone()),
+                    "access": l["access"],
+                    "refused": refused,
+                })
+            })
+            .collect()
+    };
     let agents: Vec<Value> = agent_list
         .iter()
         .map(|a| {
@@ -1220,6 +1315,8 @@ pub(crate) fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> 
                 "limits": a["limits"],
                 "public_key": a["public_key"],
                 "host_grants": host_grants_of(a),
+                "links_out": links_of(a, true),
+                "links_in": links_of(a, false),
             })
         })
         .collect();
@@ -1260,6 +1357,7 @@ pub(crate) fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> 
         "apply_error": status["apply_error"],
         "refused_grants": status["refused_grants"],
         "refused_host_grants": status["refused_host_grants"],
+        "refused_links": status["refused_links"],
         "host_names": status["host_names"],
         "enrollment": status["enrollment"],
         "invites": status["invites"],
@@ -2180,6 +2278,73 @@ mod tests {
         assert!(calls
             .iter()
             .any(|c| c.contains("HostDeny") && c.contains("server")));
+    }
+
+    #[tokio::test]
+    async fn links_are_allowed_both_ways_and_withdrawn_like_the_cli() {
+        let (panel, fake) = panel(config(PanelAccess::Private, ""));
+        let cookie = logged_in(&panel).await;
+        let added = act(
+            &panel,
+            "127.0.0.1",
+            &cookie,
+            r#"{"action":"link_allow","from":"node4","to":"nas","ports":"22/tcp","server":true,"both":true}"#,
+            "",
+        )
+        .await;
+        assert!(added.starts_with("HTTP/1.1 200"), "{added}");
+        let empty = act(
+            &panel,
+            "127.0.0.1",
+            &cookie,
+            r#"{"action":"link_allow","from":"node4","to":"nas"}"#,
+            "",
+        )
+        .await;
+        assert!(empty.starts_with("HTTP/1.1 400"), "{empty}");
+        let denied = act(
+            &panel,
+            "127.0.0.1",
+            &cookie,
+            r#"{"action":"link_deny","from":"node4","to":"nas"}"#,
+            "",
+        )
+        .await;
+        assert!(denied.starts_with("HTTP/1.1 200"), "{denied}");
+        let calls = fake.calls.lock().unwrap().clone();
+        let allows: Vec<_> = calls.iter().filter(|c| c.contains("LinkAllow")).collect();
+        assert_eq!(allows.len(), 4, "server and 22/tcp, each way: {calls:?}");
+        assert!(
+            allows
+                .iter()
+                .any(|c| c.contains("\"from\": String(\"nas\")")),
+            "{allows:?}"
+        );
+        assert!(calls
+            .iter()
+            .any(|c| c.contains("LinkDeny") && c.contains("\"access\": Null")));
+    }
+
+    #[test]
+    fn the_overview_lists_links_both_ways_per_agent_with_refusals() {
+        let status = json!({"snapshot": {
+            "agents": [{"id": "a1", "name": "home", "tunnel_ipv4": "10.13.0.2"},
+                       {"id": "a2", "name": "nas", "tunnel_ipv4": "10.13.0.3", "status": "active"}],
+            "agent_links": [{"from_agent_id": "a1", "to_agent_id": "a2", "access": "server"},
+                            {"from_agent_id": "a2", "to_agent_id": "a1", "access": "full"}]},
+            "refused_links": [{"from": "nas", "to": "home", "access": "full", "reason": "home: old"}]});
+        let overview = compose_overview(&status, &json!([]), &json!({}));
+        let home = &overview["agents"][0];
+        assert_eq!(home["links_out"][0]["agent"], "nas");
+        assert_eq!(home["links_out"][0]["tunnel_ipv4"], "10.13.0.3");
+        assert!(home["links_out"][0]["refused"].is_null());
+        assert_eq!(home["links_in"][0]["agent"], "nas");
+        assert_eq!(home["links_in"][0]["refused"], "home: old");
+        assert_eq!(
+            overview["agents"][1]["links_out"][0]["refused"],
+            "home: old"
+        );
+        assert_eq!(overview["refused_links"][0]["from"], "nas");
     }
 
     #[test]

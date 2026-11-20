@@ -1055,6 +1055,9 @@ fn attention(app: &App) -> Vec<Line<'static>> {
     {
         push(false, crate::output::refused_host_grant(refused));
     }
+    for refused in status["refused_links"].as_array().into_iter().flatten() {
+        push(false, crate::output::refused_link(refused));
+    }
     for stuck in status["inapplicable_forwards"]
         .as_array()
         .into_iter()
@@ -1333,6 +1336,37 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
             let what = crate::output::vpn_access(&grant["access"]);
             lines.push(match grant["refused"].as_str() {
                 Some(why) => Line::styled(format!("  ✗ {what}: refused, {why}"), theme::warn()),
+                None => Line::raw(format!("  {what}")),
+            });
+        }
+    }
+    // `rift link allow`: what this agent reaches on others (→) and who reaches it (←).
+    let links: Vec<(&str, &Value)> = [("→", "links_out"), ("←", "links_in")]
+        .into_iter()
+        .flat_map(|(arrow, key)| {
+            agent[key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(move |l| (arrow, l))
+        })
+        .collect();
+    lines.push(Line::raw(""));
+    if links.is_empty() {
+        lines.push(Line::styled(
+            "Links: none (l links it with another agent)",
+            theme::muted(),
+        ));
+    } else {
+        lines.push(Line::styled("Links", theme::accent()));
+        for (arrow, link) in links {
+            let what = format!(
+                "{arrow} {} {}",
+                link["agent"].as_str().unwrap_or("?"),
+                crate::output::vpn_access(&link["access"])
+            );
+            lines.push(match link["refused"].as_str() {
+                Some(why) => Line::styled(format!("  ✗ {what}: {why}"), theme::warn()),
                 None => Line::raw(format!("  {what}")),
             });
         }

@@ -703,7 +703,7 @@ For three home servers that should all reach each other, allow each pair once wi
 - **Trust between agents.** Whoever is root on node1 reaches the granted ports on node2. Grant only what node1 needs.
 - **Bandwidth.** All traffic crosses the server twice, so its connection and the upload of both homes limit throughput; two agents in the same LAN still go through the server.
 
-Export and import carry links (`links` in the file, by agent name). Removing an agent removes its links in both directions; disabling one pauses them. The web panel and the terminal UI do not show links yet; use `rift link list` (or `:link list` in the terminal UI).
+Export and import carry links (`links` in the file, by agent name). Removing an agent removes its links in both directions; disabling one pauses them. In the web panel and the terminal UI, the Agents tab lists an agent's links in its details (→ what it reaches, ← who reaches it); `l` ("Links") adds and withdraws them, in the terminal UI `L` withdraws one.
 
 ## Use RIFT as a VPN (exit)
 

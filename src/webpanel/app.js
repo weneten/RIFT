@@ -428,6 +428,7 @@ function attention() {
   for (const f of data.forwards || []) if (f.refused && f.enabled) push("warn", `Forward ${f.id} refused by ${f.agent}: ${f.refused}`);
   for (const g of data.refused_grants || []) push("warn", `Access of ${g.device} to ${g.agent} (${access(g.access)}) refused by the agent: ${g.reason}`);
   for (const g of data.refused_host_grants || []) push("warn", `Access of this server to ${g.agent} (${access(g.access)}) refused by the agent: ${g.reason}`);
+  for (const l of data.refused_links || []) push("warn", `Link ${l.from} → ${l.to} (${access(l.access)}) does not work: ${l.reason}`);
   for (const i of data.invites || []) push("info", `Invitation for ${i.name} open, ${duration(i.expires_at - now)} left`);
   if ((data.sites || {}).available === false && (data.sites || {}).queue === false) push("muted", "Sites: the host helper is not installed (sudo sh deploy/install-cli)");
   return items;
@@ -477,6 +478,7 @@ function actions() {
         else if (item.status === "disabled") add("e", "Enable", () => runAct({ action: "agent_enable", name: item.id, enabled: true }), w);
         if (item.status === "active") add("f", "Add forward", () => forwardDialog(item.name), w);
         if (item.status === "active" || (item.host_grants || []).length) add("h", "Server access", () => hostDialog(item.name), w);
+        if (item.status === "active" || (item.links_out || []).length || (item.links_in || []).length) add("l", "Links", () => linksDialog(item.name), w);
         add("r", "Rename", () => renameDialog(item), w);
         if (item.status !== "pending") add("K", "Rotate key", () => confirmAct(`Give ${item.name} a new WireGuard key? It happens on the agent's next sync.`, { action: "agent_rotate", name: item.id }), w);
         if (item.dns_name) add("n", item.names ? "Names off" : "Names on", () => namesChange({ action: "agent_names", name: item.id, on: !item.names }), w);
@@ -868,6 +870,8 @@ function drawAgents() {
           ? el("span", { class: "error", title: g.refused }, "refused by the agent")
           : el("span", { class: "ok-text" }, "allowed")))
         : [el("p", { class: "muted" }, "None: the VPS host reaches nothing on this agent (h allows ports).")]),
+      el("h3", {}, "Links to other agents"),
+      ...linkRows(a),
       hostNameRow(a),
       a.last_error ? el("p", { class: "error" }, `✗ ${a.last_error}`) : null,
       el("p", { class: "muted" }, `${forwards} forward(s)`),
@@ -1597,6 +1601,74 @@ function hostDialog(name) {
     content.push(el("div", { class: "form" }, el("div", { class: "buttons" }, button("Done", closeModal, "primary"))));
   }
   openModal(`Server access to ${name}`, ...content);
+}
+
+// One line per link of an agent (`rift link allow`): → what it reaches, ← who reaches it.
+function linkRows(a) {
+  const state = (l) => l.refused
+    ? el("span", { class: "error", title: l.refused }, "does not work")
+    : l.status && l.status !== "active" ? el("span", { class: "muted" }, l.status) : el("span", { class: "ok-text" }, "allowed");
+  const rows = [
+    ...(a.links_out || []).map((l) => kv(`→ ${l.agent} ${access(l.access)}`, state(l))),
+    ...(a.links_in || []).map((l) => kv(`← ${l.agent} ${access(l.access)}`, state(l))),
+  ];
+  return rows.length ? rows : [el("p", { class: "muted" }, "None: no other agent reaches this one, and it reaches none (l adds links).")];
+}
+
+// What agents may reach on other agents (`rift link allow`), through this server.
+function linksDialog(name) {
+  const agent = (data.agents || []).find((a) => a.name === name);
+  if (!agent) { closeModal(); return; }
+  const refresh = async () => { await load(); linksDialog(name); };
+  const list = (links, outgoing) => {
+    const ul = el("ul", { class: "grant-list" });
+    for (const l of links) {
+      const [from, to] = outgoing ? [name, l.agent] : [l.agent, name];
+      const where = outgoing && l.tunnel_ipv4 ? ` at ${l.tunnel_ipv4}` : "";
+      ul.append(el("li", {}, el("span", { title: l.refused || "" }, `${outgoing ? "→" : "←"} ${l.agent}${where}: ${access(l.access)}${l.refused ? ` (does not work: ${l.refused})` : ""}`),
+        button("Withdraw", async () => {
+          try {
+            await act({ action: "link_deny", from, to, access: l.access });
+            await refresh();
+          } catch (e) { showBanner(e.message); }
+        }, "danger")));
+    }
+    if (!ul.children.length) ul.append(el("li", { class: "muted" }, "None."));
+    return ul;
+  };
+  const content = [
+    el("p", { class: "hint" }, `A link lets one agent open connections to ports of another agent's tunnel address, through this server and without a public port. One way only, unless you tick both directions. The agent that is reached keeps its RIFT_AGENT_ALLOW_PORTS, and either agent can refuse links with RIFT_AGENT_ALLOW_LINKS=false. Connections start from the agent host itself (its shell, programs with host networking).`),
+    el("h4", {}, `${name} reaches`), list(agent.links_out || [], true),
+    el("h4", {}, `Reach ${name}`), list(agent.links_in || [], false)];
+  const others = agentOptions(true).filter(([n]) => n !== name);
+  if (agent.status === "active" && others.length) {
+    const other = select(others, others[0][0]);
+    const direction = select([["out", `${name} reaches the other agent`], ["in", `the other agent reaches ${name}`]], "out");
+    const kind = select([["ports", "ports on the agent host"], ["server", "the agent host (TCP, UDP, ping)"], ["full", "the agent host, all protocols"]], "ports");
+    const value = el("input", { placeholder: "e.g. 22/tcp 8000-8010/tcp" });
+    const both = el("input", { type: "checkbox" });
+    const valueRow = row("Ports", value);
+    const update = () => { valueRow.hidden = kind.value !== "ports"; value.required = !valueRow.hidden; };
+    kind.addEventListener("change", update);
+    update();
+    content.push(el("hr", { class: "sep" }), el("h4", {}, "Allow more"), form([
+      el("div", { class: "row inline" }, row("Other agent", other), row("Direction", direction)),
+      row("Access to", kind), valueRow,
+      check("Both directions", both),
+    ], "Allow", async () => {
+      const [from, to] = direction.value === "out" ? [name, other.value] : [other.value, name];
+      const body = { action: "link_allow", from, to, both: both.checked };
+      if (kind.value === "server") body.server = true;
+      if (kind.value === "full") body.full = true;
+      if (kind.value === "ports") body.ports = value.value;
+      const result = await act(body);
+      await refresh();
+      if ((result.warnings || []).length) showBanner(result.warnings.join(" "));
+    }));
+  } else {
+    content.push(el("div", { class: "form" }, el("div", { class: "buttons" }, button("Done", closeModal, "primary"))));
+  }
+  openModal(`Links of ${name}`, ...content);
 }
 
 function grantsDialog(name, notes) {

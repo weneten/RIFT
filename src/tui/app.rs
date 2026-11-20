@@ -185,6 +185,7 @@ pub enum Submit {
     Device,
     Grant(String),
     Host(String),
+    Link(String),
     Site,
     TwoFactorConfirm,
     LogFilter,
@@ -206,6 +207,9 @@ pub enum Act {
     /// `rift host allow`: what the VPS host itself may reach on the agent.
     AgentHost,
     AgentHostDeny,
+    /// `rift link allow`: links between this agent and another one.
+    AgentLink,
+    AgentLinkDeny,
     CancelInvite,
     NewToken,
     AgentRemove,
@@ -1488,6 +1492,15 @@ impl App {
                     {
                         add("H", "Withdraw server access", Act::AgentHostDeny);
                     }
+                    if agent["status"] == "active" && self.agent_names(true).len() > 1 {
+                        add("l", "Link", Act::AgentLink);
+                    }
+                    if ["links_out", "links_in"]
+                        .iter()
+                        .any(|k| agent[*k].as_array().is_some_and(|l| !l.is_empty()))
+                    {
+                        add("L", "Withdraw link", Act::AgentLinkDeny);
+                    }
                     add("r", "Rename", Act::AgentRename);
                     if agent["status"] != "pending" {
                         add("K", "Rotate key", Act::AgentRotate);
@@ -1732,6 +1745,80 @@ impl App {
                     )),
                     Submit::Host(name),
                 )
+            }
+            Act::AgentLink => {
+                let others: Vec<(String, String)> = self
+                    .agent_names(true)
+                    .into_iter()
+                    .filter(|other| *other != name)
+                    .map(|other| (other.clone(), other))
+                    .collect();
+                self.open_form(
+                    Form::new(
+                        &format!("Link {name} with another agent"),
+                        "Allow",
+                        vec![
+                            Field::select("other", "Other agent", others),
+                            Field::select(
+                                "direction",
+                                "Direction",
+                                vec![
+                                    ("out".into(), format!("{name} reaches the other agent")),
+                                    ("in".into(), format!("the other agent reaches {name}")),
+                                ],
+                            ),
+                            Field::text(
+                                "ports",
+                                "Ports",
+                                "",
+                                "optional, e.g. 22/tcp 8000-8010/tcp",
+                            ),
+                            Field::check("server", "Whole host (TCP, UDP, ping)", false),
+                            Field::check("full", "All protocols", false),
+                            Field::check("both", "Both directions", false),
+                        ],
+                    )
+                    .intro(
+                        "A link lets one agent open connections to ports of another agent's tunnel address, through this server and without a public port. One way only unless both directions are ticked. The agent that is reached keeps its RIFT_AGENT_ALLOW_PORTS; either agent can refuse links with RIFT_AGENT_ALLOW_LINKS=false.",
+                    ),
+                    Submit::Link(name),
+                )
+            }
+            Act::AgentLinkDeny => {
+                let mut items = Vec::new();
+                for (key, outgoing) in [("links_out", true), ("links_in", false)] {
+                    for link in item[key].as_array().into_iter().flatten() {
+                        let Ok(access) =
+                            serde_json::from_value::<VpnAccess>(link["access"].clone())
+                        else {
+                            continue;
+                        };
+                        let other = link["agent"].as_str().unwrap_or_default().to_string();
+                        let (from, to) = if outgoing {
+                            (name.clone(), other.clone())
+                        } else {
+                            (other.clone(), name.clone())
+                        };
+                        items.push(MenuItem {
+                            label: format!(
+                                "{} {other}: {}",
+                                if outgoing { "→" } else { "←" },
+                                output::vpn_access(&link["access"])
+                            ),
+                            hint: if link["refused"].is_string() {
+                                "does not work".into()
+                            } else {
+                                String::new()
+                            },
+                            what: MenuWhat::op(requests(vec![AdminRequest::LinkDeny {
+                                from,
+                                to,
+                                access: Some(access),
+                            }])),
+                        });
+                    }
+                }
+                self.menu(&format!("Withdraw a link of {name}"), items);
             }
             Act::AgentHostDeny => {
                 let mut items = Vec::new();
@@ -2591,6 +2678,42 @@ impl App {
                         .collect(),
                 )
             }
+            Submit::Link(agent) => {
+                let other = form.text("other");
+                anyhow::ensure!(!other.is_empty(), "choose the other agent");
+                let accesses = vpn::accesses(
+                    form.on("server"),
+                    form.on("full"),
+                    &webpanel::words(&form.text("ports")),
+                    &[],
+                    false,
+                )?;
+                anyhow::ensure!(
+                    !accesses.is_empty(),
+                    "choose what to allow: ports, the whole host or all protocols"
+                );
+                let (from, to) = if form.text("direction") == "in" {
+                    (other, agent.clone())
+                } else {
+                    (agent.clone(), other)
+                };
+                let mut directions = vec![(from.clone(), to.clone())];
+                if form.on("both") {
+                    directions.push((to, from));
+                }
+                Op::Requests(
+                    directions
+                        .into_iter()
+                        .flat_map(|(from, to)| {
+                            accesses.iter().map(move |access| AdminRequest::LinkAllow {
+                                from: from.clone(),
+                                to: to.clone(),
+                                access: access.clone(),
+                            })
+                        })
+                        .collect(),
+                )
+            }
             Submit::Site => {
                 let host = form.text("host");
                 let port: u32 = form
@@ -3238,6 +3361,78 @@ mod tests {
         app.on_msg(Msg::Health(Ok(json!({"checks": []}))));
         assert!(!app.health_loading && !app.health_quiet);
         assert!(app.health_at.unwrap().elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn agents_offer_links_and_their_form_asks_for_both_directions() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = Config {
+            public_endpoint: "rift.example.net".into(),
+            ..Default::default()
+        };
+        let mut app = App::new(config, PathBuf::from("config.toml"), tx);
+        app.snapshot = Some(Snapshot {
+            status: json!({}),
+            overview: json!({"agents": [
+                {"id": "a1", "name": "home", "status": "active", "tunnel_ipv4": "10.13.0.2", "host_grants": [],
+                 "links_out": [{"agent": "nas", "access": "server", "refused": null}],
+                 "links_in": [{"agent": "nas", "access": "full", "refused": "home: no links"}]},
+                {"id": "a2", "name": "nas", "status": "active", "tunnel_ipv4": "10.13.0.3",
+                 "host_grants": [], "links_out": [], "links_in": []}
+            ]}),
+            logs: Vec::new(),
+        });
+        app.tab = app.tabs.iter().position(|t| *t == Tab::Agents).unwrap();
+        app.clamp_selections();
+        let keys = |app: &App| -> Vec<&'static str> {
+            app.actions().into_iter().map(|(k, _, _)| k).collect()
+        };
+        assert!(keys(&app).contains(&"l") && keys(&app).contains(&"L"));
+        app.table(Tab::Agents).select(Some(1));
+        assert!(keys(&app).contains(&"l") && !keys(&app).contains(&"L"));
+
+        app.table(Tab::Agents).select(Some(0));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 50)).unwrap();
+        terminal
+            .draw(|frame| super::super::ui::draw(frame, &mut app))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(140)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>() + "\n")
+            .collect();
+        assert!(screen.contains("→ nas"), "{screen}");
+        assert!(screen.contains("✗ ← nas"), "{screen}");
+        app.act(Act::AgentLinkDeny);
+        let Some(Modal::Menu { items, .. }) = app.modals.last() else {
+            panic!("no withdraw menu")
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].hint, "does not work");
+        app.modals.clear();
+
+        app.act(Act::AgentLink);
+        let Some(Modal::Form { form, submit }) = app.modals.last() else {
+            panic!("no form")
+        };
+        let (mut form, submit) = (form.clone(), submit.clone());
+        assert!(app.build(&submit, &form).is_err(), "nothing chosen");
+        for field in &mut form.fields {
+            match field.key {
+                "server" | "both" => field.kind = super::super::form::Kind::Check { on: true },
+                _ => {}
+            }
+        }
+        let Ok(Op::Requests(requests)) = app.build(&submit, &form) else {
+            panic!("a valid request")
+        };
+        assert!(matches!(&requests[..], [
+            AdminRequest::LinkAllow { from: f1, to: t1, access: VpnAccess::Server },
+            AdminRequest::LinkAllow { from: f2, to: t2, access: VpnAccess::Server },
+        ] if (f1.as_str(), t1.as_str(), f2.as_str(), t2.as_str()) == ("home", "nas", "nas", "home")));
     }
 
     #[test]
