@@ -123,11 +123,23 @@ pub enum Msg {
     },
 }
 
+/// The longest answer shown as a notification; a longer one opens a dialog.
+const MAX_TOAST_LINES: usize = 8;
+
 /// What a finished operation shows.
 pub enum Done {
-    Message { text: String, warn: bool },
+    /// `act`: the answer asks something of the user (a warning, a configuration to import
+    /// again), so it opens a dialog instead of a notification that fades.
+    Message {
+        text: String,
+        warn: bool,
+        act: bool,
+    },
     Modal(Box<Modal>),
-    Site { id: String, title: String },
+    Site {
+        id: String,
+        title: String,
+    },
     Password(String),
 }
 
@@ -838,8 +850,10 @@ impl App {
                     }
                 }
                 match result {
-                    Ok(Done::Message { text, warn }) => {
-                        if text.lines().count() > 2 || text.chars().count() > 160 {
+                    Ok(Done::Message { text, warn, act }) => {
+                        // The content decides, not how many requests answered: a dialog when
+                        // there is something to do or too much to read in the corner.
+                        if act || text.lines().count() > MAX_TOAST_LINES {
                             self.modals.push(text_modal(
                                 if warn { "Done, with warnings" } else { "Done" },
                                 &text,
@@ -875,11 +889,14 @@ impl App {
             self.spawn_logs();
         }
         if let Some(toast) = &self.toast {
-            let keep = match toast.level {
-                Level::Info => 5,
-                Level::Warn => 10,
-                Level::Error => 12,
-            };
+            // A second more for every line after the second, to read them all.
+            let extra = toast.text.lines().count().saturating_sub(2) as u64;
+            let keep = extra
+                + match toast.level {
+                    Level::Info => 5,
+                    Level::Warn => 10,
+                    Level::Error => 12,
+                };
             if toast.at.elapsed() > Duration::from_secs(keep) {
                 self.toast = None;
             }
@@ -2912,6 +2929,7 @@ async fn execute(config: &Config, op: Op) -> anyhow::Result<Done> {
             Done::Message {
                 text: text.join("\n"),
                 warn,
+                act: warn || !names.is_empty(),
             }
         }
         Op::Invite {
@@ -3129,6 +3147,43 @@ mod tests {
             AdminRequest::HostAllow { agent, access: VpnAccess::Port { ports, .. } }
                 if agent == "home" && ports.start == 22
         ));
+    }
+
+    #[tokio::test]
+    async fn answers_open_a_dialog_when_they_ask_something_whatever_their_number() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), PathBuf::from("config.toml"), tx);
+        let done = |lines: usize, warn: bool, act: bool| Msg::Done {
+            form: false,
+            result: Ok(Done::Message {
+                text: (1..=lines)
+                    .map(|i| format!("cachyos may now reach core: port {i}/tcp."))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                warn,
+                act,
+            }),
+        };
+        // Plain confirmations, one or several: a notification.
+        for lines in [1, 2, 3, MAX_TOAST_LINES] {
+            app.toast = None;
+            app.on_msg(done(lines, false, false));
+            assert!(app.modals.is_empty(), "{lines} lines opened a dialog");
+            assert_eq!(app.toast.as_ref().unwrap().text.lines().count(), lines);
+        }
+        // Something to do (import again, a warning), one grant or several: a dialog.
+        for lines in [2, 3] {
+            app.toast = None;
+            app.modals.clear();
+            app.on_msg(done(lines, false, true));
+            assert!(
+                app.toast.is_none() && app.modals.len() == 1,
+                "{lines} lines"
+            );
+        }
+        app.modals.clear();
+        app.on_msg(done(MAX_TOAST_LINES + 1, false, false));
+        assert!(app.toast.is_none() && app.modals.len() == 1, "too long");
     }
 
     #[test]
