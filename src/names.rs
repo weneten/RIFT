@@ -61,7 +61,31 @@ pub fn server_rules(config: &Config, snap: &StateSnapshot) -> vpn::Rules {
             "add rule inet rift input iifname \"{interface}\" ip saddr {source} ip daddr {server} meta l4proto {{ tcp, udp }} th dport {port} accept\n"
         ));
     }
+    // Agents that link to named agents ask the name server directly, on its own port, for
+    // those names only (their host's resolver sends nothing else).
+    for agent in snap
+        .agents
+        .iter()
+        .filter(|a| !link_agents(snap, &a.id).is_empty())
+    {
+        let source = agent.tunnel_ipv4;
+        rules.input.push_str(&format!(
+            "add rule inet rift input iifname \"{interface}\" ip saddr {source} ip daddr {server} meta l4proto {{ tcp, udp }} th dport {port} accept\n"
+        ));
+    }
     rules
+}
+
+/// The agents whose names an agent's host resolves: those it opens links to that have names
+/// on (`rift link allow`, `rift vpn names agent NAME on`).
+pub fn link_agents<'a>(snap: &'a StateSnapshot, agent_id: &str) -> Vec<&'a AgentRecord> {
+    let mut out: Vec<&AgentRecord> = Vec::new();
+    for link in vpn::effective_links(snap) {
+        if link.from.id == agent_id && link.to.names && !out.iter().any(|a| a.id == link.to.id) {
+            out.push(link.to);
+        }
+    }
+    out
 }
 
 /// Agents that must answer DNS from the server: those that are the DNS agent (`vpn dns`) of
@@ -284,6 +308,71 @@ pub fn write_host_names(dir: &std::path::Path, text: &str) -> Result<()> {
     std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))
 }
 
+/// On an agent, the directory it shares with its host (`deploy/install-cli` creates it, the
+/// compose file mounts it): rift-agent writes `HOST_NAMES_FILE` there for the host service
+/// `rift-host-names`, which writes its status beside it.
+pub const AGENT_HOST_DIR: &str = "/var/lib/rift-agent-host";
+
+/// The text of `HOST_NAMES_FILE` on an agent: the names of the agents it links to (already
+/// checked by `agent_policy::names_for_host`) and the server's name server.
+pub fn agent_host_names_text(
+    interface: &str,
+    server: SocketAddr,
+    names: Option<&crate::model::AgentNames>,
+) -> String {
+    let domains = names.map(|n| n.domains.join(" ")).unwrap_or_default();
+    let server = names.map_or(server, |n| n.server);
+    format!(
+        "# Written by rift-agent: the names this host resolves through RIFT (rift link allow).\n\
+         server={server}\ninterface={interface}\ndomains={domains}\n"
+    )
+}
+
+/// How the agent's host resolves the names of the agents it links to, for `rift doctor` on the
+/// agent: (fine, text). None while it has no such name and the host part is not installed.
+pub fn agent_host_names_note(dir: &std::path::Path) -> Option<(bool, String)> {
+    let wanted: Vec<String> = std::fs::read_to_string(dir.join(HOST_NAMES_FILE))
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .filter_map(|l| l.strip_prefix("domains="))
+                .next_back()
+                .map(|d| d.split_whitespace().map(String::from).collect())
+        })
+        .unwrap_or_default();
+    let status = host_names_status(dir);
+    let detail = status["detail"].as_str().unwrap_or_default();
+    let list = wanted.join(", ");
+    Some(match status["state"].as_str() {
+        None if wanted.is_empty() => return None,
+        None => (
+            false,
+            format!("{list}: the host part is missing (sudo sh deploy/install-cli on this host)"),
+        ),
+        Some("off") => (
+            wanted.is_empty(),
+            "switched off on this host (sudo rift host names on)".to_string(),
+        ),
+        Some("unavailable") => (wanted.is_empty(), format!("not possible here: {detail}")),
+        Some("error") => (false, detail.to_string()),
+        _ if wanted.is_empty() => (
+            true,
+            "none: this agent links to no agent with names on".to_string(),
+        ),
+        _ if !wanted
+            .iter()
+            .all(|w| status["domains"].as_array().is_some_and(|d| d.iter().any(|d| d == w))) =>
+        {
+            (false, format!("{list}: being applied"))
+        }
+        _ if status["lookup"] == "missing" => (
+            false,
+            format!("{list} resolve, but ssh does not ask systemd-resolved (apt install libnss-resolve)"),
+        ),
+        _ => (true, format!("{list} ✓")),
+    })
+}
+
 /// What the host service last did (`host-names.status`, written by `rift-host-names`):
 /// `{"state": "active|off|unavailable|error", "detail", "domains": [...], "lookup": "ok|missing"}`,
 /// or null when the host part is not installed or older.
@@ -354,7 +443,13 @@ pub fn host_name_note(
 /// (`rift host names on`), so nothing is passed on: an unknown name under the suffix does not
 /// exist, and any other name is refused rather than resolved for the host.
 fn decide_host(query: &[u8], snap: &StateSnapshot, names: &str) -> Reply {
-    match decide_among(query, &host_agents(snap), names) {
+    decide_only(query, &host_agents(snap), names)
+}
+
+/// Answers the names of `agents` and nothing else: an unknown name under the suffix does not
+/// exist, any other name is refused. For hosts whose resolver sends only RIFT's names here.
+fn decide_only(query: &[u8], agents: &[&AgentRecord], names: &str) -> Reply {
+    match decide_among(query, agents, names) {
         Reply::Forward => {
             let question = read_question(query);
             let under = question
@@ -582,6 +677,17 @@ async fn handle(query: &[u8], source: IpAddr, ctx: &Names, tcp: bool) -> Vec<u8>
     // agent or a device only from its own address.
     if source == IpAddr::V4(ctx.config.server_ipv4) {
         return match decide_host(query, &snap, &vpn::names_suffix()) {
+            Reply::Local(answer) => answer,
+            Reply::Forward => respond(query, None, RCODE_REFUSED, None),
+        };
+    }
+    // An agent's host asks for the agents it links to (its resolver sends only those names).
+    if let Some(agent) = snap
+        .agents
+        .iter()
+        .find(|a| IpAddr::V4(a.tunnel_ipv4) == source && a.status == AgentStatus::Active)
+    {
+        return match decide_only(query, &link_agents(&snap, &agent.id), &vpn::names_suffix()) {
             Reply::Local(answer) => answer,
             Reply::Forward => respond(query, None, RCODE_REFUSED, None),
         };
@@ -875,6 +981,115 @@ mod tests {
             "internal",
         ));
         assert_eq!(rcode(&gone), RCODE_NXDOMAIN);
+    }
+
+    #[test]
+    fn an_agent_resolves_the_named_agents_it_links_to_and_nothing_else() {
+        let mut snap = snap();
+        let link = |from: &str, to: &str| crate::model::AgentLink {
+            from_agent_id: format!("id-{from}"),
+            to_agent_id: format!("id-{to}"),
+            access: VpnAccess::Server,
+        };
+        // node1 links to node2 (names on) and other (names off); nobody links to node1.
+        snap.agent_links = vec![link("node1", "node2"), link("node1", "other")];
+        let names: Vec<&str> = link_agents(&snap, "id-node1")
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(names, ["node2"]);
+        assert!(
+            link_agents(&snap, "id-node2").is_empty(),
+            "links are one way"
+        );
+        let agents = link_agents(&snap, "id-node1");
+        let a = local(decide_only(
+            &query("node2.internal", TYPE_A),
+            &agents,
+            "internal",
+        ));
+        assert_eq!(&a[a.len() - 4..], &[10, 13, 0, 3]);
+        for unknown in ["node1.internal", "other.internal"] {
+            let answer = local(decide_only(&query(unknown, TYPE_A), &agents, "internal"));
+            assert_eq!(rcode(&answer), RCODE_NXDOMAIN, "{unknown}");
+        }
+        let public = local(decide_only(
+            &query("example.com", TYPE_A),
+            &agents,
+            "internal",
+        ));
+        assert_eq!(
+            rcode(&public),
+            RCODE_REFUSED,
+            "nothing is resolved for the agent's host"
+        );
+        // The server lets node1 ask on the name server's port, and nobody else.
+        let config = Config {
+            server_ipv4: Ipv4Addr::new(10, 13, 0, 1),
+            ..Config::default()
+        };
+        let rules = server_rules(&config, &snap).input;
+        assert!(rules.contains("ip saddr 10.13.0.2 ip daddr 10.13.0.1 meta l4proto { tcp, udp } th dport 53053 accept"), "{rules}");
+        assert!(
+            !rules.contains("ip saddr 10.13.0.3 ") && !rules.contains("ip saddr 10.13.0.4 "),
+            "{rules}"
+        );
+        // A disabled target is no longer named.
+        snap.agents[1].status = AgentStatus::Disabled;
+        assert!(link_agents(&snap, "id-node1").is_empty());
+    }
+
+    #[test]
+    fn an_agent_tells_its_host_the_names_and_doctor_reads_what_the_host_did() {
+        let names = crate::model::AgentNames {
+            server: "10.13.0.1:53053".parse().unwrap(),
+            domains: vec!["nas.internal".into(), "pi.internal".into()],
+        };
+        let text = agent_host_names_text("rift0", "10.13.0.1:53053".parse().unwrap(), Some(&names));
+        assert!(
+            text.contains(
+                "\nserver=10.13.0.1:53053\ninterface=rift0\ndomains=nas.internal pi.internal\n"
+            ),
+            "{text}"
+        );
+        let none = agent_host_names_text("rift0", "10.13.0.1:53053".parse().unwrap(), None);
+        assert!(none.ends_with("\ndomains=\n"), "{none}");
+
+        let dir = std::env::temp_dir().join(format!("rift-agent-host-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            agent_host_names_note(&dir),
+            None,
+            "nothing wanted, nothing installed"
+        );
+        write_host_names(&dir, &text).unwrap();
+        let (fine, note) = agent_host_names_note(&dir).unwrap();
+        assert!(!fine && note.contains("deploy/install-cli"), "{note}");
+        let status = |body: &str| std::fs::write(dir.join("host-names.status"), body).unwrap();
+        status("state=active\ndetail=\ndomains=nas.internal\nlookup=ok\n");
+        assert!(agent_host_names_note(&dir)
+            .unwrap()
+            .1
+            .contains("being applied"));
+        status("state=active\ndetail=\ndomains=nas.internal pi.internal\nlookup=ok\n");
+        assert_eq!(
+            agent_host_names_note(&dir).unwrap(),
+            (true, "nas.internal, pi.internal ✓".into())
+        );
+        status("state=active\ndetail=\ndomains=nas.internal pi.internal\nlookup=missing\n");
+        assert!(agent_host_names_note(&dir)
+            .unwrap()
+            .1
+            .contains("libnss-resolve"));
+        status("state=unavailable\ndetail=systemd-resolved does not run on this host\ndomains=\nlookup=missing\n");
+        assert_eq!(
+            agent_host_names_note(&dir).unwrap(),
+            (
+                false,
+                "not possible here: systemd-resolved does not run on this host".into()
+            )
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

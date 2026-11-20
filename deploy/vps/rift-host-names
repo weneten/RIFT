@@ -1,7 +1,9 @@
 #!/bin/sh
-# RIFT's names for the VPS host itself (see README: Reach agents from the server itself).
-# rift-server lists the names the host may resolve in /var/lib/rift-site-queue/host-names:
-# agents with names on and a host grant. This script gives systemd-resolved one routing domain
+# RIFT's names for the host itself (see README: Reach agents from the server itself, and Reach
+# agents from other agents). On the VPS, rift-server lists the names the host may resolve in
+# /var/lib/rift-site-queue/host-names: agents with names on and a host grant. On an agent,
+# rift-agent lists them in /var/lib/rift-agent-host/host-names: agents with names on that it
+# opens links to. This script gives systemd-resolved one routing domain
 # per name on the tunnel interface, so only these exact names (`node1.internal`) go to RIFT's
 # name server; every other name, other names under the suffix included
 # (`metadata.google.internal`), keeps the host's own DNS. Without a name the interface gets no
@@ -17,10 +19,25 @@
 #   apply  apply the list now (run by the units)
 set -eu
 
-queue=${RIFT_SITE_QUEUE:-/var/lib/rift-site-queue}
+# The VPS has the web panel's queue (deploy/install-cli creates it there first); an agent has
+# the directory it shares with rift-agent. The units run this script without an environment,
+# so it finds the same one each time.
+if [ -n "${RIFT_SITE_QUEUE-}" ]; then
+    queue=$RIFT_SITE_QUEUE
+elif [ -d /var/lib/rift-site-queue ]; then
+    queue=/var/lib/rift-site-queue
+else
+    queue=/var/lib/rift-agent-host
+fi
+if [ "$queue" = /var/lib/rift-agent-host ]; then
+    role=agent
+    marker=${RIFT_HOST_NAMES_OFF:-$queue/host-names-off}
+else
+    role=server
+    marker=${RIFT_HOST_NAMES_OFF:-/var/lib/rift-site/host-names-off}
+fi
 file=$queue/host-names
 status_file=$queue/host-names.status
-marker=${RIFT_HOST_NAMES_OFF:-/var/lib/rift-site/host-names-off}
 units=${RIFT_SYSTEMD_DIR:-/etc/systemd/system}
 service=$units/rift-host-names.service
 path=$units/rift-host-names.path
@@ -171,9 +188,13 @@ report() {
             ;;
     esac
     if [ ! -f "$file" ]; then
-        echo "rift: on; the names follow once rift-server runs this version (docker compose pull && docker compose up -d)."
+        echo "rift: on; the names follow once rift-$role runs this version (docker compose pull && docker compose up -d)."
     elif [ -n "$domains" ]; then
         echo "rift: this host resolves $domains through RIFT; every other name keeps its own DNS."
+    elif [ "$role" = agent ]; then
+        echo "rift: on. Another agent's name resolves here once it has names on (rift vpn names agent NAME on)"
+        echo "      and the server links this agent to it (rift link allow THIS NAME ...); until then the"
+        echo "      tunnel has no DNS settings."
     else
         echo "rift: on. An agent's name resolves here once it has names on (rift vpn names agent NAME on)"
         echo "      and a host grant (rift host allow NAME ...); until then the tunnel has no DNS settings."
@@ -199,7 +220,11 @@ auto() {
         return
     fi
     install_units
-    echo "rift: this host resolves the names of agents with names on and a host grant (rift-host-names)."
+    if [ "$role" = agent ]; then
+        echo "rift: this host resolves the names of agents with names on that it links to (rift-host-names)."
+    else
+        echo "rift: this host resolves the names of agents with names on and a host grant (rift-host-names)."
+    fi
 }
 
 off() {

@@ -783,6 +783,32 @@ s.sendall(b"rift-test"); print(s.recv(256).decode())
     assert forced(AGENTS[2], two, 19086) == 3, "agent3 used agent1's link to agent2"
     listed = json.loads(cli(VPS, server_cfg, "link", "list").stdout)
     assert [(l["from"], l["to"], l["state"]) for l in listed] == [("agent1", "agent2", "allowed")], listed
+    # Names: with names on for agent2, the name server answers agent1 (the source of a link to
+    # it) on its own port, from agent1's tunnel address; agent3 gets nothing.
+    server_v4 = ns(VPS, "ip", "-4", "-o", "address", "show", "dev", "rift0").stdout.split()[3].split("/")[0]
+    dns = r'''import socket,struct,sys
+q=struct.pack(">HHHHHH",0x4243,0x0100,1,0,0,0)+b"".join(bytes([len(p)])+p.encode() for p in sys.argv[3].split("."))+b"\0"+struct.pack(">HH",1,1)
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.bind((sys.argv[1],0))
+s.sendto(q,(sys.argv[2],53053))
+try: a=s.recv(512)
+except OSError: print("no answer"); sys.exit(0)
+rcode=a[3]&15; count=struct.unpack(">H",a[6:8])[0]
+print(".".join(map(str,a[-4:])) if rcode==0 and count==1 else f"rcode={rcode} answers={count}")
+'''
+
+    def resolve(namespace, source, name):
+        return ns(namespace, "python3", "-c", dns, source, server_v4, name).stdout.strip()
+
+    three = agents["agent3"]["tunnel_ipv4"]
+    assert resolve(AGENTS[0], one, "agent2.internal") == "no answer", "names answered with names off"
+    cli(VPS, server_cfg, "vpn", "names", "agent", "agent2", "on")
+    wait_policy(server_cfg, 3)
+    wait_until(lambda: resolve(AGENTS[0], one, "agent2.internal") == two or None,
+               "agent1 to resolve agent2.internal", timeout=20)
+    assert resolve(AGENTS[0], one, "agent3.internal") == "rcode=3 answers=0"
+    assert resolve(AGENTS[0], one, "example.com") == "rcode=5 answers=0", "the name server resolved a public name for an agent"
+    assert resolve(AGENTS[2], three, "agent2.internal") == "no answer", "agent3 asked the name server without a link"
+    cli(VPS, server_cfg, "vpn", "names", "agent", "agent2", "off")
     assert not any(f["target_ports"]["start"] == 19086 for f in status(server_cfg)["snapshot"]["forwards"])
 
     cli(VPS, server_cfg, "link", "allow", "agent1", "agent2", "19087/tcp", "--both")
@@ -799,7 +825,7 @@ s.sendall(b"rift-test"); print(s.recv(256).decode())
     wait_until(lambda: not route(AGENTS[0], two).strip() or None,
                "agent1 to drop its route to agent2", timeout=20)
     assert json.loads(cli(VPS, server_cfg, "link", "list").stdout) == []
-    print("PASS agents reach each other only through links: one way, granted ports, the source's own address; deny closes them")
+    print("PASS agents reach each other only through links: one way, granted ports, the source's own address, names of linked agents; deny closes them")
 
 
 def _client_probe():

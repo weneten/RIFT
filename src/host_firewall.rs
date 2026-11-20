@@ -100,6 +100,8 @@ pub struct AgentSpec<'a> {
     pub vpn: &'a [AgentVpnRule],
     /// Links this agent opens to other agents: their replies come in on the tunnel.
     pub outbound: &'a [crate::model::AgentOutboundRule],
+    /// RIFT's name server, while the agent's host resolves the names of linked agents.
+    pub names: Option<std::net::SocketAddr>,
     /// Set while the agent runs an internet exit.
     pub exit: Option<ExitSpec<'a>>,
 }
@@ -414,6 +416,17 @@ pub fn plan_agent(obs: &Observation, spec: &AgentSpec<'_>) -> Result<Plan> {
                         }
                     }
                     _ => rules.push(format!("{from} accept comment \"rift:link\"")),
+                }
+            }
+            if let Some(std::net::SocketAddr::V4(server)) = spec.names {
+                for protocol in ["udp", "tcp"] {
+                    rules.push(format!(
+                        "iifname \"{}\" ip saddr {} ip daddr {} meta l4proto {protocol} {protocol} sport {} accept comment \"rift:names\"",
+                        spec.interface,
+                        server.ip(),
+                        spec.tunnel_v4,
+                        server.port()
+                    ));
                 }
             }
         }
@@ -763,6 +776,7 @@ mod tests {
                 forwards: &[],
                 vpn: &[],
                 outbound: &outbound,
+                names: Some("10.88.0.1:53053".parse().unwrap()),
                 exit: None,
             },
         )
@@ -895,6 +909,7 @@ mod tests {
                 forwards: &[],
                 vpn: &vpn,
                 outbound: &[],
+                names: None,
                 exit: Some(ExitSpec {
                     interface: "rift-exit",
                     uplinks: &uplinks,
@@ -1087,6 +1102,7 @@ mod tests {
                 forwards: &[&forward],
                 vpn: &[],
                 outbound: &[],
+                names: None,
                 exit: None,
             },
         )
@@ -1129,6 +1145,7 @@ mod tests {
                 forwards: &[],
                 vpn: &[rule],
                 outbound: &[],
+                names: None,
                 exit: None,
             },
         )
@@ -1171,6 +1188,7 @@ mod tests {
             forwards: &[],
             vpn: &[],
             outbound: &[],
+            names: None,
             exit,
         };
         assert!(!plan_agent(&obs, &spec(None))

@@ -703,6 +703,14 @@ For three home servers that should all reach each other, allow each pair once wi
 - **Trust between agents.** Whoever is root on node1 reaches the granted ports on node2. Grant only what node1 needs.
 - **Bandwidth.** All traffic crosses the server twice, so its connection and the upload of both homes limit throughput; two agents in the same LAN still go through the server.
 
+**Names on the agent.** With names on for the agent it reaches (`rift vpn names agent node2 on`), node1 uses `node2.internal` instead of the address, with nothing else to do:
+
+```sh
+ssh USER@node2.internal    # on node1, with rift link allow node1 node2 22/tcp
+```
+
+This works as for the VPS host (see [Names on the VPS](#reach-agents-from-the-server-itself)): `deploy/install-cli` on the agent, which `deploy/join` runs, installs the same two systemd units. rift-agent lists the names in `/var/lib/rift-agent-host/host-names` (the compose file mounts that directory), and `rift-host-names` gives systemd-resolved one routing domain per name on `rift0`, so only these exact names go to RIFT's name server on the server's tunnel address; every other lookup keeps the host's own DNS. The name server answers an agent only the names of agents it links to that have names on, refuses everything else, and lets no other agent ask. The agent takes only names under its own `RIFT_NAMES_SUFFIX` (default `internal`; set the server's value there too if it differs) and only the server's tunnel address as the name server, so even a compromised server cannot redirect other lookups of the host. `rift doctor` on the agent shows whether the names resolve ("Names of linked agents"); `sudo rift host names off` on the agent turns them off for good, `on` back on. It needs systemd-resolved 246 or newer and programs that ask it, as on the VPS; without it, put the address into `/etc/hosts`.
+
 Export and import carry links (`links` in the file, by agent name). Removing an agent removes its links in both directions; disabling one pauses them. In the web panel and the terminal UI, the Agents tab lists an agent's links in its details (→ what it reaches, ← who reaches it); `l` ("Links") adds and withdraws them, in the terminal UI `L` withdraws one.
 
 ## Use RIFT as a VPN (exit)
@@ -1104,7 +1112,7 @@ The web panel runs `add site`, `remove site`, `export`, `import` and `backup` th
 | `RIFT_VPN_POOL6` | `fd88:5249:4655::/64` | Server. IPv6 addresses of VPN devices; a ULA network that must not overlap `RIFT_IPV6_POOL`; restart required. The first host is reserved. |
 | `RIFT_VPN_DNS` | `9.9.9.9,2620:fe::fe` | Server. DNS servers written into configurations that have an [internet exit](#use-rift-as-a-vpn-exit), unless the device has its own (`rift vpn dns`); needs one IPv4 address, IPv6 ones are used only where the exit carries IPv6. |
 | `RIFT_NAMES_PORT` | `53053` | Server. TCP and UDP port of RIFT's name server (`NAME.internal` for VPN devices) on the server's tunnel address; devices ask port 53 and RIFT redirects it there, and the host firewall integration opens it on the tunnel. Change it only if another program uses it on every address; `deploy/setup-server` checks it. 1024 or higher; restart required. |
-| `RIFT_NAMES_SUFFIX` | `internal` | Server. The suffix of the agents' names for VPN devices (`NAME.internal`). Any domain name in lower case; `internal` (ICANN, private use) and `home.arpa` (RFC 8375) are recommended, a subdomain of your own works without a DNS record (see "Which suffix?" under VPN). RIFT answers only the agents' names under it and passes every other name on. Devices import nothing new; restart required. |
+| `RIFT_NAMES_SUFFIX` | `internal` | Server. The suffix of the agents' names for VPN devices (`NAME.internal`). Any domain name in lower case; `internal` (ICANN, private use) and `home.arpa` (RFC 8375) are recommended, a subdomain of your own works without a DNS record (see "Which suffix?" under VPN). RIFT answers only the agents' names under it and passes every other name on. Devices import nothing new; restart required. On an agent: the only suffix under which it takes [names of linked agents](#reach-agents-from-other-agents) for its host; set the server's value there too if it is not `internal`. |
 | `RIFT_WEBPANEL` | `false` | Server. Serves the [web panel](#web-panel). Restart required. |
 | `RIFT_WEBPANEL_ACCESS` | `private` | Server. `private`: loopback and tunnel address only; `public`: every address. |
 | `RIFT_WEBPANEL_PORT` | `8090` | Server. TCP port of the panel. |

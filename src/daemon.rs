@@ -877,6 +877,7 @@ struct PolicyNets {
     vpn_pool6: ipnet::Ipv6Net,
     tunnel_pool: ipnet::Ipv4Net,
     server_ipv4: std::net::Ipv4Addr,
+    names_port: u16,
 }
 impl PolicyNets {
     fn of(config: &Config) -> Self {
@@ -885,6 +886,7 @@ impl PolicyNets {
             vpn_pool6: config.vpn_pool6,
             tunnel_pool: config.ipv4_pool,
             server_ipv4: config.server_ipv4,
+            names_port: config.names_port,
         }
     }
 }
@@ -894,6 +896,7 @@ fn policy_for(snapshot: &StateSnapshot, id: &str, nets: PolicyNets) -> AgentPoli
         vpn_pool6,
         tunnel_pool,
         server_ipv4,
+        names_port,
     } = nets;
     let snapshot = &without_refused(snapshot.clone());
     let mut vpn = crate::vpn::agent_rules(snapshot, id);
@@ -936,6 +939,20 @@ fn policy_for(snapshot: &StateSnapshot, id: &str, nets: PolicyNets) -> AgentPoli
             access: l.access.clone(),
         })
         .collect();
+    // The names of the agents it links to that have names on, for its host's resolver.
+    let suffix = crate::vpn::names_suffix();
+    let mut domains: Vec<String> = links
+        .iter()
+        .filter(|l| l.from.id == id && l.to.names)
+        .filter_map(|l| crate::vpn::dns_label(&l.to.name))
+        .map(|label| format!("{label}.{suffix}"))
+        .collect();
+    domains.sort();
+    domains.dedup();
+    let names = (!domains.is_empty()).then(|| AgentNames {
+        server: std::net::SocketAddr::new(server_ipv4.into(), names_port),
+        domains,
+    });
     let policy = AgentPolicy {
         generation: snapshot.generation,
         forwards: snapshot
@@ -949,6 +966,7 @@ fn policy_for(snapshot: &StateSnapshot, id: &str, nets: PolicyNets) -> AgentPoli
         exit: crate::vpn::agent_exit_policy(snapshot, id, vpn_pool, vpn_pool6),
         tunnel_pool: Some(tunnel_pool),
         outbound,
+        names,
     };
     let protocol = snapshot
         .agents
@@ -968,6 +986,7 @@ fn downgrade(mut policy: AgentPolicy, protocol: u16) -> AgentPolicy {
     if (1..protocol::LINKS_VERSION).contains(&protocol) {
         policy.tunnel_pool = None;
         policy.outbound.clear();
+        policy.names = None;
     }
     policy
 }
@@ -2471,6 +2490,7 @@ async fn run_agent_inner(
     kernel
         .apply_agent(welcome, &cached_policy, &key_path)
         .await?;
+    write_agent_host_names(&config, welcome, &cached_policy);
     let poll = Duration::from_secs(config.poll_seconds);
     let mut failures = 0u32;
     loop {
@@ -2793,6 +2813,20 @@ fn read_identity(bytes: &[u8]) -> Result<AgentIdentity> {
     identity.version = IDENTITY_VERSION;
     Ok(identity)
 }
+/// Tells the agent's host which names of linked agents to send to RIFT (`rift-host-names` on
+/// the host applies them). Nothing without the shared directory; a failure only costs names.
+fn write_agent_host_names(config: &Config, welcome: &Welcome, policy: &AgentPolicy) {
+    let text = crate::names::agent_host_names_text(
+        &config.interface,
+        std::net::SocketAddr::new(welcome.server_ipv4.into(), config.names_port),
+        policy.names.as_ref(),
+    );
+    if let Err(error) =
+        crate::names::write_host_names(std::path::Path::new(crate::names::AGENT_HOST_DIR), &text)
+    {
+        tracing::warn!("names for this host not written: {error:#}");
+    }
+}
 /// The cached policy, narrowed again by the current allowlists so a tightened `.env`
 /// takes effect on restart without waiting for the server. The server sends the whole policy
 /// with every sync, so a cache this RIFT cannot read (from another version) is dropped and
@@ -2845,6 +2879,7 @@ async fn agent_sync(
             note_refusals(&refusals);
             let k = Kernel::new(config.clone());
             k.apply_agent(w, &policy, key_path).await?;
+            write_agent_host_names(config, w, &policy);
             atomic_json(&config.state_dir.join("agent-policy.json"), &policy)?;
             identity.applied_generation = policy.generation;
             atomic_json(&config.identity_path(), identity)?;
@@ -3026,6 +3061,7 @@ mod tests {
             vpn_pool6: "fd88:5249:4655::/64".parse().unwrap(),
             tunnel_pool: "10.13.0.0/24".parse().unwrap(),
             server_ipv4: "10.13.0.1".parse().unwrap(),
+            names_port: 53053,
         }
     }
 
@@ -3331,6 +3367,38 @@ mod tests {
         fresh.protocol = 0;
         let fresh = snap(vec![fresh, link_agent("b", 3)]);
         assert!(link_refusal(&fresh, &fresh.agent_links[0]).is_none());
+    }
+
+    #[test]
+    fn the_source_of_a_link_learns_the_names_of_targets_with_names_on() {
+        let link = |to: &str| AgentLink {
+            from_agent_id: "a".into(),
+            to_agent_id: to.into(),
+            access: VpnAccess::Server,
+        };
+        let mut named = link_agent("b", 3);
+        named.names = true;
+        let mut snap = StateSnapshot {
+            agents: vec![link_agent("a", 2), named, link_agent("c", 4)],
+            agent_links: vec![link("b"), link("c")],
+            ..Default::default()
+        };
+        let names = policy_for(&snap, "a", test_nets()).names.unwrap();
+        assert_eq!(names.server, "10.13.0.1:53053".parse().unwrap());
+        assert_eq!(names.domains, ["b.internal"], "c has names off");
+        assert!(
+            policy_for(&snap, "b", test_nets()).names.is_none(),
+            "one way"
+        );
+        assert!(downgrade(policy_for(&snap, "a", test_nets()), 1)
+            .names
+            .is_none());
+        // A refused link names nothing.
+        snap.agents[1].limits = Some(AgentLimits {
+            no_links: true,
+            ..Default::default()
+        });
+        assert!(policy_for(&snap, "a", test_nets()).names.is_none());
     }
 
     #[test]

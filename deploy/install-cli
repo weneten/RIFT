@@ -26,8 +26,17 @@ install -d -m 755 /usr/local/bin
 install -m 755 "$script_dir/rift" /usr/local/bin/rift
 
 if [ "$role" = agent ]; then
-    printf '%s\n' 'Installed /usr/local/bin/rift. On this agent, rift status, rift doctor and rift logs' \
-        'now run inside the rift-agent container.'
+    install -d -m 755 /usr/local/lib/rift
+    install -m 755 "$script_dir/vps/rift-host-names" /usr/local/lib/rift/rift-host-names
+    printf '%s\n' 'Installed /usr/local/bin/rift and /usr/local/lib/rift/rift-host-names. On this agent,' \
+        'rift status, rift doctor and rift logs now run inside the rift-agent container.'
+    # rift-agent tells the host which names of linked agents (node2.internal) to send to RIFT.
+    # The compose file mounts this directory; created here first so it is the host's own.
+    install -d -m 700 /var/lib/rift-agent-host
+    chmod 700 /var/lib/rift-agent-host
+    # Set up unless switched off with `sudo rift host names off`; it changes nothing until the
+    # agent links to an agent with names on.
+    /usr/local/lib/rift/rift-host-names auto || true
     exit 0
 fi
 

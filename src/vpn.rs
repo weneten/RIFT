@@ -172,6 +172,22 @@ pub fn agent_outbound_rules(
     out
 }
 
+/// The agent accepts the answers of RIFT's name server to the lookups its host sends there
+/// (`AgentPolicy::names`), and nothing else from that port.
+pub fn agent_names_rules(interface: &str, tunnel: Ipv4Addr, names: &AgentNames) -> Rules {
+    let mut out = Rules::default();
+    let IpAddr::V4(server) = names.server.ip() else {
+        return out;
+    };
+    let port = names.server.port();
+    for protocol in ["udp", "tcp"] {
+        out.input.push_str(&format!(
+            "add rule inet rift input iifname \"{interface}\" ct direction reply ct original ip saddr {tunnel} ct original ip daddr {server} ct original protocol {protocol} meta l4proto {protocol} ct original proto-dst {port} accept\n"
+        ));
+    }
+    out
+}
+
 /// The default suffix of the names RIFT gives agents: `NAME.internal`. ICANN reserved
 /// `.internal` for private networks in 2024, so it never clashes with a public name.
 pub const NAMES_SUFFIX: &str = "internal";

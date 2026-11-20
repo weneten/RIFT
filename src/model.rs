@@ -1,7 +1,7 @@
 use anyhow::{bail, Context};
 use ipnet::{IpNet, Ipv4Net};
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -527,6 +527,17 @@ pub struct AgentPolicy {
     /// Links this agent opens to other agents (protocol 2).
     #[serde(default)]
     pub outbound: Vec<AgentOutboundRule>,
+    /// The names of the agents this agent links to, for its host's resolver (protocol 2).
+    #[serde(default)]
+    pub names: Option<AgentNames>,
+}
+/// RIFT's name server and the names it answers for an agent's host: those of the agents the
+/// agent opens links to that have names on (`node2.internal`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentNames {
+    /// The server's tunnel address and `RIFT_NAMES_PORT`.
+    pub server: SocketAddr,
+    pub domains: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Welcome {

@@ -72,6 +72,12 @@ services:
     <<: *rift
     profiles: ["agent"]
     container_name: rift-agent
+    volumes:
+      - rift-state:/var/lib/rift
+      - ${RIFT_CONFIG:-./config.toml}:/etc/rift/config.toml:ro
+      # The names of linked agents for this host's resolver (rift-host-names). Created by
+      # deploy/install-cli; Docker creates it empty otherwise, and the names then stay unused.
+      - /var/lib/rift-agent-host:/var/lib/rift-agent-host
     environment:
       RIFT_SERVER: ${RIFT_SERVER:-}
       RIFT_AGENT_NAME: ${RIFT_AGENT_NAME:-}
@@ -80,6 +86,7 @@ services:
       RIFT_AGENT_ALLOW_SUBNETS: ${RIFT_AGENT_ALLOW_SUBNETS:-}
       RIFT_AGENT_ALLOW_EXIT: ${RIFT_AGENT_ALLOW_EXIT:-}
       RIFT_AGENT_ALLOW_LINKS: ${RIFT_AGENT_ALLOW_LINKS:-}
+      RIFT_NAMES_SUFFIX: ${RIFT_NAMES_SUFFIX:-}
       RIFT_TUI: ${RIFT_TUI:-}
     command: ["--config", "/etc/rift/config.toml", "agent"]
 

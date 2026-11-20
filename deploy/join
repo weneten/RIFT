@@ -46,12 +46,13 @@ usage() {
 
 # The settings in the order of .env.agent.example, and RIFT's default of each.
 keys="RIFT_VERSION RIFT_SERVER RIFT_AGENT_NAME RIFT_ENROLLMENT_TOKEN
-RIFT_AGENT_ALLOW_PORTS RIFT_AGENT_ALLOW_SUBNETS RIFT_AGENT_ALLOW_EXIT RIFT_AGENT_ALLOW_LINKS RIFT_TUI"
+RIFT_AGENT_ALLOW_PORTS RIFT_AGENT_ALLOW_SUBNETS RIFT_AGENT_ALLOW_EXIT RIFT_AGENT_ALLOW_LINKS RIFT_NAMES_SUFFIX RIFT_TUI"
 builtin() {
   case $1 in
     RIFT_VERSION) echo latest ;;
     RIFT_AGENT_ALLOW_EXIT) echo false ;;
     RIFT_AGENT_ALLOW_LINKS) echo true ;;
+    RIFT_NAMES_SUFFIX) echo internal ;;
     RIFT_TUI) echo true ;;
     *) echo ;;
   esac

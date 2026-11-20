@@ -440,6 +440,13 @@ impl Kernel {
             welcome.tunnel_ipv4,
             &outbound,
         ));
+        if let Some(names) = &policy.names {
+            vpn_rules.merge(vpn::agent_names_rules(
+                self.interface(),
+                welcome.tunnel_ipv4,
+                names,
+            ));
+        }
         self.ensure_nft_ownership().await?;
         let rules = render_agent_rules(
             self.interface(),
@@ -450,8 +457,15 @@ impl Kernel {
             &vpn_rules,
         )?;
         self.replace_nft_table(&rules).await?;
-        self.sync_agent_host_firewall(welcome, &forwards, &policy.vpn, &outbound, exit_active)
-            .await?;
+        self.sync_agent_host_firewall(
+            welcome,
+            &forwards,
+            &policy.vpn,
+            &outbound,
+            policy.names.as_ref().map(|n| n.server),
+            exit_active,
+        )
+        .await?;
         Ok(())
     }
 
@@ -690,6 +704,15 @@ impl Kernel {
             },
         );
         if !server {
+            if let Some((fine, text)) =
+                crate::names::agent_host_names_note(Path::new(crate::names::AGENT_HOST_DIR))
+            {
+                checks.push(
+                    if fine { OK } else { WARN },
+                    "Names of linked agents".into(),
+                    text,
+                );
+            }
             let exit = self.config.agent_allow_exit;
             checks.push(
                 OK,
@@ -947,6 +970,7 @@ impl Kernel {
         forwards: &[&Forward],
         vpn: &[crate::model::AgentVpnRule],
         outbound: &[AgentOutboundRule],
+        names: Option<SocketAddr>,
         exit: bool,
     ) -> Result<()> {
         if self.config.host_firewall == crate::config::HostFirewall::Off {
@@ -970,6 +994,7 @@ impl Kernel {
                 forwards,
                 vpn,
                 outbound,
+                names,
                 exit: exit.then_some(crate::host_firewall::ExitSpec {
                     interface: vpn::EXIT_INTERFACE,
                     uplinks: &uplinks,

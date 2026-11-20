@@ -217,8 +217,9 @@ pub struct Config {
     /// Server only. The port RIFT's name server (`NAME.internal` for VPN devices) listens on,
     /// on the server's tunnel address; devices reach it as port 53 through a redirect.
     pub names_port: u16,
-    /// Server only. The suffix of the agents' names (`RIFT_NAMES_SUFFIX`): `NAME.internal` by
-    /// default; `home.arpa` or a domain of your own work too (see `vpn::validate_suffix`).
+    /// The suffix of the agents' names (`RIFT_NAMES_SUFFIX`): `NAME.internal` by default;
+    /// `home.arpa` or a domain of your own work too (see `vpn::validate_suffix`). On an agent,
+    /// the only suffix under which it lets the server name other agents for its host.
     pub names_suffix: String,
     /// Whether `rift` without a command opens the terminal UI (`RIFT_TUI`). On by default:
     /// it runs only through `docker exec` on the host, with the same rights as the CLI.

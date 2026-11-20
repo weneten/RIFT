@@ -1,7 +1,9 @@
 //! The agent's own limits on what the server may ask of it. A compromised server can send
 //! any policy; the agent applies only the part its owner allowed in the environment.
 
-use crate::model::{AgentLimits, AgentOutboundRule, AgentPolicy, AgentVpnRule, VpnAccess};
+use crate::model::{
+    AgentLimits, AgentNames, AgentOutboundRule, AgentPolicy, AgentVpnRule, VpnAccess,
+};
 use std::net::Ipv4Addr;
 
 /// Whether `rule` is a link from another agent (`rift link allow`): its source is an address
@@ -86,6 +88,51 @@ pub fn refuse_outbound(
     None
 }
 
+/// The names the agent's host may send to RIFT: only from the server's own tunnel address, and
+/// only `LABEL.SUFFIX` with the agent's own `RIFT_NAMES_SUFFIX`, so even a compromised server
+/// cannot take over the host's lookups of other names (`example.com`). Returns what is left and
+/// one text per name it drops.
+pub fn names_for_host(
+    names: &AgentNames,
+    server: Option<Ipv4Addr>,
+    suffix: &str,
+) -> (Option<AgentNames>, Vec<String>) {
+    if server.is_none_or(|server| names.server.ip() != std::net::IpAddr::V4(server)) {
+        return (
+            None,
+            vec![format!(
+                "names for this host refused: {} is not the server's tunnel address",
+                names.server.ip()
+            )],
+        );
+    }
+    let mut refusals = Vec::new();
+    let mut domains = Vec::new();
+    for domain in names.domains.iter().take(1024) {
+        let label = domain.strip_suffix(&format!(".{suffix}"));
+        let valid = label.is_some_and(|label| {
+            (1..=63).contains(&label.len())
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        });
+        if valid {
+            domains.push(domain.clone());
+        } else {
+            refusals.push(format!(
+                "name {domain} refused: this agent takes only names under its own suffix .{suffix} (RIFT_NAMES_SUFFIX on the agent)"
+            ));
+        }
+    }
+    let names = (!domains.is_empty()).then_some(AgentNames {
+        server: names.server,
+        domains,
+    });
+    (names, refusals)
+}
+
 /// Returns the part of `policy` the agent's limits permit, and one refusal text per dropped
 /// entry. The server leaves refused entries out itself once it knows the limits, so refusals
 /// normally only appear before the first sync or from a server that ignores them. `server` is
@@ -133,6 +180,18 @@ pub fn restrict(
             )),
         }
     }
+    let names = match (&policy.names, limits.refuse_links()) {
+        (None, _) => None,
+        (Some(_), Some(why)) => {
+            refusals.push(format!("names for this host refused: {why}"));
+            None
+        }
+        (Some(names), None) => {
+            let (names, dropped) = names_for_host(names, server, &crate::vpn::names_suffix());
+            refusals.extend(dropped);
+            names
+        }
+    };
     let exit = match (&policy.exit, limits.refuse_exit()) {
         (Some(_), Some(why)) => {
             refusals.push(format!("internet exit refused: {why}"));
@@ -149,6 +208,7 @@ pub fn restrict(
             exit,
             tunnel_pool: policy.tunnel_pool,
             outbound,
+            names,
         },
         refusals,
     )
@@ -215,6 +275,57 @@ mod tests {
         );
         assert!(refusals[1].starts_with("access of the server host (10.13.0.1)"));
         assert!(refusals[2].starts_with("VPN grant for 10.14.0.2"));
+    }
+
+    #[test]
+    fn a_server_can_name_only_agents_under_the_agents_own_suffix() {
+        let server = Some(Ipv4Addr::new(10, 13, 0, 1));
+        let names = |at: &str, domains: &[&str]| AgentNames {
+            server: at.parse().unwrap(),
+            domains: domains.iter().map(|d| d.to_string()).collect(),
+        };
+        let (kept, refusals) = names_for_host(
+            &names(
+                "10.13.0.1:53053",
+                &[
+                    "nas.internal",
+                    "example.com",
+                    "a.b.internal",
+                    "-x.internal",
+                    "internal",
+                ],
+            ),
+            server,
+            "internal",
+        );
+        assert_eq!(kept.unwrap().domains, ["nas.internal"]);
+        assert_eq!(refusals.len(), 4, "{refusals:?}");
+        assert!(refusals[0].contains("example.com") && refusals[0].contains("RIFT_NAMES_SUFFIX"));
+        // Another suffix on the server: nothing, until the agent's owner sets the same one.
+        let other = names("10.13.0.1:53053", &["nas.home.arpa"]);
+        assert!(names_for_host(&other, server, "internal").0.is_none());
+        assert!(names_for_host(&other, server, "home.arpa").0.is_some());
+        // Only the server's own tunnel address answers.
+        let elsewhere = names("192.168.178.1:53", &["nas.internal"]);
+        let (kept, refusals) = names_for_host(&elsewhere, server, "internal");
+        assert!(kept.is_none() && refusals[0].contains("192.168.178.1"));
+        assert!(names_for_host(
+            &names("10.13.0.1:53053", &["nas.internal"]),
+            None,
+            "internal"
+        )
+        .0
+        .is_none());
+        // RIFT_AGENT_ALLOW_LINKS=false: no names either.
+        let mut p = links_policy();
+        p.names = Some(names("10.13.0.1:53053", &["nas.internal"]));
+        let mut closed = cfg("", "");
+        closed.no_links = true;
+        let (out, refusals) = restrict_(&p, &closed);
+        assert!(out.names.is_none());
+        assert!(refusals
+            .iter()
+            .any(|r| r.starts_with("names for this host refused")));
     }
 
     #[test]
@@ -335,6 +446,7 @@ mod tests {
             exit: None,
             tunnel_pool: None,
             outbound: vec![],
+            names: None,
         }
     }
     fn subnet(net: &str) -> VpnAccess {

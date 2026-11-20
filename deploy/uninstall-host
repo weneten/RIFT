@@ -83,6 +83,9 @@ fi
 if [ "$purge" -eq 1 ] && [ -d /var/lib/rift-site-queue ]; then
   rm -rf /var/lib/rift-site-queue && echo "rift: removed /var/lib/rift-site-queue"
 fi
+if [ "$purge" -eq 1 ] && [ -d /var/lib/rift-agent-host ]; then
+  rm -rf /var/lib/rift-agent-host && echo "rift: removed /var/lib/rift-agent-host"
+fi
 
 # Host files installed by deploy/prepare-host and deploy/install-cli.
 for f in /usr/local/bin/rift /usr/local/lib/rift/rift-site /usr/local/lib/rift/rift-host-names /etc/sysctl.d/99-rift.conf; do
