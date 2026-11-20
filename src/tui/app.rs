@@ -1678,7 +1678,7 @@ impl App {
                             Field::text(
                                 "ports",
                                 "Ports",
-                                "22/tcp",
+                                "",
                                 "optional, e.g. 22/tcp 8000-8010/tcp",
                             ),
                             Field::check("server", "Whole host (TCP, UDP, ping)", false),
@@ -3103,9 +3103,25 @@ mod tests {
         let Some(Modal::Form { form, submit }) = app.modals.last() else {
             panic!("no form")
         };
-        let (form, submit) = (form.clone(), submit.clone());
+        let (mut form, submit) = (form.clone(), submit.clone());
+        // Nothing is chosen in advance: an empty form asks for a choice.
+        let empty = app
+            .build(&submit, &form)
+            .err()
+            .expect("an empty form is refused");
+        assert!(
+            empty.to_string().contains("choose what to allow"),
+            "{empty}"
+        );
+        for field in &mut form.fields {
+            if let crate::tui::form::Kind::Text { value, .. } = &mut field.kind {
+                if field.key == "ports" {
+                    *value = "22/tcp".into();
+                }
+            }
+        }
         let Ok(Op::Requests(requests)) = app.build(&submit, &form) else {
-            panic!("the default 22/tcp is a valid request")
+            panic!("22/tcp is a valid request")
         };
         assert_eq!(requests.len(), 1);
         assert!(matches!(

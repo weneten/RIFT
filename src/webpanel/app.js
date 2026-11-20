@@ -1547,7 +1547,7 @@ function hostDialog(name) {
     el("h4", {}, "Current access"), list];
   if (agent.status === "active") {
     const kind = select([["ports", "ports on the agent host"], ["server", "the agent host (TCP, UDP, ping)"], ["full", "the agent host, all protocols"]], "ports");
-    const value = el("input", { placeholder: "e.g. 22/tcp 8000-8010/tcp", value: "22/tcp" });
+    const value = el("input", { placeholder: "e.g. 22/tcp 8000-8010/tcp" });
     const valueRow = row("Ports", value);
     const update = () => { valueRow.hidden = kind.value !== "ports"; value.required = !valueRow.hidden; };
     kind.addEventListener("change", update);
