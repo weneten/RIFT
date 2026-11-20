@@ -1765,6 +1765,7 @@ impl App {
                                 vec![
                                     ("out".into(), format!("{name} reaches the other agent")),
                                     ("in".into(), format!("the other agent reaches {name}")),
+                                    ("both".into(), "both reach each other".into()),
                                 ],
                             ),
                             Field::text(
@@ -1775,11 +1776,10 @@ impl App {
                             ),
                             Field::check("server", "Whole host (TCP, UDP, ping)", false),
                             Field::check("full", "All protocols", false),
-                            Field::check("both", "Both directions", false),
                         ],
                     )
                     .intro(
-                        "A link lets one agent open connections to ports of another agent's tunnel address, through this server and without a public port. One way only unless both directions are ticked. The agent that is reached keeps its RIFT_AGENT_ALLOW_PORTS; either agent can refuse links with RIFT_AGENT_ALLOW_LINKS=false.",
+                        "A link lets one agent open connections to ports of another agent's tunnel address, through this server and without a public port. One way only, unless the direction is both. The agent that is reached keeps its RIFT_AGENT_ALLOW_PORTS; either agent can refuse links with RIFT_AGENT_ALLOW_LINKS=false.",
                     ),
                     Submit::Link(name),
                 )
@@ -2692,15 +2692,13 @@ impl App {
                     !accesses.is_empty(),
                     "choose what to allow: ports, the whole host or all protocols"
                 );
-                let (from, to) = if form.text("direction") == "in" {
-                    (other, agent.clone())
-                } else {
-                    (agent.clone(), other)
+                let out = (agent.clone(), other.clone());
+                let back = (other, agent.clone());
+                let directions = match form.text("direction").as_str() {
+                    "in" => vec![back],
+                    "both" => vec![out, back],
+                    _ => vec![out],
                 };
-                let mut directions = vec![(from.clone(), to.clone())];
-                if form.on("both") {
-                    directions.push((to, from));
-                }
                 Op::Requests(
                     directions
                         .into_iter()
@@ -3422,7 +3420,12 @@ mod tests {
         assert!(app.build(&submit, &form).is_err(), "nothing chosen");
         for field in &mut form.fields {
             match field.key {
-                "server" | "both" => field.kind = super::super::form::Kind::Check { on: true },
+                "server" => field.kind = super::super::form::Kind::Check { on: true },
+                "direction" => {
+                    if let super::super::form::Kind::Select { index, .. } = &mut field.kind {
+                        *index = 2;
+                    }
+                }
                 _ => {}
             }
         }

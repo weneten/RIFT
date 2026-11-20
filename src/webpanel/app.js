@@ -1637,16 +1637,15 @@ function linksDialog(name) {
     return ul;
   };
   const content = [
-    el("p", { class: "hint" }, `A link lets one agent open connections to ports of another agent's tunnel address, through this server and without a public port. One way only, unless you tick both directions. The agent that is reached keeps its RIFT_AGENT_ALLOW_PORTS, and either agent can refuse links with RIFT_AGENT_ALLOW_LINKS=false. Connections start from the agent host itself (its shell, programs with host networking).`),
+    el("p", { class: "hint" }, `A link lets one agent open connections to ports of another agent's tunnel address, through this server and without a public port. One way only, unless you choose both directions. The agent that is reached keeps its RIFT_AGENT_ALLOW_PORTS, and either agent can refuse links with RIFT_AGENT_ALLOW_LINKS=false. Connections start from the agent host itself (its shell, programs with host networking).`),
     el("h4", {}, `${name} reaches`), list(agent.links_out || [], true),
     el("h4", {}, `Reach ${name}`), list(agent.links_in || [], false)];
   const others = agentOptions(true).filter(([n]) => n !== name);
   if (agent.status === "active" && others.length) {
     const other = select(others, others[0][0]);
-    const direction = select([["out", `${name} reaches the other agent`], ["in", `the other agent reaches ${name}`]], "out");
+    const direction = select([["out", `${name} reaches the other agent`], ["in", `the other agent reaches ${name}`], ["both", "both reach each other"]], "out");
     const kind = select([["ports", "ports on the agent host"], ["server", "the agent host (TCP, UDP, ping)"], ["full", "the agent host, all protocols"]], "ports");
     const value = el("input", { placeholder: "e.g. 22/tcp 8000-8010/tcp" });
-    const both = el("input", { type: "checkbox" });
     const valueRow = row("Ports", value);
     const update = () => { valueRow.hidden = kind.value !== "ports"; value.required = !valueRow.hidden; };
     kind.addEventListener("change", update);
@@ -1654,10 +1653,9 @@ function linksDialog(name) {
     content.push(el("hr", { class: "sep" }), el("h4", {}, "Allow more"), form([
       el("div", { class: "row inline" }, row("Other agent", other), row("Direction", direction)),
       row("Access to", kind), valueRow,
-      check("Both directions", both),
     ], "Allow", async () => {
-      const [from, to] = direction.value === "out" ? [name, other.value] : [other.value, name];
-      const body = { action: "link_allow", from, to, both: both.checked };
+      const [from, to] = direction.value === "in" ? [other.value, name] : [name, other.value];
+      const body = { action: "link_allow", from, to, both: direction.value === "both" };
       if (kind.value === "server") body.server = true;
       if (kind.value === "full") body.full = true;
       if (kind.value === "ports") body.ports = value.value;
