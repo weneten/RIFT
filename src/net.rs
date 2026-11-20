@@ -660,14 +660,17 @@ impl Kernel {
                 format!("{} (not strict)", rp.unwrap_or_else(|| "unknown".into()))
             },
         );
+        // Not needed: RIFT keeps reverse-path filtering on its own interface loose
+        // (set_rp_filter), so marked replies pass either way. deploy/prepare-host leaves it
+        // alone on purpose (docs/deploy.md); other WireGuard tools such as wg-quick turn it on.
         let mark = sysctl("src_valid_mark_all").as_deref() == Some("1");
         checks.push(
-            if mark { OK } else { WARN },
+            OK,
             "src_valid_mark".into(),
             if mark {
                 "on".into()
             } else {
-                "off; run `sudo sh deploy/prepare-host`".into()
+                "off; not needed, RIFT keeps reverse-path filtering on its interface loose".into()
             },
         );
         if !server {

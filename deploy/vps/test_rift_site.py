@@ -120,6 +120,14 @@ class EdgeTests(unittest.TestCase):
             load.assert_not_called()
             self.assertIn("PORT is the agent's port number, for example 8081", str(caught.exception))
 
+    def test_a_port_from_the_queue_is_a_number_and_accepted(self):
+        # The web panel and the terminal UI queue the port as a JSON number.
+        with mock.patch.object(rift_site, "load_state", side_effect=rift_site.SiteError("stop")) as load:
+            with self.assertRaises(rift_site.SiteError) as caught:
+                rift_site.command_add("node1", "app.example", 8081, None)
+        load.assert_called_once()
+        self.assertEqual(str(caught.exception), "stop")
+
     def setUp(self):
         self.traefik = [
             {

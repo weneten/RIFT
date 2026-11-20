@@ -1008,6 +1008,9 @@ def command_purge():
 
 def command_add(agent, host, port, proxy, allow_from=()):
     allow_from = parse_allow_from(list(allow_from))
+    # The command line passes the port as text, the web panel's and terminal UI's queue as a
+    # number (parse_queue_request checked it); both are checked as text below.
+    port = str(port)
     if not valid_agent(agent) or not valid_host(host):
         raise SiteError("agent or host is not a usable name")
     if not re.fullmatch(r"[0-9]{1,5}", port) or not 1 <= int(port) <= 65535:
