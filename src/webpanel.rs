@@ -1029,6 +1029,7 @@ impl Action {
                     "SNAT applies only to a subnet"
                 );
                 let accesses = crate::vpn::accesses(server, full, &words(&ports), &subnets, snat)?;
+                crate::vpn::single_host_access(&accesses)?;
                 ensure!(
                     !accesses.is_empty(),
                     "choose what to allow: host, all protocols, ports or a subnet"
@@ -1068,6 +1069,7 @@ impl Action {
                 ports,
             } => {
                 let accesses = crate::vpn::accesses(server, full, &words(&ports), &[], false)?;
+                crate::vpn::single_host_access(&accesses)?;
                 ensure!(
                     !accesses.is_empty(),
                     "choose what to allow: the host, all protocols or ports"
@@ -1095,6 +1097,7 @@ impl Action {
                 both,
             } => {
                 let accesses = crate::vpn::accesses(server, full, &words(&ports), &[], false)?;
+                crate::vpn::single_host_access(&accesses)?;
                 ensure!(
                     !accesses.is_empty(),
                     "choose what to allow: the host, all protocols or ports"
@@ -2237,11 +2240,23 @@ mod tests {
             &panel,
             "127.0.0.1",
             &cookie,
-            r#"{"action":"host_allow","agent":"node4","server":true,"ports":"22/tcp, 53/both"}"#,
+            r#"{"action":"host_allow","agent":"node4","ports":"22/tcp, 53/both"}"#,
             "",
         )
         .await;
         assert!(added.starts_with("HTTP/1.1 200"), "{added}");
+        let overlapping = act(
+            &panel,
+            "127.0.0.1",
+            &cookie,
+            r#"{"action":"host_allow","agent":"node4","server":true,"ports":"22/tcp"}"#,
+            "",
+        )
+        .await;
+        assert!(
+            overlapping.starts_with("HTTP/1.1 400") && overlapping.contains("choose one"),
+            "the whole host includes every port: {overlapping}"
+        );
         let empty = act(
             &panel,
             "127.0.0.1",
@@ -2274,7 +2289,7 @@ mod tests {
         assert!(denied.starts_with("HTTP/1.1 200"), "{denied}");
         let calls = fake.calls.lock().unwrap().clone();
         let allows = calls.iter().filter(|c| c.contains("HostAllow")).count();
-        assert_eq!(allows, 4, "server, 22/tcp, 53/udp and 53/tcp: {calls:?}");
+        assert_eq!(allows, 3, "22/tcp, 53/udp and 53/tcp: {calls:?}");
         assert!(calls
             .iter()
             .any(|c| c.contains("HostDeny") && c.contains("server")));
@@ -2288,11 +2303,20 @@ mod tests {
             &panel,
             "127.0.0.1",
             &cookie,
-            r#"{"action":"link_allow","from":"node4","to":"nas","ports":"22/tcp","server":true,"both":true}"#,
+            r#"{"action":"link_allow","from":"node4","to":"nas","ports":"22/tcp 80/tcp","both":true}"#,
             "",
         )
         .await;
         assert!(added.starts_with("HTTP/1.1 200"), "{added}");
+        let overlapping = act(
+            &panel,
+            "127.0.0.1",
+            &cookie,
+            r#"{"action":"link_allow","from":"node4","to":"nas","server":true,"full":true}"#,
+            "",
+        )
+        .await;
+        assert!(overlapping.starts_with("HTTP/1.1 400"), "{overlapping}");
         let empty = act(
             &panel,
             "127.0.0.1",
@@ -2313,7 +2337,7 @@ mod tests {
         assert!(denied.starts_with("HTTP/1.1 200"), "{denied}");
         let calls = fake.calls.lock().unwrap().clone();
         let allows: Vec<_> = calls.iter().filter(|c| c.contains("LinkAllow")).collect();
-        assert_eq!(allows.len(), 4, "server and 22/tcp, each way: {calls:?}");
+        assert_eq!(allows.len(), 4, "22/tcp and 80/tcp, each way: {calls:?}");
         assert!(
             allows
                 .iter()

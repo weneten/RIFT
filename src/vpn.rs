@@ -380,6 +380,21 @@ pub fn agent_rules(snap: &StateSnapshot, agent_id: &str) -> Vec<AgentVpnRule> {
         .collect()
 }
 
+/// For allowing: the whole host (`server`: TCP, UDP and ping), all protocols (`full`) and
+/// ports overlap, as `full` covers `server` and both cover every port. Several of them at once
+/// would only store grants that add nothing, so only one of them may be chosen. Networks, DNS
+/// and the exit are something else and may sit beside it. Withdrawing may name several.
+pub fn single_host_access(accesses: &[VpnAccess]) -> Result<()> {
+    let server = accesses.contains(&VpnAccess::Server);
+    let full = accesses.contains(&VpnAccess::Full);
+    let ports = accesses.iter().any(|a| matches!(a, VpnAccess::Port { .. }));
+    ensure!(
+        [server, full, ports].iter().filter(|x| **x).count() <= 1,
+        "choose one: ports, the whole host (server: TCP, UDP and ping) or all protocols (full). All protocols include the whole host, and both include every port"
+    );
+    Ok(())
+}
+
 /// The accesses the `vpn allow`/`deny` selectors name, in CLI flag terms.
 pub fn accesses(
     server: bool,
@@ -898,6 +913,34 @@ mod tests {
         assert!(server_link_rules("rift0", &StateSnapshot::default())
             .forward
             .is_empty());
+    }
+
+    #[test]
+    fn allowing_takes_ports_the_whole_host_or_all_protocols_not_several() {
+        let port = || VpnAccess::Port {
+            protocol: Protocol::Tcp,
+            ports: PortRange { start: 22, end: 22 },
+        };
+        let subnet = VpnAccess::Subnet {
+            net: "192.168.178.0/24".parse().unwrap(),
+            snat: false,
+        };
+        for fine in [
+            vec![port(), port()],
+            vec![VpnAccess::Server],
+            vec![VpnAccess::Full, subnet.clone()],
+            vec![port(), subnet.clone()],
+            vec![],
+        ] {
+            single_host_access(&fine).unwrap();
+        }
+        for overlapping in [
+            vec![port(), VpnAccess::Server],
+            vec![port(), VpnAccess::Full],
+            vec![VpnAccess::Server, VpnAccess::Full],
+        ] {
+            assert!(single_host_access(&overlapping).is_err(), "{overlapping:?}");
+        }
     }
 
     #[test]

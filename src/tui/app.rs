@@ -1730,14 +1730,9 @@ impl App {
                         &format!("Server access to {name}"),
                         "Allow",
                         vec![
-                            Field::text(
-                                "ports",
-                                "Ports",
-                                "",
-                                "optional, e.g. 22/tcp 8000-8010/tcp",
-                            ),
-                            Field::check("server", "Whole host (TCP, UDP, ping)", false),
-                            Field::check("full", "All protocols", false),
+                            access_field(),
+                            Field::text("ports", "Ports", "", "e.g. 22/tcp 8000-8010/tcp")
+                                .hint("only with \"only these ports\""),
                         ],
                     )
                     .intro(&format!(
@@ -1768,14 +1763,9 @@ impl App {
                                     ("both".into(), "both reach each other".into()),
                                 ],
                             ),
-                            Field::text(
-                                "ports",
-                                "Ports",
-                                "",
-                                "optional, e.g. 22/tcp 8000-8010/tcp",
-                            ),
-                            Field::check("server", "Whole host (TCP, UDP, ping)", false),
-                            Field::check("full", "All protocols", false),
+                            access_field(),
+                            Field::text("ports", "Ports", "", "e.g. 22/tcp 8000-8010/tcp")
+                                .hint("only with \"only these ports\""),
                         ],
                     )
                     .intro(
@@ -2426,14 +2416,9 @@ impl App {
             "Grant",
             vec![
                 Field::select("agent", "Agent", agents),
-                Field::text(
-                    "ports",
-                    "Ports",
-                    "",
-                    "optional, e.g. 22/tcp 53/both 8000-8010/tcp",
-                ),
-                Field::check("server", "Whole host (TCP, UDP, ping)", false),
-                Field::check("full", "All protocols", false),
+                access_field(),
+                Field::text("ports", "Ports", "", "e.g. 22/tcp 53/both 8000-8010/tcp")
+                    .hint("only with \"only these ports\""),
                 Field::text(
                     "subnets",
                     "LAN networks",
@@ -2629,13 +2614,8 @@ impl App {
                     !snat || !subnets.is_empty(),
                     "masquerading applies only to a LAN network"
                 );
-                let accesses = vpn::accesses(
-                    form.on("server"),
-                    form.on("full"),
-                    &webpanel::words(&form.text("ports")),
-                    &subnets,
-                    snat,
-                )?;
+                let (server, full, ports) = host_access(form)?;
+                let accesses = vpn::accesses(server, full, &ports, &subnets, snat)?;
                 let mut requests: Vec<AdminRequest> = accesses
                     .into_iter()
                     .map(|access| AdminRequest::VpnAllow {
@@ -2657,13 +2637,8 @@ impl App {
                 Op::Requests(requests)
             }
             Submit::Host(agent) => {
-                let accesses = vpn::accesses(
-                    form.on("server"),
-                    form.on("full"),
-                    &webpanel::words(&form.text("ports")),
-                    &[],
-                    false,
-                )?;
+                let (server, full, ports) = host_access(form)?;
+                let accesses = vpn::accesses(server, full, &ports, &[], false)?;
                 anyhow::ensure!(
                     !accesses.is_empty(),
                     "choose what to allow: ports, the whole host or all protocols"
@@ -2681,13 +2656,8 @@ impl App {
             Submit::Link(agent) => {
                 let other = form.text("other");
                 anyhow::ensure!(!other.is_empty(), "choose the other agent");
-                let accesses = vpn::accesses(
-                    form.on("server"),
-                    form.on("full"),
-                    &webpanel::words(&form.text("ports")),
-                    &[],
-                    false,
-                )?;
+                let (server, full, ports) = host_access(form)?;
+                let accesses = vpn::accesses(server, full, &ports, &[], false)?;
                 anyhow::ensure!(
                     !accesses.is_empty(),
                     "choose what to allow: ports, the whole host or all protocols"
@@ -3184,6 +3154,32 @@ async fn execute(config: &Config, op: Op) -> anyhow::Result<Done> {
     })
 }
 
+/// What a form asks for on the agent host: only some ports, the whole host or all protocols.
+/// One choice, since all protocols include the whole host and both include every port.
+fn access_field() -> Field {
+    Field::select(
+        "access",
+        "Access to",
+        vec![
+            ("ports".into(), "only these ports".into()),
+            ("server".into(), "the whole host (TCP, UDP, ping)".into()),
+            ("full".into(), "the whole host, all protocols".into()),
+        ],
+    )
+}
+
+/// `access_field` and the ports: (server, full, ports). Ports count only with "only these
+/// ports"; typed with another choice, they are an error rather than silently dropped.
+fn host_access(form: &Form) -> anyhow::Result<(bool, bool, Vec<String>)> {
+    let ports = webpanel::words(&form.text("ports"));
+    let choice = form.text("access");
+    anyhow::ensure!(
+        choice == "ports" || ports.is_empty(),
+        "the whole host already includes every port; clear the ports or choose \"only these ports\""
+    );
+    Ok((choice == "server", choice == "full", ports))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3419,16 +3415,24 @@ mod tests {
         let (mut form, submit) = (form.clone(), submit.clone());
         assert!(app.build(&submit, &form).is_err(), "nothing chosen");
         for field in &mut form.fields {
-            match field.key {
-                "server" => field.kind = super::super::form::Kind::Check { on: true },
-                "direction" => {
-                    if let super::super::form::Kind::Select { index, .. } = &mut field.kind {
-                        *index = 2;
-                    }
-                }
+            match (field.key, &mut field.kind) {
+                // the whole host, both directions
+                ("access", super::super::form::Kind::Select { index, .. }) => *index = 1,
+                ("direction", super::super::form::Kind::Select { index, .. }) => *index = 2,
                 _ => {}
             }
         }
+        // Ports beside the whole host would add nothing: refused, not dropped.
+        let mut with_ports = form.clone();
+        for field in &mut with_ports.fields {
+            if let ("ports", super::super::form::Kind::Text { value, .. }) =
+                (field.key, &mut field.kind)
+            {
+                *value = "22/tcp".into();
+            }
+        }
+        let refused = app.build(&submit, &with_ports).err().unwrap().to_string();
+        assert!(refused.contains("every port"), "{refused}");
         let Ok(Op::Requests(requests)) = app.build(&submit, &form) else {
             panic!("a valid request")
         };

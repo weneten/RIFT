@@ -50,6 +50,7 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ### Fixes
 
+- Allowing ports together with `server` or `full` (or `server` with `full`) is refused with a message instead of storing grants that add nothing: `full` includes `server`, and both include every port. This holds for `rift vpn allow`, `rift vpn connect`, `rift host allow`, `rift link allow` and the web panel; withdrawing may still name several. The forms of the terminal UI ask for one choice (only these ports, the whole host, all protocols) instead of two boxes beside the ports, and the link form asks for the direction once (this agent reaches the other, the other reaches it, or both).
 - The Health tab of the terminal UI and the web panel runs the checks again every 10 seconds while it is open, without the spinner and without clearing the list; it says how old the results are. `r` still runs them at once.
 - Adding a site from the web panel or the terminal UI failed with "TypeError: expected string or bytes-like object, got 'int'": the host helper checked the port as text, and the queue passes it as a number. `sudo rift add site` on the command line was not affected.
 - `rift doctor` warned "src_valid_mark: off; run `sudo sh deploy/prepare-host`", although RIFT does not need it (it keeps reverse-path filtering on its own interface loose) and `prepare-host` does not set it. It is shown as information now.

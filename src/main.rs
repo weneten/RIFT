@@ -341,6 +341,9 @@ impl LinkArgs {
     }
     fn requests(&self, allow: bool) -> Result<Vec<AdminRequest>> {
         let accesses = self.accesses()?;
+        if allow {
+            rift::vpn::single_host_access(&accesses)?;
+        }
         let mut out = Vec::new();
         for (from, to) in self.directions() {
             if allow {
@@ -819,7 +822,9 @@ async fn run() -> Result<()> {
             HostCommand::Names { .. } => unreachable!("handled above"),
             HostCommand::List => AdminRequest::HostList,
             HostCommand::Allow(args) => {
-                let mut requests = args.accesses()?.into_iter().map(|access| {
+                let accesses = args.accesses()?;
+                rift::vpn::single_host_access(&accesses)?;
+                let mut requests = accesses.into_iter().map(|access| {
                     AdminRequest::HostAllow {
                         agent: args.agent.clone(),
                         access,
@@ -1052,6 +1057,7 @@ async fn host_names(config: &Config, json: bool) -> Result<()> {
 /// The requests of `rift vpn allow`: the grants first, then the internet exit.
 fn vpn_allow_requests(args: &VpnAccessArgs) -> Result<Vec<AdminRequest>> {
     let plan = args.plan()?;
+    rift::vpn::single_host_access(&plan.accesses)?;
     let mut requests = Vec::new();
     if let Some(agent) = &plan.agent {
         for access in plan.accesses {
@@ -1951,11 +1957,27 @@ mod tests {
             }
         };
         let got = requests(
-            &["rift", "link", "allow", "a", "b", "22/tcp", "server"],
+            &["rift", "link", "allow", "a", "b", "22/tcp", "80/tcp"],
             true,
         )
         .unwrap();
         assert_eq!(got.len(), 2, "{got:?}");
+        // The whole host includes every port: allowing both is refused, withdrawing both is not.
+        assert!(requests(
+            &["rift", "link", "allow", "a", "b", "22/tcp", "server"],
+            true
+        )
+        .is_err());
+        assert!(requests(&["rift", "link", "allow", "a", "b", "server", "full"], true).is_err());
+        assert_eq!(
+            requests(
+                &["rift", "link", "deny", "a", "b", "22/tcp", "server"],
+                false
+            )
+            .unwrap()
+            .len(),
+            2
+        );
         assert!(got.iter().all(
             |r| matches!(r, AdminRequest::LinkAllow { from, to, .. } if from == "a" && to == "b")
         ));
