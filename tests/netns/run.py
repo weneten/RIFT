@@ -824,6 +824,13 @@ print(".".join(map(str,a[-4:])) if rcode==0 and count==1 else f"rcode={rcode} an
     assert forced(AGENTS[1], one, 19087) == 3, "agent2 kept access after link deny --both"
     wait_until(lambda: not route(AGENTS[0], two).strip() or None,
                "agent1 to drop its route to agent2", timeout=20)
+    # Without the link, agent2's address fails at once on agent1 instead of leaving by the
+    # underlay: the tunnel network is unreachable except for the server and linked agents.
+    lookup = ns(AGENTS[0], "ip", "-4", "route", "get", two, check=False)
+    assert lookup.returncode != 0 and "No route to host" in (lookup.stderr or ""), \
+        f"agent2's address on agent1 without a link: {lookup.stdout}{lookup.stderr}"
+    server_route = ns(AGENTS[0], "ip", "-4", "route", "get", server_v4).stdout
+    assert "dev rift0" in server_route, f"the server is no longer reached: {server_route}"
     assert json.loads(cli(VPS, server_cfg, "link", "list").stdout) == []
     print("PASS agents reach each other only through links: one way, granted ports, the source's own address, names of linked agents; deny closes them")
 

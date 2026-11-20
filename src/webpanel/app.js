@@ -1558,7 +1558,7 @@ function hostNameRow(a) {
   else if (host.state === "error") text = `${name}: ${host.detail}`;
   else if (!(host.domains || []).includes(name)) text = `${name}: being applied`;
   else if (host.lookup === "missing") text = `${name} resolves, but ssh does not ask systemd-resolved (apt install libnss-resolve)`;
-  else { fine = true; text = `${name} ✓ (ssh USER@${name} on the VPS)`; }
+  else { fine = true; text = `${name} ✓`; }
   return kv("Name on the VPS", el("span", { class: fine ? "ok-text" : "warn-text" }, text));
 }
 

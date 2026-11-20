@@ -435,7 +435,7 @@ pub fn host_name_note(
             false,
             format!("{name} resolves, but ssh does not ask systemd-resolved (apt install libnss-resolve)"),
         ),
-        _ => (true, format!("{name} ✓ (ssh USER@{name} on the VPS)")),
+        _ => (true, format!("{name} ✓")),
     })
 }
 

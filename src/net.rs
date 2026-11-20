@@ -367,6 +367,11 @@ impl Kernel {
         if let Err(error) = self.sync_agent_vpn_route(policy).await {
             tracing::warn!("VPN return route not installed: {error:#}");
         }
+        // Nothing addressed to the tunnel network may leave by the LAN: what no route of the
+        // tunnel covers fails at once. Like the links, it must not hold back forward grants.
+        if let Err(error) = self.sync_tunnel_guard(welcome, policy).await {
+            tracing::warn!("tunnel network not closed towards the LAN: {error:#}");
+        }
         // Links to other agents must not hold back forward grants either.
         let outbound = match self.sync_agent_links(welcome, policy).await {
             Ok(outbound) => outbound,
@@ -856,6 +861,23 @@ impl Kernel {
         if self.is_route_owned().await {
             self.delete_all_agent_rules().await?;
             self.delete_agent_routes().await?;
+            for guard in self.tunnel_guards().await? {
+                run_ok_allow_missing(
+                    "ip",
+                    [
+                        "-4",
+                        "route",
+                        "del",
+                        "unreachable",
+                        &guard.to_string(),
+                        "proto",
+                        ROUTE_PROTOCOL,
+                        "table",
+                        "main",
+                    ],
+                )
+                .await?;
+            }
             remove_owner_file(&self.owner_path("routes")).await?;
         }
         self.remove_exit_interface().await?;
@@ -1125,7 +1147,7 @@ impl Kernel {
                 &run_output("ip", ["-N", family, "-j", "route", "show", "table", "main"]).await?,
             )?;
             for route in routes.as_array().context("invalid ip route JSON")? {
-                if route["dev"].as_str() == Some(self.interface()) {
+                if route["dev"].as_str() == Some(self.interface()) || is_tunnel_guard(route) {
                     continue;
                 }
                 let Some(destination) = route["dst"].as_str().filter(|s| *s != "default") else {
@@ -1712,6 +1734,112 @@ impl Kernel {
         note_link_refusals(&refused);
         self.delete_stale_link_routes(welcome, &keep).await?;
         Ok(accepted)
+    }
+
+    /// An `unreachable` route for the agents' tunnel network (`RIFT_IPV4_POOL`) in the main
+    /// table. The host routes to the server and to linked agents are more specific and win;
+    /// any other tunnel address (a withdrawn link, a typo, a stale cache) fails at once with
+    /// "No route to host" instead of going to the LAN's router, which might even reach another
+    /// host with that address. Left out, with a note, when the network overlaps one of this
+    /// host's own networks; removed with the other routes when RIFT stops.
+    async fn sync_tunnel_guard(&self, welcome: &Welcome, policy: &AgentPolicy) -> Result<()> {
+        let wanted = policy.tunnel_pool.filter(|pool| {
+            (8..=29).contains(&pool.prefix_len())
+                && pool.network().is_private()
+                && pool.contains(&welcome.tunnel_ipv4)
+                && pool.contains(&welcome.server_ipv4)
+        });
+        let mut note = None;
+        let wanted = match wanted {
+            Some(pool) => match self.check_networks_free(&[IpNet::from(pool)]).await {
+                Ok(()) => Some(pool),
+                Err(error) => {
+                    note = Some(format!(
+                        "the tunnel network {pool} stays open towards the LAN: {error:#}"
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
+        note_link_refusals_in(&GUARD_NOTE, note.as_slice());
+        for existing in self.tunnel_guards().await? {
+            if Some(existing) != wanted {
+                run_ok_allow_missing(
+                    "ip",
+                    [
+                        "-4",
+                        "route",
+                        "del",
+                        "unreachable",
+                        &existing.to_string(),
+                        "proto",
+                        ROUTE_PROTOCOL,
+                        "table",
+                        "main",
+                    ],
+                )
+                .await?;
+            }
+        }
+        let Some(pool) = wanted else {
+            return Ok(());
+        };
+        let net = pool.to_string();
+        let existing = run_output(
+            "ip",
+            ["-N", "-4", "route", "show", "exact", &net, "table", "main"],
+        )
+        .await?;
+        ensure!(
+            existing.lines().all(|l| l.contains(ROUTE_PROTOCOL)),
+            "route {net} already exists outside the RIFT route protocol; refusing to replace it"
+        );
+        run_ok(
+            "ip",
+            [
+                "-4",
+                "route",
+                "replace",
+                "unreachable",
+                &net,
+                "proto",
+                ROUTE_PROTOCOL,
+                "table",
+                "main",
+            ],
+        )
+        .await
+    }
+
+    /// RIFT's `unreachable` routes in the main table (`sync_tunnel_guard`).
+    async fn tunnel_guards(&self) -> Result<Vec<Ipv4Net>> {
+        let listing = run_output(
+            "ip",
+            [
+                "-N",
+                "-4",
+                "-j",
+                "route",
+                "show",
+                "proto",
+                ROUTE_PROTOCOL,
+                "table",
+                "main",
+            ],
+        )
+        .await?;
+        if listing.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let routes: Value = serde_json::from_str(&listing).context("parse ip route JSON")?;
+        Ok(routes
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| is_unreachable(r))
+            .filter_map(|r| r["dst"].as_str()?.parse().ok())
+            .collect())
     }
 
     async fn replace_link_route(
@@ -2357,10 +2485,26 @@ fn render_server_rules(
     Ok(out)
 }
 
+/// `ip -N -j route` reports the type as a number: 7 is RTN_UNREACHABLE.
+fn is_unreachable(route: &Value) -> bool {
+    matches!(route["type"].as_str(), Some("7" | "unreachable"))
+}
+
+/// RIFT's own `unreachable` route for the tunnel network, which the overlap checks skip.
+fn is_tunnel_guard(route: &Value) -> bool {
+    is_unreachable(route) && route["protocol"].as_str() == Some(ROUTE_PROTOCOL)
+}
+
+static LINK_NOTE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static GUARD_NOTE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// Logs the links an agent leaves out, once per change: `apply_agent` runs with every sync.
 fn note_link_refusals(refused: &[String]) {
-    static LAST: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    let Ok(mut last) = LAST.lock() else {
+    note_link_refusals_in(&LINK_NOTE, refused);
+}
+
+fn note_link_refusals_in(last: &std::sync::Mutex<Vec<String>>, refused: &[String]) {
+    let Ok(mut last) = last.lock() else {
         return;
     };
     if last.as_slice() != refused {
@@ -3719,6 +3863,24 @@ mod tests {
         assert!(!global_ipv6_in(&json("fe80::1")));
         assert!(!global_ipv6_in("[]") && !global_ipv6_in("not json"));
     }
+    #[test]
+    fn only_rifts_own_unreachable_route_is_its_tunnel_guard() {
+        let route = |v: Value| v;
+        assert!(is_tunnel_guard(&route(
+            json!({"type": "7", "dst": "10.13.0.0/24", "protocol": "242", "flags": []})
+        )));
+        assert!(is_tunnel_guard(&route(
+            json!({"type": "unreachable", "dst": "10.13.0.0/24", "protocol": "242"})
+        )));
+        // Someone else's unreachable route, or a route of RIFT that leads somewhere, is not it.
+        assert!(!is_tunnel_guard(&route(
+            json!({"type": "7", "dst": "10.13.0.0/24", "protocol": "4"})
+        )));
+        assert!(!is_tunnel_guard(&route(
+            json!({"dst": "10.13.0.3", "dev": "rift0", "protocol": "242"})
+        )));
+    }
+
     #[test]
     fn uplinks_are_the_default_route_interfaces_without_the_tunnels() {
         let json = r#"[{"dst":"default","dev":"eth0"},{"dst":"default","dev":"rift0"},{"dst":"default","dev":"wlan0"},{"dst":"default","dev":"bad name"}]"#;
