@@ -6,8 +6,10 @@
 const $ = (id) => document.getElementById(id);
 const REFRESH_MS = 5000;
 const LOG_REFRESH_MS = 3000;
+const HEALTH_REFRESH_MS = 10000;
 let timer = null;
 let logTimer = null;
+let healthTimer = null;
 let data = null;
 let canWrite = false;
 
@@ -1016,6 +1018,7 @@ function drawHealth() {
     panelBox("Health",
       el("p", { class: failures ? "error" : warnings ? "warn-text" : "ok-text" },
         failures ? `✗ ${failures} problem(s) to fix.` : warnings ? `! ${warnings} warning(s); RIFT works, but see below.` : "✓ Everything looks fine."),
+      el("p", { class: "muted small" }, `Checked ${Math.round((Date.now() - state.checks.at) / 1000)} s ago, again every ${HEALTH_REFRESH_MS / 1000} s (r now).`),
       checks.length ? null : el("p", { class: "muted" }, "The daemon reported no kernel checks."),
       el("table", { class: "checks" }, el("tbody", {}, checks.map((c) => el("tr", {},
         el("td", { class: c.status === "ok" ? "ok-text" : c.status === "fail" ? "error" : "warn-text" }, c.status === "ok" ? "✓" : c.status === "fail" ? "✗" : "!"),
@@ -1075,13 +1078,20 @@ async function loadLogs() {
   } catch (_) { /* the overview shows the error */ }
 }
 
-async function loadChecks() {
-  state.checks = null;
-  if (state.tab === "health") render();
+// `quiet` (the timer): the shown results stay until the new ones arrive.
+let checksRunning = false;
+async function loadChecks(quiet) {
+  if (checksRunning) return;
+  checksRunning = true;
+  if (quiet !== true) {
+    state.checks = null;
+    if (state.tab === "health") render();
+  }
   try {
     const result = await act({ action: "diagnostics" }, { quiet: true });
-    state.checks = { list: ((result.doctor || {}).checks) || [] };
-  } catch (e) { state.checks = { error: e.message }; }
+    state.checks = { list: ((result.doctor || {}).checks) || [], at: Date.now() };
+  } catch (e) { state.checks = { error: e.message, at: Date.now() }; }
+  checksRunning = false;
   if (state.tab === "health") render();
 }
 
@@ -1089,6 +1099,11 @@ function schedule() {
   clearInterval(timer);
   clearInterval(logTimer);
   timer = setInterval(() => { if (!document.hidden) load(); }, REFRESH_MS);
+  // The open Health tab runs the checks again every HEALTH_REFRESH_MS, as `r` does.
+  clearInterval(healthTimer);
+  healthTimer = setInterval(() => {
+    if (!document.hidden && state.tab === "health" && state.checks && Date.now() - state.checks.at >= HEALTH_REFRESH_MS) loadChecks(true);
+  }, 1000);
   logTimer = setInterval(() => {
     if (!document.hidden && ((state.tab === "logs" && state.logs.follow) || state.tab === "overview")) loadLogs();
   }, LOG_REFRESH_MS);

@@ -48,6 +48,7 @@ All notable changes are listed here. Versions follow [Semantic Versioning](https
 
 ### Fixes
 
+- The Health tab of the terminal UI and the web panel runs the checks again every 10 seconds while it is open, without the spinner and without clearing the list; it says how old the results are. `r` still runs them at once.
 - Adding a site from the web panel or the terminal UI failed with "TypeError: expected string or bytes-like object, got 'int'": the host helper checked the port as text, and the queue passes it as a number. `sudo rift add site` on the command line was not affected.
 - `rift doctor` warned "src_valid_mark: off; run `sudo sh deploy/prepare-host`", although RIFT does not need it (it keeps reverse-path filtering on its own interface loose) and `prepare-host` does not set it. It is shown as information now.
 - A VPN grant the agent refuses (outside `RIFT_AGENT_ALLOW_PORTS` or `RIFT_AGENT_ALLOW_SUBNETS`, for example after removing a port from the agent's `.env`) showed only in the device's details. The VPN devices tab now marks it in the GRANTS column (`2 ✗1`) of the terminal UI and in the Access column of the web panel, and `rift status`, `rift doctor`, the overview's attention list and the panel's name it with the reason.

@@ -2154,8 +2154,8 @@ fn draw_health(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .filter(|c| c["status"] != "fail" && c["status"] != "ok")
         .count();
-    let line = match &app.health {
-        _ if app.health_loading => Line::styled(
+    let mut line = match &app.health {
+        _ if app.health_loading && !(app.health_quiet && app.health.is_some()) => Line::styled(
             format!("{} Running the checks…", SPINNER[app.frame % SPINNER.len()]),
             theme::accent(),
         ),
@@ -2170,6 +2170,16 @@ fn draw_health(frame: &mut Frame, app: &mut App, area: Rect) {
             (f, _) => Line::styled(format!("✗ {f} problem(s) to fix."), theme::bad().bold()),
         },
     };
+    if let (Some(Ok(_)), Some(at)) = (&app.health, app.health_at) {
+        line.push_span(Span::styled(
+            format!(
+                "   checked {} s ago, again every {} s (r now)",
+                at.elapsed().as_secs(),
+                crate::tui::app::HEALTH_REFRESH.as_secs()
+            ),
+            theme::muted(),
+        ));
+    }
     frame.render_widget(
         Paragraph::new(line).block(
             Block::bordered()

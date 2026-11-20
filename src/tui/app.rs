@@ -28,6 +28,9 @@ use tokio::sync::mpsc::UnboundedSender;
 /// How often the overview is fetched again, and the log more often while it is shown.
 const REFRESH: Duration = Duration::from_secs(3);
 const LOG_REFRESH: Duration = Duration::from_secs(1);
+/// How often the Health tab runs the checks again while it is open; `rift doctor` waits up to
+/// two seconds on some of them.
+pub const HEALTH_REFRESH: Duration = Duration::from_secs(10);
 /// Samples kept for the traffic graph.
 const HISTORY: usize = 120;
 /// How long a site request may wait for the host service.
@@ -434,6 +437,10 @@ pub struct App {
     history: Vec<String>,
     pub logs: LogView,
     pub health: Option<Result<Value, String>>,
+    /// When the shown checks finished; the Health tab runs them again after HEALTH_REFRESH.
+    pub health_at: Option<Instant>,
+    /// The running checks were started by the timer: the old results stay without a spinner.
+    pub health_quiet: bool,
     pub health_loading: bool,
     pub busy: usize,
     pub password: Option<String>,
@@ -483,6 +490,8 @@ impl App {
                 level: 0,
             },
             health: None,
+            health_at: None,
+            health_quiet: false,
             health_loading: false,
             busy: 0,
             password: None,
@@ -650,10 +659,15 @@ impl App {
         });
     }
     fn spawn_health(&mut self) {
+        self.run_health(false);
+    }
+    /// `quiet`: started by the timer, so the shown results stay until the new ones arrive.
+    fn run_health(&mut self, quiet: bool) {
         if self.health_loading {
             return;
         }
         self.health_loading = true;
+        self.health_quiet = quiet;
         let (path, tx) = (self.config_path.clone(), self.tx.clone());
         tokio::spawn(async move {
             let result = async {
@@ -795,6 +809,8 @@ impl App {
             }
             Msg::Health(result) => {
                 self.health_loading = false;
+                self.health_quiet = false;
+                self.health_at = Some(Instant::now());
                 self.health = Some(result);
                 self.clamp_selections();
             }
@@ -887,6 +903,15 @@ impl App {
             && self.last_logs.is_none_or(|at| at.elapsed() >= LOG_REFRESH)
         {
             self.spawn_logs();
+        }
+        // The open Health tab keeps its checks current, like `r` but without the spinner.
+        if self.current() == Tab::Health
+            && self.health.is_some()
+            && self
+                .health_at
+                .is_some_and(|at| at.elapsed() >= HEALTH_REFRESH)
+        {
+            self.run_health(true);
         }
         if let Some(toast) = &self.toast {
             // A second more for every line after the second, to read them all.
@@ -3184,6 +3209,35 @@ mod tests {
         app.modals.clear();
         app.on_msg(done(MAX_TOAST_LINES + 1, false, false));
         assert!(app.toast.is_none() && app.modals.len() == 1, "too long");
+    }
+
+    #[tokio::test]
+    async fn the_open_health_tab_runs_its_checks_again_quietly() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = Config {
+            public_endpoint: "rift.example.net".into(),
+            ..Default::default()
+        };
+        let mut app = App::new(config, PathBuf::from("config.toml"), tx);
+        app.health = Some(Ok(json!({"checks": []})));
+        app.health_at = Some(Instant::now());
+        app.tab = app.tabs.iter().position(|t| *t == Tab::Health).unwrap();
+        app.on_tick();
+        assert!(!app.health_loading, "fresh results are kept");
+        let stale = Instant::now() - HEALTH_REFRESH - Duration::from_secs(1);
+        app.health_at = Some(stale);
+        app.tab = app.tabs.iter().position(|t| *t == Tab::Agents).unwrap();
+        app.on_tick();
+        assert!(!app.health_loading, "only while the Health tab is open");
+        app.tab = app.tabs.iter().position(|t| *t == Tab::Health).unwrap();
+        app.on_tick();
+        assert!(
+            app.health_loading && app.health_quiet,
+            "stale: run again, quietly"
+        );
+        app.on_msg(Msg::Health(Ok(json!({"checks": []}))));
+        assert!(!app.health_loading && !app.health_quiet);
+        assert!(app.health_at.unwrap().elapsed() < Duration::from_secs(1));
     }
 
     #[test]
