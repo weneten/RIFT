@@ -913,6 +913,7 @@ async fn host_names(config: &Config, json: bool) -> Result<()> {
             }
         }
     }
+    let host = rift::names::host_names_status(std::path::Path::new(rift::sites::QUEUE_DIR));
     if json {
         let names: Vec<_> = names
             .iter()
@@ -920,11 +921,24 @@ async fn host_names(config: &Config, json: bool) -> Result<()> {
             .collect();
         println!(
             "{}",
-            serde_json::json!({"server": server.to_string(), "suffix": suffix, "interface": config.interface, "names": names})
+            serde_json::json!({"server": server.to_string(), "suffix": suffix, "interface": config.interface, "names": names, "host": host})
         );
         return Ok(());
     }
-    println!("With `sudo rift host names on`, systemd-resolved on the VPS sends exactly these names to RIFT at {server}; every other name, under .{suffix} too, keeps its own DNS.");
+    let detail = host["detail"].as_str().unwrap_or_default();
+    println!(
+        "{}",
+        match host["state"].as_str() {
+            None => "The host part is not installed: run sudo sh deploy/install-cli in the RIFT directory.".to_string(),
+            Some("off") => "Switched off on this VPS; sudo rift host names on turns it on.".to_string(),
+            Some("unavailable") => format!("Not possible on this VPS: {detail}. Put the names into /etc/hosts instead."),
+            Some("error") => format!("Not applied: {detail}."),
+            _ => format!("On: systemd-resolved on the VPS sends exactly these names to RIFT at {server}; every other name, under .{suffix} too, keeps its own DNS."),
+        }
+    );
+    if host["lookup"] == "missing" && host["state"] == "active" {
+        println!("ssh and other programs do not ask systemd-resolved yet: apt install libnss-resolve, or point /etc/resolv.conf to /run/systemd/resolve/stub-resolv.conf.");
+    }
     if names.is_empty() {
         println!("No name yet: an agent needs names on (rift vpn names agent NAME on) and a host grant (rift host allow NAME ...).");
     } else {
@@ -1202,9 +1216,43 @@ async fn names_check(config: &Config, status: &serde_json::Value, checks: &mut r
         .filter(|p| rift::vpn::uses_names(&snap, p))
         .map(|p| p.name.as_str())
         .collect();
-    // The VPS host resolves names too once `rift host names on` set up its resolver.
+    // The VPS host resolves names too, through the host service (rift-host-names).
     if !rift::names::host_agents(&snap).is_empty() {
         users.push("this server host");
+        let host = &status["host_names"];
+        let detail = host["detail"].as_str().unwrap_or_default();
+        let (fine, text) = match host["state"].as_str() {
+            None => (
+                false,
+                "the host part is not installed: sudo sh deploy/install-cli".to_string(),
+            ),
+            Some("off") => (false, "switched off: sudo rift host names on".to_string()),
+            Some("active") if host["lookup"] == "missing" => (
+                false,
+                "resolved has the names, but programs do not ask it: apt install libnss-resolve"
+                    .to_string(),
+            ),
+            Some("active") => (
+                true,
+                format!(
+                    "systemd-resolved sends {} to RIFT",
+                    host["domains"]
+                        .as_array()
+                        .map(|d| d
+                            .iter()
+                            .filter_map(|d| d.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "))
+                        .unwrap_or_default()
+                ),
+            ),
+            Some(_) => (false, detail.to_string()),
+        };
+        checks.push(
+            if fine { OK } else { rift::net::WARN },
+            "Names on the VPS".into(),
+            text,
+        );
     }
     if users.is_empty() {
         return;

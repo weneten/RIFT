@@ -866,9 +866,7 @@ function drawAgents() {
           ? el("span", { class: "error", title: g.refused }, "refused by the agent")
           : el("span", { class: "ok-text" }, "allowed")))
         : [el("p", { class: "muted" }, "None: the VPS host reaches nothing on this agent (h allows ports).")]),
-      (a.host_grants || []).length && a.dns_name ? kv("Name on the VPS", a.names
-        ? [el("code", {}, a.dns_name), el("span", { class: "muted" }, " with sudo rift host names on")]
-        : el("span", { class: "muted" }, "names off (n)")) : null,
+      hostNameRow(a),
       a.last_error ? el("p", { class: "error" }, `✗ ${a.last_error}`) : null,
       el("p", { class: "muted" }, `${forwards} forward(s)`),
       a.dns_name ? el("p", { class: "hint" }, a.names
@@ -1524,6 +1522,25 @@ function importNote(name, result) {
   return (result && (result.reimport || []).includes(name))
     ? [`The configuration of ${name} changed: import it again on the device (QR code / config below).`]
     : [`The configuration of ${name} is unchanged: the change works without importing anything.`];
+}
+
+// How the VPS host resolves the agent's name (as names::host_name_note in the terminal UI):
+// the host service reports its state in host_names.
+function hostNameRow(a) {
+  if (!(a.host_grants || []).length || !a.dns_name) return null;
+  const host = data.host_names || {};
+  const name = a.dns_name;
+  let fine = false;
+  let text;
+  if (!a.names) text = `${name}: names off (n turns them on)`;
+  else if (!host.state) text = `${name}: the host part is missing (sudo sh deploy/install-cli)`;
+  else if (host.state === "off") text = `${name}: switched off on the VPS (sudo rift host names on)`;
+  else if (host.state === "unavailable") text = `${name}: not possible here: ${host.detail}`;
+  else if (host.state === "error") text = `${name}: ${host.detail}`;
+  else if (!(host.domains || []).includes(name)) text = `${name}: being applied`;
+  else if (host.lookup === "missing") text = `${name} resolves, but ssh does not ask systemd-resolved (apt install libnss-resolve)`;
+  else { fine = true; text = `${name} ✓ (ssh USER@${name} on the VPS)`; }
+  return kv("Name on the VPS", el("span", { class: fine ? "ok-text" : "warn-text" }, text));
 }
 
 // What the VPS host itself may reach on an agent (`rift host allow`): no public port, no device.

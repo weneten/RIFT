@@ -1162,7 +1162,7 @@ async fn admin_call_inner(s: &Server, r: AdminRequest) -> Result<serde_json::Val
                 .map(|n| n.moved.clone())
                 .unwrap_or_default();
             let inapplicable_forwards = inapplicable(&snap, &cfg.public_ips);
-            serde_json::json!({"moved_forwards":moved_forwards,"inapplicable_forwards":inapplicable_forwards,"snapshot":snap,"enrollment":enrollment,"invites":invites,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"refused_forwards":refused_forwards,"refused_grants":refused_grants,"refused_host_grants":refused_host_grants,"fully_applied":fully_applied,"connection_history":s.state.health()?,"rift_version":protocol::RIFT_VERSION})
+            serde_json::json!({"moved_forwards":moved_forwards,"inapplicable_forwards":inapplicable_forwards,"snapshot":snap,"enrollment":enrollment,"invites":invites,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"refused_forwards":refused_forwards,"refused_grants":refused_grants,"refused_host_grants":refused_host_grants,"host_names":crate::names::host_names_status(std::path::Path::new(crate::sites::QUEUE_DIR)),"fully_applied":fully_applied,"connection_history":s.state.health()?,"rift_version":protocol::RIFT_VERSION})
         }
         AdminRequest::AgentsList => serde_json::to_value(snap.agents)?,
         AdminRequest::AgentsShow { name } => {

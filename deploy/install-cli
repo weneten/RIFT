@@ -35,11 +35,6 @@ install -d -m 755 /usr/local/lib/rift
 install -m 755 "$script_dir/vps/rift-site" /usr/local/lib/rift/rift-site
 install -m 755 "$script_dir/vps/rift-host-names" /usr/local/lib/rift/rift-host-names
 printf '%s\n' 'Installed /usr/local/bin/rift, /usr/local/lib/rift/rift-site and rift-host-names.'
-# `rift host names on` of an earlier release routed all of .internal to RIFT; renew its units.
-if [ -e /etc/systemd/system/rift-host-names.service ] && ! [ -e /etc/systemd/system/rift-host-names.path ]; then
-    /usr/local/lib/rift/rift-host-names on \
-        || printf '%s\n' 'Run sudo rift host names on again once rift-server runs this version.'
-fi
 
 # The server container reads the site records (read-only) and writes requests into the queue
 # (read-write); only the queue is writable from the container. Created before the first
@@ -49,6 +44,11 @@ install -d -m 755 /var/lib/rift-site
 install -d -m 700 /var/lib/rift-site/files
 install -d -m 700 /var/lib/rift-site-queue
 chmod 700 /var/lib/rift-site-queue
+
+# Names of agents for this host itself (node1.internal): set up unless switched off with
+# `sudo rift host names off`. It changes nothing until an agent has names on and a host grant,
+# and then only routes those exact names to RIFT. Never fails the installation.
+/usr/local/lib/rift/rift-host-names auto || true
 
 if [ ! -d /run/systemd/system ] || ! command -v systemctl > /dev/null 2>&1; then
     printf '%s\n' 'No systemd here: the web panel cannot add or remove sites or run export, import' \

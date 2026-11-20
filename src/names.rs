@@ -284,6 +284,72 @@ pub fn write_host_names(dir: &std::path::Path, text: &str) -> Result<()> {
     std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))
 }
 
+/// What the host service last did (`host-names.status`, written by `rift-host-names`):
+/// `{"state": "active|off|unavailable|error", "detail", "domains": [...], "lookup": "ok|missing"}`,
+/// or null when the host part is not installed or older.
+pub fn host_names_status(dir: &std::path::Path) -> serde_json::Value {
+    let Ok(text) = std::fs::read_to_string(dir.join(format!("{HOST_NAMES_FILE}.status"))) else {
+        return serde_json::Value::Null;
+    };
+    let field = |key: &str| {
+        text.lines()
+            .filter_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+            .next_back()
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let domains: Vec<String> = field("domains")
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    serde_json::json!({
+        "state": field("state"),
+        "detail": field("detail"),
+        "domains": domains,
+        "lookup": field("lookup"),
+    })
+}
+
+/// How the VPS host resolves this agent's name, for the agent's details: (fine, text). None
+/// when the host has no grant on the agent or the agent's name is no DNS label.
+pub fn host_name_note(
+    agent: &serde_json::Value,
+    host: &serde_json::Value,
+) -> Option<(bool, String)> {
+    if agent["host_grants"].as_array().is_none_or(|g| g.is_empty()) {
+        return None;
+    }
+    let name = agent["dns_name"].as_str()?;
+    if agent["names"] != true {
+        return Some((false, format!("{name}: names off (n turns them on)")));
+    }
+    let detail = host["detail"].as_str().unwrap_or_default();
+    Some(match host["state"].as_str() {
+        None => (
+            false,
+            format!("{name}: the host part is missing (sudo sh deploy/install-cli)"),
+        ),
+        Some("off") => (
+            false,
+            format!("{name}: switched off on the VPS (sudo rift host names on)"),
+        ),
+        Some("unavailable") => (false, format!("{name}: not possible here: {detail}")),
+        Some("error") => (false, format!("{name}: {detail}")),
+        _ if !host["domains"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|d| d == name)) =>
+        {
+            (false, format!("{name}: being applied"))
+        }
+        _ if host["lookup"] == "missing" => (
+            false,
+            format!("{name} resolves, but ssh does not ask systemd-resolved (apt install libnss-resolve)"),
+        ),
+        _ => (true, format!("{name} ✓ (ssh USER@{name} on the VPS)")),
+    })
+}
+
 /// A query of the VPS host itself. Its resolver sends only the names of `HOST_NAMES_FILE` here
 /// (`rift host names on`), so nothing is passed on: an unknown name under the suffix does not
 /// exist, and any other name is refused rather than resolved for the host.
@@ -854,6 +920,60 @@ mod tests {
         );
         write_host_names(&dir.path().join("missing"), &text).unwrap();
         assert!(!dir.path().join("missing").exists());
+    }
+
+    #[test]
+    fn the_host_service_status_tells_per_agent_whether_its_name_works_on_the_vps() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(host_names_status(dir.path()).is_null(), "no host part");
+        std::fs::write(
+            dir.path().join("host-names.status"),
+            "state=active\ndetail=\ndomains=pp.internal nas.internal\nlookup=ok\n",
+        )
+        .unwrap();
+        let host = host_names_status(dir.path());
+        assert_eq!(host["state"], "active");
+        assert_eq!(
+            host["domains"],
+            serde_json::json!(["pp.internal", "nas.internal"])
+        );
+        let agent = |names: bool, grants: bool| {
+            serde_json::json!({"dns_name": "pp.internal", "names": names,
+                "host_grants": if grants { serde_json::json!([{"access": "server"}]) } else { serde_json::json!([]) }})
+        };
+        let note =
+            |agent: &serde_json::Value, host: &serde_json::Value| host_name_note(agent, host);
+        assert_eq!(
+            note(&agent(true, false), &host),
+            None,
+            "no host grant, no line"
+        );
+        let (fine, text) = note(&agent(true, true), &host).unwrap();
+        assert!(fine && text.starts_with("pp.internal ✓"), "{text}");
+        let (fine, text) = note(&agent(false, true), &host).unwrap();
+        assert!(!fine && text.contains("names off"), "{text}");
+        let mut other = host.clone();
+        other["lookup"] = "missing".into();
+        assert!(note(&agent(true, true), &other)
+            .unwrap()
+            .1
+            .contains("libnss-resolve"));
+        other["domains"] = serde_json::json!([]);
+        assert!(note(&agent(true, true), &other)
+            .unwrap()
+            .1
+            .contains("being applied"));
+        for (state, expected) in [
+            ("off", "sudo rift host names on"),
+            ("unavailable", "not possible here: no resolved"),
+            ("error", "no resolved"),
+        ] {
+            let host = serde_json::json!({"state": state, "detail": "no resolved"});
+            let (fine, text) = note(&agent(true, true), &host).unwrap();
+            assert!(!fine && text.contains(expected), "{state}: {text}");
+        }
+        let (_, text) = note(&agent(true, true), &serde_json::Value::Null).unwrap();
+        assert!(text.contains("deploy/install-cli"), "{text}");
     }
 
     #[test]

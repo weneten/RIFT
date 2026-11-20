@@ -1260,6 +1260,7 @@ pub(crate) fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> 
         "apply_error": status["apply_error"],
         "refused_grants": status["refused_grants"],
         "refused_host_grants": status["refused_host_grants"],
+        "host_names": status["host_names"],
         "enrollment": status["enrollment"],
         "invites": status["invites"],
         "bans": bans,
