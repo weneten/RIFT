@@ -33,7 +33,13 @@ fi
 
 install -d -m 755 /usr/local/lib/rift
 install -m 755 "$script_dir/vps/rift-site" /usr/local/lib/rift/rift-site
-printf '%s\n' 'Installed /usr/local/bin/rift and /usr/local/lib/rift/rift-site.'
+install -m 755 "$script_dir/vps/rift-host-names" /usr/local/lib/rift/rift-host-names
+printf '%s\n' 'Installed /usr/local/bin/rift, /usr/local/lib/rift/rift-site and rift-host-names.'
+# `rift host names on` of an earlier release routed all of .internal to RIFT; renew its units.
+if [ -e /etc/systemd/system/rift-host-names.service ] && ! [ -e /etc/systemd/system/rift-host-names.path ]; then
+    /usr/local/lib/rift/rift-host-names on \
+        || printf '%s\n' 'Run sudo rift host names on again once rift-server runs this version.'
+fi
 
 # The server container reads the site records (read-only) and writes requests into the queue
 # (read-write); only the queue is writable from the container. Created before the first

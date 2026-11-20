@@ -69,10 +69,10 @@ if command -v systemctl > /dev/null 2>&1; then
   systemctl stop rift-site-queue.service > /dev/null 2>&1 || true
 fi
 # The resolver settings of `rift host names on`.
-if command -v systemctl > /dev/null 2>&1; then
-  systemctl disable --now rift-host-names.service > /dev/null 2>&1 || true
+if [ -x /usr/local/lib/rift/rift-host-names ]; then
+  /usr/local/lib/rift/rift-host-names off > /dev/null 2>&1 || true
 fi
-for f in /etc/systemd/system/rift-site-queue.path /etc/systemd/system/rift-site-queue.service /etc/systemd/system/rift-host-names.service; do
+for f in /etc/systemd/system/rift-site-queue.path /etc/systemd/system/rift-site-queue.service /etc/systemd/system/rift-host-names.service /etc/systemd/system/rift-host-names.path; do
   if [ -e "$f" ]; then
     rm -f "$f" && echo "rift: removed $f"
   fi
@@ -85,7 +85,7 @@ if [ "$purge" -eq 1 ] && [ -d /var/lib/rift-site-queue ]; then
 fi
 
 # Host files installed by deploy/prepare-host and deploy/install-cli.
-for f in /usr/local/bin/rift /usr/local/lib/rift/rift-site /etc/sysctl.d/99-rift.conf; do
+for f in /usr/local/bin/rift /usr/local/lib/rift/rift-site /usr/local/lib/rift/rift-host-names /etc/sysctl.d/99-rift.conf; do
   if [ -e "$f" ]; then
     rm -f "$f" && echo "rift: removed $f"
   fi

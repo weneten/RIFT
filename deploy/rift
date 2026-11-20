@@ -58,87 +58,17 @@ case " $* " in
     *" --help "* | *" -h "*) help=1 ;;
 esac
 
-# `rift host names on|off`: systemd-resolved on the VPS sends the names under RIFT's suffix
-# (`.internal`) to RIFT's name server, as a routing domain of the tunnel interface; every other
-# name keeps the VPS's own DNS. A unit bound to the interface sets it again whenever RIFT
-# creates the interface (after a restart or reboot).
-names_unit=/etc/systemd/system/rift-host-names.service
-host_names() {
-    if [ "$(id -u)" -ne 0 ]; then
-        echo "rift: run as root: sudo rift host names $1" >&2
-        exit 1
-    fi
-    if [ "$1" = off ]; then
-        if [ -e "$names_unit" ]; then
-            systemctl disable --now rift-host-names.service > /dev/null 2>&1 || true
-            rm -f "$names_unit"
-            systemctl daemon-reload
-        fi
-        echo "rift: the VPS no longer resolves RIFT's names; its own DNS answers every name again."
-        exit 0
-    fi
-    if ! command -v systemctl > /dev/null 2>&1 || ! command -v resolvectl > /dev/null 2>&1 \
-        || ! systemctl is-active --quiet systemd-resolved; then
-        echo "rift: this needs systemd-resolved, which does not run here. Add the names to /etc/hosts" >&2
-        echo "      instead, for example: echo '10.13.0.2 node1.internal' >> /etc/hosts (see rift host list)." >&2
-        exit 1
-    fi
-    version=$(resolvectl --version 2> /dev/null | sed -n '1s/^systemd \([0-9]*\).*/\1/p')
-    if [ -n "$version" ] && [ "$version" -lt 246 ]; then
-        echo "rift: systemd-resolved $version cannot use a DNS server on another port (246 or newer can);" >&2
-        echo "      add the names to /etc/hosts instead (see rift host list)." >&2
-        exit 1
-    fi
-    require_running rift-server
-    settings=$(docker exec rift-server rift --config /etc/rift/config.toml --json host names) || exit 1
-    server=$(printf '%s' "$settings" | sed -n 's/.*"server":"\([0-9.]*:[0-9]*\)".*/\1/p')
-    suffix=$(printf '%s' "$settings" | sed -n 's/.*"suffix":"\([a-z0-9.-]*\)".*/\1/p')
-    interface=$(printf '%s' "$settings" | sed -n 's/.*"interface":"\([A-Za-z0-9_.-]*\)".*/\1/p')
-    if [ -z "$server" ] || [ -z "$suffix" ] || [ -z "$interface" ]; then
-        echo "rift: could not read the name server settings from rift-server: $settings" >&2
-        exit 1
-    fi
-    resolvectl=$(command -v resolvectl)
-    device="sys-subsystem-net-devices-$interface.device"
-    cat > "$names_unit" << UNIT
-[Unit]
-Description=RIFT's names (.$suffix) for this host
-BindsTo=$device
-After=$device systemd-resolved.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=$resolvectl dns $interface $server
-ExecStart=$resolvectl domain $interface ~$suffix
-ExecStart=$resolvectl default-route $interface false
-ExecStop=-$resolvectl revert $interface
-
-[Install]
-WantedBy=$device
-UNIT
-    systemctl daemon-reload
-    systemctl enable rift-host-names.service > /dev/null 2>&1
-    if ip link show "$interface" > /dev/null 2>&1 && ! systemctl restart rift-host-names.service; then
-        echo "rift: systemd-resolved did not take the settings; see: systemctl status rift-host-names" >&2
-        exit 1
-    fi
-    echo "rift: the VPS sends *.$suffix to RIFT at $server; every other name keeps its own DNS."
-    case "$(readlink -f /etc/resolv.conf 2> /dev/null)" in
-        */systemd/resolve/stub-resolv.conf | */systemd/resolve/resolv.conf) ;;
-        *)
-            echo "rift: note: /etc/resolv.conf does not point to systemd-resolved, so programs that read it" >&2
-            echo "      (ssh among them) do not see the names. Link it: ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf" >&2
-            ;;
-    esac
-    docker exec rift-server rift --config /etc/rift/config.toml host names | sed -n '2,$p'
-    exit 0
-}
-
 # Sites live on the host: the helper writes the proxy configuration.
 if [ -z "$help" ]; then
+    # The VPS's own resolver; see /usr/local/lib/rift/rift-host-names.
     case "${1-} ${2-} ${3-}" in
-        "host names on" | "host names off") host_names "$3" ;;
+        "host names on" | "host names off")
+            if [ ! -x /usr/local/lib/rift/rift-host-names ]; then
+                echo "rift: the host part is missing; run sudo sh deploy/install-cli in the RIFT directory" >&2
+                exit 1
+            fi
+            exec /usr/local/lib/rift/rift-host-names "$3"
+            ;;
     esac
 fi
 if [ -z "$help" ]; then

@@ -1,0 +1,141 @@
+#!/bin/sh
+# RIFT's names for the VPS host itself (`sudo rift host names on|off`, see README: Reach agents
+# from the server itself). rift-server lists the names the host may resolve in
+# /var/lib/rift-site-queue/host-names: agents with names on and a host grant. This script gives
+# systemd-resolved one routing domain per name on the tunnel interface, so only these exact
+# names (`node1.internal`) go to RIFT's name server; every other name, other names under the
+# suffix included (`metadata.google.internal`), keeps the host's own DNS. Without a name the
+# interface gets no DNS settings at all.
+#
+#   on     install and start the units, apply now
+#   off    remove the units and the settings
+#   apply  apply the list now (run by the units)
+set -eu
+
+file=${RIFT_HOST_NAMES:-/var/lib/rift-site-queue/host-names}
+service=/etc/systemd/system/rift-host-names.service
+path=/etc/systemd/system/rift-host-names.path
+self=/usr/local/lib/rift/rift-host-names
+
+value() {
+    sed -n "s/^$1=\\($2\\)\$/\\1/p" "$file" 2> /dev/null | tail -n 1
+}
+
+apply() {
+    [ -f "$file" ] || exit 0
+    interface=$(value interface '[A-Za-z0-9_.-]*')
+    server=$(value server '[0-9.]*:[0-9]*')
+    domains=$(value domains '[a-z0-9. -]*')
+    if [ -z "$interface" ] || ! ip link show "$interface" > /dev/null 2>&1; then
+        exit 0
+    fi
+    if [ -z "$domains" ] || [ -z "$server" ]; then
+        resolvectl revert "$interface"
+        exit 0
+    fi
+    routing=
+    for domain in $domains; do
+        routing="$routing ~$domain"
+    done
+    resolvectl dns "$interface" "$server"
+    # shellcheck disable=SC2086 # One argument per routing domain.
+    resolvectl domain "$interface" $routing
+    resolvectl default-route "$interface" false
+}
+
+on() {
+    if ! command -v systemctl > /dev/null 2>&1 || ! command -v resolvectl > /dev/null 2>&1 \
+        || ! systemctl is-active --quiet systemd-resolved; then
+        echo "rift: this needs systemd-resolved, which does not run here. Put the names into" >&2
+        echo "      /etc/hosts instead, for example 10.13.0.2 node1.internal (see rift host list)." >&2
+        exit 1
+    fi
+    version=$(resolvectl --version 2> /dev/null | sed -n '1s/^systemd \([0-9]*\).*/\1/p')
+    if [ -n "$version" ] && [ "$version" -lt 246 ]; then
+        echo "rift: systemd-resolved $version cannot use a DNS server on another port (246 or newer can);" >&2
+        echo "      put the names into /etc/hosts instead (see rift host list)." >&2
+        exit 1
+    fi
+    if [ ! -f "$file" ]; then
+        echo "rift: $file is missing: rift-server writes it once it runs this version." >&2
+        echo "      Update and start it (docker compose pull && docker compose up -d), then run this again." >&2
+        exit 1
+    fi
+    interface=$(value interface '[A-Za-z0-9_.-]*')
+    device="sys-subsystem-net-devices-$interface.device"
+    # Started whenever RIFT creates the interface, and whenever rift-server rewrites the list.
+    cat > "$service" << UNIT
+[Unit]
+Description=RIFT's names for this host (systemd-resolved)
+After=systemd-resolved.service $device
+
+[Service]
+Type=oneshot
+ExecStart=$self apply
+
+[Install]
+WantedBy=$device
+UNIT
+    cat > "$path" << UNIT
+[Unit]
+Description=Names for this host from rift-server
+
+[Path]
+PathChanged=$file
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable rift-host-names.service > /dev/null 2>&1
+    systemctl enable --now rift-host-names.path > /dev/null 2>&1
+    if ! systemctl start rift-host-names.service; then
+        echo "rift: systemd-resolved did not take the settings; see: systemctl status rift-host-names" >&2
+        exit 1
+    fi
+    case "$(readlink -f /etc/resolv.conf 2> /dev/null)" in
+        */systemd/resolve/stub-resolv.conf | */systemd/resolve/resolv.conf) ;;
+        *)
+            echo "rift: note: /etc/resolv.conf does not point to systemd-resolved, so programs that read it" >&2
+            echo "      (ssh among them) do not see the names. Link it: ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf" >&2
+            ;;
+    esac
+    domains=$(value domains '[a-z0-9. -]*')
+    if [ -n "$domains" ]; then
+        echo "rift: this host resolves $domains through RIFT; every other name keeps its own DNS."
+    else
+        echo "rift: on, but no name yet: an agent needs names on (rift vpn names agent NAME on) and a host"
+        echo "      grant (rift host allow NAME ...). Until then $interface has no DNS settings."
+    fi
+}
+
+off() {
+    interface=$(value interface '[A-Za-z0-9_.-]*')
+    if command -v systemctl > /dev/null 2>&1; then
+        systemctl disable --now rift-host-names.path > /dev/null 2>&1 || true
+        systemctl disable rift-host-names.service > /dev/null 2>&1 || true
+    fi
+    rm -f "$path" "$service"
+    if command -v systemctl > /dev/null 2>&1; then
+        systemctl daemon-reload
+    fi
+    interface=${interface:-rift0}
+    if command -v resolvectl > /dev/null 2>&1 && ip link show "$interface" > /dev/null 2>&1; then
+        resolvectl revert "$interface" || true
+    fi
+    echo "rift: this host no longer resolves RIFT's names; its own DNS answers every name."
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "rift: run as root: sudo rift host names ${1-on}" >&2
+    exit 1
+fi
+case "${1-}" in
+    on) on ;;
+    off) off ;;
+    apply) apply ;;
+    *)
+        echo "usage: rift-host-names on|off|apply" >&2
+        exit 2
+        ;;
+esac

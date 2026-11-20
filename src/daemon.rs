@@ -355,6 +355,7 @@ async fn reconcile(s: &Server) -> Result<()> {
     if let Err(error) = sync_exit_forwards(s, &config) {
         tracing::error!("internet exit forwards: {error:#}");
     }
+    sync_host_names(s, &config);
     let k = s.kernel.lock().await;
     let snapshot =
         portable::without_inapplicable(without_refused(s.state.snapshot()?), &config.public_ips);
@@ -384,6 +385,16 @@ async fn reconcile(s: &Server) -> Result<()> {
                 .mark_failed(snapshot.generation, &sanitize_error(&format!("{error:#}")))?;
             Err(error.context("desired configuration not applied; retained safe previously confirmed grants where possible"))
         }
+    }
+}
+/// The names the VPS host resolves (`rift host names on`), written for the host service.
+fn sync_host_names(s: &Server, config: &Config) {
+    let result = s.state.snapshot().and_then(|snap| {
+        let text = crate::names::host_names_text(config, &snap);
+        crate::names::write_host_names(std::path::Path::new(crate::sites::QUEUE_DIR), &text)
+    });
+    if let Err(error) = result {
+        tracing::warn!("names for the host: {error:#}");
     }
 }
 /// Keeps the exit ports and the managed forwards of internet exits in line with the devices.
@@ -1251,6 +1262,8 @@ async fn admin_call_inner(s: &Server, r: AdminRequest) -> Result<serde_json::Val
                 a.name = new_name.clone();
                 Ok(())
             })?;
+            // The agent's name for the VPS host follows it.
+            sync_host_names(s, &s.config.read().await.clone());
             serde_json::json!({"id":id,"name":new_name})
         }
         AdminRequest::AgentRotate { name } => {

@@ -244,7 +244,47 @@ pub fn host_agents(snap: &StateSnapshot) -> Vec<&AgentRecord> {
         .collect()
 }
 
-/// A query of the VPS host itself. Its resolver sends only the names under the suffix here
+/// The file in the web panel's queue directory (shared with the host) that lists the names the
+/// VPS host resolves. The host service `rift-host-names` (`sudo rift host names on`) watches it
+/// and gives systemd-resolved one routing domain per name, so only these exact names go to
+/// RIFT: other names under the suffix, such as a cloud provider's `metadata.google.internal`,
+/// keep the host's own DNS.
+pub const HOST_NAMES_FILE: &str = "host-names";
+
+/// The text of `HOST_NAMES_FILE`: `KEY=VALUE` lines the host service reads with sed.
+pub fn host_names_text(config: &Config, snap: &StateSnapshot) -> String {
+    let suffix = vpn::names_suffix();
+    let mut domains: Vec<String> = host_agents(snap)
+        .iter()
+        .filter_map(|a| vpn::dns_label(&a.name))
+        .map(|label| format!("{label}.{suffix}"))
+        .collect();
+    domains.sort();
+    domains.dedup();
+    format!(
+        "# Written by rift-server: the names this host resolves through RIFT (rift host names).\n\
+         server={}:{}\ninterface={}\ndomains={}\n",
+        config.server_ipv4,
+        config.names_port,
+        config.interface,
+        domains.join(" ")
+    )
+}
+
+/// Writes `HOST_NAMES_FILE` into `dir` when its text changed; nothing without the directory
+/// (no host command installed). Written in place, so the host's path unit sees one close.
+pub fn write_host_names(dir: &std::path::Path, text: &str) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let path = dir.join(HOST_NAMES_FILE);
+    if std::fs::read_to_string(&path).is_ok_and(|old| old == text) {
+        return Ok(());
+    }
+    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))
+}
+
+/// A query of the VPS host itself. Its resolver sends only the names of `HOST_NAMES_FILE` here
 /// (`rift host names on`), so nothing is passed on: an unknown name under the suffix does not
 /// exist, and any other name is refused rather than resolved for the host.
 fn decide_host(query: &[u8], snap: &StateSnapshot, names: &str) -> Reply {
@@ -769,6 +809,51 @@ mod tests {
             "internal",
         ));
         assert_eq!(rcode(&gone), RCODE_NXDOMAIN);
+    }
+
+    #[test]
+    fn the_host_names_file_lists_each_name_once_and_is_written_only_on_change() {
+        let mut snap = snap();
+        let config = Config {
+            server_ipv4: Ipv4Addr::new(10, 13, 0, 1),
+            ..Config::default()
+        };
+        let empty = host_names_text(&config, &snap);
+        assert!(empty.contains("\nserver=10.13.0.1:53053\n"), "{empty}");
+        assert!(empty.contains("\ninterface=rift0\n"), "{empty}");
+        assert!(
+            empty.ends_with("\ndomains=\n"),
+            "no name, no routing domain: {empty}"
+        );
+        let host = |agent: &str, access| crate::model::HostGrant {
+            agent_id: format!("id-{agent}"),
+            access,
+        };
+        snap.host_grants = vec![
+            host("node2", VpnAccess::Server),
+            host("node1", VpnAccess::Full),
+            host("node1", VpnAccess::Server),
+            host("other", VpnAccess::Server),
+        ];
+        let text = host_names_text(&config, &snap);
+        assert!(
+            text.ends_with("\ndomains=node1.internal node2.internal\n"),
+            "sorted, once each, names on only: {text}"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        write_host_names(dir.path(), &text).unwrap();
+        let path = dir.path().join(HOST_NAMES_FILE);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        write_host_names(dir.path(), &text).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "an unchanged list does not wake the host service"
+        );
+        write_host_names(&dir.path().join("missing"), &text).unwrap();
+        assert!(!dir.path().join("missing").exists());
     }
 
     #[test]

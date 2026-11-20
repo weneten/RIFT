@@ -251,9 +251,10 @@ enum HostCommand {
     /// What this server host may reach on which agent.
     List,
     /// Names for the server host: `sudo rift host names on` (host command) makes the VPS's
-    /// systemd-resolved send `*.internal` to RIFT, so `ssh USER@node1.internal` works for each
-    /// agent with names on (`rift vpn names agent node1 on`) and a host grant. Every other name
-    /// stays with the VPS's own DNS. Without on/off it shows the settings and the names.
+    /// systemd-resolved send `node1.internal` to RIFT for each agent with names on
+    /// (`rift vpn names agent node1 on`) and a host grant, so `ssh USER@node1.internal` works.
+    /// Only those exact names go to RIFT; every other name keeps the VPS's own DNS. Without
+    /// on/off it shows the names and the name server.
     Names {
         #[arg(value_parser = ["on", "off"])]
         state: Option<String>,
@@ -923,7 +924,7 @@ async fn host_names(config: &Config, json: bool) -> Result<()> {
         );
         return Ok(());
     }
-    println!("The VPS resolves .{suffix} through RIFT at {server} once `sudo rift host names on` set up systemd-resolved (other names keep its own DNS).");
+    println!("With `sudo rift host names on`, systemd-resolved on the VPS sends exactly these names to RIFT at {server}; every other name, under .{suffix} too, keeps its own DNS.");
     if names.is_empty() {
         println!("No name yet: an agent needs names on (rift vpn names agent NAME on) and a host grant (rift host allow NAME ...).");
     } else {
