@@ -163,6 +163,10 @@ pub struct AgentLimits {
     /// Whether the agent offers its internet connection as an exit for VPN devices. The UDP
     /// port of that exit is implied by this and needs no entry in `ports`.
     pub exit: bool,
+    /// `RIFT_AGENT_ALLOW_LINKS=false`: the agent neither opens nor accepts links to and from
+    /// other agents (`rift link allow`). Absent in reports of agents before links existed.
+    #[serde(default)]
+    pub no_links: bool,
 }
 impl AgentLimits {
     fn ports_allowed(&self, protocol: Protocol, ports: PortRange) -> bool {
@@ -182,6 +186,13 @@ impl AgentLimits {
     pub fn refuse_exit(&self) -> Option<String> {
         (!self.exit).then(|| {
             "the agent does not offer an internet exit; set RIFT_AGENT_ALLOW_EXIT=true on the agent"
+                .to_string()
+        })
+    }
+    /// Why the agent refuses links to or from other agents, if it does.
+    pub fn refuse_links(&self) -> Option<String> {
+        self.no_links.then(|| {
+            "the agent allows no links to or from other agents (RIFT_AGENT_ALLOW_LINKS=false)"
                 .to_string()
         })
     }
@@ -447,6 +458,23 @@ pub struct HostGrant {
     pub agent_id: String,
     pub access: VpnAccess,
 }
+/// One agent may open connections to another agent's tunnel address (`rift link allow`),
+/// through the server. Directional: `to` cannot open connections back unless a link of its
+/// own allows it. Only `Server`, `Full` and `Port`; the target sees it as a VPN rule whose
+/// source is the tunnel address of `from`, the source as an outbound rule.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentLink {
+    pub from_agent_id: String,
+    pub to_agent_id: String,
+    pub access: VpnAccess,
+}
+/// What the agent that opens a link needs: a route to the other agent's tunnel address and
+/// the replies of the connections it opens there.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentOutboundRule {
+    pub destination: Ipv4Addr,
+    pub access: VpnAccess,
+}
 /// What an agent needs to know about one granted peer.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentVpnRule {
@@ -479,6 +507,9 @@ pub struct StateSnapshot {
     /// What the VPS host itself may reach on agents; absent in snapshots written before it existed.
     #[serde(default)]
     pub host_grants: Vec<HostGrant>,
+    /// What agents may reach on other agents (`rift link allow`); absent before it existed.
+    #[serde(default)]
+    pub agent_links: Vec<AgentLink>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct AgentPolicy {
@@ -489,6 +520,13 @@ pub struct AgentPolicy {
     pub vpn: Vec<AgentVpnRule>,
     /// Present while a device uses this agent as its internet exit.
     pub exit: Option<ExitPolicy>,
+    /// The agents' tunnel network (`RIFT_IPV4_POOL`). The agent installs outbound routes only
+    /// inside it. Absent from servers before protocol 2.
+    #[serde(default)]
+    pub tunnel_pool: Option<Ipv4Net>,
+    /// Links this agent opens to other agents (protocol 2).
+    #[serde(default)]
+    pub outbound: Vec<AgentOutboundRule>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Welcome {

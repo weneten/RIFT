@@ -735,6 +735,73 @@ print(".".join(map(str,a[-4:])) if rcode==0 and count==1 else f"rcode={rcode} an
     print("PASS the VPS host reaches an agent port by host grant from its tunnel address and resolves its name with names on; deny closes it")
 
 
+def link_test(server_cfg):
+    """`rift link allow`: one agent reaches a granted port of another through the server, one
+    way only and only that port; another agent does not; deny closes it and removes the route."""
+    agents = {a["name"]: a for a in status(server_cfg)["snapshot"]["agents"]}
+    one, two = agents["agent1"]["tunnel_ipv4"], agents["agent2"]["tunnel_ipv4"]
+    echo_file = write(WORK / "link-echo.py", ECHO, 0o755)
+    for namespace, address, label in ((AGENTS[1], two, "agent2"), (AGENTS[0], one, "agent1")):
+        for port in (19086, 19087):
+            start_echo_process(namespace, echo_file, ["4", "tcp", address, str(port)],
+                               f"echo-link-{label}-{port}")
+            wait_echo_ready(namespace, "4", "tcp", address, port)
+    probe = r'''import socket,sys
+s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(2)
+try: s.connect((sys.argv[1],int(sys.argv[2])))
+except OSError: print("unreachable"); sys.exit(3)
+s.sendall(b"rift-test"); print(s.recv(256).decode())
+'''
+
+    def reach(namespace, address, port):
+        return ns(namespace, "python3", "-c", probe, address, str(port), check=False)
+
+    def forced(namespace, address, port):
+        """As a compromised agent would: a host route into the tunnel first, so the packets
+        really reach the server and the server or the target must drop them."""
+        ns(namespace, "ip", "-4", "route", "replace", f"{address}/32", "dev", "rift0")
+        try:
+            return reach(namespace, address, port).returncode
+        finally:
+            ns(namespace, "ip", "-4", "route", "del", f"{address}/32", "dev", "rift0", check=False)
+
+    def route(namespace, address):
+        return ns(namespace, "ip", "-4", "route", "show", f"{address}/32").stdout
+
+    assert forced(AGENTS[0], two, 19086) == 3, "agent1 reached agent2 without a link"
+    cli(VPS, server_cfg, "link", "allow", "agent1", "agent2", "19086/tcp")
+    wait_policy(server_cfg, 3)
+    result = wait_until(lambda: (r := reach(AGENTS[0], two, 19086)).returncode == 0 and r,
+                        "agent1 to reach agent2 through its link", timeout=20)
+    assert result.stdout.strip() == one, \
+        f"agent2 saw {result.stdout.strip()}, expected agent1's tunnel address {one}"
+    assert "rift0" in route(AGENTS[0], two), f"no route on agent1: {route(AGENTS[0], two)!r}"
+    assert not route(AGENTS[1], one).strip(), "the target got a route back"
+    # Only the granted port, only this direction, only this agent.
+    assert reach(AGENTS[0], two, 19087).returncode == 3, "agent1 reached a port the link does not name"
+    assert forced(AGENTS[1], one, 19086) == 3, "agent2 reached agent1 back through a one-way link"
+    assert forced(AGENTS[2], two, 19086) == 3, "agent3 used agent1's link to agent2"
+    listed = json.loads(cli(VPS, server_cfg, "link", "list").stdout)
+    assert [(l["from"], l["to"], l["state"]) for l in listed] == [("agent1", "agent2", "allowed")], listed
+    assert not any(f["target_ports"]["start"] == 19086 for f in status(server_cfg)["snapshot"]["forwards"])
+
+    cli(VPS, server_cfg, "link", "allow", "agent1", "agent2", "19087/tcp", "--both")
+    wait_policy(server_cfg, 3)
+    wait_until(lambda: reach(AGENTS[1], one, 19087).returncode == 0 or None,
+               "agent2 to reach agent1 with --both", timeout=20)
+    assert reach(AGENTS[0], two, 19087).returncode == 0
+
+    cli(VPS, server_cfg, "link", "deny", "agent1", "agent2", "--both")
+    wait_policy(server_cfg, 3)
+    wait_until(lambda: reach(AGENTS[0], two, 19086).returncode == 3 or None,
+               "agent1 to lose access after link deny", timeout=20)
+    assert forced(AGENTS[1], one, 19087) == 3, "agent2 kept access after link deny --both"
+    wait_until(lambda: not route(AGENTS[0], two).strip() or None,
+               "agent1 to drop its route to agent2", timeout=20)
+    assert json.loads(cli(VPS, server_cfg, "link", "list").stdout) == []
+    print("PASS agents reach each other only through links: one way, granted ports, the source's own address; deny closes them")
+
+
 def _client_probe():
     return r'''import socket,sys
 fam=socket.AF_INET6 if sys.argv[1]=="6" else socket.AF_INET
@@ -1408,6 +1475,7 @@ def main():
         allow_from_test(server_cfg)
         host_local_proxy_test(server_cfg)
         host_grant_test(server_cfg)
+        link_test(server_cfg)
         vpn_device_test(server_cfg)
         check_routes_and_foreign(prior, baselines)
         check_normal_traffic()

@@ -79,6 +79,7 @@ services:
       RIFT_AGENT_ALLOW_PORTS: ${RIFT_AGENT_ALLOW_PORTS:-}
       RIFT_AGENT_ALLOW_SUBNETS: ${RIFT_AGENT_ALLOW_SUBNETS:-}
       RIFT_AGENT_ALLOW_EXIT: ${RIFT_AGENT_ALLOW_EXIT:-}
+      RIFT_AGENT_ALLOW_LINKS: ${RIFT_AGENT_ALLOW_LINKS:-}
       RIFT_TUI: ${RIFT_TUI:-}
     command: ["--config", "/etc/rift/config.toml", "agent"]
 

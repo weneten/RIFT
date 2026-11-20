@@ -2757,7 +2757,7 @@ pub fn split_args(line: &str) -> Result<Vec<String>, String> {
 fn complete(input: &str) -> Option<String> {
     const WORDS: &[&str] = &[
         "status", "doctor", "list", "show", "add", "remove", "disable", "enable", "rename",
-        "rotate", "vpn", "host", "panel", "config", "reload", "logs", "agents", "agent",
+        "rotate", "vpn", "host", "link", "panel", "config", "reload", "logs", "agents", "agent",
         "forwards", "forward", "bans", "ban", "devices", "device", "invite", "allow", "deny",
         "dns", "names", "connect", "password", "2fa", "setup", "confirm", "reset", "validate",
         "exit", "server", "full", "--json", "--export", "--help",

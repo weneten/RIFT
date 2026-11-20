@@ -232,6 +232,10 @@ pub struct Config {
     pub agent_allow_subnets: Vec<Ipv4Net>,
     /// Agent only. Whether the agent offers its internet connection as an exit for VPN devices.
     pub agent_allow_exit: bool,
+    /// Agent only. Whether this agent opens and accepts links to and from other agents
+    /// (`rift link allow`). On by default: a link still needs the server's grant, and the
+    /// target's port limits apply.
+    pub agent_allow_links: bool,
     pub server_address: Option<String>,
     #[serde(skip)]
     pub enrollment_token: Option<String>,
@@ -285,6 +289,7 @@ impl Default for Config {
             agent_allow_ports: None,
             agent_allow_subnets: vec![],
             agent_allow_exit: false,
+            agent_allow_links: true,
             server_address: None,
             enrollment_token: None,
             tls_cert: None,
@@ -346,6 +351,7 @@ impl Config {
         env_parse!("RIFT_VPN_POOL", vpn_pool);
         env_parse!("RIFT_VPN_POOL6", vpn_pool6);
         env_parse!("RIFT_AGENT_ALLOW_EXIT", agent_allow_exit);
+        env_parse!("RIFT_AGENT_ALLOW_LINKS", agent_allow_links);
         if let Ok(v) = std::env::var("RIFT_VPN_DNS") {
             if !v.trim().is_empty() {
                 config.vpn_dns = parse_dns_list(&v).context("invalid RIFT_VPN_DNS")?;
@@ -581,6 +587,7 @@ impl Config {
             ports: self.agent_allow_ports.clone(),
             subnets: self.agent_allow_subnets.clone(),
             exit: self.agent_allow_exit,
+            no_links: !self.agent_allow_links,
         }
     }
     /// Private key of the agent's `rift-exit` interface.
@@ -876,6 +883,8 @@ mod tests {
         assert!(range(51899, 51821).validate().is_err(), "order");
         assert!(range(80, 90).validate().is_err(), "privileged ports");
         assert!(!Config::default().agent_allow_exit);
+        assert!(Config::default().agent_allow_links);
+        assert!(!Config::default().agent_limits().no_links);
     }
     #[test]
     fn rejects_non_ula() {

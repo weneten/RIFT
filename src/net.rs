@@ -1,8 +1,8 @@
 use crate::{
     config::Config,
     model::{
-        AgentPolicy, AgentStatus, Family, Forward, ForwardMode, Ingress, PeerStats, PortRange,
-        Protocol, StateSnapshot, VpnAccess, Welcome,
+        AgentOutboundRule, AgentPolicy, AgentStatus, Family, Forward, ForwardMode, Ingress,
+        PeerStats, PortRange, Protocol, StateSnapshot, VpnAccess, Welcome,
     },
     vpn,
 };
@@ -297,6 +297,9 @@ impl Kernel {
         vpn_rules
             .input
             .insert_str(0, &crate::webpanel::input_rules(&self.config, snapshot));
+        let link_rules = vpn::server_link_rules(self.interface(), snapshot);
+        let links = !link_rules.forward.is_empty();
+        vpn_rules.merge(link_rules);
         let names = crate::names::server_rules(&self.config, snapshot);
         vpn_rules.input.insert_str(0, &names.input);
         vpn_rules.prerouting.push_str(&names.prerouting);
@@ -315,7 +318,7 @@ impl Kernel {
         self.replace_nft_table(&rules).await?;
         self.sync_server_host_firewall(
             local_ingress,
-            !vpn_grants.is_empty(),
+            !vpn_grants.is_empty() || links,
             !exit_peers.is_empty(),
         )
         .await?;
@@ -364,6 +367,14 @@ impl Kernel {
         if let Err(error) = self.sync_agent_vpn_route(policy).await {
             tracing::warn!("VPN return route not installed: {error:#}");
         }
+        // Links to other agents must not hold back forward grants either.
+        let outbound = match self.sync_agent_links(welcome, policy).await {
+            Ok(outbound) => outbound,
+            Err(error) => {
+                tracing::warn!("links to other agents not applied: {error:#}");
+                Vec::new()
+            }
+        };
 
         let peers = self.wg_dump().await?;
         let peer = peers
@@ -424,6 +435,11 @@ impl Kernel {
         if let Some(rules) = exit_rules {
             vpn_rules.merge(rules);
         }
+        vpn_rules.merge(vpn::agent_outbound_rules(
+            self.interface(),
+            welcome.tunnel_ipv4,
+            &outbound,
+        ));
         self.ensure_nft_ownership().await?;
         let rules = render_agent_rules(
             self.interface(),
@@ -434,7 +450,7 @@ impl Kernel {
             &vpn_rules,
         )?;
         self.replace_nft_table(&rules).await?;
-        self.sync_agent_host_firewall(welcome, &forwards, &policy.vpn, exit_active)
+        self.sync_agent_host_firewall(welcome, &forwards, &policy.vpn, &outbound, exit_active)
             .await?;
         Ok(())
     }
@@ -930,6 +946,7 @@ impl Kernel {
         welcome: &Welcome,
         forwards: &[&Forward],
         vpn: &[crate::model::AgentVpnRule],
+        outbound: &[AgentOutboundRule],
         exit: bool,
     ) -> Result<()> {
         if self.config.host_firewall == crate::config::HostFirewall::Off {
@@ -952,6 +969,7 @@ impl Kernel {
                 tunnel_v6: welcome.tunnel_ipv6,
                 forwards,
                 vpn,
+                outbound,
                 exit: exit.then_some(crate::host_firewall::ExitSpec {
                     interface: vpn::EXIT_INTERFACE,
                     uplinks: &uplinks,
@@ -1617,6 +1635,160 @@ impl Kernel {
         Ok(())
     }
 
+    /// Installs a host route via the tunnel to each agent this agent opens a link to, and
+    /// removes RIFT's other host routes on the tunnel except the one to the server. Returns the
+    /// links it set up. A link is left out, and named in the log, when the policy alone rules it
+    /// out (`agent_policy::refuse_outbound`) or when the address collides with a network of
+    /// this host: the server must never route the LAN or anything else into the tunnel.
+    async fn sync_agent_links(
+        &self,
+        welcome: &Welcome,
+        policy: &AgentPolicy,
+    ) -> Result<Vec<AgentOutboundRule>> {
+        let mut accepted = Vec::new();
+        let mut keep = BTreeSet::new();
+        let mut refused = Vec::new();
+        for rule in &policy.outbound {
+            let mut why =
+                crate::agent_policy::refuse_outbound(rule, policy, Some(welcome.server_ipv4))
+                    .or_else(|| {
+                        (rule.destination == welcome.tunnel_ipv4)
+                            .then(|| "it is this agent's own address".to_string())
+                    })
+                    .or_else(|| {
+                        policy
+                            .tunnel_pool
+                            .filter(|pool| !pool.contains(&welcome.tunnel_ipv4))
+                            .map(|pool| {
+                                format!(
+                                    "the tunnel network {pool} does not hold this agent's address"
+                                )
+                            })
+                    });
+            if why.is_none() {
+                why = self
+                    .check_networks_free(&[IpNet::from(IpAddr::V4(rule.destination))])
+                    .await
+                    .err()
+                    .map(|error| format!("{error:#}"));
+            }
+            if let Some(why) = why {
+                refused.push(format!(
+                    "link to the agent {} not opened: {why}",
+                    rule.destination
+                ));
+                continue;
+            }
+            if keep.insert(rule.destination) {
+                self.replace_link_route(welcome, rule.destination).await?;
+            }
+            accepted.push(rule.clone());
+        }
+        note_link_refusals(&refused);
+        self.delete_stale_link_routes(welcome, &keep).await?;
+        Ok(accepted)
+    }
+
+    async fn replace_link_route(
+        &self,
+        welcome: &Welcome,
+        destination: std::net::Ipv4Addr,
+    ) -> Result<()> {
+        let net = format!("{destination}/32");
+        let existing = run_output(
+            "ip",
+            ["-N", "-4", "route", "show", "exact", &net, "table", "main"],
+        )
+        .await?;
+        ensure!(
+            existing
+                .lines()
+                .all(|l| l.contains(self.interface()) && l.contains(ROUTE_PROTOCOL)),
+            "route {net} already exists outside the RIFT route protocol; refusing to replace it"
+        );
+        run_ok(
+            "ip",
+            [
+                "-4",
+                "route",
+                "replace",
+                &net,
+                "dev",
+                self.interface(),
+                "src",
+                &welcome.tunnel_ipv4.to_string(),
+                "proto",
+                ROUTE_PROTOCOL,
+                "table",
+                "main",
+            ],
+        )
+        .await
+    }
+
+    /// RIFT's IPv4 host routes on the agent's tunnel are the one to the server and those of
+    /// links; any other one belongs to a withdrawn link.
+    async fn delete_stale_link_routes(
+        &self,
+        welcome: &Welcome,
+        keep: &BTreeSet<std::net::Ipv4Addr>,
+    ) -> Result<()> {
+        let listing = run_output(
+            "ip",
+            [
+                "-N",
+                "-4",
+                "-j",
+                "route",
+                "show",
+                "dev",
+                self.interface(),
+                "proto",
+                ROUTE_PROTOCOL,
+                "table",
+                "main",
+            ],
+        )
+        .await?;
+        if listing.trim().is_empty() {
+            return Ok(());
+        }
+        let routes: Value = serde_json::from_str(&listing).context("parse ip route JSON")?;
+        for route in routes.as_array().into_iter().flatten() {
+            let Some(destination) = route["dst"].as_str() else {
+                continue;
+            };
+            let host = match destination.parse::<Ipv4Net>() {
+                Ok(net) if net.prefix_len() == 32 => net.addr(),
+                Ok(_) => continue,
+                Err(_) => match destination.parse() {
+                    Ok(ip) => ip,
+                    Err(_) => continue,
+                },
+            };
+            if host == welcome.server_ipv4 || keep.contains(&host) {
+                continue;
+            }
+            run_ok_allow_missing(
+                "ip",
+                [
+                    "-4",
+                    "route",
+                    "del",
+                    &format!("{host}/32"),
+                    "dev",
+                    self.interface(),
+                    "proto",
+                    ROUTE_PROTOCOL,
+                    "table",
+                    "main",
+                ],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// The agent only needs a route back to the VPN pool when it forwards for a subnet grant.
     /// Replies from its own tunnel address already use the RIFT table.
     async fn sync_agent_vpn_route(&self, policy: &AgentPolicy) -> Result<()> {
@@ -2158,6 +2330,20 @@ fn render_server_rules(
          add rule inet rift forward iifname \"{interface}\" drop\n"
     ));
     Ok(out)
+}
+
+/// Logs the links an agent leaves out, once per change: `apply_agent` runs with every sync.
+fn note_link_refusals(refused: &[String]) {
+    static LAST: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    if last.as_slice() != refused {
+        for line in refused {
+            tracing::warn!("{line}");
+        }
+        *last = refused.to_vec();
+    }
 }
 
 fn render_agent_rules(

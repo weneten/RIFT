@@ -33,6 +33,13 @@ pub struct ExportGrant {
     pub agent: String,
     pub access: VpnAccess,
 }
+/// A link between two agents, by name (`rift link allow FROM TO TARGET`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportLink {
+    pub from: String,
+    pub to: String,
+    pub access: VpnAccess,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExportDevice {
     pub name: String,
@@ -71,6 +78,9 @@ pub struct Export {
     /// What the server host itself may reach on agents (`rift host allow`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_grants: Vec<ExportGrant>,
+    /// What agents may reach on other agents (`rift link allow`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<ExportLink>,
 }
 impl Export {
     /// Reads an export file; refuses any other format.
@@ -165,6 +175,17 @@ pub fn export(snap: &StateSnapshot) -> Export {
                 Some(ExportGrant {
                     agent: name(&g.agent_id)?,
                     access: g.access.clone(),
+                })
+            })
+            .collect(),
+        links: snap
+            .agent_links
+            .iter()
+            .filter_map(|l| {
+                Some(ExportLink {
+                    from: name(&l.from_agent_id)?,
+                    to: name(&l.to_agent_id)?,
+                    access: l.access.clone(),
                 })
             })
             .collect(),
@@ -326,6 +347,7 @@ pub enum Op {
     AgentNames(String),
     Grant(VpnGrant),
     HostGrant(HostGrant),
+    Link(AgentLink),
     /// Adds the exit profile through this agent (by ID) to the device.
     AgentExit {
         name: String,
@@ -811,6 +833,53 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
             detail: None,
         });
     }
+    let mut planned_links: Vec<AgentLink> = ctx.snap.agent_links.clone();
+    for entry in &data.links {
+        let ends: Vec<(String, String)> = [&entry.from, &entry.to]
+            .into_iter()
+            .filter_map(|end| match resolve(options, ctx, end) {
+                Resolved::Agent { id, name } => Some((id, name)),
+                Resolved::Filtered { name, why } | Resolved::Unavailable { name, why } => {
+                    skips.add(&name, &why);
+                    None
+                }
+            })
+            .collect();
+        let Ok([(from_id, from), (to_id, to)]) = <[(String, String); 2]>::try_from(ends) else {
+            continue;
+        };
+        let what = format!("link {from} -> {to}: {}", describe_access(&entry.access));
+        let candidate = AgentLink {
+            from_agent_id: from_id,
+            to_agent_id: to_id,
+            access: entry.access.clone(),
+        };
+        if planned_links.contains(&candidate) {
+            plan.items.push(Item::new(Status::Present, what, None));
+            continue;
+        }
+        let valid = if candidate.from_agent_id == candidate.to_agent_id {
+            Err(anyhow::anyhow!("an agent needs no link to itself"))
+        } else if matches!(
+            candidate.access,
+            VpnAccess::Server | VpnAccess::Full | VpnAccess::Port { .. }
+        ) {
+            vpn::validate_access(&candidate.access)
+        } else {
+            Err(anyhow::anyhow!("a link is server, full or a port"))
+        };
+        if let Err(error) = valid {
+            plan.items
+                .push(Item::new(Status::Failed, what, Some(error.to_string())));
+            continue;
+        }
+        planned_links.push(candidate.clone());
+        plan.steps.push(Step {
+            op: Op::Link(candidate),
+            what,
+            detail: None,
+        });
+    }
     plan.items.extend(skips.items());
     plan
 }
@@ -891,6 +960,7 @@ mod tests {
             devices,
             sites: vec![],
             host_grants: vec![],
+            links: vec![],
         }
     }
     fn world() -> StateSnapshot {
@@ -975,6 +1045,80 @@ mod tests {
         }
         let again = Export::parse(text.as_bytes()).unwrap();
         assert_eq!(again, out);
+    }
+
+    #[test]
+    fn links_survive_an_export_and_an_import_round_trip_by_name() {
+        let ssh = VpnAccess::Port {
+            protocol: Protocol::Tcp,
+            ports: "22".parse().unwrap(),
+        };
+        let mut snap = world();
+        snap.agents.push(agent("node2", AgentStatus::Active, 5));
+        snap.agent_links.push(AgentLink {
+            from_agent_id: "id-node1".into(),
+            to_agent_id: "id-node2".into(),
+            access: ssh.clone(),
+        });
+        let out = export(&snap);
+        assert_eq!(
+            out.links,
+            [ExportLink {
+                from: "node1".into(),
+                to: "node2".into(),
+                access: ssh.clone()
+            }]
+        );
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(!text.contains("id-node"), "{text}");
+        assert_eq!(Export::parse(text.as_bytes()).unwrap(), out);
+
+        let mut target = world();
+        target.agents.push(agent("node2", AgentStatus::Active, 5));
+        let planned = run(&out, &ImportOptions::default(), &target);
+        assert!(planned.steps.iter().any(|s| matches!(
+            &s.op,
+            Op::Link(l) if l.from_agent_id == "id-node1" && l.to_agent_id == "id-node2" && l.access == ssh
+        )));
+        let again = run(&out, &ImportOptions::default(), &snap);
+        assert!(again.steps.iter().all(|s| !matches!(s.op, Op::Link(_))));
+        // An end that is missing or disabled skips the link and names why.
+        let without = run(&out, &ImportOptions::default(), &world());
+        assert!(without.steps.iter().all(|s| !matches!(s.op, Op::Link(_))));
+        let mut to_disabled = out.clone();
+        to_disabled.links[0].to = "node6".into();
+        assert!(run(&to_disabled, &ImportOptions::default(), &target)
+            .steps
+            .iter()
+            .all(|s| !matches!(s.op, Op::Link(_))));
+        // A network or a link to itself is never a link, whatever the file says.
+        for bad in [
+            ExportLink {
+                from: "node1".into(),
+                to: "node2".into(),
+                access: VpnAccess::Subnet {
+                    net: "192.168.178.0/24".parse().unwrap(),
+                    snat: false,
+                },
+            },
+            ExportLink {
+                from: "node1".into(),
+                to: "node1".into(),
+                access: VpnAccess::Server,
+            },
+        ] {
+            let mut file = out.clone();
+            file.links = vec![bad];
+            let plan = run(&file, &ImportOptions::default(), &target);
+            assert_eq!(count(&plan, Status::Failed), 1);
+        }
+        // Files without the field still parse.
+        let mut old: serde_json::Value = serde_json::from_str(&text).unwrap();
+        old.as_object_mut().unwrap().remove("links");
+        assert!(Export::parse(old.to_string().as_bytes())
+            .unwrap()
+            .links
+            .is_empty());
     }
 
     #[test]
@@ -1459,6 +1603,7 @@ mod tests {
                 Op::Forward(_) => "forward",
                 Op::AgentExit { .. } => "exit",
                 Op::HostGrant(_) => "host",
+                Op::Link(_) => "link",
             })
             .collect();
         assert_eq!(kinds, vec!["device", "flags", "grant"]);

@@ -98,6 +98,8 @@ pub struct AgentSpec<'a> {
     pub tunnel_v6: Ipv6Addr,
     pub forwards: &'a [&'a Forward],
     pub vpn: &'a [AgentVpnRule],
+    /// Links this agent opens to other agents: their replies come in on the tunnel.
+    pub outbound: &'a [crate::model::AgentOutboundRule],
     /// Set while the agent runs an internet exit.
     pub exit: Option<ExitSpec<'a>>,
 }
@@ -392,6 +394,27 @@ pub fn plan_agent(obs: &Observation, spec: &AgentSpec<'_>) -> Result<Plan> {
                     spec.interface,
                     crate::vpn::flow_match(rule.source, spec.tunnel_v4, &rule.access)
                 ));
+            }
+            // Replies of links this agent opened. That they are replies is enforced in the
+            // RIFT table; a `ct` match here would make the table unreadable for iptables.
+            for rule in spec.outbound {
+                let from = format!(
+                    "iifname \"{}\" ip saddr {} ip daddr {}",
+                    spec.interface, rule.destination, spec.tunnel_v4
+                );
+                match &rule.access {
+                    crate::model::VpnAccess::Port { protocol, ports } => rules.push(format!(
+                        "{from} meta l4proto {protocol} {protocol} sport {ports} accept comment \"rift:link\""
+                    )),
+                    crate::model::VpnAccess::Server => {
+                        for protocol in ["tcp", "udp", "icmp"] {
+                            rules.push(format!(
+                                "{from} meta l4proto {protocol} accept comment \"rift:link\""
+                            ));
+                        }
+                    }
+                    _ => rules.push(format!("{from} accept comment \"rift:link\"")),
+                }
             }
         }
         push_chain(&mut plan, obs, chain, CHAIN_IN, &rules);
@@ -714,6 +737,45 @@ fn valid_ident(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_ufw_lets_in_the_replies_of_links_this_agent_opens() {
+        let obs = observe(&ruleset()).unwrap();
+        let outbound = [
+            crate::model::AgentOutboundRule {
+                destination: Ipv4Addr::new(10, 88, 0, 3),
+                access: crate::model::VpnAccess::Port {
+                    protocol: crate::model::Protocol::Tcp,
+                    ports: crate::model::PortRange { start: 22, end: 22 },
+                },
+            },
+            crate::model::AgentOutboundRule {
+                destination: Ipv4Addr::new(10, 88, 0, 4),
+                access: crate::model::VpnAccess::Server,
+            },
+        ];
+        let plan = plan_agent(
+            &obs,
+            &AgentSpec {
+                interface: "rift0",
+                tunnel_v4: Ipv4Addr::new(10, 88, 0, 2),
+                tunnel_v6: "fd88:5249:4654::2".parse().unwrap(),
+                forwards: &[],
+                vpn: &[],
+                outbound: &outbound,
+                exit: None,
+            },
+        )
+        .unwrap();
+        assert!(plan.fill.contains("iifname \"rift0\" ip saddr 10.88.0.3 ip daddr 10.88.0.2 meta l4proto tcp tcp sport 22 accept comment \"rift:link\""), "{}", plan.fill);
+        for protocol in ["tcp", "udp", "icmp"] {
+            assert!(plan.fill.contains(&format!("iifname \"rift0\" ip saddr 10.88.0.4 ip daddr 10.88.0.2 meta l4proto {protocol} accept comment \"rift:link\"")), "{}", plan.fill);
+        }
+        assert!(
+            !plan.fill.contains("ct state"),
+            "iptables must still read the table"
+        );
+    }
     use crate::model::{ForwardMode, Protocol};
     use std::net::Ipv4Addr;
 
@@ -832,6 +894,7 @@ mod tests {
                 tunnel_v6: "fd88:5249:4654::2".parse().unwrap(),
                 forwards: &[],
                 vpn: &vpn,
+                outbound: &[],
                 exit: Some(ExitSpec {
                     interface: "rift-exit",
                     uplinks: &uplinks,
@@ -1023,6 +1086,7 @@ mod tests {
                 tunnel_v6: "fd88:5249:4654::2".parse().unwrap(),
                 forwards: &[&forward],
                 vpn: &[],
+                outbound: &[],
                 exit: None,
             },
         )
@@ -1064,6 +1128,7 @@ mod tests {
                 tunnel_v6: "fd88:5249:4654::2".parse().unwrap(),
                 forwards: &[],
                 vpn: &[rule],
+                outbound: &[],
                 exit: None,
             },
         )
@@ -1105,6 +1170,7 @@ mod tests {
             tunnel_v6: "fd88:5249:4654::2".parse().unwrap(),
             forwards: &[],
             vpn: &[],
+            outbound: &[],
             exit,
         };
         assert!(!plan_agent(&obs, &spec(None))

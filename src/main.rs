@@ -98,6 +98,12 @@ enum Command {
         #[command(subcommand)]
         command: HostCommand,
     },
+    /// Let one agent reach another over the tunnel, through this server: `rift link allow
+    /// node1 node2 22/tcp`, then `ssh USER@10.13.0.3` on node1. One way only, unless `--both`.
+    Link {
+        #[command(subcommand)]
+        command: LinkCommand,
+    },
     /// The optional web panel on the VPS (RIFT_WEBPANEL=true in the server .env).
     Panel {
         #[command(subcommand)]
@@ -282,6 +288,86 @@ impl HostArgs {
             }
         }
         rift::vpn::accesses(server, full, &ports, &[], false)
+    }
+}
+#[derive(Subcommand)]
+enum LinkCommand {
+    /// `rift link allow FROM TO TARGET... [--both]`: FROM may open connections to TO's tunnel
+    /// address. PORT/tcp, PORT/udp or PORT/both (ranges like 8000-8010/tcp), `server` (TCP,
+    /// UDP and ping) or `full` (every protocol). TO's RIFT_AGENT_ALLOW_PORTS still applies;
+    /// `--both` allows the same from TO to FROM.
+    Allow(LinkArgs),
+    /// `rift link deny FROM TO [TARGET...] [--both]`: without a target, withdraws every link
+    /// from FROM to TO.
+    Deny(LinkArgs),
+    /// Which agent may reach what on which other agent.
+    List,
+}
+#[derive(Args)]
+struct LinkArgs {
+    /// The agent that opens the connections.
+    from: String,
+    /// The agent it reaches.
+    to: String,
+    /// What FROM may reach on TO.
+    #[arg(value_name = "TARGET")]
+    targets: Vec<String>,
+    /// The same in the other direction too.
+    #[arg(long)]
+    both: bool,
+}
+impl LinkArgs {
+    fn accesses(&self) -> Result<Vec<VpnAccess>> {
+        let (mut server, mut full, mut ports) = (false, false, Vec::new());
+        for target in &self.targets {
+            match target.as_str() {
+                "server" => server = true,
+                "full" => full = true,
+                t if t.contains('/') && t.parse::<Ipv4Net>().is_err() => ports.push(t.to_string()),
+                t => bail!(
+                    "{t:?}: a link reaches only the other agent itself; use PORT/tcp, PORT/udp, PORT/both, server or full"
+                ),
+            }
+        }
+        rift::vpn::accesses(server, full, &ports, &[], false)
+    }
+    /// The directions this command names: FROM to TO, and back with `--both`.
+    fn directions(&self) -> Vec<(String, String)> {
+        let mut out = vec![(self.from.clone(), self.to.clone())];
+        if self.both {
+            out.push((self.to.clone(), self.from.clone()));
+        }
+        out
+    }
+    fn requests(&self, allow: bool) -> Result<Vec<AdminRequest>> {
+        let accesses = self.accesses()?;
+        let mut out = Vec::new();
+        for (from, to) in self.directions() {
+            if allow {
+                anyhow::ensure!(
+                    !accesses.is_empty(),
+                    "choose what to allow, for example: 22/tcp, server or full"
+                );
+                out.extend(accesses.iter().map(|access| AdminRequest::LinkAllow {
+                    from: from.clone(),
+                    to: to.clone(),
+                    access: access.clone(),
+                }));
+            } else if accesses.is_empty() {
+                out.push(AdminRequest::LinkDeny {
+                    from,
+                    to,
+                    access: None,
+                });
+            } else {
+                out.extend(accesses.iter().map(|access| AdminRequest::LinkDeny {
+                    from: from.clone(),
+                    to: to.clone(),
+                    access: Some(access.clone()),
+                }));
+            }
+        }
+        Ok(out)
     }
 }
 #[derive(Subcommand)]
@@ -763,6 +849,21 @@ async fn run() -> Result<()> {
                 }
             }
         },
+        Command::Link { command } => match command {
+            LinkCommand::List => AdminRequest::LinkList,
+            LinkCommand::Allow(args) => {
+                let mut requests = args.requests(true)?.into_iter();
+                let first = requests.next().context("nothing to allow")?;
+                more.extend(requests);
+                first
+            }
+            LinkCommand::Deny(args) => {
+                let mut requests = args.requests(false)?.into_iter();
+                let first = requests.next().context("nothing to deny")?;
+                more.extend(requests);
+                first
+            }
+        },
         Command::Status => AdminRequest::Status,
         Command::Reload => AdminRequest::Reload,
         Command::Logs { lines } => AdminRequest::Logs {
@@ -1142,6 +1243,13 @@ async fn server_checks(config: &Config, checks: &mut rift::net::Checks) {
             WARN,
             "Access of this server".to_string(),
             rift::output::refused_host_grant(refused),
+        );
+    }
+    for refused in status["refused_links"].as_array().into_iter().flatten() {
+        checks.push(
+            WARN,
+            "Link between agents".to_string(),
+            rift::output::refused_link(refused),
         );
     }
     for refused in status["refused_grants"].as_array().into_iter().flatten() {
@@ -1831,6 +1939,53 @@ mod tests {
             _ => unreachable!(),
         }
     }
+    #[test]
+    fn link_commands_take_two_agents_targets_and_both_directions() {
+        let requests = |args: &[&str], allow: bool| -> Result<Vec<AdminRequest>> {
+            let cli = Cli::try_parse_from(args).unwrap();
+            match cli.command.unwrap() {
+                Command::Link {
+                    command: LinkCommand::Allow(a) | LinkCommand::Deny(a),
+                } => a.requests(allow),
+                _ => unreachable!(),
+            }
+        };
+        let got = requests(
+            &["rift", "link", "allow", "a", "b", "22/tcp", "server"],
+            true,
+        )
+        .unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got.iter().all(
+            |r| matches!(r, AdminRequest::LinkAllow { from, to, .. } if from == "a" && to == "b")
+        ));
+        let both = requests(&["rift", "link", "allow", "a", "b", "full", "--both"], true).unwrap();
+        assert!(matches!(&both[..], [
+            AdminRequest::LinkAllow { from: f1, to: t1, access: VpnAccess::Full },
+            AdminRequest::LinkAllow { from: f2, to: t2, access: VpnAccess::Full },
+        ] if (f1.as_str(), t1.as_str(), f2.as_str(), t2.as_str()) == ("a", "b", "b", "a")));
+        assert!(
+            requests(&["rift", "link", "allow", "a", "b"], true).is_err(),
+            "nothing to allow"
+        );
+        let deny = requests(&["rift", "link", "deny", "a", "b", "--both"], false).unwrap();
+        assert!(matches!(
+            &deny[..],
+            [
+                AdminRequest::LinkDeny { access: None, .. },
+                AdminRequest::LinkDeny { access: None, .. },
+            ]
+        ));
+        for bad in ["192.168.178.0/24", "exit", "2222:22/tcp", "22/v6"] {
+            assert!(
+                requests(&["rift", "link", "allow", "a", "b", bad], true).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        assert!(Cli::try_parse_from(["rift", "link", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["rift", "link", "allow", "a"]).is_err());
+    }
+
     #[test]
     fn host_commands_parse_ports_server_and_full_and_refuse_networks() {
         let accesses = |args: &[&str]| -> Result<Vec<VpnAccess>> {

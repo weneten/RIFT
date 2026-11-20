@@ -435,6 +435,9 @@ fn status(data: &Value) -> String {
         for refused in data["refused_host_grants"].as_array().into_iter().flatten() {
             lines.push(refused_host_grant(refused));
         }
+        for refused in data["refused_links"].as_array().into_iter().flatten() {
+            lines.push(refused_link(refused));
+        }
         for moved in data["moved_forwards"].as_array().into_iter().flatten() {
             lines.push(format!(
                 "Forward {} moved from {} to {}: the server no longer has the first address (RIFT_PUBLIC_IPS).",
@@ -577,6 +580,52 @@ pub fn refused_host_grant(refused: &Value) -> String {
         vpn_access(&refused["access"]),
         field(refused, "reason")
     )
+}
+
+/// One link between agents that does not work: refused by an agent or waiting for its update.
+pub fn refused_link(refused: &Value) -> String {
+    format!(
+        "Link {} -> {} ({}) does not work: {}",
+        field(refused, "from"),
+        field(refused, "to"),
+        vpn_access(&refused["access"]),
+        field(refused, "reason")
+    )
+}
+
+/// What agents may reach on other agents (`rift link list`).
+fn links(data: &Value) -> String {
+    let rows = data
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|l| {
+            let state = if l["refused"].is_string() {
+                format!("refused: {}", field(l, "refused"))
+            } else {
+                field(l, "state")
+            };
+            vec![
+                field(l, "from"),
+                field(l, "to"),
+                field(l, "to_tunnel_ipv4"),
+                vpn_access(&l["access"]),
+                state,
+            ]
+        })
+        .collect();
+    table(
+        &["FROM", "TO", "TO ADDRESS", "ACCESS", "STATE"],
+        rows,
+        "No agent reaches another. Allow it with: rift link allow FROM TO 22/tcp",
+    )
+}
+
+/// The address a `rift link allow` opens, as the confirmation names it.
+fn link_reach(data: &Value) -> String {
+    let mut target = data.clone();
+    target["tunnel_ipv4"] = data["to_tunnel_ipv4"].clone();
+    host_reach(&target)
 }
 
 /// What the server host may reach on agents (`rift host list`).
@@ -852,6 +901,11 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
         AdminRequest::HostDeny { agent, access: None } => format!("This server can no longer reach {agent}."),
         AdminRequest::HostDeny { agent, access: Some(access) } => format!("This server can no longer reach {agent}: {}.", vpn_access(&serde_json::to_value(access).unwrap_or_default())),
         AdminRequest::HostList => host_grants(data),
+        AdminRequest::LinkAllow { from, .. } if data["refused"].is_string() => format!("Link stored, but {from} cannot reach {} yet (see the warning).", link_reach(data)),
+        AdminRequest::LinkAllow { from, .. } => format!("{from} may now reach {}.", link_reach(data)),
+        AdminRequest::LinkDeny { from, to, access: None } => format!("{from} can no longer reach {to}."),
+        AdminRequest::LinkDeny { from, to, access: Some(access) } => format!("{from} can no longer reach {to}: {}.", vpn_access(&serde_json::to_value(access).unwrap_or_default())),
+        AdminRequest::LinkList => links(data),
         AdminRequest::VpnDns { peer, agent: Some(agent) } if refused(data) => format!("DNS of {peer} stored, but {agent} refuses port 53 (see the warning): names will not resolve while the tunnel is on until {agent} allows it."),
         AdminRequest::VpnDns { peer, agent: Some(agent) } => format!("{peer} now uses {agent} as its DNS server (port 53 on {agent} is allowed)."),
         AdminRequest::VpnDns { peer, agent: None } => format!("{peer} uses the default DNS again."),
@@ -938,6 +992,51 @@ mod tests {
         assert!(text.contains("cannot reach node2"), "{text}");
         let ok = render(&request, &json!({"warning": null}), None);
         assert!(ok.contains("handy may now reach node2"), "{ok}");
+    }
+
+    #[test]
+    fn links_name_the_address_to_use_and_why_one_does_not_work() {
+        let ssh = VpnAccess::Port {
+            protocol: Protocol::Tcp,
+            ports: PortRange { start: 22, end: 22 },
+        };
+        let request = AdminRequest::LinkAllow {
+            from: "a".into(),
+            to: "b".into(),
+            access: ssh.clone(),
+        };
+        let data = json!({"from":"a","to":"b","to_tunnel_ipv4":"10.13.0.3","access":ssh,"state":"allowed","refused":null,"warning":null});
+        assert_eq!(
+            render(&request, &data, None),
+            "a may now reach 10.13.0.3:22/tcp."
+        );
+        let refused = json!({"from":"a","to":"b","to_tunnel_ipv4":"10.13.0.3","access":ssh,"state":"refused","refused":"b: no","warning":"w"});
+        assert!(render(&request, &refused, None).contains("a cannot reach 10.13.0.3:22/tcp yet"));
+        let list = json!([
+            {"from":"a","to":"b","to_tunnel_ipv4":"10.13.0.3","access":ssh,"state":"allowed","refused":null},
+            {"from":"b","to":"a","to_tunnel_ipv4":"10.13.0.2","access":"server","state":"refused","refused":"a: old"}
+        ]);
+        let table = render(&AdminRequest::LinkList, &list, None);
+        assert!(
+            table.contains("FROM") && table.contains("allowed"),
+            "{table}"
+        );
+        assert!(table.contains("refused: a: old"), "{table}");
+        assert!(render(&AdminRequest::LinkList, &json!([]), None).contains("rift link allow"));
+        let deny = AdminRequest::LinkDeny {
+            from: "a".into(),
+            to: "b".into(),
+            access: None,
+        };
+        assert_eq!(render(&deny, &json!({}), None), "a can no longer reach b.");
+        let status = status(
+            &json!({"snapshot":{"generation":1,"forwards":[]},"fully_applied":true,
+            "agent_health":[],"refused_links":[{"from":"a","to":"b","access":"full","reason":"r"}]}),
+        );
+        assert!(
+            status.contains("Link a -> b (full) does not work: r"),
+            "{status}"
+        );
     }
 
     #[test]

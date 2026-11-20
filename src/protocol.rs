@@ -9,12 +9,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const MAX_FRAME: usize = 65536;
 const MAX_ADMIN_RESPONSE: usize = 4 * 1024 * 1024;
 /// The control and enrollment protocol this RIFT speaks.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 /// The oldest protocol a server still accepts from agents. A server of release 1.N serves the
 /// agents of 1.(N-1) and 1.N, so agents can be updated after their server, one at a time. When
 /// a release changes the protocol, VERSION goes up and this stays at the previous one for one
 /// release; `daemon::policy_for` then leaves out what older agents cannot read.
 pub const MIN_PEER_VERSION: u16 = 1;
+/// The first protocol whose agents open links to other agents (`rift link allow`).
+pub const LINKS_VERSION: u16 = 2;
 
 /// Whether this server serves a peer that speaks `version`.
 pub fn supported(version: u16) -> bool {
@@ -174,6 +176,19 @@ pub enum AdminRequest {
         access: Option<VpnAccess>,
     },
     HostList,
+    /// Lets agent `from` reach agent `to` through the server: `server`, `full` or a port.
+    LinkAllow {
+        from: String,
+        to: String,
+        access: VpnAccess,
+    },
+    /// Without `access`, withdraws every link from `from` to `to`.
+    LinkDeny {
+        from: String,
+        to: String,
+        access: Option<VpnAccess>,
+    },
+    LinkList,
     /// Makes the agent's tunnel address the DNS server of the device's main profile and allows
     /// port 53 there; `None` returns to the default (no DNS line, or `RIFT_VPN_DNS` with an exit).
     VpnDns {

@@ -494,6 +494,12 @@ fn safe_rollback(mut previous: StateSnapshot, desired: &StateSnapshot) -> StateS
     previous.host_grants.retain(|old| {
         desired.host_grants.contains(old) && previous.agents.iter().any(|a| a.id == old.agent_id)
     });
+    previous.agent_links.retain(|old| {
+        desired.agent_links.contains(old)
+            && [&old.from_agent_id, &old.to_agent_id]
+                .iter()
+                .all(|id| previous.agents.iter().any(|a| &a.id == *id))
+    });
     previous.bans = desired
         .bans
         .iter()
@@ -668,30 +674,15 @@ async fn handle_control(mut stream: TcpStream, source: IpAddr, s: Arc<Server>) -
             if previous != applied_generation || changed_report {
                 reconcile(&s).await?;
             }
-            let (pool, pool6, server4) = {
-                let config = s.config.read().await;
-                (config.vpn_pool, config.vpn_pool6, config.server_ipv4)
-            };
+            let nets = PolicyNets::of(&*s.config.read().await);
             if let Some((rotation_id, _, committed)) = s.state.rotation(&agent.id)? {
                 if !committed {
                     ControlResponse::RotateRequested { rotation_id }
                 } else {
-                    ControlResponse::Policy(policy_for(
-                        &s.state.snapshot()?,
-                        &agent.id,
-                        pool,
-                        pool6,
-                        server4,
-                    ))
+                    ControlResponse::Policy(policy_for(&s.state.snapshot()?, &agent.id, nets))
                 }
             } else {
-                ControlResponse::Policy(policy_for(
-                    &s.state.snapshot()?,
-                    &agent.id,
-                    pool,
-                    pool6,
-                    server4,
-                ))
+                ControlResponse::Policy(policy_for(&s.state.snapshot()?, &agent.id, nets))
             }
         }
         ControlRequest::Ban {
@@ -787,6 +778,32 @@ fn host_grant_refusal(snap: &StateSnapshot, grant: &HostGrant) -> Option<String>
     let agent = snap.agents.iter().find(|a| a.id == grant.agent_id)?;
     agent.limits.as_ref()?.refuse_access(&grant.access)
 }
+/// Why a link does not work: the target refuses the access or links at all, the source
+/// refuses links, or the source runs a RIFT too old to open links (protocol 1). An agent that
+/// has not synced yet (protocol 0) is taken to speak the current protocol.
+fn link_refusal(snap: &StateSnapshot, link: &AgentLink) -> Option<String> {
+    let find = |id: &str| snap.agents.iter().find(|a| a.id == id);
+    let (from, to) = (find(&link.from_agent_id)?, find(&link.to_agent_id)?);
+    if (1..protocol::LINKS_VERSION).contains(&from.protocol) {
+        return Some(format!(
+            "{} runs RIFT {}, which cannot open links; update it",
+            from.name,
+            if from.rift_version.is_empty() {
+                "of an older release"
+            } else {
+                &from.rift_version
+            }
+        ));
+    }
+    if let Some(why) = from.limits.as_ref().and_then(AgentLimits::refuse_links) {
+        return Some(format!("{}: {why}", from.name));
+    }
+    let limits = to.limits.as_ref()?;
+    limits
+        .refuse_links()
+        .or_else(|| limits.refuse_access(&link.access))
+        .map(|why| format!("{}: {why}", to.name))
+}
 /// The snapshot without what agents refuse. Publishing a forward the agent drops would open
 /// a public port nothing answers on; the agent enforces its limits anyway.
 fn without_refused(snap: StateSnapshot) -> StateSnapshot {
@@ -795,6 +812,7 @@ fn without_refused(snap: StateSnapshot) -> StateSnapshot {
     out.vpn_grants.retain(|g| grant_refusal(&snap, g).is_none());
     out.host_grants
         .retain(|g| host_grant_refusal(&snap, g).is_none());
+    out.agent_links.retain(|l| link_refusal(&snap, l).is_none());
     for peer in &mut out.vpn_peers {
         peer.agent_exits.retain(|id| {
             !snap
@@ -852,13 +870,31 @@ fn inapplicable(snap: &StateSnapshot, public_ips: &[IpAddr]) -> Vec<serde_json::
         })
         .collect()
 }
-fn policy_for(
-    snapshot: &StateSnapshot,
-    id: &str,
+/// The server's pools and its tunnel address, as the policies of agents need them.
+#[derive(Clone, Copy)]
+struct PolicyNets {
     vpn_pool: ipnet::Ipv4Net,
     vpn_pool6: ipnet::Ipv6Net,
+    tunnel_pool: ipnet::Ipv4Net,
     server_ipv4: std::net::Ipv4Addr,
-) -> AgentPolicy {
+}
+impl PolicyNets {
+    fn of(config: &Config) -> Self {
+        Self {
+            vpn_pool: config.vpn_pool,
+            vpn_pool6: config.vpn_pool6,
+            tunnel_pool: config.ipv4_pool,
+            server_ipv4: config.server_ipv4,
+        }
+    }
+}
+fn policy_for(snapshot: &StateSnapshot, id: &str, nets: PolicyNets) -> AgentPolicy {
+    let PolicyNets {
+        vpn_pool,
+        vpn_pool6,
+        tunnel_pool,
+        server_ipv4,
+    } = nets;
     let snapshot = &without_refused(snapshot.clone());
     let mut vpn = crate::vpn::agent_rules(snapshot, id);
     // The server asks this agent's DNS server for devices that use RIFT's names.
@@ -880,6 +916,26 @@ fn policy_for(
                 access: g.access.clone(),
             }),
     );
+    // `rift link allow`: the target enforces a link as a VPN rule whose source is the other
+    // agent's tunnel address; the source gets a route there and the replies.
+    let links = crate::vpn::effective_links(snapshot);
+    vpn.extend(
+        links
+            .iter()
+            .filter(|l| l.to.id == id)
+            .map(|l| AgentVpnRule {
+                source: l.from.tunnel_ipv4,
+                access: l.access.clone(),
+            }),
+    );
+    let outbound = links
+        .iter()
+        .filter(|l| l.from.id == id)
+        .map(|l| AgentOutboundRule {
+            destination: l.to.tunnel_ipv4,
+            access: l.access.clone(),
+        })
+        .collect();
     let policy = AgentPolicy {
         generation: snapshot.generation,
         forwards: snapshot
@@ -891,6 +947,8 @@ fn policy_for(
         vpn_pool: Some(vpn_pool),
         vpn,
         exit: crate::vpn::agent_exit_policy(snapshot, id, vpn_pool, vpn_pool6),
+        tunnel_pool: Some(tunnel_pool),
+        outbound,
     };
     let protocol = snapshot
         .agents
@@ -901,10 +959,16 @@ fn policy_for(
 }
 /// The policy as an agent speaking an older protocol can read it. Every protocol change that
 /// adds something to the policy leaves it out here for agents below that protocol, so a server
-/// serves the agents of the previous release (`protocol::MIN_PEER_VERSION`). Protocol 1 is
-/// the only one so far; nothing to leave out yet. An agent that has not synced yet (0) gets
-/// the current policy.
-fn downgrade(policy: AgentPolicy, _protocol: u16) -> AgentPolicy {
+/// serves the agents of the previous release (`protocol::MIN_PEER_VERSION`). An agent that
+/// has not synced yet (0) gets the current policy.
+///
+/// Protocol 2 added links: `tunnel_pool` and `outbound`. An agent of protocol 1 would ignore
+/// them and look as if it opened its links; `link_refusal` names it instead.
+fn downgrade(mut policy: AgentPolicy, protocol: u16) -> AgentPolicy {
+    if (1..protocol::LINKS_VERSION).contains(&protocol) {
+        policy.tunnel_pool = None;
+        policy.outbound.clear();
+    }
     policy
 }
 
@@ -1039,6 +1103,7 @@ fn reads_only(r: &AdminRequest) -> bool {
             | AdminRequest::Logs { .. }
             | AdminRequest::VpnPeerList
             | AdminRequest::HostList
+            | AdminRequest::LinkList
             | AdminRequest::VpnConfig { .. }
             | AdminRequest::PanelStatus
             | AdminRequest::PanelPassword
@@ -1146,6 +1211,15 @@ async fn admin_call_inner(s: &Server, r: AdminRequest) -> Result<serde_json::Val
                     Some(serde_json::json!({"agent":agent.name,"access":g.access,"reason":why}))
                 })
                 .collect();
+            let refused_links: Vec<_> = snap
+                .agent_links
+                .iter()
+                .filter_map(|l| {
+                    let why = link_refusal(&snap, l)?;
+                    let name = |id: &str| snap.agents.iter().find(|a| a.id == id).map(|a| a.name.clone());
+                    Some(serde_json::json!({"from":name(&l.from_agent_id)?,"to":name(&l.to_agent_id)?,"access":l.access,"reason":why}))
+                })
+                .collect();
             let fully_applied =
                 error.is_none() && applied == Some(snap.generation) && pending_forwards.is_empty();
             let cfg = s.config.read().await.clone();
@@ -1162,7 +1236,7 @@ async fn admin_call_inner(s: &Server, r: AdminRequest) -> Result<serde_json::Val
                 .map(|n| n.moved.clone())
                 .unwrap_or_default();
             let inapplicable_forwards = inapplicable(&snap, &cfg.public_ips);
-            serde_json::json!({"moved_forwards":moved_forwards,"inapplicable_forwards":inapplicable_forwards,"snapshot":snap,"enrollment":enrollment,"invites":invites,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"refused_forwards":refused_forwards,"refused_grants":refused_grants,"refused_host_grants":refused_host_grants,"host_names":crate::names::host_names_status(std::path::Path::new(crate::sites::QUEUE_DIR)),"fully_applied":fully_applied,"connection_history":s.state.health()?,"rift_version":protocol::RIFT_VERSION})
+            serde_json::json!({"moved_forwards":moved_forwards,"inapplicable_forwards":inapplicable_forwards,"snapshot":snap,"enrollment":enrollment,"invites":invites,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"refused_forwards":refused_forwards,"refused_grants":refused_grants,"refused_host_grants":refused_host_grants,"refused_links":refused_links,"host_names":crate::names::host_names_status(std::path::Path::new(crate::sites::QUEUE_DIR)),"fully_applied":fully_applied,"connection_history":s.state.health()?,"rift_version":protocol::RIFT_VERSION})
         }
         AdminRequest::AgentsList => serde_json::to_value(snap.agents)?,
         AdminRequest::AgentsShow { name } => {
@@ -1462,6 +1536,9 @@ async fn admin_call_inner(s: &Server, r: AdminRequest) -> Result<serde_json::Val
         host_request @ (AdminRequest::HostAllow { .. }
         | AdminRequest::HostDeny { .. }
         | AdminRequest::HostList) => host_admin(s, &snap, host_request).await?,
+        link_request @ (AdminRequest::LinkAllow { .. }
+        | AdminRequest::LinkDeny { .. }
+        | AdminRequest::LinkList) => link_admin(s, &snap, link_request).await?,
         vpn_request => vpn_admin(s, &snap, vpn_request).await?,
     };
     Ok(data)
@@ -1542,6 +1619,112 @@ async fn host_admin(
     Ok(data)
 }
 
+/// One link as `rift link list` and the confirmations show it.
+fn link_json(snap: &StateSnapshot, link: &AgentLink) -> serde_json::Value {
+    let find = |id: &str| snap.agents.iter().find(|a| a.id == id);
+    let (from, to) = (find(&link.from_agent_id), find(&link.to_agent_id));
+    let refused = link_refusal(snap, link);
+    let inactive = [from, to]
+        .into_iter()
+        .flatten()
+        .find(|a| a.status != AgentStatus::Active);
+    let state = if refused.is_some() {
+        "refused".to_string()
+    } else if let Some(agent) = inactive {
+        format!(
+            "{} {}",
+            agent.name,
+            serde_json::to_value(&agent.status)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default()
+        )
+    } else {
+        "allowed".to_string()
+    };
+    serde_json::json!({
+        "from": from.map(|a| a.name.clone()),
+        "to": to.map(|a| a.name.clone()),
+        "from_tunnel_ipv4": from.map(|a| a.tunnel_ipv4),
+        "to_tunnel_ipv4": to.map(|a| a.tunnel_ipv4),
+        "access": link.access,
+        "state": state,
+        "refused": refused,
+    })
+}
+
+/// `rift link allow|deny|list`: what agents may reach on other agents.
+async fn link_admin(
+    s: &Server,
+    snap: &StateSnapshot,
+    r: AdminRequest,
+) -> Result<serde_json::Value> {
+    let data = match r {
+        AdminRequest::LinkAllow { from, to, access } => {
+            anyhow::ensure!(
+                matches!(
+                    access,
+                    VpnAccess::Server | VpnAccess::Full | VpnAccess::Port { .. }
+                ),
+                "a link reaches only the other agent itself: PORT/tcp, PORT/udp, PORT/both, server or full"
+            );
+            crate::vpn::validate_access(&access)?;
+            let source = find_agent(snap, &from)?;
+            let target = find_agent(snap, &to)?;
+            anyhow::ensure!(source.id != target.id, "an agent needs no link to itself");
+            for agent in [source, target] {
+                anyhow::ensure!(
+                    agent.status == AgentStatus::Active,
+                    "agent {} must be active",
+                    agent.name
+                );
+            }
+            let link = AgentLink {
+                from_agent_id: source.id.clone(),
+                to_agent_id: target.id.clone(),
+                access,
+            };
+            s.state.mutate("link-allow", |x| {
+                if !x.agent_links.contains(&link) {
+                    x.agent_links.push(link.clone());
+                }
+                Ok(())
+            })?;
+            reconcile(s).await?;
+            let snap = s.state.snapshot()?;
+            let mut out = link_json(&snap, &link);
+            out["warning"] = link_refusal(&snap, &link)
+                .map(|why| format!("the link was added, but it does not work yet: {why}"))
+                .into();
+            out
+        }
+        AdminRequest::LinkDeny { from, to, access } => {
+            let from_id = find_agent(snap, &from)?.id.clone();
+            let to_id = find_agent(snap, &to)?.id.clone();
+            s.state.mutate("link-deny", |x| {
+                let before = x.agent_links.len();
+                x.agent_links.retain(|l| {
+                    !(l.from_agent_id == from_id
+                        && l.to_agent_id == to_id
+                        && access.as_ref().is_none_or(|a| *a == l.access))
+                });
+                anyhow::ensure!(before != x.agent_links.len(), "no matching link");
+                Ok(())
+            })?;
+            reconcile(s).await?;
+            serde_json::json!({"from":from,"to":to,"denied":true})
+        }
+        AdminRequest::LinkList => serde_json::Value::Array(
+            snap.agent_links
+                .iter()
+                .map(|l| link_json(snap, l))
+                .collect(),
+        ),
+        _ => unreachable!("not a link request"),
+    };
+    Ok(data)
+}
+
 /// Creates what an export holds and this server lacks. Everything that passes the checks is
 /// written in one transaction and applied once; a dry run stops before that.
 async fn import_admin(
@@ -1577,7 +1760,7 @@ async fn import_admin(
                     }
                 }
                 Op::Device(_) => cfg.check_vpn_pool()?,
-                Op::AgentNames(_) | Op::HostGrant(_) => {}
+                Op::AgentNames(_) | Op::HostGrant(_) | Op::Link(_) => {}
                 Op::Flags { name, .. } | Op::AgentExit { name, .. } => {
                     anyhow::ensure!(
                         !lost_devices.contains(name),
@@ -1716,6 +1899,11 @@ async fn import_admin(
                 Op::HostGrant(g) => {
                     if !x.host_grants.contains(g) {
                         x.host_grants.push(g.clone());
+                    }
+                }
+                Op::Link(l) => {
+                    if !x.agent_links.contains(l) {
+                        x.agent_links.push(l.clone());
                     }
                 }
                 Op::AgentExit { name, agent_id } => {
@@ -2268,8 +2456,9 @@ async fn run_agent_inner(
     }
     // Rebuild the local kernel after every process or host restart before opening control.
     let policy_path = config.state_dir.join("agent-policy.json");
+    let server_ipv4 = identity.welcome.as_ref().map(|w| w.server_ipv4);
     let cached_policy = if policy_path.exists() {
-        load_agent_policy(&config)?
+        load_agent_policy(&config, server_ipv4)?
     } else {
         identity.applied_generation = 0;
         AgentPolicy::default()
@@ -2295,7 +2484,7 @@ async fn run_agent_inner(
         // Repair routes and refresh an unreachable DNS endpoint BEFORE trying control.
         // Control cannot repair its own transport when its connection is already down.
         let current_policy = if policy_path.exists() {
-            load_agent_policy(&config)?
+            load_agent_policy(&config, Some(welcome.server_ipv4))?
         } else {
             AgentPolicy::default()
         };
@@ -2608,7 +2797,10 @@ fn read_identity(bytes: &[u8]) -> Result<AgentIdentity> {
 /// takes effect on restart without waiting for the server. The server sends the whole policy
 /// with every sync, so a cache this RIFT cannot read (from another version) is dropped and
 /// replaced on the next sync instead of stopping the agent.
-fn load_agent_policy(config: &Config) -> Result<AgentPolicy> {
+fn load_agent_policy(
+    config: &Config,
+    server_ipv4: Option<std::net::Ipv4Addr>,
+) -> Result<AgentPolicy> {
     let path = config.state_dir.join("agent-policy.json");
     let cached: AgentPolicy = match serde_json::from_slice(&std::fs::read(&path)?) {
         Ok(policy) => policy,
@@ -2620,7 +2812,7 @@ fn load_agent_policy(config: &Config) -> Result<AgentPolicy> {
             AgentPolicy::default()
         }
     };
-    Ok(agent_policy::restrict(&cached, &config.agent_limits()).0)
+    Ok(agent_policy::restrict(&cached, &config.agent_limits(), server_ipv4).0)
 }
 async fn agent_sync(
     config: &Config,
@@ -2648,7 +2840,8 @@ async fn agent_sync(
     .await?;
     match protocol::receive::<ControlResponse, _>(&mut stream).await? {
         ControlResponse::Policy(policy) => {
-            let (policy, refusals) = agent_policy::restrict(&policy, &config.agent_limits());
+            let (policy, refusals) =
+                agent_policy::restrict(&policy, &config.agent_limits(), Some(w.server_ipv4));
             note_refusals(&refusals);
             let k = Kernel::new(config.clone());
             k.apply_agent(w, &policy, key_path).await?;
@@ -2713,7 +2906,7 @@ async fn drive_rotation(
     let old_private = std::fs::read(&old)?;
     let policy_path = config.state_dir.join("agent-policy.json");
     let policy = if policy_path.exists() {
-        load_agent_policy(config)?
+        load_agent_policy(config, Some(w.server_ipv4))?
     } else {
         AgentPolicy::default()
     };
@@ -2826,6 +3019,15 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_nets() -> PolicyNets {
+        PolicyNets {
+            vpn_pool: "10.14.0.0/24".parse().unwrap(),
+            vpn_pool6: "fd88:5249:4655::/64".parse().unwrap(),
+            tunnel_pool: "10.13.0.0/24".parse().unwrap(),
+            server_ipv4: "10.13.0.1".parse().unwrap(),
+        }
+    }
 
     fn token(ca: &str) -> String {
         let raw = serde_json::json!({"version":1,"secret":"s".repeat(43),"ca_pem":ca});
@@ -2972,6 +3174,7 @@ mod tests {
             ports: crate::config::parse_port_allow("3001,1337,8090").unwrap(),
             subnets: vec![],
             exit: false,
+            no_links: false,
         });
         let limited = snap(&agent);
         let (state, why) = forward_state(&limited, &limited.forwards[0]);
@@ -2988,13 +3191,7 @@ mod tests {
             1,
             "the whole-host grant is left out"
         );
-        let policy = policy_for(
-            &limited,
-            "node4",
-            "10.14.0.0/24".parse().unwrap(),
-            "fd88:5249:4655::/64".parse().unwrap(),
-            "10.13.0.1".parse().unwrap(),
-        );
+        let policy = policy_for(&limited, "node4", test_nets());
         assert_eq!(policy.forwards.len(), 1);
         assert_eq!(
             policy.generation, 2,
@@ -3004,6 +3201,161 @@ mod tests {
         let mut stale = limited.clone();
         stale.forwards[1].generation = 3;
         assert_eq!(forward_state(&stale, &stale.forwards[1]).0, "pending");
+    }
+
+    fn link_agent(id: &str, n: u8) -> AgentRecord {
+        AgentRecord {
+            protocol: protocol::VERSION,
+            rift_version: "1.1.0".into(),
+            names: false,
+            id: id.into(),
+            name: id.into(),
+            public_key: format!("k-{id}"),
+            tunnel_ipv4: std::net::Ipv4Addr::new(10, 13, 0, n),
+            tunnel_ipv6: std::net::Ipv6Addr::new(0xfd88, 0x5249, 0x4654, 0, 0, 0, 0, n.into()),
+            status: AgentStatus::Active,
+            attempt_id: id.into(),
+            generation: 1,
+            applied_generation: 1,
+            last_error: None,
+            created_at: 0,
+            pending_deadline: None,
+            limits: None,
+            exit: None,
+            exit_port: None,
+        }
+    }
+
+    #[test]
+    fn a_link_reaches_the_target_from_the_sources_address_and_routes_only_the_source() {
+        let ssh = VpnAccess::Port {
+            protocol: Protocol::Tcp,
+            ports: "22".parse().unwrap(),
+        };
+        let snap = |agents: Vec<AgentRecord>| StateSnapshot {
+            generation: 3,
+            agents,
+            agent_links: vec![AgentLink {
+                from_agent_id: "a".into(),
+                to_agent_id: "b".into(),
+                access: ssh.clone(),
+            }],
+            ..Default::default()
+        };
+        let both = snap(vec![
+            link_agent("a", 2),
+            link_agent("b", 3),
+            link_agent("c", 4),
+        ]);
+        let a = policy_for(&both, "a", test_nets());
+        let b = policy_for(&both, "b", test_nets());
+        let c = policy_for(&both, "c", test_nets());
+        assert_eq!(
+            a.outbound,
+            [AgentOutboundRule {
+                destination: "10.13.0.3".parse().unwrap(),
+                access: ssh.clone()
+            }]
+        );
+        assert!(
+            a.vpn.is_empty(),
+            "the source accepts nothing new: {:?}",
+            a.vpn
+        );
+        assert_eq!(a.tunnel_pool, Some("10.13.0.0/24".parse().unwrap()));
+        assert_eq!(
+            b.vpn,
+            [AgentVpnRule {
+                source: "10.13.0.2".parse().unwrap(),
+                access: ssh.clone()
+            }]
+        );
+        assert!(b.outbound.is_empty(), "one way only");
+        assert!(c.vpn.is_empty() && c.outbound.is_empty());
+
+        // A disabled end: nothing on either side, and the server forwards nothing.
+        let mut disabled = link_agent("b", 3);
+        disabled.status = AgentStatus::Disabled;
+        let off = snap(vec![link_agent("a", 2), disabled]);
+        assert!(policy_for(&off, "a", test_nets()).outbound.is_empty());
+        assert!(crate::vpn::effective_links(&off).is_empty());
+        assert!(link_json(&off, &off.agent_links[0])["state"]
+            .as_str()
+            .unwrap()
+            .contains("disabled"));
+
+        // The target's RIFT_AGENT_ALLOW_PORTS, RIFT_AGENT_ALLOW_LINKS on either end.
+        let mut target = link_agent("b", 3);
+        target.limits = Some(AgentLimits {
+            ports: crate::config::parse_port_allow("80/tcp").unwrap(),
+            ..Default::default()
+        });
+        let limited = snap(vec![link_agent("a", 2), target]);
+        let why = link_refusal(&limited, &limited.agent_links[0]).unwrap();
+        assert!(
+            why.starts_with("b: ") && why.contains("RIFT_AGENT_ALLOW_PORTS"),
+            "{why}"
+        );
+        assert!(policy_for(&limited, "a", test_nets()).outbound.is_empty());
+        assert!(policy_for(&limited, "b", test_nets()).vpn.is_empty());
+        for end in ["a", "b"] {
+            let mut agents = vec![link_agent("a", 2), link_agent("b", 3)];
+            for agent in agents.iter_mut().filter(|x| x.id == end) {
+                agent.limits = Some(AgentLimits {
+                    no_links: true,
+                    ..Default::default()
+                });
+            }
+            let closed = snap(agents);
+            let why = link_refusal(&closed, &closed.agent_links[0]).unwrap();
+            assert!(why.contains("RIFT_AGENT_ALLOW_LINKS=false"), "{why}");
+            assert!(why.starts_with(&format!("{end}: ")), "{why}");
+        }
+
+        // A source of protocol 1 cannot open links: named, and the policy it gets has none.
+        let mut old = link_agent("a", 2);
+        old.protocol = 1;
+        old.rift_version = "1.0.0".into();
+        let outdated = snap(vec![old, link_agent("b", 3)]);
+        let why = link_refusal(&outdated, &outdated.agent_links[0]).unwrap();
+        assert!(why.contains("1.0.0") && why.contains("update"), "{why}");
+        let mut full = policy_for(&both, "a", test_nets());
+        assert!(!full.outbound.is_empty());
+        full = downgrade(full, 1);
+        assert!(full.outbound.is_empty() && full.tunnel_pool.is_none());
+        assert!(!downgrade(policy_for(&both, "a", test_nets()), 0)
+            .outbound
+            .is_empty());
+        // Before its first sync (protocol 0) an agent counts as current.
+        let mut fresh = link_agent("a", 2);
+        fresh.protocol = 0;
+        let fresh = snap(vec![fresh, link_agent("b", 3)]);
+        assert!(link_refusal(&fresh, &fresh.agent_links[0]).is_none());
+    }
+
+    #[test]
+    fn a_rollback_keeps_no_withdrawn_link() {
+        let link = AgentLink {
+            from_agent_id: "a".into(),
+            to_agent_id: "b".into(),
+            access: VpnAccess::Server,
+        };
+        let previous = StateSnapshot {
+            agents: vec![link_agent("a", 2), link_agent("b", 3)],
+            agent_links: vec![link.clone()],
+            ..Default::default()
+        };
+        let desired = StateSnapshot {
+            agent_links: vec![],
+            ..previous.clone()
+        };
+        assert!(safe_rollback(previous.clone(), &desired)
+            .agent_links
+            .is_empty());
+        assert_eq!(
+            safe_rollback(previous.clone(), &previous).agent_links,
+            [link]
+        );
     }
 
     #[test]
@@ -3056,9 +3408,10 @@ mod tests {
             policy_for(
                 snap,
                 "node4",
-                "10.14.0.0/24".parse().unwrap(),
-                "fd88:5249:4655::/64".parse().unwrap(),
-                server,
+                PolicyNets {
+                    server_ipv4: server,
+                    ..test_nets()
+                },
             )
         };
         let open = policy(&snap(&agent));
@@ -3081,6 +3434,7 @@ mod tests {
             ports: crate::config::parse_port_allow("22/tcp").unwrap(),
             subnets: vec![],
             exit: false,
+            no_links: false,
         });
         let limited = snap(&agent);
         assert_eq!(
@@ -3164,7 +3518,15 @@ mod tests {
             agent.limits = limits;
             let allowed = snap(&agent);
             assert_eq!(forward_state(&allowed, &allowed.forwards[0]).0, "enabled");
-            let policy = policy_for(&allowed, "node4", pool, pool6, "10.13.0.1".parse().unwrap());
+            let policy = policy_for(
+                &allowed,
+                "node4",
+                PolicyNets {
+                    vpn_pool: pool,
+                    vpn_pool6: pool6,
+                    ..test_nets()
+                },
+            );
             assert_eq!(
                 policy.forwards.len(),
                 1,
@@ -3184,7 +3546,15 @@ mod tests {
         let applied = without_refused(refused.clone());
         assert!(applied.forwards.is_empty());
         assert!(applied.vpn_peers[0].agent_exits.is_empty());
-        let policy = policy_for(&refused, "node4", pool, pool6, "10.13.0.1".parse().unwrap());
+        let policy = policy_for(
+            &refused,
+            "node4",
+            PolicyNets {
+                vpn_pool: pool,
+                vpn_pool6: pool6,
+                ..test_nets()
+            },
+        );
         assert!(policy.exit.is_none() && policy.forwards.is_empty());
         let shown = exits_json(&refused, &refused.vpn_peers[0]);
         assert_eq!(shown[0]["state"], "refused");

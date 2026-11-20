@@ -113,6 +113,65 @@ pub fn effective(snap: &StateSnapshot) -> Vec<Effective<'_>> {
         .collect()
 }
 
+/// A link whose two agents are active.
+pub struct EffectiveLink<'a> {
+    pub from: &'a AgentRecord,
+    pub to: &'a AgentRecord,
+    pub access: VpnAccess,
+}
+
+/// The links between active agents, as the server forwards them and the agents apply them.
+pub fn effective_links(snap: &StateSnapshot) -> Vec<EffectiveLink<'_>> {
+    let active = |id: &str| {
+        snap.agents
+            .iter()
+            .find(|a| a.id == id && a.status == AgentStatus::Active)
+    };
+    snap.agent_links
+        .iter()
+        .filter_map(|link| {
+            Some(EffectiveLink {
+                from: active(&link.from_agent_id)?,
+                to: active(&link.to_agent_id)?,
+                access: link.access.clone(),
+            })
+        })
+        .collect()
+}
+
+/// The server forwards a link from one agent's tunnel address to the other's on `rift0`, and
+/// the replies. Nothing else passes between agents: the renderer's final drops stay.
+pub fn server_link_rules(interface: &str, snap: &StateSnapshot) -> Rules {
+    let mut rules = Rules::default();
+    for link in effective_links(snap) {
+        let (from, to) = (link.from.tunnel_ipv4, link.to.tunnel_ipv4);
+        rules.forward.push_str(&format!(
+            "add rule inet rift forward iifname \"{interface}\" oifname \"{interface}\" {}accept\n\
+             add rule inet rift forward iifname \"{interface}\" oifname \"{interface}\" ip saddr {to} ip daddr {from} ct state established,related accept\n",
+            flow_match(from, to, &link.access),
+        ));
+    }
+    rules
+}
+
+/// The agent that opens a link accepts the replies of the connections it opened to the other
+/// agent, and nothing else from it. The route there is `Kernel::apply_agent`'s.
+pub fn agent_outbound_rules(
+    interface: &str,
+    tunnel: Ipv4Addr,
+    rules: &[AgentOutboundRule],
+) -> Rules {
+    let mut out = Rules::default();
+    for rule in rules {
+        out.input.push_str(&format!(
+            "add rule inet rift input iifname \"{interface}\" ct direction reply ct original ip saddr {tunnel} ct original ip daddr {} {}accept\n",
+            rule.destination,
+            original_protocols(&rule.access)
+        ));
+    }
+    out
+}
+
 /// The default suffix of the names RIFT gives agents: `NAME.internal`. ICANN reserved
 /// `.internal` for private networks in 2024, so it never clashes with a public name.
 pub const NAMES_SUFFIX: &str = "internal";
@@ -769,6 +828,88 @@ pub fn qr(text: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_server_forwards_a_link_one_way_and_its_replies_between_active_agents() {
+        let agent = |id: &str, n: u8, status: AgentStatus| AgentRecord {
+            protocol: 2,
+            rift_version: String::new(),
+            names: false,
+            id: id.into(),
+            name: id.into(),
+            public_key: format!("k-{id}"),
+            tunnel_ipv4: Ipv4Addr::new(10, 13, 0, n),
+            tunnel_ipv6: Ipv6Addr::new(0xfd88, 0x5249, 0x4654, 0, 0, 0, 0, n.into()),
+            status,
+            attempt_id: id.into(),
+            generation: 1,
+            applied_generation: 1,
+            last_error: None,
+            created_at: 0,
+            pending_deadline: None,
+            limits: None,
+            exit: None,
+            exit_port: None,
+        };
+        let link = |from: &str, to: &str| AgentLink {
+            from_agent_id: from.into(),
+            to_agent_id: to.into(),
+            access: VpnAccess::Port {
+                protocol: Protocol::Tcp,
+                ports: PortRange { start: 22, end: 22 },
+            },
+        };
+        let snap = StateSnapshot {
+            agents: vec![
+                agent("a", 2, AgentStatus::Active),
+                agent("b", 3, AgentStatus::Active),
+                agent("c", 4, AgentStatus::Disabled),
+            ],
+            agent_links: vec![link("a", "b"), link("a", "c")],
+            ..Default::default()
+        };
+        let rules = server_link_rules("rift0", &snap);
+        assert_eq!(
+            rules.forward,
+            "add rule inet rift forward iifname \"rift0\" oifname \"rift0\" ip saddr 10.13.0.2 ip daddr 10.13.0.3 meta l4proto tcp tcp dport 22 accept\n\
+             add rule inet rift forward iifname \"rift0\" oifname \"rift0\" ip saddr 10.13.0.3 ip daddr 10.13.0.2 ct state established,related accept\n"
+        );
+        assert!(
+            !rules.forward.contains("10.13.0.4"),
+            "a disabled agent gets nothing"
+        );
+        assert!(rules.input.is_empty() && rules.nat.is_empty());
+        assert!(server_link_rules("rift0", &StateSnapshot::default())
+            .forward
+            .is_empty());
+    }
+
+    #[test]
+    fn the_source_of_a_link_accepts_only_the_replies_of_what_it_opened() {
+        let rules = agent_outbound_rules(
+            "rift0",
+            Ipv4Addr::new(10, 13, 0, 2),
+            &[
+                AgentOutboundRule {
+                    destination: Ipv4Addr::new(10, 13, 0, 3),
+                    access: VpnAccess::Port {
+                        protocol: Protocol::Tcp,
+                        ports: PortRange { start: 22, end: 22 },
+                    },
+                },
+                AgentOutboundRule {
+                    destination: Ipv4Addr::new(10, 13, 0, 4),
+                    access: VpnAccess::Server,
+                },
+            ],
+        );
+        assert_eq!(
+            rules.input,
+            "add rule inet rift input iifname \"rift0\" ct direction reply ct original ip saddr 10.13.0.2 ct original ip daddr 10.13.0.3 ct original protocol tcp meta l4proto tcp ct original proto-dst 22 accept\n\
+             add rule inet rift input iifname \"rift0\" ct direction reply ct original ip saddr 10.13.0.2 ct original ip daddr 10.13.0.4 meta l4proto { tcp, udp, icmp } accept\n"
+        );
+        assert!(rules.forward.is_empty() && rules.reply_via_tunnel.is_empty());
+    }
 
     #[test]
     fn any_domain_name_is_a_suffix() {

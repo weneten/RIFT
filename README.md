@@ -30,6 +30,7 @@ The agent initiates the connection to the server. RIFT manages the tunnel, expli
 - [Manage agents and forwards](#manage-agents-and-forwards)
 - [Private VPN access](#private-vpn-access)
 - [Reach agents from the server itself](#reach-agents-from-the-server-itself)
+- [Reach agents from other agents](#reach-agents-from-other-agents)
 - [Use RIFT as a VPN (exit)](#use-rift-as-a-vpn-exit)
 - [Web panel](#web-panel)
 - [Terminal UI](#terminal-ui)
@@ -160,7 +161,7 @@ Then, in that folder, run the `deploy/join` line that `rift add agent` printed, 
 sudo sh deploy/join rift.example.net:8443 node1 v1.eyJ2...
 ```
 
-Paste the line exactly as printed; leave the token out to be asked for it without it landing in the shell history. The script then asks what the server may open on this host (see [Harden the agent](#harden-the-agent)): the allowed ports (`RIFT_AGENT_ALLOW_PORTS`), the LAN networks VPN devices may reach (`RIFT_AGENT_ALLOW_SUBNETS`; it shows the networks it finds on this host, the default stays no LAN access) and whether the host is an internet exit (`RIFT_AGENT_ALLOW_EXIT`), plus the image version. It runs `deploy/prepare-host`, writes `config.toml` and `.env`, installs the `rift` command, starts the agent, waits until the agent has a WireGuard handshake with the server (showing the agent's latest message every 10 seconds) and then removes the used token from `.env`. An agent that is still enrolled with a server that was set up again since refuses the new token with a message: remove its old state with `docker compose down -v` and run `deploy/join` again. Run `sudo sh deploy/join` again without a token to change these settings of an enrolled agent. Without questions: `--allow-ports LIST`, `--allow-subnets LIST`, `--exit`/`--no-exit`, `--version`, `--set KEY=VALUE` and `--yes`. The web panel's invitation dialog shows the same command.
+Paste the line exactly as printed; leave the token out to be asked for it without it landing in the shell history. The script then asks what the server may open on this host (see [Harden the agent](#harden-the-agent)): the allowed ports (`RIFT_AGENT_ALLOW_PORTS`), the LAN networks VPN devices may reach (`RIFT_AGENT_ALLOW_SUBNETS`; it shows the networks it finds on this host, the default stays no LAN access) whether the host is an internet exit (`RIFT_AGENT_ALLOW_EXIT`) and whether it takes part in links with other agents (`RIFT_AGENT_ALLOW_LINKS`), plus the image version. It runs `deploy/prepare-host`, writes `config.toml` and `.env`, installs the `rift` command, starts the agent, waits until the agent has a WireGuard handshake with the server (showing the agent's latest message every 10 seconds) and then removes the used token from `.env`. An agent that is still enrolled with a server that was set up again since refuses the new token with a message: remove its old state with `docker compose down -v` and run `deploy/join` again. Run `sudo sh deploy/join` again without a token to change these settings of an enrolled agent. Without questions: `--allow-ports LIST`, `--allow-subnets LIST`, `--exit`/`--no-exit`, `--links`/`--no-links`, `--version`, `--set KEY=VALUE` and `--yes`. The web panel's invitation dialog shows the same command.
 
 The enrollment port opens with the invitation. With the default `RIFT_ENROLLMENT=auto` the server listens on TCP 8443 (and RIFT's UFW rule for it exists) only while at least one invitation is open. It closes again as soon as the last agent is active or the last invitation has expired or been cancelled; expiry is noticed within one reconcile interval (10 s). RIFT can only close the port on the server itself: a rule in your cloud firewall or security group stays open, but nothing listens behind it. Set `RIFT_ENROLLMENT=always` to keep the port open permanently, or `off` to turn enrollment off. `rift status` shows the port's state and the open invitations.
 
@@ -223,6 +224,7 @@ The server tells each agent which ports to forward and which VPN grants to enfor
 | `RIFT_AGENT_ALLOW_PORTS` | empty (no limit) | Comma-separated `PORT` or `PORT-PORT`, each optionally with `/tcp`, `/udp` or `/both` (default both), for example `22/tcp,80,443,27015-27020/udp`. The agent refuses forwards and VPN port grants that are not entirely inside this list. It also refuses `server` and `full` VPN grants, because they reach every port. |
 | `RIFT_AGENT_ALLOW_SUBNETS` | empty (no LAN access) | Comma-separated private IPv4 networks behind the agent, for example `192.168.178.0/24`. A VPN network grant works only when its network lies inside one of these, and devices that use the agent as [internet exit](#use-rift-as-a-vpn-exit) may reach them. |
 | `RIFT_AGENT_ALLOW_EXIT` | `false` | `true` offers the agent's internet connection as an [exit for VPN devices](#use-rift-as-a-vpn-exit). It also allows the one UDP port of that exit, whatever `RIFT_AGENT_ALLOW_PORTS` says. |
+| `RIFT_AGENT_ALLOW_LINKS` | `true` | `false`: the agent neither opens nor accepts [links to and from other agents](#reach-agents-from-other-agents). Links it accepts are capped by `RIFT_AGENT_ALLOW_PORTS` like every grant. |
 
 The secure default for subnets is deliberate: until you list a network, no device can reach your LAN through this agent, whatever the server grants. Restart the agent after changing `.env` (`docker compose up -d --force-recreate`).
 
@@ -680,6 +682,29 @@ It needs systemd-resolved 246 or newer (Debian 11, Ubuntu 22.04 and later; Ubunt
 
 Export and import carry these grants (`host_grants` in the file). In the web panel and the terminal UI, the Agents tab lists them in an agent's details; `h` ("Server access") adds and withdraws them, and in the terminal UI `H` withdraws one. When the agent refuses a host grant, its own log says `access of the server host (10.13.0.1) to ... refused`.
 
+## Reach agents from other agents
+
+Agents cannot reach each other by default: the server drops what one agent sends to another, and each agent drops what arrives through the tunnel unless a forward or a grant names it. A **link** lets one agent open connections to chosen ports of another, for example SSH from one home server to the next, through the server and without a public port:
+
+```sh
+rift link allow node1 node2 22/tcp            # then, on node1: ssh USER@10.13.0.3
+rift link allow node1 node2 5432/tcp --both   # node1 to node2 and node2 to node1
+rift link list                                # every link, with the address to connect to
+rift link deny node1 node2 22/tcp             # without a target: everything from node1 to node2
+```
+
+For three home servers that should all reach each other, allow each pair once with `--both`. Targets are those of `rift host allow`: a port or range (`22/tcp`, `8000-8010/tcp`, `53/both`), `server` (TCP, UDP and ping) or `full` (every protocol). A network behind the agent is not offered.
+
+- **One way.** `rift link allow node1 node2 22/tcp` lets node1 open connections to port 22 on node2's tunnel address; replies come back, but node2 cannot open anything on node1 unless a link of its own (or `--both`) allows it. A third agent gains nothing from it.
+- **Where it applies.** The server forwards exactly the granted flow from node1's tunnel address to node2's. node1 gets a host route to node2's tunnel address and accepts only the replies of what it opened; node2 accepts the flow like a VPN grant whose source is node1. The service on node2 sees node1's tunnel address as its client and must listen on `0.0.0.0` or the tunnel address, as for forwards. Connections start from node1 itself: commands in its shell and programs with host networking. Docker containers in bridge networks on node1 do not reach the tunnel. Links are IPv4 only.
+- **The agents decide.** `RIFT_AGENT_ALLOW_PORTS` of the target applies as to every grant, and either agent can refuse links altogether with `RIFT_AGENT_ALLOW_LINKS=false`. `rift link allow` stores a refused link anyway and warns; `rift link list`, `rift status` and `rift doctor` name the reason until it works.
+- **Updates.** An agent opens links from the release that introduced them on; an older one is named (`node1 runs RIFT 1.0.0, which cannot open links; update it`) while the agent it reaches may still be older. Update the server first, as always.
+- **What the server can do.** The source agent installs routes only to other addresses of the agents' tunnel network (`RIFT_IPV4_POOL`), never to the server, the VPN pool or any network the host has itself, so even a compromised server cannot pull the agent's LAN or other traffic into the tunnel. As with every grant, a compromised server can reach what the target's `RIFT_AGENT_ALLOW_PORTS` allows; keep the service's own authentication on.
+- **Trust between agents.** Whoever is root on node1 reaches the granted ports on node2. Grant only what node1 needs.
+- **Bandwidth.** All traffic crosses the server twice, so its connection and the upload of both homes limit throughput; two agents in the same LAN still go through the server.
+
+Export and import carry links (`links` in the file, by agent name). Removing an agent removes its links in both directions; disabling one pauses them. The web panel and the terminal UI do not show links yet; use `rift link list` (or `:link list` in the terminal UI).
+
 ## Use RIFT as a VPN (exit)
 
 A device can also send **all** its internet traffic through RIFT, like a commercial VPN. One device can have several exits at once, each as its own WireGuard profile:
@@ -1023,6 +1048,8 @@ The web panel runs `add site`, `remove site`, `export`, `import` and `backup` th
 | `rift host allow AGENT TARGET...` | Lets the VPS host itself reach the agent's tunnel address: `22/tcp` (port or range), `server` or `full`. Nothing is published. Example: `rift host allow node1 22/tcp`, then `ssh USER@10.13.0.2` on the VPS. |
 | `sudo rift host names off` / `sudo rift host names on` / `rift host names` | Host command: stops the VPS from resolving `AGENT.internal` through RIFT, for good / sets it up again (`deploy/install-cli` does by default) / shows the names, the name server and whether the VPS uses them. |
 | `rift host deny AGENT [TARGET...]` / `rift host list` | Withdraws it; without a target everything on that agent / lists what the server host may reach. |
+| `rift link allow FROM TO TARGET... [--both]` | Lets agent FROM open connections to agent TO's tunnel address through the server: `22/tcp` (port or range), `server` or `full`; `--both` also from TO to FROM. Example: `rift link allow node1 node2 22/tcp`, then `ssh USER@10.13.0.3` on node1. See [Reach agents from other agents](#reach-agents-from-other-agents). |
+| `rift link deny FROM TO [TARGET...] [--both]` / `rift link list` | Withdraws it; without a target everything from FROM to TO / lists every link with its state. |
 | `rift vpn allow DEVICE exit` | Adds the server as an internet exit of the device (main profile). Other exits stay; import the profile RIFT names. |
 | `rift vpn deny DEVICE AGENT [TARGET...]` | Withdraws access; without a target everything on that agent, including the exit through it. |
 | `rift vpn deny DEVICE exit` / `rift vpn deny DEVICE AGENT exit` | Ends the exit through the server / through that agent; the device's other exits stay. |
@@ -1093,6 +1120,7 @@ The web panel runs `add site`, `remove site`, `export`, `import` and `backup` th
 | `RIFT_AGENT_ALLOW_PORTS` | empty | Agent. Ports the agent may open for forwards and VPN grants, e.g. `22/tcp,80,27015-27020/udp`; empty means no limit. See [Harden the agent](#harden-the-agent). |
 | `RIFT_AGENT_ALLOW_SUBNETS` | empty | Agent. Networks behind the agent that VPN network grants and internet-exit devices may reach; empty means no LAN access. |
 | `RIFT_AGENT_ALLOW_EXIT` | `false` | Agent. `true` offers the agent's internet connection as an [exit for VPN devices](#use-rift-as-a-vpn-exit). |
+| `RIFT_AGENT_ALLOW_LINKS` | `true` | Agent. `false`: no [links to or from other agents](#reach-agents-from-other-agents). |
 | `exit_port_min`, `exit_port_max` | `51821`, `51899` | Server, in `config.toml`. UDP ports the server assigns to the internet exits of agents; must not contain the WireGuard, control or enrollment port. Restart required. |
 | `interface`, `wg_port`, `control_port` | `rift0`, `51820`, `8444` | WireGuard interface and ports. |
 | `ipv4_pool`, `ipv6_pool` | `10.13.0.0/24`, `fd88:5249:4654::/64` | Tunnel address pools; avoid overlaps. |

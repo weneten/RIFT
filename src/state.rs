@@ -642,6 +642,8 @@ impl StateStore {
         s.bans.retain(|b| b.agent_id != id);
         s.vpn_grants.retain(|g| g.agent_id != id);
         s.host_grants.retain(|g| g.agent_id != id);
+        s.agent_links
+            .retain(|l| l.from_agent_id != id && l.to_agent_id != id);
         for peer in &mut s.vpn_peers {
             peer.agent_exits.retain(|x| x != id);
         }
@@ -794,6 +796,25 @@ fn validate_snapshot(s: &StateSnapshot) -> Result<()> {
         );
         crate::vpn::validate_access(&g.access)?;
         anyhow::ensure!(!s.host_grants[..i].contains(g), "duplicate host grant");
+    }
+    for (i, l) in s.agent_links.iter().enumerate() {
+        anyhow::ensure!(
+            ids.contains(&l.from_agent_id) && ids.contains(&l.to_agent_id),
+            "link references unknown agent"
+        );
+        anyhow::ensure!(
+            l.from_agent_id != l.to_agent_id,
+            "an agent needs no link to itself"
+        );
+        anyhow::ensure!(
+            matches!(
+                l.access,
+                VpnAccess::Server | VpnAccess::Full | VpnAccess::Port { .. }
+            ),
+            "a link is server, full or a port"
+        );
+        crate::vpn::validate_access(&l.access)?;
+        anyhow::ensure!(!s.agent_links[..i].contains(l), "duplicate link");
     }
     let mut ban_ids = HashSet::new();
     for b in &s.bans {
@@ -1021,6 +1042,37 @@ mod tests {
             validate_snapshot(&s).is_err(),
             "a host grant reaches the agent only"
         );
+        let link = |from: &str, to: &str, access| AgentLink {
+            from_agent_id: from.into(),
+            to_agent_id: to.into(),
+            access,
+        };
+        let mut s = base.clone();
+        s.agent_links.push(link("a", "b", VpnAccess::Server));
+        s.agent_links.push(link("b", "a", VpnAccess::Server));
+        validate_snapshot(&s).unwrap();
+        s.agent_links.push(link("a", "b", VpnAccess::Server));
+        assert!(validate_snapshot(&s).is_err(), "duplicate link");
+        for (bad, why) in [
+            (link("a", "a", VpnAccess::Full), "link to itself"),
+            (
+                link("a", "zzz", VpnAccess::Full),
+                "link to an unknown agent",
+            ),
+            (
+                link("zzz", "a", VpnAccess::Full),
+                "link from an unknown agent",
+            ),
+            (
+                link("a", "b", subnet("192.168.178.0/24")),
+                "a link reaches the agent only",
+            ),
+            (link("a", "b", VpnAccess::Dns), "a link is no DNS grant"),
+        ] {
+            let mut s = base.clone();
+            s.agent_links.push(bad);
+            assert!(validate_snapshot(&s).is_err(), "{why}");
+        }
         let mut s = base.clone();
         s.vpn_grants.push(grant("a", subnet("192.168.178.0/24")));
         assert!(validate_snapshot(&s).is_err(), "duplicate grant");
