@@ -666,7 +666,7 @@ Targets are those of `rift vpn allow` on the agent itself: a port or range (`22/
 - **Services.** The service must listen on `0.0.0.0` or on the agent's tunnel address, as for forwards, and sees the server's tunnel address as its client. A Docker port published on the tunnel address works as well.
 - **Trust.** Whoever is root on the VPS reaches the granted ports. That is no new trust in the VPS, which can already reach forwarded ports and could forge grants, but keep the service's own authentication on: for SSH keys only, and ideally a key used only for this.
 
-Export and import carry these grants (`host_grants` in the file). The web panel and the terminal UI do not show or change them yet; `:` in the terminal UI runs `rift host ...`.
+Export and import carry these grants (`host_grants` in the file). In the web panel and the terminal UI, the Agents tab lists them in an agent's details; `h` ("Server access") adds and withdraws them, and in the terminal UI `H` withdraws one. When the agent refuses a host grant, its own log says `access of the server host (10.13.0.1) to ... refused`.
 
 ## Use RIFT as a VPN (exit)
 

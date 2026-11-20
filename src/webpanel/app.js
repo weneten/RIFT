@@ -425,6 +425,7 @@ function attention() {
   }
   for (const f of data.forwards || []) if (f.refused && f.enabled) push("warn", `Forward ${f.id} refused by ${f.agent}: ${f.refused}`);
   for (const g of data.refused_grants || []) push("warn", `Access of ${g.device} to ${g.agent} (${access(g.access)}) refused by the agent: ${g.reason}`);
+  for (const g of data.refused_host_grants || []) push("warn", `Access of this server to ${g.agent} (${access(g.access)}) refused by the agent: ${g.reason}`);
   for (const i of data.invites || []) push("info", `Invitation for ${i.name} open, ${duration(i.expires_at - now)} left`);
   if ((data.sites || {}).available === false && (data.sites || {}).queue === false) push("muted", "Sites: the host helper is not installed (sudo sh deploy/install-cli)");
   return items;
@@ -473,6 +474,7 @@ function actions() {
         if (item.status === "active") add("e", "Disable", () => confirmAct(`Disable ${item.name}? Its forwards and VPN access stop until it is enabled again.`, { action: "agent_enable", name: item.id, enabled: false }), w);
         else if (item.status === "disabled") add("e", "Enable", () => runAct({ action: "agent_enable", name: item.id, enabled: true }), w);
         if (item.status === "active") add("f", "Add forward", () => forwardDialog(item.name), w);
+        if (item.status === "active" || (item.host_grants || []).length) add("h", "Server access", () => hostDialog(item.name), w);
         add("r", "Rename", () => renameDialog(item), w);
         if (item.status !== "pending") add("K", "Rotate key", () => confirmAct(`Give ${item.name} a new WireGuard key? It happens on the agent's next sync.`, { action: "agent_rotate", name: item.id }), w);
         if (item.dns_name) add("n", item.names ? "Names off" : "Names on", () => namesChange({ action: "agent_names", name: item.id, on: !item.names }), w);
@@ -858,6 +860,12 @@ function drawAgents() {
       limits ? kv("Ports", ports) : null,
       limits ? kv("LANs", (limits.subnets || []).join(", ") || "none") : null,
       limits ? kv("Exit", limits.exit ? "offered" : "not offered") : null,
+      el("h3", {}, "Server host access"),
+      ...((a.host_grants || []).length
+        ? a.host_grants.map((g) => kv(access(g.access), g.refused
+          ? el("span", { class: "error", title: g.refused }, "refused by the agent")
+          : el("span", { class: "ok-text" }, "allowed")))
+        : [el("p", { class: "muted" }, "None: the VPS host reaches nothing on this agent (h allows ports).")]),
       a.last_error ? el("p", { class: "error" }, `✗ ${a.last_error}`) : null,
       el("p", { class: "muted" }, `${forwards} forward(s)`),
       a.dns_name ? el("p", { class: "hint" }, a.names
@@ -1513,6 +1521,47 @@ function importNote(name, result) {
   return (result && (result.reimport || []).includes(name))
     ? [`The configuration of ${name} changed: import it again on the device (QR code / config below).`]
     : [`The configuration of ${name} is unchanged: the change works without importing anything.`];
+}
+
+// What the VPS host itself may reach on an agent (`rift host allow`): no public port, no device.
+function hostDialog(name) {
+  const agent = (data.agents || []).find((a) => a.name === name);
+  if (!agent) { closeModal(); return; }
+  const refresh = async () => { await load(); hostDialog(name); };
+  const list = el("ul", { class: "grant-list" });
+  for (const g of agent.host_grants || []) {
+    list.append(el("li", {}, el("span", { title: g.refused || "" }, `${access(g.access)}${g.refused ? " (refused by the agent)" : ""}`),
+      button("Withdraw", async () => {
+        try {
+          await act({ action: "host_deny", agent: name, access: g.access });
+          await refresh();
+        } catch (e) { showBanner(e.message); }
+      }, "danger")));
+  }
+  if (!list.children.length) list.append(el("li", { class: "muted" }, "No access yet."));
+  const content = [
+    el("p", { class: "hint" }, `Lets the VPS host itself (its shell, programs with host networking) connect to ${agent.tunnel_ipv4 || "the agent's tunnel address"}, for example ssh USER@${agent.tunnel_ipv4 || "ADDRESS"} on the VPS. Nothing is published; Docker containers in bridge networks and VPN devices do not gain access. The agent's RIFT_AGENT_ALLOW_PORTS still applies.`),
+    el("h4", {}, "Current access"), list];
+  if (agent.status === "active") {
+    const kind = select([["ports", "ports on the agent host"], ["server", "the agent host (TCP, UDP, ping)"], ["full", "the agent host, all protocols"]], "ports");
+    const value = el("input", { placeholder: "e.g. 22/tcp 8000-8010/tcp", value: "22/tcp" });
+    const valueRow = row("Ports", value);
+    const update = () => { valueRow.hidden = kind.value !== "ports"; value.required = !valueRow.hidden; };
+    kind.addEventListener("change", update);
+    update();
+    content.push(el("hr", { class: "sep" }), el("h4", {}, "Allow more"), form([row("Access to", kind), valueRow], "Allow", async () => {
+      const body = { action: "host_allow", agent: name };
+      if (kind.value === "server") body.server = true;
+      if (kind.value === "full") body.full = true;
+      if (kind.value === "ports") body.ports = value.value;
+      const result = await act(body);
+      await refresh();
+      if ((result.warnings || []).length) showBanner(result.warnings.join(" "));
+    }));
+  } else {
+    content.push(el("div", { class: "form" }, el("div", { class: "buttons" }, button("Done", closeModal, "primary"))));
+  }
+  openModal(`Server access to ${name}`, ...content);
 }
 
 function grantsDialog(name, notes) {

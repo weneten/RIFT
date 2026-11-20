@@ -732,6 +732,22 @@ enum Action {
         #[serde(default)]
         access: Option<VpnAccess>,
     },
+    /// `rift host allow`: what the server host itself may reach on the agent.
+    HostAllow {
+        agent: String,
+        #[serde(default)]
+        server: bool,
+        #[serde(default)]
+        full: bool,
+        #[serde(default)]
+        ports: String,
+    },
+    /// `rift host deny`; without `access`, everything on that agent.
+    HostDeny {
+        agent: String,
+        #[serde(default)]
+        access: Option<VpnAccess>,
+    },
     /// The DNS server of the device's main profile: an agent, or `null` for the default.
     VpnDns {
         peer: String,
@@ -1025,6 +1041,36 @@ impl Action {
                     })
                     .await?
             }
+            Self::HostAllow {
+                agent,
+                server,
+                full,
+                ports,
+            } => {
+                let accesses = crate::vpn::accesses(server, full, &words(&ports), &[], false)?;
+                ensure!(
+                    !accesses.is_empty(),
+                    "choose what to allow: the host, all protocols or ports"
+                );
+                let mut warnings = Vec::new();
+                for access in accesses {
+                    let added = panel
+                        .admin(AdminRequest::HostAllow {
+                            agent: agent.clone(),
+                            access,
+                        })
+                        .await?;
+                    if let Some(warning) = added.get("warning").filter(|w| w.is_string()) {
+                        warnings.push(warning.clone());
+                    }
+                }
+                json!({"agent": agent, "warnings": warnings})
+            }
+            Self::HostDeny { agent, access } => {
+                panel
+                    .admin(AdminRequest::HostDeny { agent, access })
+                    .await?
+            }
             Self::VpnDns { peer, agent } => {
                 panel.admin(AdminRequest::VpnDns { peer, agent }).await?
             }
@@ -1135,6 +1181,23 @@ pub(crate) fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> 
             .map(|a| a["name"].clone())
             .unwrap_or_else(|| id.clone())
     };
+    let refused_host = status["refused_host_grants"].as_array().unwrap_or(&empty);
+    // What the server host may reach on an agent (`rift host allow`), with the agent's refusal.
+    let host_grants_of = |a: &Value| -> Vec<Value> {
+        snapshot["host_grants"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter(|g| g["agent_id"] == a["id"])
+            .map(|g| {
+                let refused = refused_host
+                    .iter()
+                    .find(|r| r["agent"] == a["name"] && r["access"] == g["access"])
+                    .map_or(Value::Null, |r| r["reason"].clone());
+                json!({"access": g["access"], "refused": refused})
+            })
+            .collect()
+    };
     let agents: Vec<Value> = agent_list
         .iter()
         .map(|a| {
@@ -1156,6 +1219,7 @@ pub(crate) fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> 
                 // counters below are keyed by.
                 "limits": a["limits"],
                 "public_key": a["public_key"],
+                "host_grants": host_grants_of(a),
             })
         })
         .collect();
@@ -1195,6 +1259,7 @@ pub(crate) fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> 
         "fully_applied": status["fully_applied"],
         "apply_error": status["apply_error"],
         "refused_grants": status["refused_grants"],
+        "refused_host_grants": status["refused_host_grants"],
         "enrollment": status["enrollment"],
         "invites": status["invites"],
         "bans": bans,
@@ -2063,6 +2128,73 @@ mod tests {
         assert!(act(&panel, "127.0.0.1", &cookie, change, "")
             .await
             .starts_with("HTTP/1.1 403"));
+    }
+
+    #[tokio::test]
+    async fn host_access_is_allowed_and_withdrawn_like_the_cli() {
+        let (panel, fake) = panel(config(PanelAccess::Private, ""));
+        let cookie = logged_in(&panel).await;
+        let added = act(
+            &panel,
+            "127.0.0.1",
+            &cookie,
+            r#"{"action":"host_allow","agent":"node4","server":true,"ports":"22/tcp, 53/both"}"#,
+            "",
+        )
+        .await;
+        assert!(added.starts_with("HTTP/1.1 200"), "{added}");
+        let empty = act(
+            &panel,
+            "127.0.0.1",
+            &cookie,
+            r#"{"action":"host_allow","agent":"node4"}"#,
+            "",
+        )
+        .await;
+        assert!(empty.starts_with("HTTP/1.1 400"), "{empty}");
+        let subnet = act(
+            &panel,
+            "127.0.0.1",
+            &cookie,
+            r#"{"action":"host_allow","agent":"node4","subnets":"192.168.178.0/24"}"#,
+            "",
+        )
+        .await;
+        assert!(
+            subnet.starts_with("HTTP/1.1 400"),
+            "unknown field: {subnet}"
+        );
+        let denied = act(
+            &panel,
+            "127.0.0.1",
+            &cookie,
+            r#"{"action":"host_deny","agent":"node4","access":"server"}"#,
+            "",
+        )
+        .await;
+        assert!(denied.starts_with("HTTP/1.1 200"), "{denied}");
+        let calls = fake.calls.lock().unwrap().clone();
+        let allows = calls.iter().filter(|c| c.contains("HostAllow")).count();
+        assert_eq!(allows, 4, "server, 22/tcp, 53/udp and 53/tcp: {calls:?}");
+        assert!(calls
+            .iter()
+            .any(|c| c.contains("HostDeny") && c.contains("server")));
+    }
+
+    #[test]
+    fn the_overview_lists_host_access_per_agent_with_refusals() {
+        let status = json!({"snapshot": {
+            "agents": [{"id": "a1", "name": "home"}, {"id": "a2", "name": "nas"}],
+            "host_grants": [{"agent_id": "a1", "access": {"port": {"protocol": "tcp", "ports": {"start": 22, "end": 22}}}},
+                            {"agent_id": "a1", "access": "full"}]},
+            "refused_host_grants": [{"agent": "home", "access": "full", "reason": "only 22/tcp"}]});
+        let overview = compose_overview(&status, &json!([]), &json!({}));
+        let home = &overview["agents"][0]["host_grants"];
+        assert_eq!(home.as_array().unwrap().len(), 2);
+        assert!(home[0]["refused"].is_null());
+        assert_eq!(home[1]["refused"], "only 22/tcp");
+        assert_eq!(overview["agents"][1]["host_grants"], json!([]));
+        assert_eq!(overview["refused_host_grants"][0]["agent"], "home");
     }
 
     #[tokio::test]

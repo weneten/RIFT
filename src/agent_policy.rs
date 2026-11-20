@@ -2,8 +2,11 @@
 //! any policy; the agent applies only the part its owner allowed in the environment.
 
 use crate::model::{AgentLimits, AgentPolicy, AgentVpnRule, VpnAccess};
+use ipnet::Ipv4Net;
 
-fn describe_rule(rule: &AgentVpnRule) -> String {
+/// A rule whose source lies outside the VPN pool comes from the server itself: a host grant
+/// (`rift host allow`) or RIFT's name server asking the agent's DNS server.
+fn describe_rule(rule: &AgentVpnRule, vpn_pool: Option<Ipv4Net>) -> String {
     let what = match &rule.access {
         VpnAccess::Server => "the host".to_string(),
         VpnAccess::Full => "the host, all protocols".to_string(),
@@ -11,7 +14,11 @@ fn describe_rule(rule: &AgentVpnRule) -> String {
         VpnAccess::Subnet { net, .. } => format!("subnet {net}"),
         VpnAccess::Dns => "DNS (53/both)".to_string(),
     };
-    format!("VPN grant for {} to {what}", rule.source)
+    if vpn_pool.is_some_and(|pool| !pool.contains(&rule.source)) {
+        format!("access of the server host ({}) to {what}", rule.source)
+    } else {
+        format!("VPN grant for {} to {what}", rule.source)
+    }
 }
 
 /// Returns the part of `policy` the agent's limits permit, and one refusal text per dropped
@@ -33,7 +40,10 @@ pub fn restrict(policy: &AgentPolicy, limits: &AgentLimits) -> (AgentPolicy, Vec
     for rule in &policy.vpn {
         match limits.refuse_access(&rule.access) {
             None => vpn.push(rule.clone()),
-            Some(why) => refusals.push(format!("{} refused: {why}", describe_rule(rule))),
+            Some(why) => refusals.push(format!(
+                "{} refused: {why}",
+                describe_rule(rule, policy.vpn_pool)
+            )),
         }
     }
     let exit = match (&policy.exit, limits.refuse_exit()) {
@@ -230,6 +240,30 @@ mod tests {
         assert!(refusals[2].contains("every port"));
         assert!(refusals[3].contains("every port"));
         assert_eq!(out.generation, 9);
+    }
+
+    #[test]
+    fn refusals_name_the_server_host_for_sources_outside_the_vpn_pool() {
+        let mut p = policy(
+            vec![],
+            vec![
+                rule(VpnAccess::Full),
+                AgentVpnRule {
+                    source: Ipv4Addr::new(10, 13, 0, 1),
+                    access: VpnAccess::Full,
+                },
+            ],
+        );
+        p.vpn_pool = Some("10.14.0.0/24".parse().unwrap());
+        let (_, refusals) = restrict(&p, &cfg("22/tcp", ""));
+        assert!(
+            refusals[0].starts_with("VPN grant for 10.14.0.2"),
+            "{refusals:?}"
+        );
+        assert!(
+            refusals[1].starts_with("access of the server host (10.13.0.1) to the host"),
+            "{refusals:?}"
+        );
     }
 
     #[test]

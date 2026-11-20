@@ -1048,6 +1048,13 @@ fn attention(app: &App) -> Vec<Line<'static>> {
     for refused in status["refused_grants"].as_array().into_iter().flatten() {
         push(false, crate::output::refused_grant(refused));
     }
+    for refused in status["refused_host_grants"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        push(false, crate::output::refused_host_grant(refused));
+    }
     for stuck in status["inapplicable_forwards"]
         .as_array()
         .into_iter()
@@ -1299,6 +1306,28 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
     if let Some(error) = agent["last_error"].as_str() {
         lines.push(Line::raw(""));
         lines.push(Line::styled(format!("✗ {error}"), theme::bad()));
+    }
+    // `rift host allow`: what the VPS host itself may reach on this agent.
+    let host: Vec<&Value> = agent["host_grants"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .collect();
+    lines.push(Line::raw(""));
+    if host.is_empty() {
+        lines.push(Line::styled(
+            "Server access: none (h allows ports)",
+            theme::muted(),
+        ));
+    } else {
+        lines.push(Line::styled("Server access", theme::accent()));
+        for grant in host {
+            let what = crate::output::vpn_access(&grant["access"]);
+            lines.push(match grant["refused"].as_str() {
+                Some(why) => Line::styled(format!("  ✗ {what}: refused, {why}"), theme::warn()),
+                None => Line::raw(format!("  {what}")),
+            });
+        }
     }
     let forwards = app
         .all_forwards()

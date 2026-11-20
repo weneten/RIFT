@@ -169,6 +169,7 @@ pub enum Submit {
     Ban,
     Device,
     Grant(String),
+    Host(String),
     Site,
     TwoFactorConfirm,
     LogFilter,
@@ -187,6 +188,9 @@ pub enum Act {
     AgentNames,
     AgentForward,
     AgentDetails,
+    /// `rift host allow`: what the VPS host itself may reach on the agent.
+    AgentHost,
+    AgentHostDeny,
     CancelInvite,
     NewToken,
     AgentRemove,
@@ -1434,6 +1438,13 @@ impl App {
                     }
                     if agent["status"] == "active" {
                         add("f", "Add forward", Act::AgentForward);
+                        add("h", "Server access", Act::AgentHost);
+                    }
+                    if agent["host_grants"]
+                        .as_array()
+                        .is_some_and(|g| !g.is_empty())
+                    {
+                        add("H", "Withdraw server access", Act::AgentHostDeny);
                     }
                     add("r", "Rename", Act::AgentRename);
                     if agent["status"] != "pending" {
@@ -1657,6 +1668,61 @@ impl App {
                 false,
             ),
             Act::AgentDetails => self.spawn_op(Op::Details(AdminRequest::AgentsShow { name }), false),
+            Act::AgentHost => {
+                let address = item["tunnel_ipv4"].as_str().unwrap_or("its tunnel address");
+                self.open_form(
+                    Form::new(
+                        &format!("Server access to {name}"),
+                        "Allow",
+                        vec![
+                            Field::text(
+                                "ports",
+                                "Ports",
+                                "22/tcp",
+                                "optional, e.g. 22/tcp 8000-8010/tcp",
+                            ),
+                            Field::check("server", "Whole host (TCP, UDP, ping)", false),
+                            Field::check("full", "All protocols", false),
+                        ],
+                    )
+                    .intro(&format!(
+                        "Lets the VPS host itself connect to {address}, e.g. ssh USER@{address} on the VPS. Nothing is published; containers in Docker bridge networks and VPN devices gain nothing. The agent's RIFT_AGENT_ALLOW_PORTS still applies."
+                    )),
+                    Submit::Host(name),
+                )
+            }
+            Act::AgentHostDeny => {
+                let mut items = Vec::new();
+                for grant in item["host_grants"].as_array().into_iter().flatten() {
+                    let Ok(access) = serde_json::from_value::<VpnAccess>(grant["access"].clone())
+                    else {
+                        continue;
+                    };
+                    items.push(MenuItem {
+                        label: output::vpn_access(&grant["access"]),
+                        hint: if grant["refused"].is_string() {
+                            "refused by the agent".into()
+                        } else {
+                            String::new()
+                        },
+                        what: MenuWhat::op(requests(vec![AdminRequest::HostDeny {
+                            agent: name.clone(),
+                            access: Some(access),
+                        }])),
+                    });
+                }
+                if items.len() > 1 {
+                    items.push(MenuItem {
+                        label: "everything on this agent".into(),
+                        hint: String::new(),
+                        what: MenuWhat::op(requests(vec![AdminRequest::HostDeny {
+                            agent: name.clone(),
+                            access: None,
+                        }])),
+                    });
+                }
+                self.menu(&format!("Withdraw server access to {name}"), items);
+            }
             Act::CancelInvite => self.ask(
                 "Cancel invitation",
                 &format!("Cancel the open invitation for {name}?"),
@@ -2461,6 +2527,28 @@ impl App {
                 );
                 Op::Requests(requests)
             }
+            Submit::Host(agent) => {
+                let accesses = vpn::accesses(
+                    form.on("server"),
+                    form.on("full"),
+                    &webpanel::words(&form.text("ports")),
+                    &[],
+                    false,
+                )?;
+                anyhow::ensure!(
+                    !accesses.is_empty(),
+                    "choose what to allow: ports, the whole host or all protocols"
+                );
+                Op::Requests(
+                    accesses
+                        .into_iter()
+                        .map(|access| AdminRequest::HostAllow {
+                            agent: agent.clone(),
+                            access,
+                        })
+                        .collect(),
+                )
+            }
             Submit::Site => {
                 let host = form.text("host");
                 let port: u32 = form
@@ -2959,6 +3047,72 @@ mod tests {
             rows + 6 <= with_comments,
             "{rows} rows here, {with_comments} with comments"
         );
+    }
+
+    #[test]
+    fn agents_offer_server_access_and_its_form_asks_for_host_grants() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = Config {
+            public_endpoint: "rift.example.net".into(),
+            ..Default::default()
+        };
+        let mut app = App::new(config, PathBuf::from("config.toml"), tx);
+        app.snapshot = Some(Snapshot {
+            status: json!({}),
+            overview: json!({"agents": [
+                {"id": "a1", "name": "home", "status": "active", "tunnel_ipv4": "10.13.0.2",
+                 "host_grants": [{"access": "server", "refused": null},
+                                 {"access": "full", "refused": "the agent allows only 22/tcp"}]},
+                {"id": "a2", "name": "nas", "status": "active", "tunnel_ipv4": "10.13.0.3", "host_grants": []}
+            ]}),
+            logs: Vec::new(),
+        });
+        app.tab = app.tabs.iter().position(|t| *t == Tab::Agents).unwrap();
+        app.clamp_selections();
+        let keys = |app: &App| -> Vec<&'static str> {
+            app.actions().into_iter().map(|(k, _, _)| k).collect()
+        };
+        assert!(keys(&app).contains(&"h") && keys(&app).contains(&"H"));
+        app.table(Tab::Agents).select(Some(1));
+        assert!(keys(&app).contains(&"h") && !keys(&app).contains(&"H"));
+
+        app.table(Tab::Agents).select(Some(0));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal
+            .draw(|frame| super::super::ui::draw(frame, &mut app))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(140)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>() + "\n")
+            .collect();
+        assert!(screen.contains("Server access"), "{screen}");
+        assert!(screen.contains("✗ full: refused"), "{screen}");
+        app.act(Act::AgentHostDeny);
+        let Some(Modal::Menu { items, .. }) = app.modals.last() else {
+            panic!("no withdraw menu")
+        };
+        assert_eq!(items.len(), 3, "both grants and everything");
+        assert_eq!(items[1].hint, "refused by the agent");
+        app.modals.clear();
+
+        app.act(Act::AgentHost);
+        let Some(Modal::Form { form, submit }) = app.modals.last() else {
+            panic!("no form")
+        };
+        let (form, submit) = (form.clone(), submit.clone());
+        let Ok(Op::Requests(requests)) = app.build(&submit, &form) else {
+            panic!("the default 22/tcp is a valid request")
+        };
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            &requests[0],
+            AdminRequest::HostAllow { agent, access: VpnAccess::Port { ports, .. } }
+                if agent == "home" && ports.start == 22
+        ));
     }
 
     #[test]
