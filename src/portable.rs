@@ -68,6 +68,9 @@ pub struct Export {
     pub forwards: Vec<ExportForward>,
     pub devices: Vec<ExportDevice>,
     pub sites: Vec<ExportSite>,
+    /// What the server host itself may reach on agents (`rift host allow`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_grants: Vec<ExportGrant>,
 }
 impl Export {
     /// Reads an export file; refuses any other format.
@@ -155,6 +158,16 @@ pub fn export(snap: &StateSnapshot) -> Export {
             })
             .collect(),
         sites: Vec::new(),
+        host_grants: snap
+            .host_grants
+            .iter()
+            .filter_map(|g| {
+                Some(ExportGrant {
+                    agent: name(&g.agent_id)?,
+                    access: g.access.clone(),
+                })
+            })
+            .collect(),
     }
 }
 
@@ -312,6 +325,7 @@ pub enum Op {
     /// Turns on the names (`NAME.internal`) of this agent (by ID).
     AgentNames(String),
     Grant(VpnGrant),
+    HostGrant(HostGrant),
     /// Adds the exit profile through this agent (by ID) to the device.
     AgentExit {
         name: String,
@@ -761,6 +775,42 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
             detail: Some(format!("{label}.{}", vpn::names_suffix())),
         });
     }
+    let mut planned_host: Vec<HostGrant> = ctx.snap.host_grants.clone();
+    for entry in &data.host_grants {
+        let (agent_id, agent) = match resolve(options, ctx, &entry.agent) {
+            Resolved::Agent { id, name } => (id, name),
+            Resolved::Filtered { name, why } | Resolved::Unavailable { name, why } => {
+                skips.add(&name, &why);
+                continue;
+            }
+        };
+        let what = format!("host access to {agent}: {}", describe_access(&entry.access));
+        let candidate = HostGrant {
+            agent_id,
+            access: entry.access.clone(),
+        };
+        if planned_host.contains(&candidate) {
+            plan.items.push(Item::new(Status::Present, what, None));
+            continue;
+        }
+        let valid = matches!(
+            candidate.access,
+            VpnAccess::Server | VpnAccess::Full | VpnAccess::Port { .. }
+        )
+        .then(|| vpn::validate_access(&candidate.access))
+        .unwrap_or_else(|| Err(anyhow::anyhow!("a host grant is server, full or a port")));
+        if let Err(error) = valid {
+            plan.items
+                .push(Item::new(Status::Failed, what, Some(error.to_string())));
+            continue;
+        }
+        planned_host.push(candidate.clone());
+        plan.steps.push(Step {
+            op: Op::HostGrant(candidate),
+            what,
+            detail: None,
+        });
+    }
     plan.items.extend(skips.items());
     plan
 }
@@ -840,6 +890,7 @@ mod tests {
             forwards,
             devices,
             sites: vec![],
+            host_grants: vec![],
         }
     }
     fn world() -> StateSnapshot {
@@ -924,6 +975,58 @@ mod tests {
         }
         let again = Export::parse(text.as_bytes()).unwrap();
         assert_eq!(again, out);
+    }
+
+    #[test]
+    fn host_grants_survive_an_export_and_an_import_round_trip() {
+        let ssh = VpnAccess::Port {
+            protocol: Protocol::Tcp,
+            ports: "22".parse().unwrap(),
+        };
+        let mut snap = world();
+        snap.host_grants.push(HostGrant {
+            agent_id: "id-node1".into(),
+            access: ssh.clone(),
+        });
+        let out = export(&snap);
+        assert_eq!(
+            out.host_grants,
+            [ExportGrant {
+                agent: "node1".into(),
+                access: ssh.clone()
+            }]
+        );
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(!text.contains("id-node1"), "{text}");
+        assert_eq!(Export::parse(text.as_bytes()).unwrap(), out);
+
+        let planned = run(&out, &ImportOptions::default(), &world());
+        assert!(planned.steps.iter().any(|s| matches!(
+            &s.op,
+            Op::HostGrant(g) if g.agent_id == "id-node1" && g.access == ssh
+        )));
+        let again = run(&out, &ImportOptions::default(), &snap);
+        assert!(again.steps.is_empty() && count(&again, Status::Present) == 1);
+        // A network is never a host grant, whatever the file says.
+        let mut bad = out.clone();
+        bad.host_grants[0].access = VpnAccess::Subnet {
+            net: "192.168.178.0/24".parse().unwrap(),
+            snat: false,
+        };
+        assert_eq!(
+            count(
+                &run(&bad, &ImportOptions::default(), &world()),
+                Status::Failed
+            ),
+            1
+        );
+        // Files without the field still parse.
+        let mut old: serde_json::Value = serde_json::from_str(&text).unwrap();
+        old.as_object_mut().unwrap().remove("host_grants");
+        assert!(Export::parse(old.to_string().as_bytes())
+            .unwrap()
+            .host_grants
+            .is_empty());
     }
 
     #[test]
@@ -1355,6 +1458,7 @@ mod tests {
                 Op::Grant(_) => "grant",
                 Op::Forward(_) => "forward",
                 Op::AgentExit { .. } => "exit",
+                Op::HostGrant(_) => "host",
             })
             .collect();
         assert_eq!(kinds, vec!["device", "flags", "grant"]);

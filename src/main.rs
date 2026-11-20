@@ -91,6 +91,13 @@ enum Command {
         #[command(subcommand)]
         command: Vpn,
     },
+    /// Let this server host itself reach an agent over the tunnel, for example SSH from the
+    /// VPS to a home server: `rift host allow node1 22/tcp`, then `ssh USER@10.13.0.2` on the
+    /// VPS. Nothing is published; only the VPS host reaches it, by the agent's tunnel address.
+    Host {
+        #[command(subcommand)]
+        command: HostCommand,
+    },
     /// The optional web panel on the VPS (RIFT_WEBPANEL=true in the server .env).
     Panel {
         #[command(subcommand)]
@@ -232,6 +239,41 @@ enum Vpn {
         #[arg(long)]
         export: bool,
     },
+}
+#[derive(Subcommand)]
+enum HostCommand {
+    /// `rift host allow AGENT TARGET...`: PORT/tcp, PORT/udp or PORT/both (ranges like
+    /// 8000-8010/tcp), `server` (TCP, UDP and ping) or `full` (every protocol). The agent's
+    /// RIFT_AGENT_ALLOW_PORTS still applies.
+    Allow(HostArgs),
+    /// `rift host deny AGENT [TARGET...]`: without a target, withdraws everything on the agent.
+    Deny(HostArgs),
+    /// What this server host may reach on which agent.
+    List,
+}
+#[derive(Args)]
+struct HostArgs {
+    /// The agent.
+    agent: String,
+    /// What the server host may reach on it.
+    #[arg(value_name = "TARGET")]
+    targets: Vec<String>,
+}
+impl HostArgs {
+    fn accesses(&self) -> Result<Vec<VpnAccess>> {
+        let (mut server, mut full, mut ports) = (false, false, Vec::new());
+        for target in &self.targets {
+            match target.as_str() {
+                "server" => server = true,
+                "full" => full = true,
+                t if t.contains('/') && t.parse::<Ipv4Net>().is_err() => ports.push(t.to_string()),
+                t => bail!(
+                    "{t:?}: the server host reaches only the agent itself; use PORT/tcp, PORT/udp, PORT/both, server or full"
+                ),
+            }
+        }
+        rift::vpn::accesses(server, full, &ports, &[], false)
+    }
 }
 #[derive(Subcommand)]
 enum NamesWhat {
@@ -670,6 +712,39 @@ async fn run() -> Result<()> {
             },
             Vpn::Config { .. } | Vpn::Connect { .. } => unreachable!("handled above"),
         },
+        Command::Host { command } => match command {
+            HostCommand::List => AdminRequest::HostList,
+            HostCommand::Allow(args) => {
+                let mut requests = args.accesses()?.into_iter().map(|access| {
+                    AdminRequest::HostAllow {
+                        agent: args.agent.clone(),
+                        access,
+                    }
+                });
+                let first = requests
+                    .next()
+                    .context("choose what to allow, for example: 22/tcp, server or full")?;
+                more.extend(requests);
+                first
+            }
+            HostCommand::Deny(args) => {
+                let accesses = args.accesses()?;
+                if accesses.is_empty() {
+                    AdminRequest::HostDeny {
+                        agent: args.agent,
+                        access: None,
+                    }
+                } else {
+                    let mut requests = accesses.into_iter().map(|access| AdminRequest::HostDeny {
+                        agent: args.agent.clone(),
+                        access: Some(access),
+                    });
+                    let first = requests.next().context("nothing to deny")?;
+                    more.extend(requests);
+                    first
+                }
+            }
+        },
         Command::Status => AdminRequest::Status,
         Command::Reload => AdminRequest::Reload,
         Command::Logs { lines } => AdminRequest::Logs {
@@ -989,6 +1064,17 @@ async fn server_checks(config: &Config, checks: &mut rift::net::Checks) {
             WARN,
             format!("Forward {}", refused["id"]),
             refused["reason"].as_str().unwrap_or("refused").to_string(),
+        );
+    }
+    for refused in status["refused_host_grants"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        checks.push(
+            WARN,
+            "Access of this server".to_string(),
+            rift::output::refused_host_grant(refused),
         );
     }
     for refused in status["refused_grants"].as_array().into_iter().flatten() {
@@ -1640,6 +1726,44 @@ mod tests {
             _ => unreachable!(),
         }
     }
+    #[test]
+    fn host_commands_parse_ports_server_and_full_and_refuse_networks() {
+        let accesses = |args: &[&str]| -> Result<Vec<VpnAccess>> {
+            let cli = Cli::try_parse_from(args).unwrap();
+            match cli.command.unwrap() {
+                Command::Host {
+                    command: HostCommand::Allow(a) | HostCommand::Deny(a),
+                } => a.accesses(),
+                _ => unreachable!(),
+            }
+        };
+        let got = accesses(&[
+            "rift", "host", "allow", "home", "22/tcp", "53/both", "server",
+        ])
+        .unwrap();
+        assert_eq!(got.len(), 4, "{got:?}");
+        assert_eq!(got[0], VpnAccess::Server);
+        assert!(got.contains(&VpnAccess::Port {
+            protocol: Protocol::Tcp,
+            ports: PortRange { start: 22, end: 22 },
+        }));
+        assert_eq!(
+            accesses(&["rift", "host", "allow", "home", "full"]).unwrap(),
+            [VpnAccess::Full]
+        );
+        assert!(accesses(&["rift", "host", "deny", "home"])
+            .unwrap()
+            .is_empty());
+        for bad in ["192.168.178.0/24", "exit", "2222:22/tcp", "22/v6"] {
+            assert!(
+                accesses(&["rift", "host", "allow", "home", bad]).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        assert!(Cli::try_parse_from(["rift", "host", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["rift", "host", "allow"]).is_err());
+    }
+
     #[test]
     fn vpn_connect_takes_the_allow_arguments_and_names_the_addresses() {
         let cli = Cli::try_parse_from([

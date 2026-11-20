@@ -675,6 +675,44 @@ def host_local_proxy_test(server_cfg):
     print("PASS a proxy on the VPS itself reaches local-ingress forwards over IPv4/IPv6 TCP/UDP; outside clients do not")
 
 
+def host_grant_test(server_cfg):
+    """`rift host allow`: the VPS host itself reaches a port on an agent's tunnel address,
+    which no forward or VPN grant covers, only while the grant exists."""
+    agent = next(a for a in status(server_cfg)["snapshot"]["agents"] if a["name"] == "agent2")
+    address = agent["tunnel_ipv4"]
+    echo_file = write(WORK / "host-echo.py", ECHO, 0o755)
+    start_echo_process(AGENTS[1], echo_file, ["4", "tcp", address, "19085"], "echo-host-grant")
+    wait_echo_ready(AGENTS[1], "4", "tcp", address, 19085)
+    server_v4 = ns(VPS, "ip", "-4", "-o", "address", "show", "dev", "rift0").stdout.split()[3].split("/")[0]
+    probe = r'''import socket,sys
+s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(2)
+try: s.connect((sys.argv[1],int(sys.argv[2])))
+except OSError: print("unreachable"); sys.exit(3)
+s.sendall(b"rift-test"); print(s.recv(256).decode())
+'''
+
+    def reach():
+        return ns(VPS, "python3", "-c", probe, address, "19085", check=False)
+
+    assert reach().returncode == 3, "the VPS host reached an agent port without a host grant"
+    cli(VPS, server_cfg, "host", "allow", "agent2", "19085/tcp")
+    wait_policy(server_cfg, 3)
+    result = wait_until(lambda: (r := reach()).returncode == 0 and r,
+                        "the VPS host to reach agent2 through its host grant", timeout=20)
+    assert result.stdout.strip() == server_v4, \
+        f"agent2 saw {result.stdout.strip()}, expected the server tunnel address {server_v4}"
+    listed = json.loads(cli(VPS, server_cfg, "host", "list").stdout)
+    assert [(g["agent"], g["refused"]) for g in listed] == [("agent2", None)], listed
+    # A client on the internet still finds nothing: no public port exists for it.
+    assert not any(f["target_ports"]["start"] == 19085 for f in status(server_cfg)["snapshot"]["forwards"])
+    cli(VPS, server_cfg, "host", "deny", "agent2")
+    wait_policy(server_cfg, 3)
+    wait_until(lambda: reach().returncode == 3 or None,
+               "the VPS host to lose access after host deny", timeout=20)
+    assert json.loads(cli(VPS, server_cfg, "host", "list").stdout) == []
+    print("PASS the VPS host reaches an agent port by host grant from its tunnel address; deny closes it")
+
+
 def _client_probe():
     return r'''import socket,sys
 fam=socket.AF_INET6 if sys.argv[1]=="6" else socket.AF_INET
@@ -1347,6 +1385,7 @@ def main():
         translation_ban_test(server_cfg)
         allow_from_test(server_cfg)
         host_local_proxy_test(server_cfg)
+        host_grant_test(server_cfg)
         vpn_device_test(server_cfg)
         check_routes_and_foreign(prior, baselines)
         check_normal_traffic()

@@ -163,6 +163,17 @@ pub enum AdminRequest {
         agent: String,
         access: Option<VpnAccess>,
     },
+    /// Lets the VPS host itself reach the agent's tunnel address: `server`, `full` or a port.
+    HostAllow {
+        agent: String,
+        access: VpnAccess,
+    },
+    /// Without `access`, withdraws every host grant on that agent.
+    HostDeny {
+        agent: String,
+        access: Option<VpnAccess>,
+    },
+    HostList,
     /// Makes the agent's tunnel address the DNS server of the device's main profile and allows
     /// port 53 there; `None` returns to the default (no DNS line, or `RIFT_VPN_DNS` with an exit).
     VpnDns {

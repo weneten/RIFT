@@ -29,6 +29,7 @@ The agent initiates the connection to the server. RIFT manages the tunnel, expli
 - [Publish websites with HTTPS](#publish-websites-with-https)
 - [Manage agents and forwards](#manage-agents-and-forwards)
 - [Private VPN access](#private-vpn-access)
+- [Reach agents from the server itself](#reach-agents-from-the-server-itself)
 - [Use RIFT as a VPN (exit)](#use-rift-as-a-vpn-exit)
 - [Web panel](#web-panel)
 - [Terminal UI](#terminal-ui)
@@ -648,6 +649,25 @@ Turning names on or off changes the main profile of the devices concerned (its D
 
 **Trust boundary.** The server authenticates devices by WireGuard key, and the agent enforces its own input and forwarding rules by the device's VPN source address. A compromised server can forge an allowed source address, so the agent-side rules limit mistakes and stolen device keys, not a hostile server. What a hostile server can reach is capped by the agent's own `RIFT_AGENT_ALLOW_PORTS` and `RIFT_AGENT_ALLOW_SUBNETS`: it can never open a port outside the first or the LAN outside the second. Protecting against that needs end-to-end authentication between device and agent, which RIFT does not provide for grants; an exit through an agent is end to end between the device and the agent.
 
+## Reach agents from the server itself
+
+The VPS host can open connections to an agent's tunnel address, for example SSH from the VPS to the home server, without a public port and without a VPN device. Like everything else this is denied until allowed: an agent drops what arrives through the tunnel unless a forward or a grant names it.
+
+```sh
+rift host allow node1 22/tcp     # then, on the VPS: ssh USER@10.13.0.2
+rift host list                   # what the server host may reach, with each agent's address
+rift host deny node1 22/tcp      # without a target: everything on node1
+```
+
+Targets are those of `rift vpn allow` on the agent itself: a port or range (`22/tcp`, `8000-8010/tcp`, `53/both`), `server` (TCP, UDP and ping) or `full` (every protocol). A network behind the agent is not offered. `rift list agents` shows the tunnel address to connect to.
+
+- **What is allowed.** Connections from the server's own tunnel address (`10.13.0.1` by default) to the agent's tunnel address on the granted ports. In practice that is the VPS host itself: commands in its shell, and programs that run with host networking, RIFT's container included. Docker containers in bridge networks on the VPS do not reach the tunnel, and VPN devices keep their own grants. Nothing is published on the public address.
+- **The agent decides.** `RIFT_AGENT_ALLOW_PORTS` applies as to every grant: a port outside it, or `server`/`full` while the agent limits ports, is refused. `rift host allow` stores it anyway and warns; `rift status` and `rift doctor` name it until the agent allows it.
+- **Services.** The service must listen on `0.0.0.0` or on the agent's tunnel address, as for forwards, and sees the server's tunnel address as its client. A Docker port published on the tunnel address works as well.
+- **Trust.** Whoever is root on the VPS reaches the granted ports. That is no new trust in the VPS, which can already reach forwarded ports and could forge grants, but keep the service's own authentication on: for SSH keys only, and ideally a key used only for this.
+
+Export and import carry these grants (`host_grants` in the file). The web panel and the terminal UI do not show or change them yet; `:` in the terminal UI runs `rift host ...`.
+
 ## Use RIFT as a VPN (exit)
 
 A device can also send **all** its internet traffic through RIFT, like a commercial VPN. One device can have several exits at once, each as its own WireGuard profile:
@@ -988,6 +1008,8 @@ The web panel runs `add site`, `remove site`, `export`, `import` and `backup` th
 | `rift add device NAME` | Registers a device with a key and an address. It reaches nothing yet. |
 | `rift list devices [FILTER...] [--agent NAME]` | All devices with state, last handshake and access, including the exits (`exit via server; exit via node1; exit via node2`); `--agent` keeps devices with a grant on that agent or an exit through it. |
 | `rift vpn allow DEVICE AGENT TARGET... [--snat]` | Grants access. `TARGET` is `22/tcp` (port or range), `server` (the agent host), `full` (all protocols to the host), a network such as `192.168.178.30/32` (`--snat` for networks whose router has no route back), or `exit`: adds an internet exit through that agent, as an extra profile of the device. |
+| `rift host allow AGENT TARGET...` | Lets the VPS host itself reach the agent's tunnel address: `22/tcp` (port or range), `server` or `full`. Nothing is published. Example: `rift host allow node1 22/tcp`, then `ssh USER@10.13.0.2` on the VPS. |
+| `rift host deny AGENT [TARGET...]` / `rift host list` | Withdraws it; without a target everything on that agent / lists what the server host may reach. |
 | `rift vpn allow DEVICE exit` | Adds the server as an internet exit of the device (main profile). Other exits stay; import the profile RIFT names. |
 | `rift vpn deny DEVICE AGENT [TARGET...]` | Withdraws access; without a target everything on that agent, including the exit through it. |
 | `rift vpn deny DEVICE exit` / `rift vpn deny DEVICE AGENT exit` | Ends the exit through the server / through that agent; the device's other exits stay. |

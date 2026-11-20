@@ -641,6 +641,7 @@ impl StateStore {
         s.forwards.retain(|f| f.agent_id != id);
         s.bans.retain(|b| b.agent_id != id);
         s.vpn_grants.retain(|g| g.agent_id != id);
+        s.host_grants.retain(|g| g.agent_id != id);
         for peer in &mut s.vpn_peers {
             peer.agent_exits.retain(|x| x != id);
         }
@@ -778,6 +779,21 @@ fn validate_snapshot(s: &StateSnapshot) -> Result<()> {
                 }
             }
         }
+    }
+    for (i, g) in s.host_grants.iter().enumerate() {
+        anyhow::ensure!(
+            ids.contains(&g.agent_id),
+            "host grant references unknown agent"
+        );
+        anyhow::ensure!(
+            matches!(
+                g.access,
+                VpnAccess::Server | VpnAccess::Full | VpnAccess::Port { .. }
+            ),
+            "a host grant is server, full or a port"
+        );
+        crate::vpn::validate_access(&g.access)?;
+        anyhow::ensure!(!s.host_grants[..i].contains(g), "duplicate host grant");
     }
     let mut ban_ids = HashSet::new();
     for b in &s.bans {
@@ -984,6 +1000,27 @@ mod tests {
         let mut s = base.clone();
         s.vpn_grants.push(grant("zzz", VpnAccess::Server));
         assert!(validate_snapshot(&s).is_err(), "unknown agent");
+        let host = |agent: &str, access| HostGrant {
+            agent_id: agent.into(),
+            access,
+        };
+        let mut s = base.clone();
+        s.host_grants.push(host("a", VpnAccess::Server));
+        validate_snapshot(&s).unwrap();
+        s.host_grants.push(host("a", VpnAccess::Server));
+        assert!(validate_snapshot(&s).is_err(), "duplicate host grant");
+        let mut s = base.clone();
+        s.host_grants.push(host("zzz", VpnAccess::Full));
+        assert!(
+            validate_snapshot(&s).is_err(),
+            "host grant on an unknown agent"
+        );
+        let mut s = base.clone();
+        s.host_grants.push(host("a", subnet("192.168.178.0/24")));
+        assert!(
+            validate_snapshot(&s).is_err(),
+            "a host grant reaches the agent only"
+        );
         let mut s = base.clone();
         s.vpn_grants.push(grant("a", subnet("192.168.178.0/24")));
         assert!(validate_snapshot(&s).is_err(), "duplicate grant");

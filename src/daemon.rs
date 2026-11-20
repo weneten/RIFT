@@ -480,6 +480,9 @@ fn safe_rollback(mut previous: StateSnapshot, desired: &StateSnapshot) -> StateS
     previous.vpn_grants.retain(|old| {
         desired.vpn_grants.contains(old) && previous.vpn_peers.iter().any(|p| p.name == old.peer)
     });
+    previous.host_grants.retain(|old| {
+        desired.host_grants.contains(old) && previous.agents.iter().any(|a| a.id == old.agent_id)
+    });
     previous.bans = desired
         .bans
         .iter()
@@ -769,12 +772,18 @@ fn grant_refusal(snap: &StateSnapshot, grant: &VpnGrant) -> Option<String> {
     let agent = snap.agents.iter().find(|a| a.id == grant.agent_id)?;
     agent.limits.as_ref()?.refuse_access(&grant.access)
 }
+fn host_grant_refusal(snap: &StateSnapshot, grant: &HostGrant) -> Option<String> {
+    let agent = snap.agents.iter().find(|a| a.id == grant.agent_id)?;
+    agent.limits.as_ref()?.refuse_access(&grant.access)
+}
 /// The snapshot without what agents refuse. Publishing a forward the agent drops would open
 /// a public port nothing answers on; the agent enforces its limits anyway.
 fn without_refused(snap: StateSnapshot) -> StateSnapshot {
     let mut out = snap.clone();
     out.forwards.retain(|f| forward_refusal(&snap, f).is_none());
     out.vpn_grants.retain(|g| grant_refusal(&snap, g).is_none());
+    out.host_grants
+        .retain(|g| host_grant_refusal(&snap, g).is_none());
     for peer in &mut out.vpn_peers {
         peer.agent_exits.retain(|id| {
             !snap
@@ -848,6 +857,18 @@ fn policy_for(
     {
         vpn.push(crate::names::upstream_rule(server_ipv4));
     }
+    // `rift host allow`: connections the VPS host opens to the agent come from the server's
+    // own tunnel address, so the agent enforces them as VPN rules with that source.
+    vpn.extend(
+        snapshot
+            .host_grants
+            .iter()
+            .filter(|g| g.agent_id == id)
+            .map(|g| AgentVpnRule {
+                source: server_ipv4,
+                access: g.access.clone(),
+            }),
+    );
     let policy = AgentPolicy {
         generation: snapshot.generation,
         forwards: snapshot
@@ -1006,6 +1027,7 @@ fn reads_only(r: &AdminRequest) -> bool {
             | AdminRequest::BansList
             | AdminRequest::Logs { .. }
             | AdminRequest::VpnPeerList
+            | AdminRequest::HostList
             | AdminRequest::VpnConfig { .. }
             | AdminRequest::PanelStatus
             | AdminRequest::PanelPassword
@@ -1104,6 +1126,15 @@ async fn admin_call_inner(s: &Server, r: AdminRequest) -> Result<serde_json::Val
                     Some(serde_json::json!({"device":g.peer,"agent":agent.name,"access":g.access,"reason":why}))
                 })
                 .collect();
+            let refused_host_grants: Vec<_> = snap
+                .host_grants
+                .iter()
+                .filter_map(|g| {
+                    let why = host_grant_refusal(&snap, g)?;
+                    let agent = snap.agents.iter().find(|a| a.id == g.agent_id)?;
+                    Some(serde_json::json!({"agent":agent.name,"access":g.access,"reason":why}))
+                })
+                .collect();
             let fully_applied =
                 error.is_none() && applied == Some(snap.generation) && pending_forwards.is_empty();
             let cfg = s.config.read().await.clone();
@@ -1120,7 +1151,7 @@ async fn admin_call_inner(s: &Server, r: AdminRequest) -> Result<serde_json::Val
                 .map(|n| n.moved.clone())
                 .unwrap_or_default();
             let inapplicable_forwards = inapplicable(&snap, &cfg.public_ips);
-            serde_json::json!({"moved_forwards":moved_forwards,"inapplicable_forwards":inapplicable_forwards,"snapshot":snap,"enrollment":enrollment,"invites":invites,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"refused_forwards":refused_forwards,"refused_grants":refused_grants,"fully_applied":fully_applied,"connection_history":s.state.health()?,"rift_version":protocol::RIFT_VERSION})
+            serde_json::json!({"moved_forwards":moved_forwards,"inapplicable_forwards":inapplicable_forwards,"snapshot":snap,"enrollment":enrollment,"invites":invites,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"refused_forwards":refused_forwards,"refused_grants":refused_grants,"refused_host_grants":refused_host_grants,"fully_applied":fully_applied,"connection_history":s.state.health()?,"rift_version":protocol::RIFT_VERSION})
         }
         AdminRequest::AgentsList => serde_json::to_value(snap.agents)?,
         AdminRequest::AgentsShow { name } => {
@@ -1415,7 +1446,78 @@ async fn admin_call_inner(s: &Server, r: AdminRequest) -> Result<serde_json::Val
             s.two_factor.reset()?;
             serde_json::json!({"enabled":false})
         }
+        host_request @ (AdminRequest::HostAllow { .. }
+        | AdminRequest::HostDeny { .. }
+        | AdminRequest::HostList) => host_admin(s, &snap, host_request).await?,
         vpn_request => vpn_admin(s, &snap, vpn_request).await?,
+    };
+    Ok(data)
+}
+
+/// `rift host allow|deny|list`: what the VPS host itself may reach on agents.
+async fn host_admin(
+    s: &Server,
+    snap: &StateSnapshot,
+    r: AdminRequest,
+) -> Result<serde_json::Value> {
+    let data = match r {
+        AdminRequest::HostAllow { agent, access } => {
+            anyhow::ensure!(
+                matches!(
+                    access,
+                    VpnAccess::Server | VpnAccess::Full | VpnAccess::Port { .. }
+                ),
+                "the server host reaches only the agent itself: PORT/tcp, PORT/udp, PORT/both, server or full"
+            );
+            crate::vpn::validate_access(&access)?;
+            let target = find_agent(snap, &agent)?;
+            anyhow::ensure!(target.status == AgentStatus::Active, "agent must be active");
+            let grant = HostGrant {
+                agent_id: target.id.clone(),
+                access,
+            };
+            s.state.mutate("host-allow", |x| {
+                if !x.host_grants.contains(&grant) {
+                    x.host_grants.push(grant.clone());
+                }
+                Ok(())
+            })?;
+            reconcile(s).await?;
+            let warning = host_grant_refusal(&s.state.snapshot()?, &grant)
+                .map(|why| format!("the grant was added, but agent {agent} will refuse it: {why}"));
+            serde_json::json!({"agent":agent,"tunnel_ipv4":target.tunnel_ipv4,"access":grant.access,"warning":warning})
+        }
+        AdminRequest::HostDeny { agent, access } => {
+            let agent_id = find_agent(snap, &agent)?.id.clone();
+            s.state.mutate("host-deny", |x| {
+                let before = x.host_grants.len();
+                x.host_grants.retain(|g| {
+                    !(g.agent_id == agent_id && access.as_ref().is_none_or(|a| *a == g.access))
+                });
+                anyhow::ensure!(before != x.host_grants.len(), "no matching host grant");
+                Ok(())
+            })?;
+            reconcile(s).await?;
+            serde_json::json!({"agent":agent,"denied":true})
+        }
+        AdminRequest::HostList => {
+            let rows: Vec<_> = snap
+                .host_grants
+                .iter()
+                .map(|g| {
+                    let agent = snap.agents.iter().find(|a| a.id == g.agent_id);
+                    serde_json::json!({
+                        "agent": agent.map(|a| a.name.clone()),
+                        "tunnel_ipv4": agent.map(|a| a.tunnel_ipv4),
+                        "agent_status": agent.map(|a| a.status.clone()),
+                        "access": g.access,
+                        "refused": host_grant_refusal(snap, g),
+                    })
+                })
+                .collect();
+            serde_json::Value::Array(rows)
+        }
+        _ => unreachable!("not a host request"),
     };
     Ok(data)
 }
@@ -1455,7 +1557,7 @@ async fn import_admin(
                     }
                 }
                 Op::Device(_) => cfg.check_vpn_pool()?,
-                Op::AgentNames(_) => {}
+                Op::AgentNames(_) | Op::HostGrant(_) => {}
                 Op::Flags { name, .. } | Op::AgentExit { name, .. } => {
                     anyhow::ensure!(
                         !lost_devices.contains(name),
@@ -1589,6 +1691,11 @@ async fn import_admin(
                 Op::AgentNames(id) => {
                     for a in x.agents.iter_mut().filter(|a| &a.id == id) {
                         a.names = true;
+                    }
+                }
+                Op::HostGrant(g) => {
+                    if !x.host_grants.contains(g) {
+                        x.host_grants.push(g.clone());
                     }
                 }
                 Op::AgentExit { name, agent_id } => {
@@ -2877,6 +2984,96 @@ mod tests {
         let mut stale = limited.clone();
         stale.forwards[1].generation = 3;
         assert_eq!(forward_state(&stale, &stale.forwards[1]).0, "pending");
+    }
+
+    #[test]
+    fn host_grants_reach_the_agent_from_the_servers_tunnel_address_within_its_limits() {
+        let mut agent = AgentRecord {
+            protocol: 0,
+            rift_version: String::new(),
+            names: false,
+            id: "node4".into(),
+            name: "home".into(),
+            public_key: "k".into(),
+            tunnel_ipv4: "10.13.0.2".parse().unwrap(),
+            tunnel_ipv6: "fd88:5249:4654::2".parse().unwrap(),
+            status: AgentStatus::Active,
+            attempt_id: "a".into(),
+            generation: 2,
+            applied_generation: 2,
+            last_error: None,
+            created_at: 0,
+            pending_deadline: None,
+            limits: None,
+            exit: None,
+            exit_port: None,
+        };
+        let ssh = VpnAccess::Port {
+            protocol: Protocol::Tcp,
+            ports: "22".parse().unwrap(),
+        };
+        let snap = |agent: &AgentRecord| StateSnapshot {
+            generation: 2,
+            agents: vec![agent.clone()],
+            host_grants: vec![
+                HostGrant {
+                    agent_id: "node4".into(),
+                    access: ssh.clone(),
+                },
+                HostGrant {
+                    agent_id: "node4".into(),
+                    access: VpnAccess::Server,
+                },
+                HostGrant {
+                    agent_id: "other".into(),
+                    access: VpnAccess::Full,
+                },
+            ],
+            ..Default::default()
+        };
+        let server: std::net::Ipv4Addr = "10.13.0.1".parse().unwrap();
+        let policy = |snap: &StateSnapshot| {
+            policy_for(
+                snap,
+                "node4",
+                "10.14.0.0/24".parse().unwrap(),
+                "fd88:5249:4655::/64".parse().unwrap(),
+                server,
+            )
+        };
+        let open = policy(&snap(&agent));
+        assert_eq!(
+            open.vpn,
+            [
+                AgentVpnRule {
+                    source: server,
+                    access: ssh.clone()
+                },
+                AgentVpnRule {
+                    source: server,
+                    access: VpnAccess::Server
+                },
+            ],
+            "only this agent's grants, with the server as the source"
+        );
+        // Outside RIFT_AGENT_ALLOW_PORTS: left out of the policy and reported, not dropped.
+        agent.limits = Some(AgentLimits {
+            ports: crate::config::parse_port_allow("22/tcp").unwrap(),
+            subnets: vec![],
+            exit: false,
+        });
+        let limited = snap(&agent);
+        assert_eq!(
+            policy(&limited).vpn,
+            [AgentVpnRule {
+                source: server,
+                access: ssh
+            }]
+        );
+        assert!(host_grant_refusal(&limited, &limited.host_grants[1])
+            .unwrap()
+            .contains("every port"));
+        assert_eq!(without_refused(limited).host_grants.len(), 2);
     }
 
     #[test]

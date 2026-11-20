@@ -439,6 +439,14 @@ pub struct VpnGrant {
     pub agent_id: String,
     pub access: VpnAccess,
 }
+/// The VPS host itself may reach the agent's tunnel address (`rift host allow`): a connection
+/// the host opens to the agent, from the server's own tunnel address. Only `Server`, `Full`
+/// and `Port` make sense here; the agent sees it as a VPN rule whose source is the server.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostGrant {
+    pub agent_id: String,
+    pub access: VpnAccess,
+}
 /// What an agent needs to know about one granted peer.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentVpnRule {
@@ -468,6 +476,9 @@ pub struct StateSnapshot {
     pub bans: Vec<Ban>,
     pub vpn_peers: Vec<VpnPeer>,
     pub vpn_grants: Vec<VpnGrant>,
+    /// What the VPS host itself may reach on agents; absent in snapshots written before it existed.
+    #[serde(default)]
+    pub host_grants: Vec<HostGrant>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct AgentPolicy {

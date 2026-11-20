@@ -432,6 +432,9 @@ fn status(data: &Value) -> String {
         for refused in data["refused_grants"].as_array().into_iter().flatten() {
             lines.push(refused_grant(refused));
         }
+        for refused in data["refused_host_grants"].as_array().into_iter().flatten() {
+            lines.push(refused_host_grant(refused));
+        }
         for moved in data["moved_forwards"].as_array().into_iter().flatten() {
             lines.push(format!(
                 "Forward {} moved from {} to {}: the server no longer has the first address (RIFT_PUBLIC_IPS).",
@@ -564,6 +567,60 @@ pub fn refused_grant(refused: &Value) -> String {
         vpn_access(&refused["access"]),
         field(refused, "reason")
     )
+}
+
+/// One host grant (`rift host allow`) the agent refuses.
+pub fn refused_host_grant(refused: &Value) -> String {
+    format!(
+        "Access of this server to {} ({}) refused by the agent: {}",
+        field(refused, "agent"),
+        vpn_access(&refused["access"]),
+        field(refused, "reason")
+    )
+}
+
+/// What the server host may reach on agents (`rift host list`).
+fn host_grants(data: &Value) -> String {
+    let rows = data
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|g| {
+            let state = if g["refused"].is_string() {
+                format!("refused: {}", field(g, "refused"))
+            } else if g["agent_status"].as_str() == Some("active") {
+                "allowed".to_string()
+            } else {
+                format!("agent {}", field(g, "agent_status"))
+            };
+            vec![
+                field(g, "agent"),
+                field(g, "tunnel_ipv4"),
+                vpn_access(&g["access"]),
+                state,
+            ]
+        })
+        .collect();
+    table(
+        &["AGENT", "TUNNEL ADDRESS", "ACCESS", "STATE"],
+        rows,
+        "The server host reaches no agent. Allow it with: rift host allow AGENT 22/tcp",
+    )
+}
+
+/// The address a `rift host allow` opens, as the confirmation names it.
+fn host_reach(data: &Value) -> String {
+    let ip = field(data, "tunnel_ipv4");
+    match &data["access"] {
+        Value::String(kind) if kind == "server" => format!("{ip} (TCP, UDP and ping)"),
+        Value::String(kind) if kind == "full" => format!("{ip} (all protocols)"),
+        access if access["port"].is_object() => format!(
+            "{ip}:{}/{}",
+            range(&access["port"]["ports"]),
+            field(&access["port"], "protocol")
+        ),
+        other => format!("{ip} ({})", vpn_access(other)),
+    }
 }
 
 /// "exit via server" or "exit via node1 (refused by agent)", one per exit of a device.
@@ -789,6 +846,11 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
             }
             text
         }
+        AdminRequest::HostAllow { agent, .. } if refused(data) => format!("Grant stored, but this server cannot reach {} yet: {agent} refuses it (see the warning). It works once {agent} allows it.", host_reach(data)),
+        AdminRequest::HostAllow { .. } => format!("This server may now reach {}.", host_reach(data)),
+        AdminRequest::HostDeny { agent, access: None } => format!("This server can no longer reach {agent}."),
+        AdminRequest::HostDeny { agent, access: Some(access) } => format!("This server can no longer reach {agent}: {}.", vpn_access(&serde_json::to_value(access).unwrap_or_default())),
+        AdminRequest::HostList => host_grants(data),
         AdminRequest::VpnDns { peer, agent: Some(agent) } if refused(data) => format!("DNS of {peer} stored, but {agent} refuses port 53 (see the warning): names will not resolve while the tunnel is on until {agent} allows it."),
         AdminRequest::VpnDns { peer, agent: Some(agent) } => format!("{peer} now uses {agent} as its DNS server (port 53 on {agent} is allowed)."),
         AdminRequest::VpnDns { peer, agent: None } => format!("{peer} uses the default DNS again."),
@@ -875,6 +937,46 @@ mod tests {
         assert!(text.contains("cannot reach node2"), "{text}");
         let ok = render(&request, &json!({"warning": null}), None);
         assert!(ok.contains("handy may now reach node2"), "{ok}");
+    }
+
+    #[test]
+    fn host_grants_name_the_address_to_use_and_refusals() {
+        let ssh = VpnAccess::Port {
+            protocol: Protocol::Tcp,
+            ports: PortRange { start: 22, end: 22 },
+        };
+        let request = AdminRequest::HostAllow {
+            agent: "home".into(),
+            access: ssh.clone(),
+        };
+        let data = json!({"agent":"home","tunnel_ipv4":"10.13.0.2","access":ssh,"warning":null});
+        assert_eq!(
+            render(&request, &data, None),
+            "This server may now reach 10.13.0.2:22/tcp."
+        );
+        let refused = json!({"agent":"home","tunnel_ipv4":"10.13.0.2","access":ssh,
+            "warning":"the grant was added, but agent home will refuse it: the agent allows only ports 80"});
+        let text = render(&request, &refused, None);
+        assert!(text.contains("cannot reach 10.13.0.2:22/tcp yet"), "{text}");
+        let list = json!([
+            {"agent":"home","tunnel_ipv4":"10.13.0.2","agent_status":"active","access":ssh,"refused":null},
+            {"agent":"nas","tunnel_ipv4":"10.13.0.3","agent_status":"active","access":"server","refused":"no"}
+        ]);
+        let table = render(&AdminRequest::HostList, &list, None);
+        assert!(
+            table.contains("port 22/tcp") && table.contains("allowed"),
+            "{table}"
+        );
+        assert!(table.contains("refused: no"), "{table}");
+        assert!(render(&AdminRequest::HostList, &json!([]), None).contains("rift host allow"));
+        let status = status(
+            &json!({"snapshot":{"generation":1,"forwards":[]},"fully_applied":true,
+            "agent_health":[],"refused_host_grants":[{"agent":"home","access":"full","reason":"r"}]}),
+        );
+        assert!(
+            status.contains("Access of this server to home (full) refused by the agent: r"),
+            "{status}"
+        );
     }
 
     #[test]
