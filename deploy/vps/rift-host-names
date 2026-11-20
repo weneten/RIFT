@@ -41,6 +41,11 @@ apply() {
     # shellcheck disable=SC2086 # One argument per routing domain.
     resolvectl domain "$interface" $routing
     resolvectl default-route "$interface" false
+    # RIFT's name server speaks plain DNS on the host itself and its names are private, so a
+    # global DNSOverTLS=yes or DNSSEC=yes must not apply to this link: resolved would wait for
+    # TLS or a signature that never comes.
+    resolvectl dnsovertls "$interface" no
+    resolvectl dnssec "$interface" no
 }
 
 on() {
@@ -93,13 +98,19 @@ UNIT
         echo "rift: systemd-resolved did not take the settings; see: systemctl status rift-host-names" >&2
         exit 1
     fi
-    case "$(readlink -f /etc/resolv.conf 2> /dev/null)" in
-        */systemd/resolve/stub-resolv.conf | */systemd/resolve/resolv.conf) ;;
-        *)
-            echo "rift: note: /etc/resolv.conf does not point to systemd-resolved, so programs that read it" >&2
-            echo "      (ssh among them) do not see the names. Link it: ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf" >&2
-            ;;
-    esac
+    # Programs (ssh among them) ask systemd-resolved either through the resolve NSS module or
+    # through /etc/resolv.conf pointing to its stub; with neither, they never see the names.
+    if ! grep -Eq '^hosts:.*[[:space:]]resolve([[:space:]]|$)' /etc/nsswitch.conf 2> /dev/null; then
+        case "$(readlink -f /etc/resolv.conf 2> /dev/null)" in
+            */systemd/resolve/stub-resolv.conf) ;;
+            *)
+                echo "rift: note: programs on this host do not ask systemd-resolved yet, so ssh will not find" >&2
+                echo "      the names. Either install its NSS module (Debian, Ubuntu: apt install libnss-resolve)," >&2
+                echo "      which leaves /etc/resolv.conf alone, or point /etc/resolv.conf to its stub:" >&2
+                echo "      ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf" >&2
+                ;;
+        esac
+    fi
     domains=$(value domains '[a-z0-9. -]*')
     if [ -n "$domains" ]; then
         echo "rift: this host resolves $domains through RIFT; every other name keeps its own DNS."
