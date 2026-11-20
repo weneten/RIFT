@@ -34,23 +34,27 @@ value() {
 # whether programs such as ssh ask systemd-resolved at all.
 status() {
     [ -d "$queue" ] || return 0
-    printf 'state=%s\ndetail=%s\ndomains=%s\nlookup=%s\n' "$1" "$2" "${3-}" "$(lookup)" \
+    printf 'state=%s\ndetail=%s\ndomains=%s\nlookup=%s\n' "$1" "$2" "${3-}" "$(lookup "${3-}")" \
         > "$status_file.tmp"
     chmod 644 "$status_file.tmp"
     mv -f "$status_file.tmp" "$status_file"
 }
 
-# Programs ask systemd-resolved through its NSS module or through /etc/resolv.conf pointing to
-# its stub; with neither, they never see the names.
+# Whether programs such as ssh find the names: ok or missing. With a name to try, it asks
+# exactly as ssh does (getent goes through NSS); otherwise it looks at how this host resolves:
+# systemd-resolved's NSS module, or /etc/resolv.conf naming its stub (a link or a plain file).
 lookup() {
-    if grep -Eq '^hosts:.*[[:space:]]resolve([[:space:]]|$)' /etc/nsswitch.conf 2> /dev/null; then
-        echo ok
+    first=${1%% *}
+    if [ -n "$first" ] && command -v getent > /dev/null 2>&1; then
+        if timeout 5 getent hosts "$first" > /dev/null 2>&1; then echo ok; else echo missing; fi
         return
     fi
-    case "$(readlink -f /etc/resolv.conf 2> /dev/null)" in
-        */systemd/resolve/stub-resolv.conf) echo ok ;;
-        *) echo missing ;;
-    esac
+    if grep -Eq '^hosts:.*[[:space:]]resolve([[:space:]]|$)' /etc/nsswitch.conf 2> /dev/null \
+        || grep -Eq '^nameserver[[:space:]]+127\.0\.0\.5[34]([[:space:]]|$)' /etc/resolv.conf 2> /dev/null; then
+        echo ok
+    else
+        echo missing
+    fi
 }
 
 # Empty when systemd-resolved can do it, else why not.
@@ -93,7 +97,14 @@ apply() {
         && resolvectl default-route "$interface" false \
         && resolvectl dnsovertls "$interface" no \
         && resolvectl dnssec "$interface" no; then
-        status active "" "$domains"
+        # systemd-resolved itself must get an answer from RIFT; whether ssh then sees it is
+        # the lookup in the status.
+        first=${domains%% *}
+        if timeout 5 resolvectl query "$first" > /dev/null 2>&1; then
+            status active "" "$domains"
+        else
+            status error "systemd-resolved got no answer from RIFT for $first (resolvectl query $first)" ""
+        fi
     else
         status error "systemd-resolved did not take the settings (systemctl status rift-host-names)" ""
         exit 1
@@ -167,7 +178,7 @@ report() {
         echo "rift: on. An agent's name resolves here once it has names on (rift vpn names agent NAME on)"
         echo "      and a host grant (rift host allow NAME ...); until then the tunnel has no DNS settings."
     fi
-    if [ "$(lookup)" = missing ]; then
+    if [ "$(sed -n 's/^lookup=//p' "$status_file" 2> /dev/null)" = missing ]; then
         echo "rift: note: programs on this host do not ask systemd-resolved yet, so ssh will not find" >&2
         echo "      the names. Either install its NSS module (Debian, Ubuntu: apt install libnss-resolve)," >&2
         echo "      which leaves /etc/resolv.conf alone, or point /etc/resolv.conf to its stub:" >&2
