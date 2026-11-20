@@ -250,6 +250,14 @@ enum HostCommand {
     Deny(HostArgs),
     /// What this server host may reach on which agent.
     List,
+    /// Names for the server host: `sudo rift host names on` (host command) makes the VPS's
+    /// systemd-resolved send `*.internal` to RIFT, so `ssh USER@node1.internal` works for each
+    /// agent with names on (`rift vpn names agent node1 on`) and a host grant. Every other name
+    /// stays with the VPS's own DNS. Without on/off it shows the settings and the names.
+    Names {
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
 }
 #[derive(Args)]
 struct HostArgs {
@@ -712,7 +720,16 @@ async fn run() -> Result<()> {
             },
             Vpn::Config { .. } | Vpn::Connect { .. } => unreachable!("handled above"),
         },
+        Command::Host {
+            command: HostCommand::Names { state: Some(state) },
+        } => bail!(
+            "`rift host names {state}` changes the resolver of the VPS itself and runs in the host command: sudo rift host names {state}"
+        ),
+        Command::Host {
+            command: HostCommand::Names { state: None },
+        } => return host_names(&config, cli.json).await,
         Command::Host { command } => match command {
+            HostCommand::Names { .. } => unreachable!("handled above"),
             HostCommand::List => AdminRequest::HostList,
             HostCommand::Allow(args) => {
                 let mut requests = args.accesses()?.into_iter().map(|access| {
@@ -878,6 +895,41 @@ async fn run() -> Result<()> {
             );
         }
         show(&config, cli.json, false, &request, &response).await?;
+    }
+    Ok(())
+}
+/// `rift host names`: where the host's resolver sends the names (read by the host command's
+/// `rift host names on`) and which names it resolves.
+async fn host_names(config: &Config, json: bool) -> Result<()> {
+    let server = std::net::SocketAddr::new(config.server_ipv4.into(), config.names_port);
+    let suffix = rift::vpn::names_suffix();
+    let rows = admin_ok(config, AdminRequest::HostList).await?;
+    let mut names: Vec<(String, String)> = Vec::new();
+    for row in rows.as_array().into_iter().flatten() {
+        if let (Some(name), Some(ip)) = (row["dns_name"].as_str(), row["tunnel_ipv4"].as_str()) {
+            if !names.iter().any(|(n, _)| n == name) {
+                names.push((name.to_string(), ip.to_string()));
+            }
+        }
+    }
+    if json {
+        let names: Vec<_> = names
+            .iter()
+            .map(|(name, ip)| serde_json::json!({"name": name, "ipv4": ip}))
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({"server": server.to_string(), "suffix": suffix, "interface": config.interface, "names": names})
+        );
+        return Ok(());
+    }
+    println!("The VPS resolves .{suffix} through RIFT at {server} once `sudo rift host names on` set up systemd-resolved (other names keep its own DNS).");
+    if names.is_empty() {
+        println!("No name yet: an agent needs names on (rift vpn names agent NAME on) and a host grant (rift host allow NAME ...).");
+    } else {
+        for (name, ip) in names {
+            println!("  {name}  {ip}");
+        }
     }
     Ok(())
 }
@@ -1143,12 +1195,16 @@ async fn names_check(config: &Config, status: &serde_json::Value, checks: &mut r
     else {
         return;
     };
-    let users: Vec<&str> = snap
+    let mut users: Vec<&str> = snap
         .vpn_peers
         .iter()
         .filter(|p| rift::vpn::uses_names(&snap, p))
         .map(|p| p.name.as_str())
         .collect();
+    // The VPS host resolves names too once `rift host names on` set up its resolver.
+    if !rift::names::host_agents(&snap).is_empty() {
+        users.push("this server host");
+    }
     if users.is_empty() {
         return;
     }
@@ -1761,6 +1817,14 @@ mod tests {
             );
         }
         assert!(Cli::try_parse_from(["rift", "host", "list"]).is_ok());
+        for ok in [
+            vec!["rift", "host", "names"],
+            vec!["rift", "host", "names", "on"],
+            vec!["rift", "host", "names", "off"],
+        ] {
+            assert!(Cli::try_parse_from(&ok).is_ok(), "{ok:?}");
+        }
+        assert!(Cli::try_parse_from(["rift", "host", "names", "maybe"]).is_err());
         assert!(Cli::try_parse_from(["rift", "host", "allow"]).is_err());
     }
 

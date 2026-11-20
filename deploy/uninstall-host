@@ -68,7 +68,11 @@ if command -v systemctl > /dev/null 2>&1; then
   systemctl disable --now rift-site-queue.path > /dev/null 2>&1 || true
   systemctl stop rift-site-queue.service > /dev/null 2>&1 || true
 fi
-for f in /etc/systemd/system/rift-site-queue.path /etc/systemd/system/rift-site-queue.service; do
+# The resolver settings of `rift host names on`.
+if command -v systemctl > /dev/null 2>&1; then
+  systemctl disable --now rift-host-names.service > /dev/null 2>&1 || true
+fi
+for f in /etc/systemd/system/rift-site-queue.path /etc/systemd/system/rift-site-queue.service /etc/systemd/system/rift-host-names.service; do
   if [ -e "$f" ]; then
     rm -f "$f" && echo "rift: removed $f"
   fi

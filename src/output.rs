@@ -596,13 +596,14 @@ fn host_grants(data: &Value) -> String {
             vec![
                 field(g, "agent"),
                 field(g, "tunnel_ipv4"),
+                g["dns_name"].as_str().unwrap_or("-").to_string(),
                 vpn_access(&g["access"]),
                 state,
             ]
         })
         .collect();
     table(
-        &["AGENT", "TUNNEL ADDRESS", "ACCESS", "STATE"],
+        &["AGENT", "TUNNEL ADDRESS", "NAME", "ACCESS", "STATE"],
         rows,
         "The server host reaches no agent. Allow it with: rift host allow AGENT 22/tcp",
     )

@@ -1501,6 +1501,7 @@ async fn host_admin(
             serde_json::json!({"agent":agent,"denied":true})
         }
         AdminRequest::HostList => {
+            let named = crate::names::host_agents(snap);
             let rows: Vec<_> = snap
                 .host_grants
                 .iter()
@@ -1512,6 +1513,12 @@ async fn host_admin(
                         "agent_status": agent.map(|a| a.status.clone()),
                         "access": g.access,
                         "refused": host_grant_refusal(snap, g),
+                        // The name the host resolves once `rift host names on` set up its
+                        // resolver: only while the agent has names on.
+                        "dns_name": agent
+                            .filter(|a| named.iter().any(|n| n.id == a.id))
+                            .and_then(|a| crate::vpn::dns_label(&a.name))
+                            .map(|l| format!("{l}.{}", crate::vpn::names_suffix())),
                     })
                 })
                 .collect();

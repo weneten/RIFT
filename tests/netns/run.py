@@ -703,6 +703,28 @@ s.sendall(b"rift-test"); print(s.recv(256).decode())
         f"agent2 saw {result.stdout.strip()}, expected the server tunnel address {server_v4}"
     listed = json.loads(cli(VPS, server_cfg, "host", "list").stdout)
     assert [(g["agent"], g["refused"]) for g in listed] == [("agent2", None)], listed
+    # Names for the host (the resolver part of `rift host names on` is systemd's): the name
+    # server answers the host's own address for agents with names on and a host grant.
+    dns = r'''import socket,struct,sys
+q=struct.pack(">HHHHHH",0x4242,0x0100,1,0,0,0)+b"".join(bytes([len(p)])+p.encode() for p in sys.argv[2].split("."))+b"\0"+struct.pack(">HH",1,1)
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.bind((sys.argv[1],0))
+s.sendto(q,(sys.argv[1],53053))
+try: a=s.recv(512)
+except OSError: print("no answer"); sys.exit(0)
+rcode=a[3]&15; count=struct.unpack(">H",a[6:8])[0]
+print(".".join(map(str,a[-4:])) if rcode==0 and count==1 else f"rcode={rcode} answers={count}")
+'''
+
+    def resolve():
+        return ns(VPS, "python3", "-c", dns, server_v4, "agent2.internal").stdout.strip()
+
+    assert resolve() == "rcode=3 answers=0", "the host resolved agent2 while its names were off"
+    cli(VPS, server_cfg, "vpn", "names", "agent", "agent2", "on")
+    assert wait_until(lambda: resolve() == address or None,
+                      "the host to resolve agent2.internal", timeout=10)
+    names = json.loads(cli(VPS, server_cfg, "host", "names").stdout)
+    assert names["names"] == [{"name": "agent2.internal", "ipv4": address}], names
+    cli(VPS, server_cfg, "vpn", "names", "agent", "agent2", "off")
     # A client on the internet still finds nothing: no public port exists for it.
     assert not any(f["target_ports"]["start"] == 19085 for f in status(server_cfg)["snapshot"]["forwards"])
     cli(VPS, server_cfg, "host", "deny", "agent2")
@@ -710,7 +732,7 @@ s.sendall(b"rift-test"); print(s.recv(256).decode())
     wait_until(lambda: reach().returncode == 3 or None,
                "the VPS host to lose access after host deny", timeout=20)
     assert json.loads(cli(VPS, server_cfg, "host", "list").stdout) == []
-    print("PASS the VPS host reaches an agent port by host grant from its tunnel address; deny closes it")
+    print("PASS the VPS host reaches an agent port by host grant from its tunnel address and resolves its name with names on; deny closes it")
 
 
 def _client_probe():

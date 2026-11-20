@@ -1321,6 +1321,13 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
         ));
     } else {
         lines.push(Line::styled("Server access", theme::accent()));
+        if let Some(dns) = agent["dns_name"].as_str() {
+            lines.push(if agent["names"] == true {
+                kv("  Name", format!("{dns} (sudo rift host names on)"))
+            } else {
+                kv("  Name", "names off (n)")
+            });
+        }
         for grant in host {
             let what = crate::output::vpn_access(&grant["access"]);
             lines.push(match grant["refused"].as_str() {

@@ -666,6 +666,17 @@ Targets are those of `rift vpn allow` on the agent itself: a port or range (`22/
 - **Services.** The service must listen on `0.0.0.0` or on the agent's tunnel address, as for forwards, and sees the server's tunnel address as its client. A Docker port published on the tunnel address works as well.
 - **Trust.** Whoever is root on the VPS reaches the granted ports. That is no new trust in the VPS, which can already reach forwarded ports and could forge grants, but keep the service's own authentication on: for SSH keys only, and ideally a key used only for this.
 
+**Names on the VPS.** With names on for the agent (`rift vpn names agent node1 on`) and a host grant, the VPS can use `node1.internal` instead of the address:
+
+```sh
+sudo rift host names on          # once, on the VPS (host command)
+ssh USER@node1.internal
+```
+
+`rift host names on` makes systemd-resolved on the VPS send the names under RIFT's suffix (`.internal` by default, `RIFT_NAMES_SUFFIX`) to RIFT's name server, as a routing domain of `rift0`. Only those names go there: every other lookup keeps the VPS's own DNS, and RIFT answers the host nothing else. A unit, `rift-host-names.service`, sets this again whenever RIFT creates `rift0`, after a restart or a reboot; `sudo rift host names off` removes it. The name server answers the VPS only for agents with names on and a host grant; any other name under the suffix does not exist for it. `rift host list` shows the NAME, and `rift host names` the names and the server it uses.
+
+It needs systemd-resolved 246 or newer (Debian 11, Ubuntu 22.04 and later; Ubuntu 20.04 has 245) with `/etc/resolv.conf` pointing to it, which is the default where it runs; the command says so otherwise. Without systemd-resolved, put the address into `/etc/hosts` (`10.13.0.2 node1.internal`); it changes only when the agent is removed and invited again.
+
 Export and import carry these grants (`host_grants` in the file). In the web panel and the terminal UI, the Agents tab lists them in an agent's details; `h` ("Server access") adds and withdraws them, and in the terminal UI `H` withdraws one. When the agent refuses a host grant, its own log says `access of the server host (10.13.0.1) to ... refused`.
 
 ## Use RIFT as a VPN (exit)
@@ -1009,6 +1020,7 @@ The web panel runs `add site`, `remove site`, `export`, `import` and `backup` th
 | `rift list devices [FILTER...] [--agent NAME]` | All devices with state, last handshake and access, including the exits (`exit via server; exit via node1; exit via node2`); `--agent` keeps devices with a grant on that agent or an exit through it. |
 | `rift vpn allow DEVICE AGENT TARGET... [--snat]` | Grants access. `TARGET` is `22/tcp` (port or range), `server` (the agent host), `full` (all protocols to the host), a network such as `192.168.178.30/32` (`--snat` for networks whose router has no route back), or `exit`: adds an internet exit through that agent, as an extra profile of the device. |
 | `rift host allow AGENT TARGET...` | Lets the VPS host itself reach the agent's tunnel address: `22/tcp` (port or range), `server` or `full`. Nothing is published. Example: `rift host allow node1 22/tcp`, then `ssh USER@10.13.0.2` on the VPS. |
+| `sudo rift host names on` / `sudo rift host names off` / `rift host names` | Host command: lets systemd-resolved on the VPS resolve `AGENT.internal` through RIFT for agents with names on and a host grant; other names keep the VPS's DNS / shows the names and the name server. |
 | `rift host deny AGENT [TARGET...]` / `rift host list` | Withdraws it; without a target everything on that agent / lists what the server host may reach. |
 | `rift vpn allow DEVICE exit` | Adds the server as an internet exit of the device (main profile). Other exits stay; import the profile RIFT names. |
 | `rift vpn deny DEVICE AGENT [TARGET...]` | Withdraws access; without a target everything on that agent, including the exit through it. |

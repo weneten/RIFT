@@ -11,7 +11,7 @@
 
 use crate::{
     config::Config,
-    model::{AgentRecord, StateSnapshot, VpnAccess, VpnPeer},
+    model::{AgentRecord, AgentStatus, StateSnapshot, VpnAccess, VpnPeer},
     state::StateStore,
     vpn,
 };
@@ -41,6 +41,7 @@ const TYPE_A: u16 = 1;
 const CLASS_IN: u16 = 1;
 const RCODE_FORMERR: u8 = 1;
 const RCODE_SERVFAIL: u8 = 2;
+const RCODE_NXDOMAIN: u8 = 3;
 const RCODE_NOTIMP: u8 = 4;
 const RCODE_REFUSED: u8 = 5;
 
@@ -190,6 +191,11 @@ fn decide(query: &[u8], snap: &StateSnapshot, peer: &VpnPeer) -> Reply {
 
 /// `decide` for the names under `names` (`internal`, `home.arpa`, a domain of your own).
 fn decide_under(query: &[u8], snap: &StateSnapshot, peer: &VpnPeer, names: &str) -> Reply {
+    decide_among(query, &vpn::named_agents(snap, peer), names)
+}
+
+/// Answers the name of one of `agents` under `names`; every other well-formed query goes on.
+fn decide_among(query: &[u8], agents: &[&AgentRecord], names: &str) -> Reply {
     if query.len() < 12 || query[2] & 0x80 != 0 {
         return Reply::Local(respond(query, None, RCODE_FORMERR, None));
     }
@@ -202,8 +208,8 @@ fn decide_under(query: &[u8], snap: &StateSnapshot, peer: &VpnPeer, names: &str)
     let Some(label) = question.name.strip_suffix(&format!(".{names}")) else {
         return Reply::Forward;
     };
-    let agent: Option<&AgentRecord> = vpn::named_agents(snap, peer)
-        .into_iter()
+    let agent = agents
+        .iter()
         .find(|a| vpn::dns_label(&a.name).as_deref() == Some(label));
     // Every other name under the suffix goes on, as any name does: public ones of a domain of
     // your own keep working, and for a private suffix the upstream answers that it does not
@@ -222,6 +228,39 @@ fn decide_under(query: &[u8], snap: &StateSnapshot, peer: &VpnPeer, names: &str)
         // The name exists; only an IPv4 address: grants reach agents over IPv4 only, and an
         // AAAA answer would send apps to an address the device does not route.
         Reply::Local(respond(query, Some(question.end), 0, None))
+    }
+}
+
+/// The agents whose names the VPS host itself resolves: active, names on, and the host has a
+/// grant on them (`rift host allow`).
+pub fn host_agents(snap: &StateSnapshot) -> Vec<&AgentRecord> {
+    snap.agents
+        .iter()
+        .filter(|a| {
+            a.names
+                && a.status == AgentStatus::Active
+                && snap.host_grants.iter().any(|g| g.agent_id == a.id)
+        })
+        .collect()
+}
+
+/// A query of the VPS host itself. Its resolver sends only the names under the suffix here
+/// (`rift host names on`), so nothing is passed on: an unknown name under the suffix does not
+/// exist, and any other name is refused rather than resolved for the host.
+fn decide_host(query: &[u8], snap: &StateSnapshot, names: &str) -> Reply {
+    match decide_among(query, &host_agents(snap), names) {
+        Reply::Forward => {
+            let question = read_question(query);
+            let under = question
+                .as_ref()
+                .is_some_and(|q| q.name == names || q.name.ends_with(&format!(".{names}")));
+            Reply::Local(if under {
+                respond(query, question.map(|q| q.end), RCODE_NXDOMAIN, None)
+            } else {
+                respond(query, None, RCODE_REFUSED, None)
+            })
+        }
+        local => local,
     }
 }
 
@@ -432,6 +471,15 @@ async fn handle(query: &[u8], source: IpAddr, ctx: &Names, tcp: bool) -> Vec<u8>
     let Some(snap) = ctx.snapshots.get().await else {
         return respond(query, None, RCODE_SERVFAIL, None);
     };
+    // The VPS host itself asks from the server's tunnel address. Nobody else can: the kernel
+    // drops packets from outside that carry a local source address, and WireGuard admits an
+    // agent or a device only from its own address.
+    if source == IpAddr::V4(ctx.config.server_ipv4) {
+        return match decide_host(query, &snap, &vpn::names_suffix()) {
+            Reply::Local(answer) => answer,
+            Reply::Forward => respond(query, None, RCODE_REFUSED, None),
+        };
+    }
     let Some(peer) = device(&snap, source) else {
         return respond(query, None, RCODE_REFUSED, None);
     };
@@ -677,6 +725,53 @@ mod tests {
     }
 
     #[test]
+    fn the_server_host_resolves_named_agents_it_has_a_host_grant_on_and_nothing_else() {
+        let mut snap = snap();
+        let host = |agent: &str| crate::model::HostGrant {
+            agent_id: format!("id-{agent}"),
+            access: VpnAccess::Server,
+        };
+        // node1: names on and a host grant. node2: names on, no host grant. other: a host
+        // grant, names off.
+        snap.host_grants = vec![host("node1"), host("other")];
+        let names: Vec<&str> = host_agents(&snap).iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["node1"]);
+        let a = local(decide_host(
+            &query("node1.internal", TYPE_A),
+            &snap,
+            "internal",
+        ));
+        assert_eq!((rcode(&a), answers(&a)), (0, 1));
+        assert_eq!(&a[a.len() - 4..], &[10, 13, 0, 2]);
+        let aaaa = local(decide_host(&query("node1.internal", 28), &snap, "internal"));
+        assert_eq!((rcode(&aaaa), answers(&aaaa)), (0, 0), "exists, IPv4 only");
+        for unknown in [
+            "node2.internal",
+            "other.internal",
+            "nope.internal",
+            "internal",
+        ] {
+            let answer = local(decide_host(&query(unknown, TYPE_A), &snap, "internal"));
+            assert_eq!(rcode(&answer), RCODE_NXDOMAIN, "{unknown}");
+        }
+        // Nothing is passed on for the host: its own resolver handles every other name.
+        let public = local(decide_host(
+            &query("example.com", TYPE_A),
+            &snap,
+            "internal",
+        ));
+        assert_eq!(rcode(&public), RCODE_REFUSED);
+        // A disabled agent is not found either.
+        snap.agents[0].status = AgentStatus::Disabled;
+        let gone = local(decide_host(
+            &query("node1.internal", TYPE_A),
+            &snap,
+            "internal",
+        ));
+        assert_eq!(rcode(&gone), RCODE_NXDOMAIN);
+    }
+
+    #[test]
     fn other_suffixes_answer_the_agents_and_pass_on_public_names() {
         let snap = snap();
         let phone = &snap.vpn_peers[0];
@@ -828,7 +923,7 @@ mod tests {
     }
 
     /// The real sockets: a query over UDP and over TCP on loopback, from a device whose
-    /// address is the loopback address.
+    /// address is 127.0.0.1, and one of the host itself from the server's address 127.0.0.2.
     #[tokio::test]
     async fn the_server_answers_over_udp_and_tcp() {
         let dir = tempfile::tempdir().unwrap();
@@ -840,15 +935,20 @@ mod tests {
                 x.agents = vec![agent("node1", 2, true)];
                 x.vpn_peers = vec![phone];
                 x.vpn_grants = vec![port("phone", "node1", 3000)];
+                x.host_grants = vec![crate::model::HostGrant {
+                    agent_id: "id-node1".into(),
+                    access: VpnAccess::Server,
+                }];
                 Ok(())
             })
             .unwrap();
+        let server_ip = Ipv4Addr::new(127, 0, 0, 2);
         let config = Config {
-            server_ipv4: Ipv4Addr::LOCALHOST,
+            server_ipv4: server_ip,
             ..Config::default()
         };
         tokio::spawn(serve(config, state));
-        let server: SocketAddr = (Ipv4Addr::LOCALHOST, DNS_PORT).into();
+        let server: SocketAddr = (server_ip, DNS_PORT).into();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let q = query("node1.internal", TYPE_A);
         let mut buf = [0u8; 512];
@@ -876,6 +976,25 @@ mod tests {
         let mut answer = vec![0u8; n];
         stream.read_exact(&mut answer).await.unwrap();
         assert_eq!(&answer[answer.len() - 4..], &[10, 13, 0, 2], "over TCP too");
+
+        // The host itself: it asks from the server's own address.
+        let host = UdpSocket::bind((server_ip, 0)).await.unwrap();
+        host.send_to(&query("node1.internal", TYPE_A), server)
+            .await
+            .unwrap();
+        let (n, _) = timeout(Duration::from_secs(2), host.recv_from(&mut buf))
+            .await
+            .expect("no answer for the host")
+            .unwrap();
+        assert_eq!(&buf[n - 4..n], &[10, 13, 0, 2], "the host resolves node1");
+        host.send_to(&query("example.com", TYPE_A), server)
+            .await
+            .unwrap();
+        let (n, _) = timeout(Duration::from_secs(2), host.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rcode(&buf[..n]), RCODE_REFUSED, "and nothing else");
     }
 
     /// Other names are passed on unchanged and the upstream's answer comes back as it is.

@@ -866,6 +866,9 @@ function drawAgents() {
           ? el("span", { class: "error", title: g.refused }, "refused by the agent")
           : el("span", { class: "ok-text" }, "allowed")))
         : [el("p", { class: "muted" }, "None: the VPS host reaches nothing on this agent (h allows ports).")]),
+      (a.host_grants || []).length && a.dns_name ? kv("Name on the VPS", a.names
+        ? [el("code", {}, a.dns_name), el("span", { class: "muted" }, " with sudo rift host names on")]
+        : el("span", { class: "muted" }, "names off (n)")) : null,
       a.last_error ? el("p", { class: "error" }, `✗ ${a.last_error}`) : null,
       el("p", { class: "muted" }, `${forwards} forward(s)`),
       a.dns_name ? el("p", { class: "hint" }, a.names
