@@ -285,12 +285,7 @@ pub fn plan_server(obs: &Observation, spec: &ServerSpec<'_>) -> Result<Plan> {
         }
         if chain.family == "ip" || chain.family == "inet" {
             for rule in spec.server_grants {
-                rules.extend(vpn_accepts(
-                    spec.interface,
-                    spec.server_v4,
-                    rule,
-                    "rift:server",
-                ));
+                rules.extend(vpn_accepts(spec.interface, spec.server_v4, rule, "rift:rs"));
             }
         }
         if let Some(panel) = spec.panel {
@@ -1167,15 +1162,12 @@ mod tests {
             },
         ];
         let mut spec = server_spec(&uplinks);
-        assert!(!plan_server(&obs, &spec)
-            .unwrap()
-            .fill
-            .contains("rift:server"));
+        assert!(!plan_server(&obs, &spec).unwrap().fill.contains("rift:rs"));
         spec.server_grants = &grants;
         let plan = plan_server(&obs, &spec).unwrap();
-        assert!(plan.fill.contains("iifname \"rift0\" ip saddr 10.14.0.2 ip daddr 10.88.0.1 meta l4proto tcp tcp dport 22 accept comment \"rift:server\""), "{}", plan.fill);
+        assert!(plan.fill.contains("iifname \"rift0\" ip saddr 10.14.0.2 ip daddr 10.88.0.1 meta l4proto tcp tcp dport 22 accept comment \"rift:rs\""), "{}", plan.fill);
         for protocol in ["tcp", "udp", "icmp"] {
-            assert!(plan.fill.contains(&format!("iifname \"rift0\" ip saddr 10.14.0.3 ip daddr 10.88.0.1 meta l4proto {protocol} accept comment \"rift:server\"")), "{}", plan.fill);
+            assert!(plan.fill.contains(&format!("iifname \"rift0\" ip saddr 10.14.0.3 ip daddr 10.88.0.1 meta l4proto {protocol} accept comment \"rift:rs\"")), "{}", plan.fill);
         }
     }
 

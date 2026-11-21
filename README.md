@@ -671,7 +671,7 @@ Targets are a port or range (`22/tcp`, `8000-8010/tcp`), `server` (TCP, UDP and 
 
 - **What stays closed.** RIFT's own ports on the tunnel address are dropped for devices whatever the grant says: the control port, the web panel port (it has its own permission, `rift panel allow`) and the name server's port (devices that use names reach it on port 53 through its own rules). Devices still cannot reach each other.
 - **Services.** The service must listen on `0.0.0.0` or on the tunnel address; one bound to `127.0.0.1` stays out of reach. sshd listens on every address by default. A port published by Docker on all addresses is translated before RIFT sees it and forwarded to the container; RIFT accepts that for the granted ports too, with the replies (not yet tested on a real host).
-- **Host firewall.** With UFW or another dropping firewall RIFT adds an accept per grant (comment `rift:server`) for the device and the tunnel address only, as for the panel.
+- **Host firewall.** With UFW or another dropping firewall RIFT adds an accept per grant (comment `rift:rs`) for the device and the tunnel address only, as for the panel.
 - **Name.** The server has no default name: `rift vpn names rs on LABEL` chooses one, and it must not be the name of an agent with names on. Devices with a grant on `rs` resolve it like an agent's name (see [Names instead of addresses](#private-vpn-access)); `rift vpn names rs off` removes it.
 - **Trust.** A grant on `rs` lets a device into the host that runs RIFT. Keep the service's own authentication on: for SSH keys only.
 
