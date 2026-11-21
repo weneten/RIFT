@@ -53,7 +53,7 @@ pub struct ExportDevice {
     /// The device does not use RIFT's names (`rift vpn names device NAME off`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub names_off: bool,
-    /// What the device may reach on the server itself (`rift vpn allow DEVICE server ...`).
+    /// What the device may reach on the server itself (`rift vpn allow DEVICE rs ...`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub server_grants: Vec<VpnAccess>,
 }
@@ -78,7 +78,7 @@ pub struct Export {
     /// DNS names chosen for agents (`rift vpn names agent NAME on LABEL`), by agent name.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub dns_labels: std::collections::BTreeMap<String, String>,
-    /// The server's own DNS name (`rift vpn names server on LABEL`).
+    /// The server's own DNS name (`rift vpn names rs on LABEL`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_label: Option<String>,
     pub forwards: Vec<ExportForward>,

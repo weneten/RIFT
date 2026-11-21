@@ -83,7 +83,7 @@ pub struct ServerSpec<'a> {
     pub panel_proxies: &'a [ipnet::IpNet],
     /// The name server's port (`RIFT_NAMES_PORT`), opened on the tunnel while `vpn` is set.
     pub names_port: u16,
-    /// Devices that may reach the VPS itself (`rift vpn allow DEVICE server`): the source is the
+    /// Devices that may reach the VPS itself (`rift vpn allow DEVICE rs`): the source is the
     /// device. RIFT's own ports stay closed in the RIFT table.
     pub server_grants: &'a [AgentVpnRule],
 }

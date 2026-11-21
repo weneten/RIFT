@@ -260,22 +260,20 @@ pub fn fqdn(label: &str) -> String {
     format!("{label}.{}", names_suffix())
 }
 
-/// The word that stands for this server itself where commands take an agent:
-/// `rift vpn allow DEVICE server 22/tcp`, `rift vpn names server on LABEL`. `rs` (RIFT server)
-/// is its short form. No agent may be called either.
-pub const SERVER_TARGET: &str = "server";
-pub const SERVER_SHORT: &str = "rs";
+/// The word that stands for this server itself (RIFT server) where commands take an agent:
+/// `rift vpn allow DEVICE rs 22/tcp`, `rift vpn names rs on LABEL`. No agent may be called so.
+pub const SERVER_TARGET: &str = "rs";
 
-/// Whether a target names this server: `server` or `rs`.
+/// Whether a target names this server.
 pub fn is_server_target(name: &str) -> bool {
-    name == SERVER_TARGET || name == SERVER_SHORT
+    name == SERVER_TARGET
 }
 
 /// Names no agent may have, as commands read them as something else.
 pub fn check_agent_name(name: &str) -> Result<()> {
     ensure!(
         name != "exit" && name != "default" && !is_server_target(name),
-        "an agent cannot be called exit, default, {SERVER_TARGET} or {SERVER_SHORT}: `rift vpn allow DEVICE exit`, `rift vpn dns DEVICE default` and `rift vpn allow DEVICE {SERVER_TARGET} ...` would be ambiguous"
+        "an agent cannot be called exit, default or {SERVER_TARGET}: `rift vpn allow DEVICE exit`, `rift vpn dns DEVICE default` and `rift vpn allow DEVICE {SERVER_TARGET} ...` would be ambiguous"
     );
     Ok(())
 }
@@ -676,7 +674,7 @@ pub fn effective_server_grants(snap: &StateSnapshot) -> Vec<(&VpnPeer, &VpnAcces
         .collect()
 }
 
-/// The server's rules for devices that may reach the VPS itself (`rift vpn allow DEVICE server`):
+/// The server's rules for devices that may reach the VPS itself (`rift vpn allow DEVICE rs`):
 /// they go ahead of the drop that keeps devices off the VPS. RIFT's own ports in `closed`
 /// (control, panel, name server) are dropped first, whatever a grant says: the panel has its
 /// own permission (`rift panel allow`), and the name server its own rules, which come earlier.
@@ -1350,10 +1348,14 @@ mod tests {
         for bad in ["", "a.b", "-x", "x y", &"a".repeat(64)] {
             assert!(parse_label(bad).is_err(), "{bad:?}");
         }
-        for reserved in ["exit", "default", "server", "rs"] {
+        for reserved in ["exit", "default", "rs"] {
             assert!(check_agent_name(reserved).is_err(), "{reserved}");
         }
         assert!(check_agent_name("node1").is_ok());
+        assert!(
+            check_agent_name("server").is_ok(),
+            "server is a name like any other"
+        );
     }
 
     #[test]

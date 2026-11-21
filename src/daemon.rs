@@ -2497,7 +2497,7 @@ fn missing_device(snap: &StateSnapshot, name: &str) -> anyhow::Error {
     anyhow!("no device {name}; create it with `rift add device {name}`, or `rift panel connect {name}` to create it with panel access in one step")
 }
 
-/// `server` (or `rs`) stands for this server. An agent that is still called so from before must be renamed
+/// `rs` stands for this server. An agent that is still called so from before must be renamed
 /// first, or the command would be ambiguous.
 fn server_target(snap: &StateSnapshot, name: &str) -> Result<()> {
     if snap.agents.iter().any(|a| a.name == name) {

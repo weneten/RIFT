@@ -1366,19 +1366,19 @@ function namesDialog(agent) {
   }));
 }
 
-// The name of this server for devices with a grant on it (`rift vpn names server on LABEL`). It
+// The name of this server for devices with a grant on it (`rift vpn names rs on LABEL`). It
 // has no default: a name must be chosen.
 function serverNameDialog() {
   const suffix = data.names_suffix || "internal";
   const server = data.server || {};
   const label = el("input", { required: true, pattern: "[A-Za-z0-9_\\-]{1,63}", value: server.label || "", placeholder: "e.g. rs" });
-  const off = server.label ? button("Name off", () => namesChange({ action: "agent_names", name: "server", on: false }), "danger") : null;
+  const off = server.label ? button("Name off", () => namesChange({ action: "agent_names", name: "rs", on: false }), "danger") : null;
   openModal("Name of this server", form([
     row(`DNS name (.${suffix} is added)`, label),
     el("p", { class: "hint" }, `Devices with a grant on this server (Access → this server) reach it as NAME.${suffix} instead of ${server.tunnel_ipv4 || "its tunnel address"}, for example ssh USER@rs.${suffix}. Choose a name no agent has.`),
     off,
   ], "Name on", async () => {
-    await namesChange({ action: "agent_names", name: "server", on: true, label: label.value.trim() });
+    await namesChange({ action: "agent_names", name: "rs", on: true, label: label.value.trim() });
   }));
 }
 
@@ -1407,7 +1407,7 @@ function deviceDialog() {
   const list = el("datalist", { id: "device-names" }, ...peers.map((p) => el("option", { value: p.name })));
   const name = el("input", { required: true, pattern: "[A-Za-z0-9_\\-]{1,63}", placeholder: "e.g. phone", list: "device-names" });
   const agents = agentOptions(true);
-  const agent = select([["", "none"], ...agents, ["server", "this server"]], agents.length ? agents[0][0] : "");
+  const agent = select([["", "none"], ...agents, ["rs", "this server (rs)"]], agents.length ? agents[0][0] : "");
   const ports = el("input", { placeholder: "e.g. 3000/tcp 8080/tcp" });
   const panel = el("input", { type: "checkbox" });
   openModal("Connect a VPN device", form([
@@ -1433,7 +1433,7 @@ function deviceDialog() {
       const result = await act({ action: "vpn_allow", peer: device, agent: agent.value, ports: wanted }, { quiet: true });
       const refusals = result.warnings || [];
       notes.push(...refusals);
-      const host = agent.value === "server" ? data.server : (data.agents || []).find((a) => a.name === agent.value);
+      const host = agent.value === "rs" ? data.server : (data.agents || []).find((a) => a.name === agent.value);
       const ip = host && host.tunnel_ipv4;
       if (ip && refusals.length) {
         notes.push(`Stored, but not reachable yet: ${agent.value} refuses ${refusals.length === 1 ? "this grant" : "some of these grants"} (see above). It works once ${agent.value} allows it.`);
@@ -1742,7 +1742,7 @@ function grantsDialog(name, notes) {
   const content = [el("h4", {}, "Current access"), list];
   {
     // This server itself is always a target; LAN networks exist only behind agents.
-    const agent = select([...agents, ["server", "this server"]], agents.length ? agents[0][0] : "server");
+    const agent = select([...agents, ["rs", "this server (rs)"]], agents.length ? agents[0][0] : "rs");
     const kind = select([["server", "the host (TCP, UDP, ping)"], ["full", "the host, all protocols"], ["ports", "ports on the host"], ["subnet", "a network behind the agent"]], "server");
     const value = el("input", { placeholder: "" });
     const snat = el("input", { type: "checkbox" });
@@ -1750,7 +1750,7 @@ function grantsDialog(name, notes) {
     const snatRow = check("Masquerade (SNAT) on the agent, if the LAN router has no route back", snat);
     const serverHint = el("p", { class: "hint" }, `On this server: services of the VPS host on ${(data.server || {}).tunnel_ipv4 || "its tunnel address"}, e.g. SSH on 22/tcp. RIFT's own ports stay closed; the panel has its own permission.`);
     const update = () => {
-      const onServer = agent.value === "server";
+      const onServer = agent.value === "rs";
       kind.querySelector('option[value="subnet"]').disabled = onServer;
       if (onServer && kind.value === "subnet") kind.value = "ports";
       serverHint.hidden = !onServer;

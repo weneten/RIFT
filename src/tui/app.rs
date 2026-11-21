@@ -180,7 +180,7 @@ pub enum Op {
 pub enum Submit {
     Invite,
     Rename(String),
-    /// Names on, under the DNS name of the form: an agent's, or `server` for this server.
+    /// Names on, under the DNS name of the form: an agent's, or `rs` for this server.
     Names(String),
     Forward,
     Ban,
@@ -231,7 +231,7 @@ pub enum Act {
     DevicePanel,
     DeviceToggle,
     DeviceRemove,
-    /// The DNS name of this server for devices with a grant on it (`rift vpn names server`).
+    /// The DNS name of this server for devices with a grant on it (`rift vpn names rs`).
     ServerName,
     ServerNameForm,
     SiteAdd,
@@ -2470,7 +2470,7 @@ impl App {
         // This server itself comes first: it is always there, agents may not be yet.
         let mut targets = vec![(
             vpn::SERVER_TARGET.to_string(),
-            "this server (server, rs)".to_string(),
+            "this server (rs)".to_string(),
         )];
         targets.extend(self.agent_options());
         let form = Form::new(
