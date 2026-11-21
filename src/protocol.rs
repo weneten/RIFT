@@ -106,7 +106,7 @@ pub enum AdminRequest {
     AgentEnable {
         name: String,
     },
-    /// `NAME.internal` for devices with a grant on the agent; `name` `vps` is the VPS itself.
+    /// `NAME.internal` for devices with a grant on the agent; `name` `server` or `rs` is this server.
     /// `label` is the DNS name to use (without the suffix); without it an agent uses its own
     /// name, while the VPS needs one.
     AgentNames {

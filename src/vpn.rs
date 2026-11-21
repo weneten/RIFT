@@ -260,15 +260,22 @@ pub fn fqdn(label: &str) -> String {
     format!("{label}.{}", names_suffix())
 }
 
-/// The word that stands for the VPS itself where commands take an agent:
-/// `rift vpn allow DEVICE vps 22/tcp`, `rift vpn names vps on LABEL`. No agent may be called so.
-pub const SERVER_TARGET: &str = "vps";
+/// The word that stands for this server itself where commands take an agent:
+/// `rift vpn allow DEVICE server 22/tcp`, `rift vpn names server on LABEL`. `rs` (RIFT server)
+/// is its short form. No agent may be called either.
+pub const SERVER_TARGET: &str = "server";
+pub const SERVER_SHORT: &str = "rs";
+
+/// Whether a target names this server: `server` or `rs`.
+pub fn is_server_target(name: &str) -> bool {
+    name == SERVER_TARGET || name == SERVER_SHORT
+}
 
 /// Names no agent may have, as commands read them as something else.
 pub fn check_agent_name(name: &str) -> Result<()> {
     ensure!(
-        name != "exit" && name != "default" && name != SERVER_TARGET,
-        "an agent cannot be called exit, default or {SERVER_TARGET}: `rift vpn allow DEVICE exit`, `rift vpn dns DEVICE default` and `rift vpn allow DEVICE {SERVER_TARGET} ...` would be ambiguous"
+        name != "exit" && name != "default" && !is_server_target(name),
+        "an agent cannot be called exit, default, {SERVER_TARGET} or {SERVER_SHORT}: `rift vpn allow DEVICE exit`, `rift vpn dns DEVICE default` and `rift vpn allow DEVICE {SERVER_TARGET} ...` would be ambiguous"
     );
     Ok(())
 }
@@ -299,7 +306,7 @@ pub enum NameFor<'a> {
 /// `None` when it is free for `whom`.
 pub fn label_owner(snap: &StateSnapshot, label: &str, whom: NameFor<'_>) -> Option<String> {
     if whom != NameFor::Server && snap.server_label.as_deref() == Some(label) {
-        return Some(format!("this server ({SERVER_TARGET})"));
+        return Some("this server".to_string());
     }
     let except_agent = match whom {
         NameFor::Agent(id) => Some(id),
@@ -669,7 +676,7 @@ pub fn effective_server_grants(snap: &StateSnapshot) -> Vec<(&VpnPeer, &VpnAcces
         .collect()
 }
 
-/// The server's rules for devices that may reach the VPS itself (`rift vpn allow DEVICE vps`):
+/// The server's rules for devices that may reach the VPS itself (`rift vpn allow DEVICE server`):
 /// they go ahead of the drop that keeps devices off the VPS. RIFT's own ports in `closed`
 /// (control, panel, name server) are dropped first, whatever a grant says: the panel has its
 /// own permission (`rift panel allow`), and the name server its own rules, which come earlier.
@@ -1323,7 +1330,7 @@ mod tests {
         // Taken names: the VPS's for agents, an agent's for the VPS and other agents.
         assert_eq!(
             label_owner(&snap, "rs", NameFor::Agent("other")).as_deref(),
-            Some("this server (vps)")
+            Some("this server")
         );
         assert_eq!(label_owner(&snap, "rs", NameFor::Server), None);
         assert_eq!(
@@ -1343,7 +1350,7 @@ mod tests {
         for bad in ["", "a.b", "-x", "x y", &"a".repeat(64)] {
             assert!(parse_label(bad).is_err(), "{bad:?}");
         }
-        for reserved in ["exit", "default", "vps"] {
+        for reserved in ["exit", "default", "server", "rs"] {
             assert!(check_agent_name(reserved).is_err(), "{reserved}");
         }
         assert!(check_agent_name("node1").is_ok());

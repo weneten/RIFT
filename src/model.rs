@@ -462,7 +462,7 @@ pub struct HostGrant {
     pub agent_id: String,
     pub access: VpnAccess,
 }
-/// A device may reach the VPS itself on its tunnel address (`rift vpn allow DEVICE vps ...`):
+/// A device may reach the VPS itself on its tunnel address (`rift vpn allow DEVICE server ...`):
 /// services of the VPS host such as SSH. Only `Server`, `Full` and `Port`; RIFT's own ports
 /// (control, panel, name server) stay closed whatever the grant says.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -522,10 +522,10 @@ pub struct StateSnapshot {
     /// What agents may reach on other agents (`rift link allow`); absent before it existed.
     #[serde(default)]
     pub agent_links: Vec<AgentLink>,
-    /// What devices may reach on the VPS itself (`rift vpn allow DEVICE vps ...`).
+    /// What devices may reach on the VPS itself (`rift vpn allow DEVICE server ...`).
     #[serde(default)]
     pub server_grants: Vec<ServerGrant>,
-    /// The DNS label of the VPS for devices with a server grant (`rift vpn names vps on
+    /// The DNS label of the VPS for devices with a server grant (`rift vpn names server on
     /// LABEL`); `None` while its name is off. It has no default: the operator chooses it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_label: Option<String>,

@@ -83,7 +83,7 @@ pub struct ServerSpec<'a> {
     pub panel_proxies: &'a [ipnet::IpNet],
     /// The name server's port (`RIFT_NAMES_PORT`), opened on the tunnel while `vpn` is set.
     pub names_port: u16,
-    /// Devices that may reach the VPS itself (`rift vpn allow DEVICE vps`): the source is the
+    /// Devices that may reach the VPS itself (`rift vpn allow DEVICE server`): the source is the
     /// device. RIFT's own ports stay closed in the RIFT table.
     pub server_grants: &'a [AgentVpnRule],
 }
@@ -289,7 +289,7 @@ pub fn plan_server(obs: &Observation, spec: &ServerSpec<'_>) -> Result<Plan> {
                     spec.interface,
                     spec.server_v4,
                     rule,
-                    "rift:vps",
+                    "rift:server",
                 ));
             }
         }
@@ -1167,12 +1167,15 @@ mod tests {
             },
         ];
         let mut spec = server_spec(&uplinks);
-        assert!(!plan_server(&obs, &spec).unwrap().fill.contains("rift:vps"));
+        assert!(!plan_server(&obs, &spec)
+            .unwrap()
+            .fill
+            .contains("rift:server"));
         spec.server_grants = &grants;
         let plan = plan_server(&obs, &spec).unwrap();
-        assert!(plan.fill.contains("iifname \"rift0\" ip saddr 10.14.0.2 ip daddr 10.88.0.1 meta l4proto tcp tcp dport 22 accept comment \"rift:vps\""), "{}", plan.fill);
+        assert!(plan.fill.contains("iifname \"rift0\" ip saddr 10.14.0.2 ip daddr 10.88.0.1 meta l4proto tcp tcp dport 22 accept comment \"rift:server\""), "{}", plan.fill);
         for protocol in ["tcp", "udp", "icmp"] {
-            assert!(plan.fill.contains(&format!("iifname \"rift0\" ip saddr 10.14.0.3 ip daddr 10.88.0.1 meta l4proto {protocol} accept comment \"rift:vps\"")), "{}", plan.fill);
+            assert!(plan.fill.contains(&format!("iifname \"rift0\" ip saddr 10.14.0.3 ip daddr 10.88.0.1 meta l4proto {protocol} accept comment \"rift:server\"")), "{}", plan.fill);
         }
     }
 

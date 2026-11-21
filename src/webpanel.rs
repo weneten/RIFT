@@ -654,7 +654,7 @@ enum Action {
         name: String,
         enabled: bool,
     },
-    /// `NAME.internal` for devices with a grant on the agent (`vps`: this server), under
+    /// `NAME.internal` for devices with a grant on the agent (`server` or `rs`: this server), under
     /// `label` if given.
     AgentNames {
         name: String,

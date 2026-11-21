@@ -180,7 +180,7 @@ pub enum Op {
 pub enum Submit {
     Invite,
     Rename(String),
-    /// Names on, under the DNS name of the form: an agent's, or `vps` for this server.
+    /// Names on, under the DNS name of the form: an agent's, or `server` for this server.
     Names(String),
     Forward,
     Ban,
@@ -231,7 +231,7 @@ pub enum Act {
     DevicePanel,
     DeviceToggle,
     DeviceRemove,
-    /// The DNS name of this server for devices with a grant on it (`rift vpn names vps`).
+    /// The DNS name of this server for devices with a grant on it (`rift vpn names server`).
     ServerName,
     ServerNameForm,
     SiteAdd,
@@ -2470,7 +2470,7 @@ impl App {
         // This server itself comes first: it is always there, agents may not be yet.
         let mut targets = vec![(
             vpn::SERVER_TARGET.to_string(),
-            format!("this server ({})", vpn::SERVER_TARGET),
+            "this server (server, rs)".to_string(),
         )];
         targets.extend(self.agent_options());
         let form = Form::new(
@@ -2603,7 +2603,7 @@ impl App {
             }
             Submit::Names(name) => {
                 let text = form.text("label");
-                let server = name == vpn::SERVER_TARGET;
+                let server = vpn::is_server_target(name);
                 anyhow::ensure!(
                     !server || !text.trim().is_empty(),
                     "this server has no name of its own; choose one, for example rs"
@@ -2696,7 +2696,7 @@ impl App {
                     "masquerading applies only to a LAN network"
                 );
                 anyhow::ensure!(
-                    agent != vpn::SERVER_TARGET || (subnets.is_empty() && !form.on("exit")),
+                    !vpn::is_server_target(&agent) || (subnets.is_empty() && !form.on("exit")),
                     "on this server a device reaches ports, the whole host or all protocols; its internet exit is under Internet exits"
                 );
                 let (server, full, ports) = host_access(form)?;
@@ -2936,7 +2936,7 @@ fn complete(input: &str) -> Option<String> {
         "rotate", "vpn", "host", "link", "panel", "config", "reload", "logs", "agents", "agent",
         "forwards", "forward", "bans", "ban", "devices", "device", "invite", "allow", "deny",
         "dns", "names", "connect", "password", "2fa", "setup", "confirm", "reset", "validate",
-        "exit", "server", "full", "vps", "--json", "--export", "--help",
+        "exit", "server", "full", "rs", "--json", "--export", "--help",
     ];
     let start = input.rfind(' ').map_or(0, |i| i + 1);
     let word = &input[start..];

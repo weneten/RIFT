@@ -2070,7 +2070,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
             }).collect();
             serde_json::Value::Array(rows)
         }
-        AdminRequest::AgentNames { name, on, label } if name == crate::vpn::SERVER_TARGET => {
+        AdminRequest::AgentNames { name, on, label } if crate::vpn::is_server_target(&name) => {
             server_target(snap, &name)?;
             let label = match (on, label) {
                 (false, Some(_)) => bail!("a DNS name goes with on: rift vpn names {name} on LABEL"),
@@ -2182,7 +2182,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
             peer,
             agent,
             access,
-        } if agent == crate::vpn::SERVER_TARGET => {
+        } if crate::vpn::is_server_target(&agent) => {
             find_peer(&peer)?;
             server_target(snap, &agent)?;
             anyhow::ensure!(
@@ -2296,7 +2296,7 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
             peer,
             agent,
             access,
-        } if agent == crate::vpn::SERVER_TARGET => {
+        } if crate::vpn::is_server_target(&agent) => {
             find_peer(&peer)?;
             server_target(snap, &agent)?;
             s.state.mutate("vpn-deny-server", |x| {
@@ -2497,7 +2497,7 @@ fn missing_device(snap: &StateSnapshot, name: &str) -> anyhow::Error {
     anyhow!("no device {name}; create it with `rift add device {name}`, or `rift panel connect {name}` to create it with panel access in one step")
 }
 
-/// `vps` stands for this server. An agent that is still called so from before must be renamed
+/// `server` (or `rs`) stands for this server. An agent that is still called so from before must be renamed
 /// first, or the command would be ambiguous.
 fn server_target(snap: &StateSnapshot, name: &str) -> Result<()> {
     if snap.agents.iter().any(|a| a.name == name) {

@@ -1426,32 +1426,32 @@ def vpn_device_test(server_cfg):
     ns(BACKEND, "ip", "route", "del", "10.14.0.0/16", "via", "10.77.0.1")
     print("PASS a published Docker port on the agent's tunnel address answers a granted device with its own address")
 
-    # The VPS itself (`vps`): a service on its tunnel address, as sshd would listen there.
+    # The server itself (`server`, short `rs`): a service on its tunnel address, as sshd would listen there.
     # Closed until granted; RIFT's own ports stay closed whatever the grant; `rs.internal`
     # resolves once the server has that name.
     server = "10.13.0.1"
     start_echo_process(VPS, write(WORK / "vps-echo.py", ECHO, 0o755),
-                       ["4", "tcp", server, "19090"], "echo-vps-4-tcp")
+                       ["4", "tcp", server, "19090"], "echo-server-4-tcp")
     wait_echo_ready(VPS, "4", "tcp", server, 19090)
     assert not device_reaches(server, 19090), "the VPS answered a device without a grant"
-    vps = json.loads(cli(VPS, server_cfg, "vpn", "allow", "phone", "vps", "19090/tcp").stdout)
-    assert vps["reimport"] == [], vps  # the device routes the server already for its names
+    own = json.loads(cli(VPS, server_cfg, "vpn", "allow", "phone", "server", "19090/tcp").stdout)
+    assert own["reimport"] == [], own  # the device routes the server already for its names
     assert wait_until(lambda: device_reaches(server, 19090, expect=me),
                       "the granted port on the VPS itself", timeout=30)
-    full = json.loads(cli(VPS, server_cfg, "vpn", "allow", "phone", "vps", "full").stdout)
+    full = json.loads(cli(VPS, server_cfg, "vpn", "allow", "phone", "rs", "full").stdout)
     assert full["server"] is True, full
     assert not device_reaches(server, 8444), "a grant on the VPS opened RIFT's control port"
-    cli(VPS, server_cfg, "vpn", "deny", "phone", "vps", "full")
-    refused_name = ns(VPS, str(BIN), "--config", str(server_cfg), "--json", "vpn", "names", "vps",
+    cli(VPS, server_cfg, "vpn", "deny", "phone", "server", "full")
+    refused_name = ns(VPS, str(BIN), "--config", str(server_cfg), "--json", "vpn", "names", "server",
                       "on", "agent1", check=False)
     assert refused_name.returncode != 0, "the VPS took the name of an agent"
-    named_vps = json.loads(cli(VPS, server_cfg, "vpn", "names", "vps", "on", "rs").stdout)
-    assert named_vps["dns_name"] == "rs.internal", named_vps
+    named = json.loads(cli(VPS, server_cfg, "vpn", "names", "rs", "on", "rs").stdout)
+    assert named["dns_name"] == "rs.internal", named
     assert wait_until(lambda: ask("rs.internal") == ["0", server], "rs.internal through the tunnel", timeout=30)
-    cli(VPS, server_cfg, "vpn", "deny", "phone", "vps")
+    cli(VPS, server_cfg, "vpn", "deny", "phone", "server")
     assert wait_until(lambda: not device_reaches(server, 19090), "the VPS closed again", timeout=30)
     assert wait_until(lambda: not_answered_here("rs.internal"), "the VPS's name gone with its grant", timeout=30)
-    cli(VPS, server_cfg, "vpn", "names", "vps", "off")
+    cli(VPS, server_cfg, "vpn", "names", "server", "off")
     print("PASS a device reaches the VPS itself only as granted, never RIFT's control port, and by the name chosen for it")
 
     # The device opts out: its configuration changes, and the server no longer answers it.

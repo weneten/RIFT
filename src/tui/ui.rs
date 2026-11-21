@@ -1740,7 +1740,7 @@ fn draw_devices(frame: &mut Frame, app: &mut App, area: Rect) {
             Span::raw("  "),
             Span::styled(
                 if grant["server"] == true {
-                    format!("this server ({})", s(&grant["agent"]))
+                    "this server".to_string()
                 } else {
                     s(&grant["agent"])
                 },
