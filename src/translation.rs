@@ -312,6 +312,7 @@ mod tests {
                 protocol: 0,
                 rift_version: String::new(),
                 names: false,
+                dns_label: None,
                 id: "a".into(),
                 name: "a".into(),
                 public_key: "test".into(),

@@ -53,6 +53,9 @@ pub struct ExportDevice {
     /// The device does not use RIFT's names (`rift vpn names device NAME off`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub names_off: bool,
+    /// What the device may reach on the server itself (`rift vpn allow DEVICE vps ...`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_grants: Vec<VpnAccess>,
 }
 /// Added by the host helper; the server process knows nothing about sites.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,6 +75,12 @@ pub struct Export {
     /// Agents with names on (`NAME.internal`). Older export files have none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub named_agents: Vec<String>,
+    /// DNS names chosen for agents (`rift vpn names agent NAME on LABEL`), by agent name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub dns_labels: std::collections::BTreeMap<String, String>,
+    /// The server's own DNS name (`rift vpn names vps on LABEL`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_label: Option<String>,
     pub forwards: Vec<ExportForward>,
     pub devices: Vec<ExportDevice>,
     pub sites: Vec<ExportSite>,
@@ -127,6 +136,13 @@ pub fn export(snap: &StateSnapshot) -> Export {
             .filter(|a| a.status != AgentStatus::Pending && a.names)
             .map(|a| a.name.clone())
             .collect(),
+        dns_labels: snap
+            .agents
+            .iter()
+            .filter(|a| a.status != AgentStatus::Pending && a.names)
+            .filter_map(|a| Some((a.name.clone(), a.dns_label.clone()?)))
+            .collect(),
+        server_label: snap.server_label.clone(),
         forwards: forwards
             .into_iter()
             .filter_map(|f| {
@@ -165,6 +181,12 @@ pub fn export(snap: &StateSnapshot) -> Export {
                 server_exit: p.server_exit,
                 agent_exits: p.agent_exits.iter().filter_map(|id| name(id)).collect(),
                 names_off: p.names_off,
+                server_grants: snap
+                    .server_grants
+                    .iter()
+                    .filter(|g| g.peer == p.name)
+                    .map(|g| g.access.clone())
+                    .collect(),
             })
             .collect(),
         sites: Vec::new(),
@@ -343,8 +365,16 @@ pub enum Op {
         server_exit: Option<bool>,
         names_off: Option<bool>,
     },
-    /// Turns on the names (`NAME.internal`) of this agent (by ID).
-    AgentNames(String),
+    /// Turns on the names (`NAME.internal`) of this agent (by ID), under a DNS name of its own
+    /// if given.
+    AgentNames {
+        id: String,
+        label: Option<String>,
+    },
+    /// The server's own DNS name.
+    ServerLabel(String),
+    /// A device's grant on the server itself.
+    ServerGrant(ServerGrant),
     Grant(VpnGrant),
     HostGrant(HostGrant),
     Link(AgentLink),
@@ -686,6 +716,41 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
             plan.items
                 .push(Item::new(Status::Present, what.clone(), None));
         }
+        for access in &device.server_grants {
+            let what = format!(
+                "grant {} to this server: {}",
+                device.name,
+                describe_access(access)
+            );
+            let candidate = ServerGrant {
+                peer: device.name.clone(),
+                access: access.clone(),
+            };
+            if ctx.snap.server_grants.contains(&candidate) {
+                plan.items.push(Item::new(Status::Present, what, None));
+                continue;
+            }
+            let valid = matches!(
+                access,
+                VpnAccess::Server | VpnAccess::Full | VpnAccess::Port { .. }
+            )
+            .then(|| vpn::validate_access(access))
+            .unwrap_or_else(|| {
+                Err(anyhow::anyhow!(
+                    "a grant on the server is server, full or a port"
+                ))
+            });
+            if let Err(error) = valid {
+                plan.items
+                    .push(Item::new(Status::Failed, what, Some(error.to_string())));
+                continue;
+            }
+            plan.steps.push(Step {
+                op: Op::ServerGrant(candidate),
+                what,
+                detail: None,
+            });
+        }
         for (grant, resolved) in device.grants.iter().zip(resolved) {
             let (agent_id, agent) = match resolved {
                 Resolved::Agent { id, name } => (id, name),
@@ -770,6 +835,47 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
             });
         }
     }
+    // Names already taken here, and those this import gives; a clash fails that entry only.
+    let mut taken: Vec<(String, String)> = ctx
+        .snap
+        .agents
+        .iter()
+        .filter(|a| a.names)
+        .filter_map(|a| Some((vpn::agent_label(a)?, a.id.clone())))
+        .collect();
+    let mut server_label = ctx.snap.server_label.clone();
+    if let Some(label) = &data.server_label {
+        let what = format!("name of this server: {}", vpn::fqdn(label));
+        let valid = vpn::dns_label(label).filter(|l| l == label);
+        if server_label.as_deref() == Some(label.as_str()) {
+            plan.items.push(Item::new(Status::Present, what, None));
+        } else if valid.is_none() {
+            plan.items.push(Item::new(
+                Status::Failed,
+                what,
+                Some("not a DNS name".into()),
+            ));
+        } else if let Some((_, id)) = taken.iter().find(|(l, _)| l == label) {
+            let owner = ctx
+                .snap
+                .agents
+                .iter()
+                .find(|a| &a.id == id)
+                .map_or("an agent", |a| a.name.as_str());
+            plan.items.push(Item::new(
+                Status::Failed,
+                what,
+                Some(format!("agent {owner} has this name; change one of them")),
+            ));
+        } else {
+            server_label = Some(label.clone());
+            plan.steps.push(Step {
+                op: Op::ServerLabel(label.clone()),
+                what,
+                detail: None,
+            });
+        }
+    }
     for entry in &data.named_agents {
         let (agent_id, agent) = match resolve(options, ctx, entry) {
             Resolved::Agent { id, name } => (id, name),
@@ -779,7 +885,12 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
             }
         };
         let what = format!("names of agent {agent}");
-        let Some(label) = vpn::dns_label(&agent) else {
+        let chosen = data
+            .dns_labels
+            .get(entry)
+            .filter(|l| vpn::dns_label(l).as_deref() == Some(l.as_str()))
+            .cloned();
+        let Some(label) = chosen.clone().or_else(|| vpn::dns_label(&agent)) else {
             plan.items.push(Item::new(
                 Status::Failed,
                 what,
@@ -787,14 +898,46 @@ pub fn plan(data: &Export, options: &ImportOptions, ctx: &World) -> Plan {
             ));
             continue;
         };
-        if ctx.snap.agents.iter().any(|a| a.id == agent_id && a.names) {
+        if ctx.snap.agents.iter().any(|a| {
+            a.id == agent_id && a.names && vpn::agent_label(a).as_deref() == Some(label.as_str())
+        }) {
             plan.items.push(Item::new(Status::Present, what, None));
             continue;
         }
+        let clash = if server_label.as_deref() == Some(label.as_str()) {
+            Some("this server".to_string())
+        } else {
+            taken
+                .iter()
+                .find(|(l, id)| *l == label && *id != agent_id)
+                .map(|(_, id)| {
+                    ctx.snap
+                        .agents
+                        .iter()
+                        .find(|a| &a.id == id)
+                        .map_or_else(|| "another agent".into(), |a| format!("agent {}", a.name))
+                })
+        };
+        if let Some(owner) = clash {
+            plan.items.push(Item::new(
+                Status::Failed,
+                what,
+                Some(format!(
+                    "{} is already the name of {owner}",
+                    vpn::fqdn(&label)
+                )),
+            ));
+            continue;
+        }
+        taken.retain(|(_, id)| *id != agent_id);
+        taken.push((label.clone(), agent_id.clone()));
         plan.steps.push(Step {
-            op: Op::AgentNames(agent_id),
+            op: Op::AgentNames {
+                id: agent_id,
+                label: chosen,
+            },
             what,
-            detail: Some(format!("{label}.{}", vpn::names_suffix())),
+            detail: Some(vpn::fqdn(&label)),
         });
     }
     let mut planned_host: Vec<HostGrant> = ctx.snap.host_grants.clone();
@@ -897,6 +1040,7 @@ mod tests {
             protocol: 0,
             rift_version: String::new(),
             names: false,
+            dns_label: None,
             id: format!("id-{name}"),
             name: name.into(),
             public_key: format!("key-{name}"),
@@ -949,11 +1093,14 @@ mod tests {
                 .collect(),
             server_exit: false,
             agent_exits: Vec::new(),
+            server_grants: Vec::new(),
         }
     }
     fn file(forwards: Vec<ExportForward>, devices: Vec<ExportDevice>) -> Export {
         Export {
             named_agents: Vec::new(),
+            dns_labels: Default::default(),
+            server_label: None,
             format: FORMAT,
             agents: vec![],
             forwards,
@@ -1122,6 +1269,71 @@ mod tests {
     }
 
     #[test]
+    fn grants_on_the_server_and_dns_names_survive_an_export_and_an_import() {
+        let ssh = VpnAccess::Port {
+            protocol: Protocol::Tcp,
+            ports: "22".parse().unwrap(),
+        };
+        let mut snap = world();
+        snap.agents[0].names = true;
+        snap.agents[0].dns_label = Some("nas".into());
+        snap.server_label = Some("rs".into());
+        snap.vpn_peers.push(VpnPeer {
+            name: "laptop".into(),
+            public_key: "key-laptop".into(),
+            ipv4: "10.14.0.2".parse().unwrap(),
+            enabled: true,
+            created_at: 0,
+            panel: false,
+            ipv6: "fd88:5249:4655::2".parse().unwrap(),
+            server_exit: false,
+            agent_exits: Vec::new(),
+            names_off: false,
+        });
+        snap.server_grants.push(ServerGrant {
+            peer: "laptop".into(),
+            access: ssh.clone(),
+        });
+        let out = export(&snap);
+        assert_eq!(out.server_label.as_deref(), Some("rs"));
+        assert_eq!(out.dns_labels.get("node1").map(String::as_str), Some("nas"));
+        assert_eq!(out.devices[0].server_grants, std::slice::from_ref(&ssh));
+        let text = serde_json::to_string(&out).unwrap();
+        assert_eq!(Export::parse(text.as_bytes()).unwrap(), out);
+
+        let planned = run(&out, &ImportOptions::default(), &world());
+        assert!(planned
+            .steps
+            .iter()
+            .any(|s| matches!(&s.op, Op::ServerLabel(l) if l == "rs")));
+        assert!(planned.steps.iter().any(|s| matches!(
+            &s.op,
+            Op::AgentNames { id, label: Some(l) } if id == "id-node1" && l == "nas"
+        )));
+        assert!(planned.steps.iter().any(|s| matches!(
+            &s.op,
+            Op::ServerGrant(g) if g.peer == "laptop" && g.access == ssh
+        )));
+        let again = run(&out, &ImportOptions::default(), &snap);
+        assert!(again.steps.is_empty(), "everything is present");
+
+        // A name the target already uses elsewhere fails that entry, not the import.
+        let mut clash = world();
+        let mut nas = agent("nas", AgentStatus::Active, 5);
+        nas.names = true;
+        clash.agents.push(nas);
+        let planned = run(&out, &ImportOptions::default(), &clash);
+        assert!(planned
+            .items
+            .iter()
+            .any(|i| i.status == Status::Failed && i.what == "names of agent node1"));
+        assert!(planned
+            .steps
+            .iter()
+            .any(|s| matches!(&s.op, Op::ServerGrant(_))));
+    }
+
+    #[test]
     fn host_grants_survive_an_export_and_an_import_round_trip() {
         let ssh = VpnAccess::Port {
             protocol: Protocol::Tcp,
@@ -1200,7 +1412,7 @@ mod tests {
         assert!(planned
             .steps
             .iter()
-            .any(|s| matches!(&s.op, Op::AgentNames(id) if id == "id-node1")));
+            .any(|s| matches!(&s.op, Op::AgentNames { id, .. } if id == "id-node1")));
         assert!(planned.steps.iter().any(|s| matches!(
             &s.op,
             Op::Flags {
@@ -1213,7 +1425,7 @@ mod tests {
         assert!(!planned
             .steps
             .iter()
-            .any(|s| matches!(&s.op, Op::AgentNames(_))));
+            .any(|s| matches!(&s.op, Op::AgentNames { .. })));
         assert!(planned
             .items
             .iter()
@@ -1598,7 +1810,8 @@ mod tests {
             .map(|s| match &s.op {
                 Op::Device(_) => "device",
                 Op::Flags { .. } => "flags",
-                Op::AgentNames(_) => "names",
+                Op::AgentNames { .. } | Op::ServerLabel(_) => "names",
+                Op::ServerGrant(_) => "grant",
                 Op::Grant(_) => "grant",
                 Op::Forward(_) => "forward",
                 Op::AgentExit { .. } => "exit",

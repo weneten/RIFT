@@ -583,7 +583,7 @@ phone ── WireGuard ──> RIFT server ── existing tunnel ──> RIFT a
                        (VPN peer 10.14.0.x)                             └─> optional LAN
 ```
 
-Everything is denied until you allow it. A device reaches only what a grant names, and devices cannot reach each other or the server itself.
+Everything is denied until you allow it. A device reaches only what a grant names, and devices cannot reach each other. The server itself is reachable only with a grant on `vps` (see [Reach the VPS itself](#reach-the-vps-itself)).
 
 **The short way.** One command on the **server** creates the device if it does not exist yet, allows what you name and prints the QR code for the WireGuard app, followed by the addresses to open:
 
@@ -611,6 +611,8 @@ rift vpn config iphone --export > iphone.conf  # or export a file (contains the 
 | `full` | Every IP protocol to the agent host. Still not its LAN. |
 | `192.168.178.0/24` | An explicitly named private network behind the agent; add `--snat` if the LAN router has no route back (see below). |
 
+In place of the agent, `vps` stands for this server itself: `rift vpn allow laptop vps 22/tcp` (see [Reach the VPS itself](#reach-the-vps-itself)). No agent can therefore be called `vps`, as `exit` and `default` are taken too.
+
 Manage devices with `rift list devices`, `rift disable device NAME` / `rift enable device NAME` (reversible) and `rift remove device NAME` (deletes the device, its key and its grants). `rift vpn deny NAME AGENT [TARGET...]` withdraws grants; without selectors it withdraws everything on that agent. A network grant made with `--snat` is withdrawn without repeating `--snat`. Revocation and denial close the path on the server in the same reconcile pass; the agent follows on its next sync.
 
 Main profiles are split-tunnel unless the device has the server [internet exit](#use-rift-as-a-vpn-exit): `AllowedIPs` lists only the granted addresses. Every device has an IPv4 and an IPv6 address; grants use IPv4 only. Exported files and QR codes contain the device's private key, which stays in a mode-0600 file under the state volume and is never logged.
@@ -636,12 +638,16 @@ This writes `DNS = <node1's tunnel address>` into the device's main profile, als
 
 ```sh
 rift vpn names agent node1 on       # node1.internal for every device with a grant on node1
+rift vpn names agent node1 on nas   # nas.internal instead: a DNS name of its own
+rift vpn names vps on rs            # rs.internal for this server (it has no default name)
 rift vpn names device iphone off    # this device keeps reaching agents by address
 ```
 
+Without a DNS name of its own an agent is found under its name, which follows a rename. `on LABEL` gives it another one (one label: letters, digits and `-`; `nas.internal` may be typed as well); `on` again without a label goes back to the agent's name, and `off` forgets the label. A name is taken once: RIFT refuses a label, a rename or `on` when another agent with names on or this server already answers to it, and says who. This server has no default name, so `rift vpn names vps on` needs one; it resolves for devices with a grant on `vps`.
+
 A device that has a grant on such an agent gets the server's tunnel address (`10.13.0.1` by default) as the DNS server of its main profile; it opens `http://node1.internal:3000` instead of `http://10.13.0.2:3000`. The name follows the agent, not its address: a new agent invited under the same name is found under it again. RIFT answers only the names of agents the device has a grant on and only with their IPv4 tunnel address, as grants are IPv4. Every other lookup it passes on, other names under the suffix included: to the device's DNS agent from `rift vpn dns`, otherwise unchanged to `RIFT_VPN_DNS`. To the device's own DNS server RIFT adds the device's VPN address as EDNS Client Subnet, so a Pi-hole with ECS evaluation on (`EDNS0_ECS`) shows and filters the real device; AdGuard Home, as far as known, uses the sender only and shows the server's tunnel address. Public resolvers never get the address. While the tunnel is on, every lookup of such a device therefore goes through the server; if the server is down, names do not resolve until the tunnel is switched off.
 
-Turning names on or off changes the main profile of the devices concerned (its DNS line); RIFT lists them, and they import it again (`rift vpn config DEVICE`). Adding another port on an agent a device already resolves changes nothing. `rift list agents` shows the DNS NAME of each agent, and `rift list devices` the names a device resolves. In the web panel, "Names on/off" in the Agents card and "Use RIFT's names" in a device's Access dialog do the same. Agent names with `_` become `-` (`home_server` is `home-server.internal`); a name that is no valid DNS label cannot have names on until it is renamed. Extra profiles through an agent exit are not covered: they end at the agent and keep `RIFT_VPN_DNS`.
+Turning names on or off changes the main profile of the devices concerned (its DNS line); RIFT lists them, and they import it again (`rift vpn config DEVICE`). Adding another port on an agent a device already resolves changes nothing. `rift list agents` shows the DNS NAME of each agent, and `rift list devices` the names a device resolves. In the web panel and the terminal UI, `n` ("Names on/off") on the Agents tab asks for the DNS name, prefilled with the agent's own, and `N` changes it while names are on; `V` ("Server name") on the VPN devices tab sets this server's; "Use RIFT's names" in a device's Access dialog (`n` in the terminal UI) turns them off per device. Agent names with `_` become `-` (`home_server` is `home-server.internal`); an agent whose name is no valid DNS label needs a DNS name of its own. Extra profiles through an agent exit are not covered: they end at the agent and keep `RIFT_VPN_DNS`.
 
 **Which suffix?** `RIFT_NAMES_SUFFIX` takes any domain name; RIFT keeps no list of which ones work where, so the choice and whether it works on your devices are yours.
 
@@ -650,6 +656,26 @@ Turning names on or off changes the main profile of the devices concerned (its D
 - Avoid suffixes that devices resolve another way: `.local` (mDNS on Apple devices and most Linux), `.localhost` (the device itself), `.onion` (Tor), `.alt`. Invented ones (`.lan`, `.home`) work today, but nothing stops them from being delegated on the internet later.
 
 **Trust boundary.** The server authenticates devices by WireGuard key, and the agent enforces its own input and forwarding rules by the device's VPN source address. A compromised server can forge an allowed source address, so the agent-side rules limit mistakes and stolen device keys, not a hostile server. What a hostile server can reach is capped by the agent's own `RIFT_AGENT_ALLOW_PORTS` and `RIFT_AGENT_ALLOW_SUBNETS`: it can never open a port outside the first or the LAN outside the second. Protecting against that needs end-to-end authentication between device and agent, which RIFT does not provide for grants; an exit through an agent is end to end between the device and the agent.
+
+## Reach the VPS itself
+
+A VPN device can reach services of the VPS host on the server's tunnel address (`10.13.0.1` by default), for example SSH while you are connected anyway for your home server. `vps` stands for the server where commands take an agent:
+
+```sh
+rift vpn allow laptop vps 22/tcp     # then, on the laptop: ssh USER@10.13.0.1
+rift vpn names vps on rs             # optional: ssh USER@rs.internal
+rift vpn deny laptop vps             # without a target: everything on the VPS
+```
+
+Targets are a port or range (`22/tcp`, `8000-8010/tcp`), `server` (TCP, UDP and ping) or `full` (every protocol); networks and `exit` are for agents (the exit through this server stays `rift vpn allow DEVICE exit`). `rift vpn connect laptop vps 22/tcp` creates the device and grants it in one step. The device's main profile routes the server's tunnel address (`AllowedIPs`), so the first grant on `vps` asks for a re-import unless the device already uses names or the panel.
+
+- **What stays closed.** RIFT's own ports on the tunnel address are dropped for devices whatever the grant says: the control port, the web panel port (it has its own permission, `rift panel allow`) and the name server's port (devices that use names reach it on port 53 through its own rules). Devices still cannot reach each other.
+- **Services.** The service must listen on `0.0.0.0` or on the tunnel address; one bound to `127.0.0.1` stays out of reach. sshd listens on every address by default. A port published by Docker on all addresses is translated before RIFT sees it and forwarded to the container; RIFT accepts that for the granted ports too, with the replies (not yet tested on a real host).
+- **Host firewall.** With UFW or another dropping firewall RIFT adds an accept per grant (comment `rift:vps`) for the device and the tunnel address only, as for the panel.
+- **Name.** The server has no default name: `rift vpn names vps on LABEL` chooses one, and it must not be the name of an agent with names on. Devices with a grant on `vps` resolve it like an agent's name (see [Names instead of addresses](#private-vpn-access)); `rift vpn names vps off` removes it.
+- **Trust.** A grant on `vps` lets a device into the host that runs RIFT. Keep the service's own authentication on: for SSH keys only.
+
+The web panel and the terminal UI offer `this server (vps)` as the first target in a device's access dialog; the device's details show the server's address and name. Export and import carry the grants (`server_grants` of each device), agents' DNS names (`dns_labels`) and the server's (`server_label`).
 
 ## Reach agents from the server itself
 
@@ -732,7 +758,7 @@ rift vpn config iphone            # scan the main profile in the WireGuard app
 rift vpn config iphone node1      # scan the profile for node1
 ```
 
-`exit` may sit beside other targets: `rift vpn allow iphone node1 22/tcp exit` grants port 22 on `node1` and adds the exit through `node1`. Exits add up: allowing another one keeps the others. Remove one at a time: `rift vpn deny iphone exit` ends the server exit, `rift vpn deny iphone node1 exit` only the one through `node1`, and `rift vpn deny iphone node1` withdraws every grant on `node1` together with that exit. After a change RIFT names the profile to import again, for example `Import the profile: rift vpn config iphone node1`. `rift list devices` shows the exits in the ACCESS column (`exit via server; exit via node1; exit via node2`, each with `(refused by agent)` or `(waiting for the agent)` when it does not work yet). The agent names `exit` and `default` are reserved.
+`exit` may sit beside other targets: `rift vpn allow iphone node1 22/tcp exit` grants port 22 on `node1` and adds the exit through `node1`. Exits add up: allowing another one keeps the others. Remove one at a time: `rift vpn deny iphone exit` ends the server exit, `rift vpn deny iphone node1 exit` only the one through `node1`, and `rift vpn deny iphone node1` withdraws every grant on `node1` together with that exit. After a change RIFT names the profile to import again, for example `Import the profile: rift vpn config iphone node1`. `rift list devices` shows the exits in the ACCESS column (`exit via server; exit via node1; exit via node2`, each with `(refused by agent)` or `(waiting for the agent)` when it does not work yet). The agent names `exit`, `default` and `vps` are reserved.
 
 **One device, several profiles.** Every profile of a device uses the same key pair and the same addresses; only one of them is active on the phone at a time, so you switch between them in the WireGuard app. The main profile reaches the web panel and the grants as usual, and with the server exit it also carries all internet traffic. A profile for an agent ends at that agent instead, so the panel and the grants on the VPS are **not** reachable while it is active: switch back to the main profile for those. The web panel offers the same in a device's Access dialog: a "Main profile" block with the box "Send all traffic through this server", an "Extra profiles" block with one switch per agent, a QR code or configuration button per profile, and a note after each change saying which profile to import again or delete in the WireGuard app. The devices table shows them apart, for example `main: exit via server · profiles: node1`.
 
@@ -869,9 +895,9 @@ Type `rift` without a command on the server or an agent host and a full-screen t
 | Tab | Shows | Actions |
 | --- | --- | --- |
 | Overview | agents online, forwards, devices, sites and bans at a glance; live traffic through the tunnel; what needs attention (apply errors, offline agents, refused forwards, open invitations); the latest log entries | invite an agent, add a forward or device, reconcile |
-| Agents | state, tunnel address, last handshake, live traffic and version of each agent; open invitations as rows of their own with how long the token is valid; beside it the details: limits the agent reported, its `.internal` name, errors, open invitation | invite (copy buttons: the whole setup with `git clone`, only the `deploy/join` line, or the three `.env` lines), new token for an open invitation, cancel it, enable/disable, rename, rotate key, names on/off, add a forward, remove |
+| Agents | state, tunnel address, last handshake, live traffic and version of each agent; open invitations as rows of their own with how long the token is valid; beside it the details: limits the agent reported, its `.internal` name, errors, open invitation | invite (copy buttons: the whole setup with `git clone`, only the `deploy/join` line, or the three `.env` lines), new token for an open invitation, cancel it, enable/disable, rename, rotate key, names on/off with a DNS name of its own, add a forward, remove |
 | Forwards | listen address and ports, target, protocol, mode, who may connect, state (active, disabled, pending, refused with the reason) | add (the short form `8080:80/tcp 53/both`, address family, mode, ingress, allowed clients), enable/disable, ban a client of a translated forward, remove, filter (`/`), sort by ID, agent, port or state (`s`) |
-| VPN devices | address, handshake, grants, exits, panel access; beside it the grants (refused ones with the reason) and exits | add, grant access (ports, host, all protocols, LAN networks with SNAT, exit), withdraw, WireGuard configuration as a QR code to scan or as text, internet exits, DNS, names, panel access, enable/disable, remove |
+| VPN devices | address, handshake, grants, exits, panel access; beside it the grants (refused ones with the reason) and exits | add, grant access (to an agent or this server itself; ports, host, all protocols, LAN networks with SNAT, exit), the server's own DNS name, withdraw, WireGuard configuration as a QR code to scan or as text, internet exits, DNS, names, panel access, enable/disable, remove |
 | Sites | domains with agent, target port, proxy, the state of their forward and the allowed clients; in the title the proxy `rift proxy` shows (for Caddy: host or container, and the site directory) | add, remove (through the same host service as the web panel) |
 | Bans | blocked client addresses and when they expire | ban an address |
 | Web panel | whether it is on, its addresses, the password (on request), two-factor state, the devices that may open it | show the password, set up / confirm / reset two-factor login (QR code), grant or withdraw devices |
@@ -1053,7 +1079,7 @@ The web panel runs `add site`, `remove site`, `export`, `import` and `backup` th
 | `rift vpn connect DEVICE AGENT TARGET... [--snat] [--export]` | Creates the device if needed, grants the targets (as `vpn allow`) and prints its configuration as a QR code with the addresses to open. Example: `rift vpn connect phone node1 3000/tcp`. |
 | `rift add device NAME` | Registers a device with a key and an address. It reaches nothing yet. |
 | `rift list devices [FILTER...] [--agent NAME]` | All devices with state, last handshake and access, including the exits (`exit via server; exit via node1; exit via node2`); `--agent` keeps devices with a grant on that agent or an exit through it. |
-| `rift vpn allow DEVICE AGENT TARGET... [--snat]` | Grants access. `TARGET` is `22/tcp` (port or range), `server` (the agent host), `full` (all protocols to the host), a network such as `192.168.178.30/32` (`--snat` for networks whose router has no route back), or `exit`: adds an internet exit through that agent, as an extra profile of the device. Ports, `server` and `full` exclude each other when allowing (`full` includes `server`, both include every port), here and for `rift host allow` and `rift link allow`; networks and `exit` may sit beside them. |
+| `rift vpn allow DEVICE AGENT TARGET... [--snat]` | Grants access. `vps` as AGENT is this server itself (ports, `server` or `full`). `TARGET` is `22/tcp` (port or range), `server` (the agent host), `full` (all protocols to the host), a network such as `192.168.178.30/32` (`--snat` for networks whose router has no route back), or `exit`: adds an internet exit through that agent, as an extra profile of the device. Ports, `server` and `full` exclude each other when allowing (`full` includes `server`, both include every port), here and for `rift host allow` and `rift link allow`; networks and `exit` may sit beside them. |
 | `rift host allow AGENT TARGET...` | Lets the VPS host itself reach the agent's tunnel address: `22/tcp` (port or range), `server` or `full`. Nothing is published. Example: `rift host allow node1 22/tcp`, then `ssh USER@10.13.0.2` on the VPS. |
 | `sudo rift host names off` / `sudo rift host names on` / `rift host names` | Host command: stops the VPS from resolving `AGENT.internal` through RIFT, for good / sets it up again (`deploy/install-cli` does by default) / shows the names, the name server and whether the VPS uses them. |
 | `rift host deny AGENT [TARGET...]` / `rift host list` | Withdraws it; without a target everything on that agent / lists what the server host may reach. |
@@ -1062,7 +1088,8 @@ The web panel runs `add site`, `remove site`, `export`, `import` and `backup` th
 | `rift vpn allow DEVICE exit` | Adds the server as an internet exit of the device (main profile). Other exits stay; import the profile RIFT names. |
 | `rift vpn deny DEVICE AGENT [TARGET...]` | Withdraws access; without a target everything on that agent, including the exit through it. |
 | `rift vpn deny DEVICE exit` / `rift vpn deny DEVICE AGENT exit` | Ends the exit through the server / through that agent; the device's other exits stay. |
-| `rift vpn names agent AGENT on\|off` | `AGENT.internal` for every device with a grant on the agent; RIFT becomes their DNS server. |
+| `rift vpn names agent AGENT on [LABEL]\|off` | `AGENT.internal`, or `LABEL.internal`, for every device with a grant on the agent; RIFT becomes their DNS server. A label another agent or the server has is refused. |
+| `rift vpn names vps on LABEL\|off` | `LABEL.internal` for this server, for every device with a grant on `vps`. There is no default name. |
 | `rift vpn names device DEVICE on\|off` | Whether this device uses the names (default on). |
 | `rift vpn dns DEVICE AGENT` / `rift vpn dns DEVICE default` | Makes the agent's tunnel address the DNS server of the device's main profile and allows port 53 there / goes back to the default. |
 | `rift vpn config DEVICE [AGENT] [--export]` | WireGuard configuration as a QR code, or with `--export` as a file (both contain the private key): the main profile, or with `AGENT` the profile of the exit through that agent. Same form as `rift panel connect NAME [--export]`. |

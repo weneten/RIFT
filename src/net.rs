@@ -293,7 +293,20 @@ impl Kernel {
             ipv6_exit,
             snapshot,
         );
-        // Panel access and RIFT's names sit ahead of the rule that keeps VPN peers off the VPS.
+        // Grants on the VPS itself, then panel access and RIFT's names sit ahead of the rule
+        // that keeps VPN peers off the VPS; the grants never open RIFT's own ports.
+        let server_grants = vpn::server_grant_rules(
+            self.interface(),
+            self.config.server_ipv4,
+            &[
+                self.config.control_port,
+                self.config.webpanel_port,
+                self.config.names_port,
+            ],
+            snapshot,
+        );
+        vpn_rules.input.insert_str(0, &server_grants.input);
+        vpn_rules.forward.push_str(&server_grants.forward);
         vpn_rules
             .input
             .insert_str(0, &crate::webpanel::input_rules(&self.config, snapshot));
@@ -316,10 +329,18 @@ impl Kernel {
             &vpn_rules,
         )?;
         self.replace_nft_table(&rules).await?;
+        let server_grants: Vec<crate::model::AgentVpnRule> = vpn::effective_server_grants(snapshot)
+            .into_iter()
+            .map(|(peer, access)| crate::model::AgentVpnRule {
+                source: peer.ipv4,
+                access: access.clone(),
+            })
+            .collect();
         self.sync_server_host_firewall(
             local_ingress,
-            !vpn_grants.is_empty() || links,
+            !vpn_grants.is_empty() || links || !server_grants.is_empty(),
             !exit_peers.is_empty(),
+            &server_grants,
         )
         .await?;
         Ok(())
@@ -941,6 +962,7 @@ impl Kernel {
         local_ingress: bool,
         vpn: bool,
         exit: bool,
+        server_grants: &[crate::model::AgentVpnRule],
     ) -> Result<()> {
         if self.config.host_firewall == crate::config::HostFirewall::Off {
             return self.remove_host_firewall().await;
@@ -981,6 +1003,7 @@ impl Kernel {
                     }),
                 panel_proxies: &self.config.webpanel_proxies,
                 names_port: self.config.names_port,
+                server_grants,
             },
         )?;
         self.apply_host_plan(&plan).await
@@ -3558,6 +3581,7 @@ mod tests {
             protocol: 0,
             rift_version: String::new(),
             names: false,
+            dns_label: None,
             id: "a1".into(),
             name: "agent".into(),
             public_key: "pub".into(),

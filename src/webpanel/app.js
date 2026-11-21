@@ -481,7 +481,10 @@ function actions() {
         if (item.status === "active" || (item.links_out || []).length || (item.links_in || []).length) add("l", "Links", () => linksDialog(item.name), w);
         add("r", "Rename", () => renameDialog(item), w);
         if (item.status !== "pending") add("K", "Rotate key", () => confirmAct(`Give ${item.name} a new WireGuard key? It happens on the agent's next sync.`, { action: "agent_rotate", name: item.id }), w);
-        if (item.dns_name) add("n", item.names ? "Names off" : "Names on", () => namesChange({ action: "agent_names", name: item.id, on: !item.names }), w);
+        if (item.names) {
+          add("n", "Names off", () => namesChange({ action: "agent_names", name: item.id, on: false }), w);
+          add("N", "DNS name", () => namesDialog(item), w);
+        } else add("n", "Names on", () => namesDialog(item), w);
         if (item.status === "active") add("i", "Invite again", () => inviteDialog(item.name), w);
         add("x", "Remove", () => confirmAct(`Remove ${item.name} with all its forwards and VPN grants? This cannot be undone.`, { action: "agent_remove", name: item.id }), { write: true, danger: true });
       }
@@ -498,6 +501,7 @@ function actions() {
       break;
     case "devices":
       add("a", "Connect device", deviceDialog, w);
+      add("V", "Server name", serverNameDialog, w);
       if (item) {
         add("g", "Access", () => grantsDialog(item.name), w);
         add("c", "Config / QR", () => configDialog(item.name), w);
@@ -562,7 +566,9 @@ function renameDialog(agent) {
   const name = el("input", { required: true, pattern: "[A-Za-z0-9_\\-]{1,63}", value: agent.name });
   openModal(`Rename ${agent.name}`, form([
     row("New name", name),
-    el("p", { class: "hint" }, `Its DNS name follows: ${agent.dns_name || "NAME"} becomes NEW.${data.names_suffix || "internal"}. Devices need nothing new.`),
+    el("p", { class: "hint" }, agent.dns_label
+      ? `Its DNS name ${agent.dns_name} is its own and stays. Devices need nothing new.`
+      : `Its DNS name follows: ${agent.dns_name || "NAME"} becomes NEW.${data.names_suffix || "internal"}. Devices need nothing new.`),
   ], "Rename", async () => {
     await act({ action: "agent_rename", name: agent.id, new_name: name.value.trim() });
     closeModal();
@@ -1343,6 +1349,39 @@ function banDialog(forward) {
   }));
 }
 
+// Names on for an agent, under its own name or one chosen here (`rift vpn names agent NAME on
+// LABEL`); empty keeps the agent's name.
+function namesDialog(agent) {
+  const suffix = data.names_suffix || "internal";
+  const own = (agent.name || "").toLowerCase().replace(/_/g, "-");
+  const label = el("input", { pattern: "[A-Za-z0-9_\\-]{1,63}", value: agent.dns_label || own, placeholder: own });
+  openModal(`Names for ${agent.name}`, form([
+    row(`DNS name (.${suffix} is added)`, label),
+    el("p", { class: "hint" }, `Devices with a grant on ${agent.name} reach it as NAME.${suffix}. Empty takes the agent's name, which then follows a rename. A name another agent or this server has is refused.`),
+  ], "Names on", async () => {
+    const text = label.value.trim();
+    const body = { action: "agent_names", name: agent.id, on: true };
+    if (text && text.toLowerCase() !== own) body.label = text;
+    await namesChange(body);
+  }));
+}
+
+// The name of this server for devices with a grant on it (`rift vpn names vps on LABEL`). It
+// has no default: a name must be chosen.
+function serverNameDialog() {
+  const suffix = data.names_suffix || "internal";
+  const server = data.server || {};
+  const label = el("input", { required: true, pattern: "[A-Za-z0-9_\\-]{1,63}", value: server.label || "", placeholder: "e.g. rs" });
+  const off = server.label ? button("Name off", () => namesChange({ action: "agent_names", name: "vps", on: false }), "danger") : null;
+  openModal("Name of this server", form([
+    row(`DNS name (.${suffix} is added)`, label),
+    el("p", { class: "hint" }, `Devices with a grant on this server (Access → this server) reach it as NAME.${suffix} instead of ${server.tunnel_ipv4 || "its tunnel address"}, for example ssh USER@rs.${suffix}. Choose a name no agent has.`),
+    off,
+  ], "Name on", async () => {
+    await namesChange({ action: "agent_names", name: "vps", on: true, label: label.value.trim() });
+  }));
+}
+
 // Turns names on or off (an agent's or a device's) and says which devices must import their
 // main profile again, because their DNS server changed.
 async function namesChange(body) {
@@ -1368,7 +1407,7 @@ function deviceDialog() {
   const list = el("datalist", { id: "device-names" }, ...peers.map((p) => el("option", { value: p.name })));
   const name = el("input", { required: true, pattern: "[A-Za-z0-9_\\-]{1,63}", placeholder: "e.g. phone", list: "device-names" });
   const agents = agentOptions(true);
-  const agent = select([["", "none"], ...agents], agents.length ? agents[0][0] : "");
+  const agent = select([["", "none"], ...agents, ["vps", "this server (vps)"]], agents.length ? agents[0][0] : "");
   const ports = el("input", { placeholder: "e.g. 3000/tcp 8080/tcp" });
   const panel = el("input", { type: "checkbox" });
   openModal("Connect a VPN device", form([
@@ -1394,7 +1433,7 @@ function deviceDialog() {
       const result = await act({ action: "vpn_allow", peer: device, agent: agent.value, ports: wanted }, { quiet: true });
       const refusals = result.warnings || [];
       notes.push(...refusals);
-      const host = (data.agents || []).find((a) => a.name === agent.value);
+      const host = agent.value === "vps" ? data.server : (data.agents || []).find((a) => a.name === agent.value);
       const ip = host && host.tunnel_ipv4;
       if (ip && refusals.length) {
         notes.push(`Stored, but not reachable yet: ${agent.value} refuses ${refusals.length === 1 ? "this grant" : "some of these grants"} (see above). It works once ${agent.value} allows it.`);
@@ -1679,7 +1718,8 @@ function grantsDialog(name, notes) {
       button("Withdraw", async () => { const result = await act({ action: "panel_allow", name, allowed: false }); await refresh(importNote(name, result)); }, "danger")));
   }
   for (const g of peer.grants || []) {
-    list.append(el("li", {}, el("span", { title: g.refused || "" }, `${g.agent || "?"}: ${access(g.access)}${g.refused ? " (refused by the agent)" : ""}`),
+    const target = g.server ? `this server (${(data.server || {}).tunnel_ipv4 || "vps"})` : g.agent || "?";
+    list.append(el("li", {}, el("span", { title: g.refused || "" }, `${target}: ${access(g.access)}${g.refused ? " (refused by the agent)" : ""}`),
       button("Withdraw", async () => {
         try {
           const result = await act({ action: "vpn_deny", peer: name, agent: g.agent, access: g.access });
@@ -1700,24 +1740,31 @@ function grantsDialog(name, notes) {
 
   const agents = agentOptions(true);
   const content = [el("h4", {}, "Current access"), list];
-  if (agents.length) {
-    const agent = select(agents, agents[0][0]);
-    const kind = select([["server", "the agent host (TCP, UDP, ping)"], ["full", "the agent host, all protocols"], ["ports", "ports on the agent host"], ["subnet", "a network behind the agent"]], "server");
+  {
+    // This server itself is always a target; LAN networks exist only behind agents.
+    const agent = select([...agents, ["vps", "this server (vps)"]], agents.length ? agents[0][0] : "vps");
+    const kind = select([["server", "the host (TCP, UDP, ping)"], ["full", "the host, all protocols"], ["ports", "ports on the host"], ["subnet", "a network behind the agent"]], "server");
     const value = el("input", { placeholder: "" });
     const snat = el("input", { type: "checkbox" });
     const valueRow = row("Ports or network", value);
     const snatRow = check("Masquerade (SNAT) on the agent, if the LAN router has no route back", snat);
+    const serverHint = el("p", { class: "hint" }, `On this server: services of the VPS host on ${(data.server || {}).tunnel_ipv4 || "its tunnel address"}, e.g. SSH on 22/tcp. RIFT's own ports stay closed; the panel has its own permission.`);
     const update = () => {
+      const vps = agent.value === "vps";
+      kind.querySelector('option[value="subnet"]').disabled = vps;
+      if (vps && kind.value === "subnet") kind.value = "ports";
+      serverHint.hidden = !vps;
       valueRow.hidden = kind.value === "server" || kind.value === "full";
       value.required = !valueRow.hidden;
       value.placeholder = kind.value === "ports" ? "e.g. 22/tcp 53/both" : "e.g. 192.168.178.0/24";
       snatRow.hidden = kind.value !== "subnet";
     };
     kind.addEventListener("change", update);
+    agent.addEventListener("change", update);
     update();
     content.push(el("hr", { class: "sep" }), el("h4", {}, "Allow more"), form([
-      el("div", { class: "row inline" }, row("Agent", agent), row("Access to", kind)),
-      valueRow, snatRow,
+      el("div", { class: "row inline" }, row("Reach", agent), row("Access to", kind)),
+      valueRow, snatRow, serverHint,
     ], "Allow", async () => {
       const body = { action: "vpn_allow", peer: name, agent: agent.value };
       if (kind.value === "server") body.server = true;
@@ -1767,10 +1814,10 @@ function grantsDialog(name, notes) {
   const namesBox = el("input", { type: "checkbox", checked: !peer.names_off });
   namesBox.addEventListener("change", () => namesChange({ action: "vpn_peer_names", name, on: namesBox.checked }));
   content.push(el("hr", { class: "sep" }), el("h4", {}, "Names"),
-    check(`Use RIFT's names (NAME.${data.names_suffix || "internal"}) for agents that have them on`, namesBox),
+    check(`Use RIFT's names (NAME.${data.names_suffix || "internal"}) for agents and this server, where they are on`, namesBox),
     el("p", { class: "hint" }, (peer.names || []).length
       ? `Resolves: ${peer.names.join(", ")}. While the tunnel is on, every lookup of the device goes through this server.`
-      : "No agent this device reaches has names on. Turn them on per agent in the Agents card."));
+      : "Nothing this device reaches has a name. Turn names on per agent in the Agents card, and for this server with \"Server name\" in the VPN devices card."));
   content.push(el("div", { class: "form" }, el("div", { class: "buttons" }, button("Done", closeModal, "primary"))));
   openModal(`Access of ${name}`, ...content);
 }

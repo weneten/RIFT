@@ -106,10 +106,14 @@ pub enum AdminRequest {
     AgentEnable {
         name: String,
     },
-    /// `NAME.internal` for devices with a grant on the agent.
+    /// `NAME.internal` for devices with a grant on the agent; `name` `vps` is the VPS itself.
+    /// `label` is the DNS name to use (without the suffix); without it an agent uses its own
+    /// name, while the VPS needs one.
     AgentNames {
         name: String,
         on: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
     },
     /// Whether this device uses RIFT's names when an agent it reaches has them on.
     VpnPeerNames {
@@ -232,7 +236,7 @@ pub enum AdminRequest {
     Export,
     /// Creates what an export file holds and the server lacks.
     Import {
-        data: Export,
+        data: Box<Export>,
         options: ImportOptions,
     },
 }

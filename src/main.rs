@@ -192,6 +192,9 @@ enum Vpn {
     /// Let a device reach an agent: `rift vpn allow DEVICE AGENT TARGET...`, for example
     /// `rift vpn allow iphone node1 22/tcp 53/both`. Without an allow, a device reaches nothing.
     ///
+    /// `vps` in place of the agent is this server itself, on its tunnel address
+    /// (`rift vpn allow laptop vps 22/tcp` for SSH); RIFT's own ports stay closed.
+    ///
     /// Use `exit` as a target to add an exit through that agent's connection
     /// (`rift vpn allow iphone node1 exit`), or alone to add the exit through this server
     /// (`rift vpn allow iphone exit`). A device can have both and several agent exits; each
@@ -214,8 +217,9 @@ enum Vpn {
         agent: String,
     },
     /// Names for VPN devices: `rift vpn names agent NAME on` makes `NAME.internal` resolve to
-    /// the agent for every device with a grant on it; `rift vpn names device NAME off` keeps a
-    /// device out. A device that uses names has RIFT as its DNS server and must import its
+    /// the agent for every device with a grant on it (`on LABEL` gives it another name);
+    /// `rift vpn names vps on LABEL` does the same for this server; `rift vpn names device
+    /// NAME off` keeps a device out. A device that uses names has RIFT as its DNS server and must import its
     /// main profile again when that starts or stops.
     Names {
         #[command(subcommand)]
@@ -375,11 +379,24 @@ impl LinkArgs {
 }
 #[derive(Subcommand)]
 enum NamesWhat {
-    /// `rift vpn names agent NAME on|off`: NAME.internal for devices with a grant on it.
+    /// `rift vpn names agent NAME on [LABEL]|off`: NAME.internal for devices with a grant on
+    /// it, or LABEL.internal with a DNS name of its own (`rift vpn names agent node1 on nas`).
+    /// `on` again with another LABEL, or without one, changes the name.
     Agent {
         name: String,
         #[arg(value_parser = ["on", "off"])]
         state: String,
+        /// The DNS name, without the suffix; the agent's name if left out.
+        label: Option<String>,
+    },
+    /// `rift vpn names vps on LABEL|off`: LABEL.internal resolves to this server for every
+    /// device with a grant on it (`rift vpn allow DEVICE vps 22/tcp`). This server has no
+    /// default name, so `on` needs one, for example `rift vpn names vps on rs`.
+    Vps {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+        /// The DNS name, without the suffix.
+        label: Option<String>,
     },
     /// `rift vpn names device NAME on|off`: whether this device uses the names (default on).
     Device {
@@ -392,9 +409,10 @@ enum NamesWhat {
 struct VpnAccessArgs {
     /// Device name.
     peer: String,
-    /// The agent, then the targets: PORT/tcp, PORT/udp or PORT/both (ranges like
-    /// 8000-8010/tcp), `server`, `full`, a network behind the agent such as 192.168.178.0/24,
-    /// or `exit`. Several are allowed. Just `exit` means the exit through this server.
+    /// The agent (or `vps` for this server), then the targets: PORT/tcp, PORT/udp or
+    /// PORT/both (ranges like 8000-8010/tcp), `server`, `full`, a network behind the agent
+    /// such as 192.168.178.0/24, or `exit`. Several are allowed. Just `exit` means the exit
+    /// through this server.
     #[arg(value_name = "AGENT TARGET", required = true, num_args = 1..)]
     rest: Vec<String>,
     /// Set only by `vpn allow`; `vpn deny` matches a grant whatever its NAT setting.
@@ -440,6 +458,11 @@ impl VpnAccessArgs {
             "name the agent first: `rift vpn allow DEVICE AGENT ... exit`. The exit through this server is `rift vpn allow DEVICE exit` on its own"
         );
         let exit = self.rest[1..].iter().any(|t| t == "exit");
+        anyhow::ensure!(
+            !(exit && agent == rift::vpn::SERVER_TARGET),
+            "the exit through this server is `rift vpn allow {} exit`, without {agent}",
+            self.peer
+        );
         Ok(VpnPlan {
             accesses: self.accesses(&self.rest[1..])?,
             exit: exit.then(|| Exit::Agent(agent.clone())),
@@ -793,10 +816,18 @@ async fn run() -> Result<()> {
                 first
             }
             Vpn::Names {
-                what: NamesWhat::Agent { name, state },
+                what: NamesWhat::Agent { name, state, label },
             } => AdminRequest::AgentNames {
                 name,
                 on: state == "on",
+                label,
+            },
+            Vpn::Names {
+                what: NamesWhat::Vps { state, label },
+            } => AdminRequest::AgentNames {
+                name: rift::vpn::SERVER_TARGET.into(),
+                on: state == "on",
+                label,
             },
             Vpn::Names {
                 what: NamesWhat::Device { name, state },
@@ -1164,7 +1195,14 @@ async fn import_command(config: &Config, json: bool, args: ImportArgs) -> Result
         map: args.map,
         dry_run: args.dry_run,
     };
-    let report = admin_ok(config, AdminRequest::Import { data, options }).await?;
+    let report = admin_ok(
+        config,
+        AdminRequest::Import {
+            data: Box::new(data),
+            options,
+        },
+    )
+    .await?;
     if json {
         println!("{}", serde_json::to_string(&report)?);
     } else {
@@ -1614,6 +1652,8 @@ async fn vpn_connect(config: &Config, json: bool, args: VpnAccessArgs, export: b
     let mut warnings = Vec::new();
     // Grants the agent's own limits refuse: stored, but not reachable yet.
     let mut refused = Vec::new();
+    // This server's tunnel address, when the target is `vps`.
+    let mut server = None;
     for request in requests {
         let data = admin_ok(config, request)
             .await
@@ -1622,8 +1662,12 @@ async fn vpn_connect(config: &Config, json: bool, args: VpnAccessArgs, export: b
             warnings.push(warning.to_string());
             refused.push(data["access"].clone());
         }
+        if let Some(address) = data["address"].as_str().filter(|_| data["server"] == true) {
+            server = Some(address.to_string());
+        }
     }
     let tunnel = match &plan.agent {
+        _ if server.is_some() => server,
         Some(agent) => admin_ok(config, AdminRequest::AgentsList)
             .await?
             .as_array()
@@ -2432,6 +2476,40 @@ mod tests {
             failed.join("\n")
         );
     }
+    #[test]
+    fn the_vps_is_a_target_and_has_a_name_of_its_own() {
+        let requests = vpn_requests(&["rift", "vpn", "allow", "laptop", "vps", "22/tcp"]).unwrap();
+        assert!(matches!(
+            &requests[..],
+            [AdminRequest::VpnAllow { agent, access: VpnAccess::Port { .. }, .. }] if agent == "vps"
+        ));
+        let error = vpn_plan(&["rift", "vpn", "allow", "laptop", "vps", "exit"])
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("rift vpn allow laptop exit"),
+            "{error}"
+        );
+        let names = |argv: &[&str]| match Cli::try_parse_from(argv).map(|c| c.command.unwrap()) {
+            Ok(Command::Vpn {
+                command: Vpn::Names { what },
+            }) => Some(what),
+            _ => None,
+        };
+        assert!(matches!(
+            names(&["rift", "vpn", "names", "vps", "on", "rs"]),
+            Some(NamesWhat::Vps { state, label: Some(l) }) if state == "on" && l == "rs"
+        ));
+        assert!(matches!(
+            names(&["rift", "vpn", "names", "agent", "node1", "on", "nas"]),
+            Some(NamesWhat::Agent { label: Some(l), .. }) if l == "nas"
+        ));
+        assert!(matches!(
+            names(&["rift", "vpn", "names", "agent", "node1", "on"]),
+            Some(NamesWhat::Agent { label: None, .. })
+        ));
+    }
+
     #[test]
     fn documented_cli_parses() {
         for args in [

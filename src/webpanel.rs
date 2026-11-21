@@ -654,10 +654,13 @@ enum Action {
         name: String,
         enabled: bool,
     },
-    /// `NAME.internal` for devices with a grant on the agent.
+    /// `NAME.internal` for devices with a grant on the agent (`vps`: this server), under
+    /// `label` if given.
     AgentNames {
         name: String,
         on: bool,
+        #[serde(default)]
+        label: Option<String>,
     },
     /// Whether a device uses RIFT's names.
     VpnPeerNames {
@@ -902,8 +905,11 @@ impl Action {
                 panel.admin(AdminRequest::CancelInvite { name }).await?
             }
             Self::AgentRemove { name } => panel.admin(AdminRequest::AgentRemove { name }).await?,
-            Self::AgentNames { name, on } => {
-                panel.admin(AdminRequest::AgentNames { name, on }).await?
+            Self::AgentNames { name, on, label } => {
+                let label = label.filter(|l| !l.trim().is_empty());
+                panel
+                    .admin(AdminRequest::AgentNames { name, on, label })
+                    .await?
             }
             Self::VpnPeerNames { name, on } => {
                 panel.admin(AdminRequest::VpnPeerNames { name, on }).await?
@@ -1308,7 +1314,8 @@ pub(crate) fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> 
                 "tunnel_ipv6": a["tunnel_ipv6"],
                 "names": a["names"].as_bool().unwrap_or(false),
                 "rift_version": a["rift_version"],
-                "dns_name": a["name"].as_str().and_then(crate::vpn::dns_label).map(|l| format!("{l}.{}", crate::vpn::names_suffix())),
+                "dns_name": crate::vpn::agent_label_json(a).map(|l| crate::vpn::fqdn(&l)),
+                "dns_label": a["dns_label"],
                 "online": h.map(|h| h["online"].clone()).unwrap_or(Value::Bool(false)),
                 "configuration_ready": h.map(|h| h["configuration_ready"].clone()).unwrap_or(Value::Bool(false)),
                 "last_handshake": h.map(|h| h["last_handshake"].clone()).unwrap_or(Value::Null),
@@ -1362,6 +1369,8 @@ pub(crate) fn compose_overview(status: &Value, peers: &Value, panel: &Value) -> 
         "refused_host_grants": status["refused_host_grants"],
         "refused_links": status["refused_links"],
         "host_names": status["host_names"],
+        // This server for VPN devices: its tunnel address and its own name, if it has one.
+        "server": status["server"],
         "enrollment": status["enrollment"],
         "invites": status["invites"],
         "bans": bans,

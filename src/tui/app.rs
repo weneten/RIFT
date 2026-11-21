@@ -180,6 +180,8 @@ pub enum Op {
 pub enum Submit {
     Invite,
     Rename(String),
+    /// Names on, under the DNS name of the form: an agent's, or `vps` for this server.
+    Names(String),
     Forward,
     Ban,
     Device,
@@ -202,6 +204,8 @@ pub enum Act {
     AgentRename,
     AgentRotate,
     AgentNames,
+    /// Change the DNS name of an agent whose names are on.
+    AgentDnsName,
     AgentForward,
     AgentDetails,
     /// `rift host allow`: what the VPS host itself may reach on the agent.
@@ -227,6 +231,9 @@ pub enum Act {
     DevicePanel,
     DeviceToggle,
     DeviceRemove,
+    /// The DNS name of this server for devices with a grant on it (`rift vpn names vps`).
+    ServerName,
+    ServerNameForm,
     SiteAdd,
     SiteRemove,
     BanAdd,
@@ -1505,16 +1512,11 @@ impl App {
                     if agent["status"] != "pending" {
                         add("K", "Rotate key", Act::AgentRotate);
                     }
-                    if agent["dns_name"].is_string() {
-                        add(
-                            "n",
-                            if agent["names"] == true {
-                                "Names off"
-                            } else {
-                                "Names on"
-                            },
-                            Act::AgentNames,
-                        );
+                    if agent["names"] == true {
+                        add("n", "Names off", Act::AgentNames);
+                        add("N", "DNS name", Act::AgentDnsName);
+                    } else {
+                        add("n", "Names on", Act::AgentNames);
                     }
                     add("i", "Details", Act::AgentDetails);
                     if invited {
@@ -1557,6 +1559,7 @@ impl App {
             (Role::Server, Tab::Devices) => {
                 add("a", "Add", Act::DeviceAdd);
                 add("/", "Filter", Act::Filter);
+                add("V", "Server name", Act::ServerName);
                 if let Some(device) = item {
                     add("g", "Grant access", Act::DeviceGrant);
                     if device["grants"].as_array().is_some_and(|g| !g.is_empty()) {
@@ -1715,13 +1718,30 @@ impl App {
                 requests(vec![AdminRequest::AgentRotate { name: name.clone() }]),
                 false,
             ),
-            Act::AgentNames => self.spawn_op(
+            Act::AgentNames if item["names"] == true => self.spawn_op(
                 requests(vec![AdminRequest::AgentNames {
                     name,
-                    on: item["names"] != true,
+                    on: false,
+                    label: None,
                 }]),
                 false,
             ),
+            Act::AgentNames | Act::AgentDnsName => {
+                let current = vpn::agent_label_json(&item).unwrap_or_default();
+                let suffix = vpn::names_suffix();
+                self.open_form(
+                    Form::new(
+                        &format!("Names for {name}"),
+                        "Names on",
+                        vec![Field::text("label", "DNS name", &current, "e.g. nas")
+                            .hint(&format!("without .{suffix}; empty takes the agent's name"))],
+                    )
+                    .intro(&format!(
+                        "Devices with a grant on {name} reach it as NAME.{suffix}; RIFT becomes their DNS server, so they import their profile once more."
+                    )),
+                    Submit::Names(name),
+                )
+            }
             Act::AgentDetails => self.spawn_op(Op::Details(AdminRequest::AgentsShow { name }), false),
             Act::AgentHost => {
                 let address = item["tunnel_ipv4"].as_str().unwrap_or("its tunnel address");
@@ -2083,6 +2103,49 @@ impl App {
                 requests(vec![AdminRequest::VpnPeerRevoke { name: name.clone() }]),
                 true,
             ),
+            Act::ServerName => {
+                let server = self.overview()["server"].clone();
+                match server["dns_name"].as_str() {
+                    Some(current) => self.menu(
+                        &format!("Name of this server: {current}"),
+                        vec![
+                            MenuItem {
+                                label: "Change the name".into(),
+                                hint: String::new(),
+                                what: MenuWhat::Act(Act::ServerNameForm),
+                            },
+                            MenuItem {
+                                label: "Name off".into(),
+                                hint: "devices reach it by address".into(),
+                                what: MenuWhat::op(requests(vec![AdminRequest::AgentNames {
+                                    name: vpn::SERVER_TARGET.into(),
+                                    on: false,
+                                    label: None,
+                                }])),
+                            },
+                        ],
+                    ),
+                    None => self.act(Act::ServerNameForm),
+                }
+            }
+            Act::ServerNameForm => {
+                let server = self.overview()["server"].clone();
+                let current = server["label"].as_str().unwrap_or_default();
+                let address = server["tunnel_ipv4"].as_str().unwrap_or("its tunnel address");
+                let suffix = vpn::names_suffix();
+                self.open_form(
+                    Form::new(
+                        "Name of this server",
+                        "Name on",
+                        vec![Field::text("label", "DNS name", current, "e.g. rs")
+                            .hint(&format!("without .{suffix}; required"))],
+                    )
+                    .intro(&format!(
+                        "Devices with a grant on this server (Grant access → this server) reach it as NAME.{suffix} instead of {address}. It has no default name; choose one that no agent has."
+                    )),
+                    Submit::Names(vpn::SERVER_TARGET.into()),
+                )
+            }
             Act::SiteAdd => self.site_form(),
             Act::SiteRemove => {
                 let host = item["host"].as_str().unwrap_or_default().to_string();
@@ -2404,18 +2467,18 @@ impl App {
     }
 
     fn grant_form(&mut self, device: &str) {
-        let agents = self.agent_options();
-        if agents.is_empty() {
-            return self.notify(
-                "No active agent yet. Invite one first (Agents → a).".into(),
-                Level::Warn,
-            );
-        }
+        // This server itself comes first: it is always there, agents may not be yet.
+        let mut targets = vec![(
+            vpn::SERVER_TARGET.to_string(),
+            format!("this server ({})", vpn::SERVER_TARGET),
+        )];
+        targets.extend(self.agent_options());
         let form = Form::new(
             &format!("Grant {device} access"),
             "Grant",
             vec![
-                Field::select("agent", "Agent", agents),
+                Field::select("agent", "Reach", targets)
+                    .hint("an agent, or this server itself (SSH on the VPS); LAN, SNAT and exit apply to agents only"),
                 access_field(),
                 Field::text("ports", "Ports", "", "e.g. 22/tcp 53/both 8000-8010/tcp")
                     .hint("only with \"only these ports\""),
@@ -2538,6 +2601,24 @@ impl App {
                     replace,
                 }
             }
+            Submit::Names(name) => {
+                let text = form.text("label");
+                let server = name == vpn::SERVER_TARGET;
+                anyhow::ensure!(
+                    !server || !text.trim().is_empty(),
+                    "this server has no name of its own; choose one, for example rs"
+                );
+                let label = (!text.trim().is_empty())
+                    .then(|| vpn::parse_label(&text))
+                    .transpose()?;
+                // The agent's own name is no name of its own: keep it following renames.
+                let label = label.filter(|l| server || vpn::dns_label(name) != Some(l.clone()));
+                Op::Requests(vec![AdminRequest::AgentNames {
+                    name: name.clone(),
+                    on: true,
+                    label,
+                }])
+            }
             Submit::Rename(old) => {
                 let new_name = form.text("name");
                 validate_name(&new_name)?;
@@ -2613,6 +2694,10 @@ impl App {
                 anyhow::ensure!(
                     !snat || !subnets.is_empty(),
                     "masquerading applies only to a LAN network"
+                );
+                anyhow::ensure!(
+                    agent != vpn::SERVER_TARGET || (subnets.is_empty() && !form.on("exit")),
+                    "on this server a device reaches ports, the whole host or all protocols; its internet exit is under Internet exits"
                 );
                 let (server, full, ports) = host_access(form)?;
                 let accesses = vpn::accesses(server, full, &ports, &subnets, snat)?;
@@ -2851,7 +2936,7 @@ fn complete(input: &str) -> Option<String> {
         "rotate", "vpn", "host", "link", "panel", "config", "reload", "logs", "agents", "agent",
         "forwards", "forward", "bans", "ban", "devices", "device", "invite", "allow", "deny",
         "dns", "names", "connect", "password", "2fa", "setup", "confirm", "reset", "validate",
-        "exit", "server", "full", "--json", "--export", "--help",
+        "exit", "server", "full", "vps", "--json", "--export", "--help",
     ];
     let start = input.rfind(' ').map_or(0, |i| i + 1);
     let word = &input[start..];

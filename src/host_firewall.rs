@@ -83,6 +83,9 @@ pub struct ServerSpec<'a> {
     pub panel_proxies: &'a [ipnet::IpNet],
     /// The name server's port (`RIFT_NAMES_PORT`), opened on the tunnel while `vpn` is set.
     pub names_port: u16,
+    /// Devices that may reach the VPS itself (`rift vpn allow DEVICE vps`): the source is the
+    /// device. RIFT's own ports stay closed in the RIFT table.
+    pub server_grants: &'a [AgentVpnRule],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -280,6 +283,16 @@ pub fn plan_server(obs: &Observation, spec: &ServerSpec<'_>) -> Result<Plan> {
                 ));
             }
         }
+        if chain.family == "ip" || chain.family == "inet" {
+            for rule in spec.server_grants {
+                rules.extend(vpn_accepts(
+                    spec.interface,
+                    spec.server_v4,
+                    rule,
+                    "rift:vps",
+                ));
+            }
+        }
         if let Some(panel) = spec.panel {
             if chain.family == "ip" || chain.family == "inet" {
                 rules.push(format!(
@@ -381,20 +394,11 @@ pub fn plan_agent(obs: &Observation, spec: &AgentSpec<'_>) -> Result<Plan> {
         }
         if chain.family == "ip" || chain.family == "inet" {
             for rule in spec.vpn {
-                // iptables has no protocol sets, so the server grant becomes one rule each.
-                if rule.access == crate::model::VpnAccess::Server {
-                    for protocol in ["tcp", "udp", "icmp"] {
-                        rules.push(format!(
-                            "iifname \"{}\" ip saddr {} ip daddr {} meta l4proto {protocol} accept comment \"rift:vpn\"",
-                            spec.interface, rule.source, spec.tunnel_v4
-                        ));
-                    }
-                    continue;
-                }
-                rules.push(format!(
-                    "iifname \"{}\" {}accept comment \"rift:vpn\"",
+                rules.extend(vpn_accepts(
                     spec.interface,
-                    crate::vpn::flow_match(rule.source, spec.tunnel_v4, &rule.access)
+                    spec.tunnel_v4,
+                    rule,
+                    "rift:vpn",
                 ));
             }
             // Replies of links this agent opened. That they are replies is enforced in the
@@ -460,6 +464,31 @@ pub fn plan_agent(obs: &Observation, spec: &AgentSpec<'_>) -> Result<Plan> {
             .count()
     );
     Ok(plan)
+}
+
+/// Accepts for one grant of a device on `address`. iptables has no protocol sets, so the
+/// whole-host grant becomes one rule per protocol.
+fn vpn_accepts(
+    interface: &str,
+    address: Ipv4Addr,
+    rule: &AgentVpnRule,
+    comment: &str,
+) -> Vec<String> {
+    if rule.access == crate::model::VpnAccess::Server {
+        return ["tcp", "udp", "icmp"]
+            .iter()
+            .map(|protocol| {
+                format!(
+                    "iifname \"{interface}\" ip saddr {} ip daddr {address} meta l4proto {protocol} accept comment \"{comment}\"",
+                    rule.source
+                )
+            })
+            .collect();
+    }
+    vec![format!(
+        "iifname \"{interface}\" {}accept comment \"{comment}\"",
+        crate::vpn::flow_match(rule.source, address, &rule.access)
+    )]
 }
 
 /// Forwarding between an exit interface and the uplinks. Only replies may come back, but
@@ -827,6 +856,7 @@ mod tests {
             panel: None,
             panel_proxies: &[],
             names_port: 53053,
+            server_grants: &[],
             exit: false,
         }
     }
@@ -1117,6 +1147,33 @@ mod tests {
         assert!(plan
             .fill
             .contains("oifname \"rift0\" accept comment \"rift:egress\""));
+    }
+
+    #[test]
+    fn devices_reach_the_vps_itself_through_a_closed_firewall_only_as_granted() {
+        let obs = observe(&ruleset()).unwrap();
+        let uplinks = vec!["eth0".to_string()];
+        let grants = [
+            AgentVpnRule {
+                source: Ipv4Addr::new(10, 14, 0, 2),
+                access: crate::model::VpnAccess::Port {
+                    protocol: crate::model::Protocol::Tcp,
+                    ports: crate::model::PortRange { start: 22, end: 22 },
+                },
+            },
+            AgentVpnRule {
+                source: Ipv4Addr::new(10, 14, 0, 3),
+                access: crate::model::VpnAccess::Server,
+            },
+        ];
+        let mut spec = server_spec(&uplinks);
+        assert!(!plan_server(&obs, &spec).unwrap().fill.contains("rift:vps"));
+        spec.server_grants = &grants;
+        let plan = plan_server(&obs, &spec).unwrap();
+        assert!(plan.fill.contains("iifname \"rift0\" ip saddr 10.14.0.2 ip daddr 10.88.0.1 meta l4proto tcp tcp dport 22 accept comment \"rift:vps\""), "{}", plan.fill);
+        for protocol in ["tcp", "udp", "icmp"] {
+            assert!(plan.fill.contains(&format!("iifname \"rift0\" ip saddr 10.14.0.3 ip daddr 10.88.0.1 meta l4proto {protocol} accept comment \"rift:vps\"")), "{}", plan.fill);
+        }
     }
 
     #[test]

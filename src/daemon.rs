@@ -944,7 +944,7 @@ fn policy_for(snapshot: &StateSnapshot, id: &str, nets: PolicyNets) -> AgentPoli
     let mut domains: Vec<String> = links
         .iter()
         .filter(|l| l.from.id == id && l.to.names)
-        .filter_map(|l| crate::vpn::dns_label(&l.to.name))
+        .filter_map(|l| crate::vpn::agent_label(l.to))
         .map(|label| format!("{label}.{suffix}"))
         .collect();
     domains.sort();
@@ -1255,7 +1255,7 @@ async fn admin_call_inner(s: &Server, r: AdminRequest) -> Result<serde_json::Val
                 .map(|n| n.moved.clone())
                 .unwrap_or_default();
             let inapplicable_forwards = inapplicable(&snap, &cfg.public_ips);
-            serde_json::json!({"moved_forwards":moved_forwards,"inapplicable_forwards":inapplicable_forwards,"snapshot":snap,"enrollment":enrollment,"invites":invites,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"refused_forwards":refused_forwards,"refused_grants":refused_grants,"refused_host_grants":refused_host_grants,"refused_links":refused_links,"host_names":crate::names::host_names_status(std::path::Path::new(crate::sites::QUEUE_DIR)),"fully_applied":fully_applied,"connection_history":s.state.health()?,"rift_version":protocol::RIFT_VERSION})
+            serde_json::json!({"moved_forwards":moved_forwards,"inapplicable_forwards":inapplicable_forwards,"snapshot":snap,"enrollment":enrollment,"invites":invites,"peers":peers,"doctor":doctor,"applied_generation":applied,"apply_error":error,"agent_health":health,"pending_forwards":pending_forwards,"refused_forwards":refused_forwards,"refused_grants":refused_grants,"refused_host_grants":refused_host_grants,"refused_links":refused_links,"host_names":crate::names::host_names_status(std::path::Path::new(crate::sites::QUEUE_DIR)),"server":{"tunnel_ipv4":cfg.server_ipv4,"label":snap.server_label,"dns_name":snap.server_label.as_deref().map(crate::vpn::fqdn)},"fully_applied":fully_applied,"connection_history":s.state.health()?,"rift_version":protocol::RIFT_VERSION})
         }
         AdminRequest::AgentsList => serde_json::to_value(snap.agents)?,
         AdminRequest::AgentsShow { name } => {
@@ -1269,10 +1269,7 @@ async fn admin_call_inner(s: &Server, r: AdminRequest) -> Result<serde_json::Val
         AdminRequest::Invite { name, ttl_seconds } => {
             let cfg = s.config.read().await.clone();
             validate_name(&name)?;
-            anyhow::ensure!(
-                name != "exit" && name != "default",
-                "an agent cannot be called exit or default: `rift vpn allow DEVICE exit` and `rift vpn dns DEVICE default` would be ambiguous"
-            );
+            crate::vpn::check_agent_name(&name)?;
             anyhow::ensure!(
                 cfg.enrollment != EnrollmentMode::Off,
                 "enrollment is off; set RIFT_ENROLLMENT=auto in the server .env and recreate the container"
@@ -1334,11 +1331,20 @@ async fn admin_call_inner(s: &Server, r: AdminRequest) -> Result<serde_json::Val
         }
         AdminRequest::AgentRename { name, new_name } => {
             validate_name(&new_name)?;
-            anyhow::ensure!(
-                new_name != "exit" && new_name != "default",
-                "an agent cannot be called exit or default: `rift vpn allow DEVICE exit` and `rift vpn dns DEVICE default` would be ambiguous"
-            );
-            let id = find_agent(&snap, &name)?.id.clone();
+            crate::vpn::check_agent_name(&new_name)?;
+            let agent = find_agent(&snap, &name)?;
+            let id = agent.id.clone();
+            // An agent with names on and no name of its own is found under its new name.
+            if agent.names && agent.dns_label.is_none() {
+                let label = crate::vpn::dns_label(&new_name).ok_or_else(|| {
+                    anyhow!("{new_name} is not usable as a DNS name, and {name} has names on; turn them off first or give it a DNS name (rift vpn names agent {name} on LABEL)")
+                })?;
+                if let Some(owner) =
+                    crate::vpn::label_owner(&snap, &label, crate::vpn::NameFor::Agent(&id))
+                {
+                    bail!("{} is already the name of {owner}; give {name} another DNS name first (rift vpn names agent {name} on LABEL)", crate::vpn::fqdn(&label));
+                }
+            }
             s.state.mutate("agent-rename", |x| {
                 if x.agents.iter().any(|a| a.id != id && a.name == new_name) {
                     bail!("agent name already exists")
@@ -1383,7 +1389,7 @@ async fn admin_call_inner(s: &Server, r: AdminRequest) -> Result<serde_json::Val
             )
         }
         AdminRequest::Export => serde_json::to_value(portable::export(&snap))?,
-        AdminRequest::Import { data, options } => import_admin(s, data, options).await?,
+        AdminRequest::Import { data, options } => import_admin(s, *data, options).await?,
         AdminRequest::ForwardAdd(mut f) => {
             f.validate()?;
             let cfg = s.config.read().await.clone();
@@ -1626,7 +1632,7 @@ async fn host_admin(
                         // resolver: only while the agent has names on.
                         "dns_name": agent
                             .filter(|a| named.iter().any(|n| n.id == a.id))
-                            .and_then(|a| crate::vpn::dns_label(&a.name))
+                            .and_then(crate::vpn::agent_label)
                             .map(|l| format!("{l}.{}", crate::vpn::names_suffix())),
                     })
                 })
@@ -1779,7 +1785,11 @@ async fn import_admin(
                     }
                 }
                 Op::Device(_) => cfg.check_vpn_pool()?,
-                Op::AgentNames(_) | Op::HostGrant(_) | Op::Link(_) => {}
+                Op::AgentNames { .. } | Op::ServerLabel(_) | Op::HostGrant(_) | Op::Link(_) => {}
+                Op::ServerGrant(g) => anyhow::ensure!(
+                    !lost_devices.contains(&g.peer),
+                    "the device could not be created"
+                ),
                 Op::Flags { name, .. } | Op::AgentExit { name, .. } => {
                     anyhow::ensure!(
                         !lost_devices.contains(name),
@@ -1910,10 +1920,18 @@ async fn import_admin(
                         p.names_off = names_off.unwrap_or(p.names_off);
                     }
                 }
-                Op::AgentNames(id) => {
+                Op::AgentNames { id, label } => {
                     for a in x.agents.iter_mut().filter(|a| &a.id == id) {
                         a.names = true;
+                        a.dns_label = label.clone();
                     }
+                }
+                Op::ServerLabel(label) => x.server_label = Some(label.clone()),
+                Op::ServerGrant(g) => {
+                    x.server_grants.retain(|old| {
+                        !(old.peer == g.peer && crate::vpn::same_target(&old.access, &g.access))
+                    });
+                    x.server_grants.push(g.clone());
                 }
                 Op::HostGrant(g) => {
                     if !x.host_grants.contains(g) {
@@ -2044,26 +2062,85 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                     let agent = snap.agents.iter().find(|a| a.id == g.agent_id).map(|a| a.name.clone());
                     serde_json::json!({"agent":agent,"access":g.access,"refused":grant_refusal(snap, g)})
                 }).collect();
-                let names: Vec<String> = crate::vpn::named_agents(snap, p).iter().filter_map(|a| crate::vpn::dns_label(&a.name)).map(|l| format!("{l}.{}", crate::vpn::names_suffix())).collect();
+                let grants: Vec<_> = grants.into_iter().chain(snap.server_grants.iter().filter(|g| g.peer == p.name).map(|g| {
+                    serde_json::json!({"agent":crate::vpn::SERVER_TARGET,"access":g.access,"refused":null,"server":true})
+                })).collect();
+                let names = crate::vpn::device_names(snap, p);
                 serde_json::json!({"name":p.name,"ipv4":p.ipv4,"ipv6":p.ipv6,"enabled":p.enabled,"panel":p.panel,"public_key":p.public_key,"last_handshake":handshake,"grants":grants,"exits":exits_json(snap, p),"names":names,"names_off":p.names_off})
             }).collect();
             serde_json::Value::Array(rows)
         }
-        AdminRequest::AgentNames { name, on } => {
-            let agent = find_agent(snap, &name)?;
-            let id = agent.id.clone();
-            let label = crate::vpn::dns_label(&agent.name).ok_or_else(|| {
-                anyhow!("{name} is not usable as a DNS name; rename the agent to letters, digits and - (rift rename agent)")
-            })?;
-            s.state.mutate("agent-names", |x| {
-                x.agents
-                    .iter_mut()
-                    .filter(|a| a.id == id)
-                    .for_each(|a| a.names = on);
+        AdminRequest::AgentNames { name, on, label } if name == crate::vpn::SERVER_TARGET => {
+            server_target(snap, &name)?;
+            let label = match (on, label) {
+                (false, Some(_)) => bail!("a DNS name goes with on: rift vpn names {name} on LABEL"),
+                (false, None) => None,
+                (true, None) => bail!(
+                    "this server has no name of its own; choose one: rift vpn names {name} on LABEL, for example rs (rs.{})",
+                    crate::vpn::names_suffix()
+                ),
+                (true, Some(text)) => Some(crate::vpn::parse_label(&text)?),
+            };
+            if let Some(label) = &label {
+                if let Some(owner) =
+                    crate::vpn::label_owner(snap, label, crate::vpn::NameFor::Server)
+                {
+                    bail!(
+                        "{} is already the name of {owner}; choose another one",
+                        crate::vpn::fqdn(label)
+                    );
+                }
+            }
+            let old = snap.server_label.clone();
+            s.state.mutate("server-names", |x| {
+                x.server_label = label.clone();
                 Ok(())
             })?;
             reconcile(s).await?;
-            serde_json::json!({"name":name,"on":on,"dns_name":format!("{label}.{}", crate::vpn::names_suffix())})
+            let shown = label.as_ref().or(old.as_ref()).map(|l| crate::vpn::fqdn(l));
+            serde_json::json!({"name":name,"on":on,"dns_name":shown,"server":true})
+        }
+        AdminRequest::AgentNames { name, on, label } => {
+            let agent = find_agent(snap, &name)?;
+            let id = agent.id.clone();
+            let chosen = match (on, label) {
+                (false, Some(_)) => {
+                    bail!("a DNS name goes with on: rift vpn names agent {name} on LABEL")
+                }
+                (_, Some(text)) => Some(crate::vpn::parse_label(&text)?),
+                (_, None) => None,
+            };
+            // Without a name of its own, the agent is found under its name.
+            let label = match &chosen {
+                Some(label) => label.clone(),
+                None => crate::vpn::dns_label(&agent.name).ok_or_else(|| {
+                    anyhow!("{name} is not usable as a DNS name; give it one (rift vpn names agent {name} on LABEL) or rename the agent to letters, digits and - (rift rename agent)")
+                })?,
+            };
+            if on {
+                if let Some(owner) =
+                    crate::vpn::label_owner(snap, &label, crate::vpn::NameFor::Agent(&id))
+                {
+                    bail!(
+                        "{} is already the name of {owner}; choose another one: rift vpn names agent {name} on LABEL",
+                        crate::vpn::fqdn(&label)
+                    );
+                }
+            }
+            let shown = if on {
+                label
+            } else {
+                crate::vpn::agent_label(agent).unwrap_or(label)
+            };
+            s.state.mutate("agent-names", |x| {
+                x.agents.iter_mut().filter(|a| a.id == id).for_each(|a| {
+                    a.names = on;
+                    a.dns_label = chosen.clone();
+                });
+                Ok(())
+            })?;
+            reconcile(s).await?;
+            serde_json::json!({"name":name,"on":on,"dns_name":crate::vpn::fqdn(&shown)})
         }
         AdminRequest::VpnPeerNames { name, on } => {
             find_peer(&name)?;
@@ -2094,11 +2171,39 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
             s.state.mutate("vpn-peer-revoke", |x| {
                 x.vpn_peers.retain(|p| p.name != name);
                 x.vpn_grants.retain(|g| g.peer != name);
+                x.server_grants.retain(|g| g.peer != name);
                 Ok(())
             })?;
             let _ = std::fs::remove_file(key_path);
             reconcile(s).await?;
             serde_json::json!({"revoked":name})
+        }
+        AdminRequest::VpnAllow {
+            peer,
+            agent,
+            access,
+        } if agent == crate::vpn::SERVER_TARGET => {
+            find_peer(&peer)?;
+            server_target(snap, &agent)?;
+            anyhow::ensure!(
+                matches!(
+                    access,
+                    VpnAccess::Server | VpnAccess::Full | VpnAccess::Port { .. }
+                ),
+                "on this server a device reaches ports, the whole host (server) or all protocols (full); the exit through it is `rift vpn allow {peer} exit`"
+            );
+            crate::vpn::validate_access(&access)?;
+            s.state.mutate("vpn-allow-server", |x| {
+                x.server_grants
+                    .retain(|g| !(g.peer == peer && crate::vpn::same_target(&g.access, &access)));
+                x.server_grants.push(ServerGrant {
+                    peer: peer.clone(),
+                    access: access.clone(),
+                });
+                Ok(())
+            })?;
+            reconcile(s).await?;
+            serde_json::json!({"peer":peer,"agent":agent,"access":access,"server":true,"address":cfg.server_ipv4})
         }
         AdminRequest::VpnAllow {
             peer,
@@ -2186,6 +2291,27 @@ async fn vpn_admin(s: &Server, snap: &StateSnapshot, r: AdminRequest) -> Result<
                 )
             });
             serde_json::json!({"peer":peer,"agent":agent,"warning":warning})
+        }
+        AdminRequest::VpnDeny {
+            peer,
+            agent,
+            access,
+        } if agent == crate::vpn::SERVER_TARGET => {
+            find_peer(&peer)?;
+            server_target(snap, &agent)?;
+            s.state.mutate("vpn-deny-server", |x| {
+                let before = x.server_grants.len();
+                x.server_grants.retain(|g| {
+                    !(g.peer == peer
+                        && access
+                            .as_ref()
+                            .is_none_or(|a| crate::vpn::same_target(&g.access, a)))
+                });
+                anyhow::ensure!(before != x.server_grants.len(), "no matching grant");
+                Ok(())
+            })?;
+            reconcile(s).await?;
+            serde_json::json!({"peer":peer,"agent":agent,"denied":true,"exit_removed":false})
         }
         AdminRequest::VpnDeny {
             peer,
@@ -2371,6 +2497,14 @@ fn missing_device(snap: &StateSnapshot, name: &str) -> anyhow::Error {
     anyhow!("no device {name}; create it with `rift add device {name}`, or `rift panel connect {name}` to create it with panel access in one step")
 }
 
+/// `vps` stands for this server. An agent that is still called so from before must be renamed
+/// first, or the command would be ambiguous.
+fn server_target(snap: &StateSnapshot, name: &str) -> Result<()> {
+    if snap.agents.iter().any(|a| a.name == name) {
+        bail!("an agent is called {name}, which now stands for this server; rename it first: rift rename agent {name} NEW")
+    }
+    Ok(())
+}
 fn find_agent<'a>(snap: &'a StateSnapshot, name: &str) -> Result<&'a AgentRecord> {
     snap.agents
         .iter()
@@ -3168,6 +3302,7 @@ mod tests {
             protocol: 0,
             rift_version: String::new(),
             names: false,
+            dns_label: None,
             id: "node4".into(),
             name: "node1".into(),
             public_key: "k".into(),
@@ -3244,6 +3379,7 @@ mod tests {
             protocol: protocol::VERSION,
             rift_version: "1.1.0".into(),
             names: false,
+            dns_label: None,
             id: id.into(),
             name: id.into(),
             public_key: format!("k-{id}"),
@@ -3432,6 +3568,7 @@ mod tests {
             protocol: 0,
             rift_version: String::new(),
             names: false,
+            dns_label: None,
             id: "node4".into(),
             name: "home".into(),
             public_key: "k".into(),
@@ -3524,6 +3661,7 @@ mod tests {
             protocol: 0,
             rift_version: String::new(),
             names: false,
+            dns_label: None,
             id: "node4".into(),
             name: "node1".into(),
             public_key: "k".into(),

@@ -242,6 +242,101 @@ pub fn dns_label(agent: &str) -> Option<String> {
     .then_some(label)
 }
 
+/// The DNS label of an agent: the one chosen for it, or else its name (`dns_label`).
+pub fn agent_label(agent: &AgentRecord) -> Option<String> {
+    agent.dns_label.clone().or_else(|| dns_label(&agent.name))
+}
+
+/// `agent_label` for an agent as the admin API lists it (JSON).
+pub fn agent_label_json(agent: &serde_json::Value) -> Option<String> {
+    agent["dns_label"]
+        .as_str()
+        .map(String::from)
+        .or_else(|| agent["name"].as_str().and_then(dns_label))
+}
+
+/// `LABEL.suffix`.
+pub fn fqdn(label: &str) -> String {
+    format!("{label}.{}", names_suffix())
+}
+
+/// The word that stands for the VPS itself where commands take an agent:
+/// `rift vpn allow DEVICE vps 22/tcp`, `rift vpn names vps on LABEL`. No agent may be called so.
+pub const SERVER_TARGET: &str = "vps";
+
+/// Names no agent may have, as commands read them as something else.
+pub fn check_agent_name(name: &str) -> Result<()> {
+    ensure!(
+        name != "exit" && name != "default" && name != SERVER_TARGET,
+        "an agent cannot be called exit, default or {SERVER_TARGET}: `rift vpn allow DEVICE exit`, `rift vpn dns DEVICE default` and `rift vpn allow DEVICE {SERVER_TARGET} ...` would be ambiguous"
+    );
+    Ok(())
+}
+
+/// A DNS label as typed: in lower case, with `_` as `-`, and without the suffix if it was
+/// given (`rs.internal` is `rs`). Only one label: letters, digits and `-`.
+pub fn parse_label(text: &str) -> Result<String> {
+    let text = text.trim().trim_end_matches('.').to_ascii_lowercase();
+    let suffix = format!(".{}", names_suffix());
+    let text = text.strip_suffix(&suffix).unwrap_or(&text);
+    let label = dns_label(text).filter(|l| !l.contains('.'));
+    label.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{text:?} is no DNS name: use 1 to 63 letters, digits and -, without a dot, for example rs (it becomes rs.{})",
+            names_suffix()
+        )
+    })
+}
+
+/// Whose name `label` would be: the VPS or the agent (by ID) that is to get it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NameFor<'a> {
+    Server,
+    Agent(&'a str),
+}
+
+/// Who else already answers to `label` among the names that are on: an agent or the VPS.
+/// `None` when it is free for `whom`.
+pub fn label_owner(snap: &StateSnapshot, label: &str, whom: NameFor<'_>) -> Option<String> {
+    if whom != NameFor::Server && snap.server_label.as_deref() == Some(label) {
+        return Some(format!("this server ({SERVER_TARGET})"));
+    }
+    let except_agent = match whom {
+        NameFor::Agent(id) => Some(id),
+        NameFor::Server => None,
+    };
+    snap.agents
+        .iter()
+        .filter(|a| a.names && Some(a.id.as_str()) != except_agent)
+        .find(|a| agent_label(a).as_deref() == Some(label))
+        .map(|a| format!("agent {}", a.name))
+}
+
+/// Whether the device resolves the VPS's own name: the VPS has one, the device uses names and
+/// has a grant on the VPS.
+pub fn resolves_server(snap: &StateSnapshot, peer: &VpnPeer) -> bool {
+    snap.server_label.is_some()
+        && !peer.names_off
+        && peer.enabled
+        && snap.server_grants.iter().any(|g| g.peer == peer.name)
+}
+
+/// Every name the device resolves through RIFT, as `LABEL.suffix`: the VPS's first, then the
+/// agents'.
+pub fn device_names(snap: &StateSnapshot, peer: &VpnPeer) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if resolves_server(snap, peer) {
+        out.extend(snap.server_label.as_deref().map(fqdn));
+    }
+    out.extend(
+        named_agents(snap, peer)
+            .iter()
+            .filter_map(|a| agent_label(a))
+            .map(|l| fqdn(&l)),
+    );
+    out
+}
+
 /// The agents whose names this device resolves: active, names on, and the device has a grant
 /// on them. Empty when the device turned names off or is disabled.
 pub fn named_agents<'a>(snap: &'a StateSnapshot, peer: &VpnPeer) -> Vec<&'a AgentRecord> {
@@ -263,9 +358,10 @@ pub fn named_agents<'a>(snap: &'a StateSnapshot, peer: &VpnPeer) -> Vec<&'a Agen
     out
 }
 
-/// Whether RIFT is this device's DNS server: it resolves at least one agent's name.
+/// Whether RIFT is this device's DNS server: it resolves at least one name, an agent's or the
+/// VPS's.
 pub fn uses_names(snap: &StateSnapshot, peer: &VpnPeer) -> bool {
-    !named_agents(snap, peer).is_empty()
+    resolves_server(snap, peer) || !named_agents(snap, peer).is_empty()
 }
 
 /// The agent whose tunnel address is the device's DNS server, when it has a DNS grant on an
@@ -559,6 +655,60 @@ pub fn server_rules(interface: &str, pools: Pools, ipv6_exit: bool, snap: &State
     rules
 }
 
+/// The grants of enabled devices on the VPS itself.
+pub fn effective_server_grants(snap: &StateSnapshot) -> Vec<(&VpnPeer, &VpnAccess)> {
+    snap.server_grants
+        .iter()
+        .filter_map(|g| {
+            let peer = snap
+                .vpn_peers
+                .iter()
+                .find(|p| p.name == g.peer && p.enabled)?;
+            Some((peer, &g.access))
+        })
+        .collect()
+}
+
+/// The server's rules for devices that may reach the VPS itself (`rift vpn allow DEVICE vps`):
+/// they go ahead of the drop that keeps devices off the VPS. RIFT's own ports in `closed`
+/// (control, panel, name server) are dropped first, whatever a grant says: the panel has its
+/// own permission (`rift panel allow`), and the name server its own rules, which come earlier.
+/// A port published by Docker on the VPS is translated before the input hook and forwarded to
+/// its container, so the grant is accepted there too, with its replies.
+pub fn server_grant_rules(
+    interface: &str,
+    server: Ipv4Addr,
+    closed: &[u16],
+    snap: &StateSnapshot,
+) -> Rules {
+    let mut rules = Rules::default();
+    let grants = effective_server_grants(snap);
+    if grants.is_empty() {
+        return rules;
+    }
+    let ports: Vec<String> = closed.iter().map(ToString::to_string).collect();
+    for (peer, _) in &grants {
+        rules.input.push_str(&format!(
+            "add rule inet rift input iifname \"{interface}\" ip saddr {} ip daddr {server} meta l4proto {{ tcp, udp }} th dport {{ {} }} drop\n",
+            peer.ipv4,
+            ports.join(", ")
+        ));
+    }
+    for (peer, access) in &grants {
+        rules.input.push_str(&format!(
+            "add rule inet rift input iifname \"{interface}\" {}accept\n",
+            flow_match(peer.ipv4, server, access)
+        ));
+        rules.forward.push_str(&format!(
+            "add rule inet rift forward iifname \"{interface}\" ip saddr {source} ct direction original ct status dnat ct original ip daddr {server} {}accept\n\
+             add rule inet rift forward oifname \"{interface}\" ip daddr {source} ct direction reply ct status dnat ct original ip daddr {server} accept\n",
+            original_protocols(access),
+            source = peer.ipv4,
+        ));
+    }
+    rules
+}
+
 const PRIVATE_V4: &str = "{ 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4 }";
 const PRIVATE_V6: &str = "{ ::/128, ::1/128, fc00::/7, fe80::/10, ff00::/8 }";
 
@@ -791,7 +941,7 @@ pub fn client_config(
         if let Some(server) = p.panel.filter(|_| peer.panel) {
             routes.insert(format!("{server}/32"));
         }
-        if names {
+        if names || snap.server_grants.iter().any(|g| g.peer == peer.name) {
             routes.insert(format!("{}/32", p.server_ipv4));
         }
         for grant in snap.vpn_grants.iter().filter(|g| g.peer == peer.name) {
@@ -866,6 +1016,7 @@ mod tests {
             protocol: 2,
             rift_version: String::new(),
             names: false,
+            dns_label: None,
             id: id.into(),
             name: id.into(),
             public_key: format!("k-{id}"),
@@ -1001,6 +1152,7 @@ mod tests {
             protocol: 0,
             rift_version: String::new(),
             names: false,
+            dns_label: None,
             id: id.into(),
             name: id.into(),
             public_key: format!("key-{id}"),
@@ -1086,6 +1238,117 @@ mod tests {
         let peer = snap.vpn_peers.iter().find(|p| p.name == name).unwrap();
         client_config(snap, peer, "SECRET", &params(&dns, None, server_ipv6), None)
     }
+    #[test]
+    fn a_grant_on_the_vps_opens_its_tunnel_address_but_never_rifts_own_ports() {
+        let mut snap = snapshot();
+        let server = Ipv4Addr::new(10, 13, 0, 1);
+        assert!(
+            server_grant_rules("rift0", server, &[7443, 8090, 53053], &snap)
+                .input
+                .is_empty()
+        );
+        snap.server_grants = vec![
+            ServerGrant {
+                peer: "iphone".into(),
+                access: VpnAccess::Port {
+                    protocol: Protocol::Tcp,
+                    ports: PortRange { start: 22, end: 22 },
+                },
+            },
+            // A disabled device gets nothing.
+            ServerGrant {
+                peer: "old".into(),
+                access: VpnAccess::Full,
+            },
+        ];
+        let rules = server_grant_rules("rift0", server, &[7443, 8090, 53053], &snap);
+        let closed = rules
+            .input
+            .find("ip saddr 10.14.0.2 ip daddr 10.13.0.1 meta l4proto { tcp, udp } th dport { 7443, 8090, 53053 } drop")
+            .expect("RIFT's ports are dropped");
+        let ssh = rules
+            .input
+            .find("iifname \"rift0\" ip saddr 10.14.0.2 ip daddr 10.13.0.1 meta l4proto tcp tcp dport 22 accept")
+            .expect("the granted port is accepted");
+        assert!(closed < ssh, "{}", rules.input);
+        assert!(!rules.input.contains("10.14.0.3"), "{}", rules.input);
+        // A port Docker publishes on the VPS is forwarded to its container, with the replies.
+        assert!(rules.forward.contains("iifname \"rift0\" ip saddr 10.14.0.2 ct direction original ct status dnat ct original ip daddr 10.13.0.1 ct original protocol tcp meta l4proto tcp ct original proto-dst 22 accept"), "{}", rules.forward);
+        assert!(rules.forward.contains("oifname \"rift0\" ip daddr 10.14.0.2 ct direction reply ct status dnat ct original ip daddr 10.13.0.1 accept"), "{}", rules.forward);
+        // The device routes the VPS's tunnel address, and nothing else is needed.
+        let text = config(&snap, "iphone", false).unwrap();
+        assert!(
+            text.contains("AllowedIPs = 10.13.0.1/32, 10.13.0.2/32"),
+            "{text}"
+        );
+        assert!(!text.contains("DNS ="), "no name, no DNS server: {text}");
+    }
+
+    #[test]
+    fn the_vps_has_a_name_only_when_chosen_and_names_do_not_clash() {
+        let mut snap = snapshot();
+        snap.agents[0].names = true;
+        let iphone = snap.vpn_peers[0].clone();
+        assert_eq!(device_names(&snap, &iphone), ["node4.internal"]);
+        snap.server_label = Some("rs".into());
+        // Without a grant on the VPS the device does not resolve its name.
+        assert_eq!(device_names(&snap, &iphone), ["node4.internal"]);
+        snap.server_grants.push(ServerGrant {
+            peer: "iphone".into(),
+            access: VpnAccess::Server,
+        });
+        assert_eq!(
+            device_names(&snap, &iphone),
+            ["rs.internal", "node4.internal"]
+        );
+        snap.agents[0].names = false;
+        assert!(
+            uses_names(&snap, &iphone),
+            "the VPS's name alone makes RIFT the DNS server"
+        );
+        let text = config(&snap, "iphone", false).unwrap();
+        assert!(text.contains("DNS = 10.13.0.1\n"), "{text}");
+        let mut off = iphone.clone();
+        off.names_off = true;
+        assert!(!uses_names(&snap, &off));
+
+        // An agent's own DNS name replaces its name.
+        snap.agents[0].names = true;
+        snap.agents[0].dns_label = Some("nas".into());
+        assert_eq!(agent_label(&snap.agents[0]).as_deref(), Some("nas"));
+        assert_eq!(
+            device_names(&snap, &iphone),
+            ["rs.internal", "nas.internal"]
+        );
+        // Taken names: the VPS's for agents, an agent's for the VPS and other agents.
+        assert_eq!(
+            label_owner(&snap, "rs", NameFor::Agent("other")).as_deref(),
+            Some("this server (vps)")
+        );
+        assert_eq!(label_owner(&snap, "rs", NameFor::Server), None);
+        assert_eq!(
+            label_owner(&snap, "nas", NameFor::Server).as_deref(),
+            Some("agent node4")
+        );
+        assert_eq!(label_owner(&snap, "nas", NameFor::Agent("node4")), None);
+        assert_eq!(label_owner(&snap, "node4", NameFor::Server), None);
+    }
+
+    #[test]
+    fn typed_dns_names_are_one_label_and_may_carry_the_suffix() {
+        assert_eq!(parse_label("RS").unwrap(), "rs");
+        assert_eq!(parse_label("rs.internal").unwrap(), "rs");
+        assert_eq!(parse_label("rs.internal.").unwrap(), "rs");
+        assert_eq!(parse_label("home_nas").unwrap(), "home-nas");
+        for bad in ["", "a.b", "-x", "x y", &"a".repeat(64)] {
+            assert!(parse_label(bad).is_err(), "{bad:?}");
+        }
+        for reserved in ["exit", "default", "vps"] {
+            assert!(check_agent_name(reserved).is_err(), "{reserved}");
+        }
+        assert!(check_agent_name("node1").is_ok());
+    }
+
     #[test]
     fn names_make_the_server_the_dns_server_of_the_main_profile() {
         let mut snap = snapshot();

@@ -1718,6 +1718,13 @@ fn draw_devices(frame: &mut Frame, app: &mut App, area: Rect) {
                 }
             },
         ),
+        kv("This server", {
+            let server = &app.overview()["server"];
+            match server["dns_name"].as_str() {
+                Some(name) => format!("{} · {name}", s(&server["tunnel_ipv4"])),
+                None => format!("{} · no name (V sets one)", s(&server["tunnel_ipv4"])),
+            }
+        }),
         Line::raw(""),
         Line::styled("Access", theme::bold()),
     ];
@@ -1731,7 +1738,14 @@ fn draw_devices(frame: &mut Frame, app: &mut App, area: Rect) {
     for grant in grants {
         let mut spans = vec![
             Span::raw("  "),
-            Span::styled(s(&grant["agent"]), theme::accent()),
+            Span::styled(
+                if grant["server"] == true {
+                    format!("this server ({})", s(&grant["agent"]))
+                } else {
+                    s(&grant["agent"])
+                },
+                theme::accent(),
+            ),
             Span::raw(format!(": {}", crate::output::vpn_access(&grant["access"]))),
         ];
         if let Some(reason) = grant["refused"].as_str() {

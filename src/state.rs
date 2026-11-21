@@ -31,11 +31,19 @@ pub const OLD_STATE: &str =
 /// The format of the state database, kept in SQLite's `user_version`. A database written
 /// before formats were numbered (builds before 1.0) has 0 and is format 1. Every change to what is
 /// stored adds a migration below and a fixture test, so an update never loses state.
-pub const STATE_VERSION: u32 = 2;
+pub const STATE_VERSION: u32 = 3;
 
 /// Migration `n` turns format `n` into `n + 1`, inside one transaction.
 type Migration = fn(&rusqlite::Transaction) -> Result<()>;
-const MIGRATIONS: &[(u32, Migration)] = &[(1, migrate_1_to_2)];
+const MIGRATIONS: &[(u32, Migration)] = &[(1, migrate_1_to_2), (2, migrate_2_to_3)];
+
+/// Format 3 adds devices' grants on the VPS itself (`server_grants`), its DNS name
+/// (`server_label`) and agents' own DNS names (`dns_label`). All are empty by default, so the
+/// stored JSON stays as it is; the step records the format, so that an older RIFT, which would
+/// drop them, refuses the state instead.
+fn migrate_2_to_3(_tx: &rusqlite::Transaction) -> Result<()> {
+    Ok(())
+}
 
 /// Format 2 adds the names of agents and devices (`names`, `names_off`). Both default to off,
 /// so the stored JSON stays as it is; the step only records the format.
@@ -391,6 +399,7 @@ impl StateStore {
             protocol: 0,
             rift_version: String::new(),
             names: false,
+            dns_label: None,
             id: id.into(),
             name: name.into(),
             public_key: key.into(),
@@ -816,6 +825,52 @@ fn validate_snapshot(s: &StateSnapshot) -> Result<()> {
         crate::vpn::validate_access(&l.access)?;
         anyhow::ensure!(!s.agent_links[..i].contains(l), "duplicate link");
     }
+    let mut labels = HashSet::new();
+    for a in &s.agents {
+        if let Some(label) = &a.dns_label {
+            anyhow::ensure!(
+                crate::vpn::dns_label(label).as_deref() == Some(label.as_str()),
+                "agent {} has an invalid DNS name",
+                a.name
+            );
+        }
+        if a.names {
+            if let Some(label) = crate::vpn::agent_label(a) {
+                // Stored before names were checked against each other: two agents whose names
+                // differ only in `_` and `-`. Only a chosen name must be free.
+                anyhow::ensure!(
+                    labels.insert(label) || a.dns_label.is_none(),
+                    "two agents have the DNS name {}",
+                    a.dns_label.as_deref().unwrap_or_default()
+                );
+            }
+        }
+    }
+    if let Some(label) = &s.server_label {
+        anyhow::ensure!(
+            crate::vpn::dns_label(label).as_deref() == Some(label.as_str()),
+            "the server has an invalid DNS name"
+        );
+        anyhow::ensure!(
+            !labels.contains(label),
+            "the server's DNS name {label} is an agent's too"
+        );
+    }
+    for (i, g) in s.server_grants.iter().enumerate() {
+        anyhow::ensure!(
+            peer_names.contains(&g.peer),
+            "server grant references unknown peer"
+        );
+        anyhow::ensure!(
+            matches!(
+                g.access,
+                VpnAccess::Server | VpnAccess::Full | VpnAccess::Port { .. }
+            ),
+            "a grant on the server is server, full or a port"
+        );
+        crate::vpn::validate_access(&g.access)?;
+        anyhow::ensure!(!s.server_grants[..i].contains(g), "duplicate server grant");
+    }
     let mut ban_ids = HashSet::new();
     for b in &s.bans {
         anyhow::ensure!(ban_ids.insert(b.id), "duplicate ban ID");
@@ -964,11 +1019,76 @@ mod tests {
     }
 
     #[test]
+    fn grants_on_the_server_and_dns_names_are_validated() {
+        let peer = VpnPeer {
+            name: "laptop".into(),
+            public_key: "key-laptop".into(),
+            ipv4: "10.14.0.2".parse().unwrap(),
+            enabled: true,
+            created_at: 0,
+            panel: false,
+            ipv6: "fd88:5249:4655::2".parse().unwrap(),
+            server_exit: false,
+            agent_exits: Vec::new(),
+            names_off: false,
+        };
+        let ssh = VpnAccess::Port {
+            protocol: Protocol::Tcp,
+            ports: PortRange { start: 22, end: 22 },
+        };
+        let mut snap = StateSnapshot {
+            vpn_peers: vec![peer],
+            server_grants: vec![ServerGrant {
+                peer: "laptop".into(),
+                access: ssh.clone(),
+            }],
+            server_label: Some("rs".into()),
+            ..Default::default()
+        };
+        validate_snapshot(&snap).unwrap();
+        snap.server_grants.push(snap.server_grants[0].clone());
+        assert!(validate_snapshot(&snap).is_err(), "duplicate");
+        snap.server_grants[1].access = VpnAccess::Dns;
+        assert!(
+            validate_snapshot(&snap).is_err(),
+            "only server, full or ports"
+        );
+        snap.server_grants[1].peer = "nobody".into();
+        snap.server_grants[1].access = VpnAccess::Full;
+        assert!(validate_snapshot(&snap).is_err(), "unknown device");
+        snap.server_grants.pop();
+        snap.server_label = Some("Not A Label".into());
+        assert!(validate_snapshot(&snap).is_err(), "invalid name");
+    }
+
+    #[test]
+    fn state_of_format_2_is_migrated_with_a_copy_first() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        v1_database(&path);
+        Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", 2)
+            .unwrap();
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.version().unwrap(), 3);
+        let snap = store.snapshot().unwrap();
+        assert!(snap.server_grants.is_empty() && snap.server_label.is_none());
+        assert!(snap.agents[0].dns_label.is_none());
+        assert!(std::fs::read_dir(dir.path()).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("state-before-v3-")));
+    }
+
+    #[test]
     fn vpn_state_is_validated() {
         let agent = |id: &str, n: u8| AgentRecord {
             protocol: 0,
             rift_version: String::new(),
             names: false,
+            dns_label: None,
             id: id.into(),
             name: id.into(),
             public_key: format!("k-{id}"),
@@ -1098,6 +1218,7 @@ mod tests {
             protocol: 0,
             rift_version: String::new(),
             names: false,
+            dns_label: None,
             id: id.into(),
             name: id.into(),
             public_key: format!("k-{id}"),
@@ -1657,6 +1778,7 @@ mod tests {
                     protocol: 0,
                     rift_version: String::new(),
                     names: false,
+                    dns_label: None,
                     id: "a".into(),
                     name: "a".into(),
                     public_key: "key".into(),

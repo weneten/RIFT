@@ -288,6 +288,10 @@ pub struct AgentRecord {
     /// (`rift vpn names agent NAME on`).
     #[serde(default)]
     pub names: bool,
+    /// The DNS label chosen for the agent (`rift vpn names agent NAME on LABEL`); `None` uses
+    /// its name (`vpn::agent_label`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_label: Option<String>,
     /// The protocol and release the agent reported with its last sync; 0 and empty before.
     #[serde(default)]
     pub protocol: u16,
@@ -458,6 +462,14 @@ pub struct HostGrant {
     pub agent_id: String,
     pub access: VpnAccess,
 }
+/// A device may reach the VPS itself on its tunnel address (`rift vpn allow DEVICE vps ...`):
+/// services of the VPS host such as SSH. Only `Server`, `Full` and `Port`; RIFT's own ports
+/// (control, panel, name server) stay closed whatever the grant says.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerGrant {
+    pub peer: String,
+    pub access: VpnAccess,
+}
 /// One agent may open connections to another agent's tunnel address (`rift link allow`),
 /// through the server. Directional: `to` cannot open connections back unless a link of its
 /// own allows it. Only `Server`, `Full` and `Port`; the target sees it as a VPN rule whose
@@ -510,6 +522,13 @@ pub struct StateSnapshot {
     /// What agents may reach on other agents (`rift link allow`); absent before it existed.
     #[serde(default)]
     pub agent_links: Vec<AgentLink>,
+    /// What devices may reach on the VPS itself (`rift vpn allow DEVICE vps ...`).
+    #[serde(default)]
+    pub server_grants: Vec<ServerGrant>,
+    /// The DNS label of the VPS for devices with a server grant (`rift vpn names vps on
+    /// LABEL`); `None` while its name is off. It has no default: the operator chooses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_label: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct AgentPolicy {

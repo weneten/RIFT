@@ -149,6 +149,7 @@ mod tests {
             protocol: 0,
             rift_version: String::new(),
             names: false,
+            dns_label: None,
             id: id.into(),
             name: id.into(),
             public_key: format!("k-{id}"),

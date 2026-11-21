@@ -243,10 +243,7 @@ fn agents(data: &Value) -> String {
         .into_iter()
         .flatten()
         .map(|a| {
-            let dns = match (
-                a["names"].as_bool(),
-                a["name"].as_str().and_then(crate::vpn::dns_label),
-            ) {
+            let dns = match (a["names"].as_bool(), crate::vpn::agent_label_json(a)) {
                 (Some(true), Some(label)) => format!("{label}.{}", crate::vpn::names_suffix()),
                 _ => "-".into(),
             };
@@ -871,7 +868,12 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
         AdminRequest::AgentRemove { name } => format!("Agent {name} removed."),
         AdminRequest::AgentDisable { name } => format!("Agent {name} disabled."),
         AdminRequest::AgentEnable { name } => format!("Agent {name} enabled."),
-        AdminRequest::AgentNames { name, on: true } => format!("Devices with a grant on {name} now reach it as {}.", field(data, "dns_name")),
+        AdminRequest::AgentNames { on: true, .. } if data["server"] == true => format!("Devices with a grant on this server now reach it as {}.", field(data, "dns_name")),
+        AdminRequest::AgentNames { on: false, .. } if data["server"] == true => match data["dns_name"].as_str() {
+            Some(name) => format!("{name} no longer resolves."),
+            None => "This server had no name.".into(),
+        },
+        AdminRequest::AgentNames { name, on: true, .. } => format!("Devices with a grant on {name} now reach it as {}.", field(data, "dns_name")),
         AdminRequest::AgentNames { on: false, .. } => format!("{} no longer resolves.", field(data, "dns_name")),
         AdminRequest::VpnPeerNames { name, on: true } => format!("{name} uses RIFT's names for the agents it reaches that have them on."),
         AdminRequest::VpnPeerNames { name, on: false } => format!("{name} no longer uses RIFT's names; it reaches agents by address."),
@@ -888,6 +890,7 @@ pub fn render(request: &AdminRequest, data: &Value, agents_data: Option<&Value>)
         AdminRequest::VpnPeerEnable { name, enabled } => format!("VPN device {name} {}.", if *enabled { "enabled" } else { "disabled; it can no longer connect" }),
         AdminRequest::VpnPeerRevoke { name } => format!("VPN device {name} revoked. Its key and grants are gone."),
         AdminRequest::VpnAllow { peer, agent, access } if refused(data) => format!("Grant stored, but {peer} cannot reach {agent}: {} yet: {agent} refuses it (see the warning). It works once {agent} allows it.", vpn_access(&serde_json::to_value(access).unwrap_or_default())),
+        AdminRequest::VpnAllow { peer, access, .. } if data["server"] == true => format!("{peer} may now reach this server at {}: {}.", field(data, "address"), vpn_access(&serde_json::to_value(access).unwrap_or_default())),
         AdminRequest::VpnAllow { peer, agent, access } => format!("{peer} may now reach {agent}: {}.", vpn_access(&serde_json::to_value(access).unwrap_or_default())),
         AdminRequest::VpnDeny { peer, agent, .. } => {
             let mut text = format!("Access of {peer} to {agent} withdrawn.");
